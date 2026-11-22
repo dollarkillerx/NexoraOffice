@@ -3,6 +3,9 @@
 
 export component AppWindow inherits Window {
     title: "G1 · 自绘表面内的输入法";
+    // Window and taskbar icon on Windows and X11. macOS takes the Dock icon from
+    // the bundle and Wayland from the desktop entry, so this does nothing there.
+    icon: @image-url("../../../assets/brand/logo/png/aster-icon-256.png");
     preferred-width: 960px;
     preferred-height: 640px;
     min-width: 480px;

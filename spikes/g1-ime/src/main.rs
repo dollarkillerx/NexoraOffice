@@ -10,17 +10,15 @@
 //!
 //! `g1-ime --dump out.png` renders one frame without opening a window.
 
-mod surface;
-
 use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::platform::Key;
+use aster_surface::host::{self, to_px};
+use aster_surface::{ImeEvent, TextSurface};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
-use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode};
-use surface::{Action, ImeEvent, Surface};
+use slint::{ComponentHandle, Timer, TimerMode};
 
 slint::include_modules!();
 
@@ -40,7 +38,7 @@ G1 输入法关卡
 const CARET_BLINK: Duration = Duration::from_millis(530);
 
 struct App {
-    surface: Surface,
+    surface: TextSurface,
     started: Instant,
     last_blink: Instant,
     caret_on: bool,
@@ -68,10 +66,6 @@ impl App {
     }
 }
 
-fn to_px(logical: f32, scale: f32) -> u16 {
-    (logical * scale).round().clamp(0.0, f32::from(u16::MAX)) as u16
-}
-
 /// Render the surface, hand the frame to Slint, and move the candidate window.
 fn present(ui: &AppWindow, app: &mut App) {
     let scale = ui.window().scale_factor();
@@ -84,30 +78,16 @@ fn present(ui: &AppWindow, app: &mut App) {
     app.surface
         .set_caret_on(app.caret_on && ui.get_surface_focused());
 
-    let pixmap = app.surface.render();
-    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-        pixmap.data_as_u8_slice(),
-        u32::from(width),
-        u32::from(height),
-    );
-    ui.set_frame(Image::from_rgba8_premultiplied(buffer));
+    if let Some(frame) = host::render_frame(&mut app.surface) {
+        ui.set_frame(frame);
+    }
     ui.set_ime_summary(app.summary().into());
 
-    if !ui.get_surface_focused() {
-        return;
+    if ui.get_surface_focused() {
+        // The candidate window follows the caret.
+        let origin = (ui.get_surface_x(), ui.get_surface_y());
+        host::place_candidate_window(ui.window(), origin, &mut app.surface);
     }
-    let (x, y, w, h) = app.surface.ime_cursor_area();
-    let origin_x = f64::from(ui.get_surface_x() * scale);
-    let origin_y = f64::from(ui.get_surface_y() * scale);
-    ui.window().with_winit_window(|window| {
-        // Slint only enables the input method for its own text inputs, and it may
-        // switch it off again when one of those loses focus, so re-assert it here.
-        window.set_ime_allowed(true);
-        window.set_ime_cursor_area(
-            winit::dpi::PhysicalPosition::new(origin_x + x, origin_y + y),
-            winit::dpi::PhysicalSize::new(w, h),
-        );
-    });
 }
 
 fn describe(event: &ImeEvent) -> String {
@@ -122,100 +102,8 @@ fn describe(event: &ImeEvent) -> String {
     }
 }
 
-fn from_winit(ime: &winit::event::Ime) -> ImeEvent {
-    match ime {
-        winit::event::Ime::Enabled => ImeEvent::Enabled,
-        winit::event::Ime::Disabled => ImeEvent::Disabled,
-        winit::event::Ime::Commit(text) => ImeEvent::Commit(text.clone()),
-        winit::event::Ime::Preedit(text, cursor) => ImeEvent::Preedit {
-            text: text.clone(),
-            cursor: *cursor,
-        },
-    }
-}
-
-/// Turn a Slint key event into an editing command. `primary` is Cmd on macOS and
-/// Ctrl elsewhere (that is how Slint reports `modifiers.control`).
-fn decode_key(text: &str, shift: bool, primary: bool, alt: bool) -> Option<Action> {
-    let mut chars = text.chars();
-    let first = chars.next()?;
-    if chars.next().is_none() {
-        let is = |key: Key| char::from(key) == first;
-        if is(Key::Backspace) {
-            return Some(Action::Backspace);
-        }
-        if is(Key::Delete) {
-            return Some(Action::Delete);
-        }
-        if is(Key::Return) {
-            return Some(Action::Newline);
-        }
-        if is(Key::Tab) {
-            return Some(Action::Insert("\t".to_owned()));
-        }
-        if is(Key::LeftArrow) {
-            return Some(if primary {
-                Action::LineStart { select: shift }
-            } else {
-                Action::Left {
-                    select: shift,
-                    word: alt,
-                }
-            });
-        }
-        if is(Key::RightArrow) {
-            return Some(if primary {
-                Action::LineEnd { select: shift }
-            } else {
-                Action::Right {
-                    select: shift,
-                    word: alt,
-                }
-            });
-        }
-        if is(Key::UpArrow) {
-            return Some(Action::Up { select: shift });
-        }
-        if is(Key::DownArrow) {
-            return Some(Action::Down { select: shift });
-        }
-        if is(Key::Home) {
-            return Some(Action::LineStart { select: shift });
-        }
-        if is(Key::End) {
-            return Some(Action::LineEnd { select: shift });
-        }
-    }
-    if primary {
-        return text.eq_ignore_ascii_case("a").then_some(Action::SelectAll);
-    }
-    // Slint reports non-text keys as control characters or private-use code points.
-    let printable = text
-        .chars()
-        .all(|c| !c.is_control() && !('\u{e000}'..='\u{f8ff}').contains(&c));
-    printable.then(|| Action::Insert(text.to_owned()))
-}
-
-/// Give Slint's own text (header, footer) the same Han fallback chain as the
-/// document surface. Slint 1.19 lays out text with its own copy of fontique and
-/// hits the same single-cached-fallback problem: without this, Simplified-only
-/// characters in the shell show as missing glyphs on a Japanese-language Mac.
-fn configure_shell_fonts() {
-    use slint::fontique_012::fontique::{FallbackKey, Script};
-
-    let mut collection = slint::fontique_012::shared_collection();
-    let families: Vec<_> = surface::HAN_FALLBACK_FAMILIES
-        .iter()
-        .filter_map(|name| collection.family_id(name))
-        .collect();
-    if !families.is_empty() {
-        let han = FallbackKey::new(Script::from_bytes(*b"Hani"), None);
-        collection.set_fallbacks(han, families.into_iter());
-    }
-}
-
 fn dump(path: &str) -> Result<(), String> {
-    let mut surface = Surface::new(SAMPLE_TEXT);
+    let mut surface = TextSurface::new(SAMPLE_TEXT);
     surface.resize(1600, 900, 2.0);
     surface.ime(ImeEvent::Preedit {
         text: "ni hao shi jie".to_owned(),
@@ -230,12 +118,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .backend_name("winit".into())
         .renderer_name("skia".into())
         .select()?;
-    configure_shell_fonts();
+    host::configure_shell_fonts();
 
     let ui = AppWindow::new()?;
     let now = Instant::now();
     let app = Rc::new(RefCell::new(App {
-        surface: Surface::new(SAMPLE_TEXT),
+        surface: TextSurface::new(SAMPLE_TEXT),
         started: now,
         last_blink: now,
         caret_on: true,
@@ -258,7 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let Ok(mut app) = app.try_borrow_mut() else {
                 return EventResult::Propagate;
             };
-            let event = from_winit(ime);
+            let event = host::ime_event(ime);
             let line = describe(&event);
             app.log(&format!("IME {line}"));
             match &event {
@@ -289,7 +177,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (Some(ui), Ok(mut app)) = (ui.upgrade(), app.try_borrow_mut()) else {
                 return false;
             };
-            let Some(action) = decode_key(text.as_str(), shift, primary, alt) else {
+            let Some(action) = host::decode_key(text.as_str(), shift, primary, alt) else {
                 return false;
             };
             app.log(&format!("KEY {action:?}"));
@@ -380,58 +268,5 @@ fn main() -> ExitCode {
             eprintln!("g1-ime: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key(key: Key) -> String {
-        char::from(key).to_string()
-    }
-
-    #[test]
-    fn plain_text_is_inserted() {
-        assert_eq!(
-            decode_key("a", false, false, false),
-            Some(Action::Insert("a".to_owned()))
-        );
-        assert_eq!(
-            decode_key("你", false, false, false),
-            Some(Action::Insert("你".to_owned()))
-        );
-    }
-
-    #[test]
-    fn editing_keys_map_to_commands() {
-        assert_eq!(
-            decode_key(&key(Key::Backspace), false, false, false),
-            Some(Action::Backspace)
-        );
-        assert_eq!(
-            decode_key(&key(Key::Return), false, false, false),
-            Some(Action::Newline)
-        );
-        assert_eq!(
-            decode_key(&key(Key::LeftArrow), true, false, true),
-            Some(Action::Left {
-                select: true,
-                word: true
-            })
-        );
-        assert_eq!(
-            decode_key(&key(Key::RightArrow), false, true, false),
-            Some(Action::LineEnd { select: false })
-        );
-    }
-
-    #[test]
-    fn shortcuts_and_function_keys_do_not_insert_text() {
-        assert_eq!(decode_key("a", false, true, false), Some(Action::SelectAll));
-        assert_eq!(decode_key("s", false, true, false), None);
-        assert_eq!(decode_key(&key(Key::F5), false, false, false), None);
-        assert_eq!(decode_key(&key(Key::Escape), false, false, false), None);
-        assert_eq!(decode_key("", false, false, false), None);
     }
 }

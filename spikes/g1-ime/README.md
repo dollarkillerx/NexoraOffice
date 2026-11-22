@@ -10,12 +10,12 @@ Slint 1.19 没有向自定义控件开放输入法接口，所以这里绕过 Sl
 cargo run -p g1-ime
 ```
 
-窗口里的白色页面不是 Slint 控件。文字由 Parley 排版、vello_cpu 渲染，再作为一张图交给 Slint 显示。每个输入法事件都会打印到 stderr，并汇总在窗口顶部和底部。
+窗口里的白色页面不是 Slint 控件。文字由 Parley 排版、vello_cpu 渲染，再作为一张图交给 Slint 显示。表面层的代码已经搬到 `crates/aster-surface`，应用外壳 `crates/aster-shell` 用的是同一份；这个工程只剩窗口和日志。每个输入法事件都会打印到 stderr，并汇总在窗口顶部和底部。
 
 其他入口：
 
 ```sh
-cargo test -p g1-ime                              # 表面层的单元测试，不开窗口
+cargo test -p aster-surface                       # 表面层的单元测试，不开窗口
 cargo run -p g1-ime -- --dump out.png             # 不开窗口渲染一帧
 cargo run -p g1-ime --example fallback_probe      # 打印汉字实际回退到哪款系统字体
 spikes/bundle-macos.sh g1-ime                     # macOS：打成最小 .app 包
@@ -50,7 +50,7 @@ macOS 上的第 6 到 8 项还没有测。
 
 ## 实测中发现的问题
 
-- **汉字回退字体只缓存一份**。fontique 把“汉字、默认语言”的回退结果缓存成一份，谁先查询谁决定。在系统语言是日文的 Mac 上先缓存的是 Hiragino Sans，它没有简体专用字的字形，于是“输、这、图、进”等字显示成方块。苹方字体在当前 macOS 上也读不出来。Slint 自己的界面文字用的是同一套库，有同样的问题。这里的处理是显式设置回退链，见 `surface.rs` 里的 `HAN_FALLBACK_FAMILIES` 和 `main.rs` 里的 `configure_shell_fonts`。
+- **汉字回退字体只缓存一份**。fontique 把“汉字、默认语言”的回退结果缓存成一份，谁先查询谁决定。在系统语言是日文的 Mac 上先缓存的是 Hiragino Sans，它没有简体专用字的字形，于是“输、这、图、进”等字显示成方块。苹方字体在当前 macOS 上也读不出来。Slint 自己的界面文字用的是同一套库，有同样的问题。这里的处理是显式设置回退链，见 `crates/aster-surface` 里 `text_surface.rs` 的 `HAN_FALLBACK_FAMILIES` 和 `host.rs` 的 `configure_shell_fonts`。
 - **必须打开 Parley 的 `complex-scripts` 特性**。不打开时每次排版中日文都会向 stderr 打印 ICU 分词错误。
 - **切换输入法时 winit 会发一次 `Disabled`**，下一次组字开始时再发 `Enabled`。收到 `Disabled` 必须清掉预编辑串。
 - **日文候选窗打开时按回车**，第一次只关闭候选窗，第二次才上屏。还没有和系统原生应用逐键对比，不确定这是否就是系统行为。

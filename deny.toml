@@ -50,6 +50,9 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Our own crates depend on each other by path, without a version: the version
+# is written once, in the workspace manifest. They are never published.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

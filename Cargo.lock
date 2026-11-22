@@ -148,6 +148,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-surface"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "parley 0.13.0",
+ "slint",
+ "vello_cpu",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1283,11 +1293,10 @@ dependencies = [
 name = "g1-ime"
 version = "0.0.1"
 dependencies = [
- "bytemuck",
+ "aster-surface",
  "parley 0.13.0",
  "slint",
  "slint-build",
- "vello_cpu",
 ]
 
 [[package]]

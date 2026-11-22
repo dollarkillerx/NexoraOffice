@@ -8,10 +8,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+aster-surface = { workspace = true }
 slint = { workspace = true }
+# Only the fallback probe example uses Parley directly.
 parley = { workspace = true }
-vello_cpu = { workspace = true }
-bytemuck = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }

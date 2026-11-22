@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/aster-surface",
     "spikes/g1-ime",
     "spikes/g2-frame",
     "spikes/g3-cjk",
@@ -23,6 +24,7 @@ publish = false
 # API both change between minor releases; upgrading means re-running the Phase 0
 # gate tests (G1 input method, G2 frame path).
 [workspace.dependencies]
+aster-surface = { path = "crates/aster-surface" }
 slint = { version = "~1.19.0", default-features = false, features = [
     "std",
     "compat-1-2",

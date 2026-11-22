@@ -1,9 +1,9 @@
-//! The document surface for gate G1.
+//! A plain-text document surface: it takes input events, owns the text and its
+//! layout, and renders into a pixel buffer.
 //!
-//! No Slint and no winit types appear in this file. It takes plain input events,
-//! owns the text and its layout, and renders into a pixel buffer. That boundary is
-//! the one the architecture relies on: the shell can be replaced without touching
-//! anything here.
+//! No Slint and no winit types appear in this file. That boundary is the one the
+//! architecture relies on: the shell can be replaced without touching anything
+//! here. The code started as the Phase 0 gate G1 spike and still backs it.
 
 use parley::fontique::Script;
 use parley::layout::PositionedLayoutItem;
@@ -14,22 +14,80 @@ use vello_cpu::kurbo::{Affine, Rect};
 use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
-/// Body text size in logical pixels.
+/// Body text size in logical pixels at 100 % zoom.
 const FONT_SIZE: f32 = 18.0;
-/// Gap between the surface edge and the page, in logical pixels.
-const PAGE_MARGIN: f64 = 16.0;
-/// Gap between the page edge and the text, in logical pixels.
-const PAGE_PADDING: f64 = 32.0;
 /// Language used to pick fallback fonts for Han characters.
 const DEFAULT_LANGUAGE: &str = "zh-Hans";
 /// Caret width in logical pixels.
 const CARET_WIDTH: f32 = 1.5;
+/// Space kept between the caret and the top or bottom edge when the view
+/// scrolls to follow it, in logical pixels.
+const CARET_SCROLL_MARGIN: f64 = 24.0;
+/// Zoom is clamped to this range.
+pub const ZOOM_RANGE: (f32, f32) = (0.5, 3.0);
 
-const DESK: Color = Color::from_rgb8(0xf1, 0xf1, 0xf0);
-const PAGE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-const INK: Color = Color::from_rgb8(0x0b, 0x0b, 0x0b);
-const SELECTION: Color = Color::from_rgb8(0xcf, 0xe3, 0xfa);
-const CARET: Color = Color::from_rgb8(0x1a, 0x5f, 0xd0);
+/// A colour as straight (not premultiplied) 8-bit RGBA.
+pub type Rgba8 = [u8; 4];
+
+fn color(rgba: Rgba8) -> Color {
+    Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+/// The colours the surface paints with. The shell fills this from its theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    /// Background around the page.
+    pub desk: Rgba8,
+    pub page: Rgba8,
+    /// One-pixel outline of the page. Fully transparent draws none.
+    pub page_edge: Rgba8,
+    /// Text, and the underline of composition text.
+    pub ink: Rgba8,
+    pub selection: Rgba8,
+    pub caret: Rgba8,
+}
+
+impl Default for Palette {
+    /// The colours of the G1 spike.
+    fn default() -> Self {
+        Self {
+            desk: [0xf1, 0xf1, 0xf0, 0xff],
+            page: [0xff, 0xff, 0xff, 0xff],
+            page_edge: [0, 0, 0, 0],
+            ink: [0x0b, 0x0b, 0x0b, 0xff],
+            selection: [0xcf, 0xe3, 0xfa, 0xff],
+            caret: [0x1a, 0x5f, 0xd0, 0xff],
+        }
+    }
+}
+
+/// Where the page sits inside the surface. Lengths are logical pixels at 100 %
+/// zoom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageLayout {
+    /// Gap between the surface edge and the page.
+    pub margin: f64,
+    /// Gap between the page edge and the text. Shrinks on a narrow surface.
+    pub padding: f64,
+    /// Widest the page gets; it is centred when the surface is wider. `None`
+    /// lets the page fill the surface.
+    pub max_width: Option<f64>,
+    /// Smallest page height as a multiple of its width, e.g. 297 / 210 for an
+    /// A4 sheet. `None` makes the page at least as tall as the surface.
+    pub min_aspect: Option<f64>,
+}
+
+impl Default for PageLayout {
+    /// The layout of the G1 spike: one page that fills the window.
+    fn default() -> Self {
+        Self {
+            margin: 16.0,
+            padding: 32.0,
+            max_width: None,
+            min_aspect: None,
+        }
+    }
+}
 
 /// The brush Parley carries on every glyph run. Solid colour only.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,7 +95,7 @@ pub struct Brush(pub Color);
 
 impl Default for Brush {
     fn default() -> Self {
-        Self(INK)
+        Self(color(Palette::default().ink))
     }
 }
 
@@ -79,8 +137,8 @@ pub enum Action {
 /// whichever query runs first. On a Mac whose system language is Japanese that is
 /// Hiragino Sans, which has no glyphs for Simplified-only characters, and PingFang
 /// is not usable at all. The product bundles its own fonts and sets this chain
-/// from them; the spike uses fonts that ship with macOS. On other systems none of
-/// these names exist and the system default is left in place.
+/// from them; until then this uses fonts that ship with macOS. On other systems
+/// none of these names exist and the system default is left in place.
 pub const HAN_FALLBACK_FAMILIES: [&str; 4] =
     ["Hiragino Sans GB", "Heiti SC", "Songti SC", "Hiragino Sans"];
 
@@ -95,7 +153,20 @@ fn configure_han_fallback(font_cx: &mut FontContext) {
     }
 }
 
-pub struct Surface {
+/// Page and text placement for the current size, zoom and scroll offset, in
+/// physical pixels relative to the surface.
+#[derive(Clone, Copy, Debug)]
+struct Geometry {
+    page_x: f64,
+    page_y: f64,
+    page_width: f64,
+    page_height: f64,
+    text_x: f64,
+    text_y: f64,
+    max_scroll: f64,
+}
+
+pub struct TextSurface {
     font_cx: FontContext,
     layout_cx: LayoutContext<Brush>,
     editor: PlainEditor<Brush>,
@@ -105,16 +176,21 @@ pub struct Surface {
     width: u16,
     height: u16,
     scale: f32,
+    zoom: f32,
+    scroll: f64,
     caret_on: bool,
+    palette: Palette,
+    page: PageLayout,
 }
 
-impl Surface {
+impl TextSurface {
     pub fn new(text: &str) -> Self {
+        let palette = Palette::default();
         let mut editor = PlainEditor::new(FONT_SIZE);
         editor.set_text(text);
         let styles = editor.edit_styles();
         styles.insert(GenericFamily::SystemUi.into());
-        styles.insert(StyleProperty::Brush(Brush(INK)));
+        styles.insert(StyleProperty::Brush(Brush(color(palette.ink))));
         // Without a language, Han characters fall back to a Japanese system font
         // on macOS and Simplified-only characters come out as missing glyphs:
         // the fallback is chosen per script and language, not per character.
@@ -136,7 +212,11 @@ impl Surface {
             width: 0,
             height: 0,
             scale: 1.0,
+            zoom: 1.0,
+            scroll: 0.0,
             caret_on: true,
+            palette,
+            page: PageLayout::default(),
         };
         surface.driver().move_to_text_end();
         surface
@@ -146,9 +226,62 @@ impl Surface {
         self.editor.driver(&mut self.font_cx, &mut self.layout_cx)
     }
 
-    /// Top-left corner of the text block, in physical pixels.
-    fn text_origin(&self) -> f64 {
-        (PAGE_MARGIN + PAGE_PADDING) * f64::from(self.scale)
+    /// Physical pixels per logical pixel of page content: display scale times zoom.
+    fn content_scale(&self) -> f64 {
+        f64::from(self.scale) * f64::from(self.zoom)
+    }
+
+    /// Horizontal placement, which does not depend on the text:
+    /// `(page_x, page_width, padding)` in physical pixels.
+    fn columns(&self) -> (f64, f64, f64) {
+        let s = self.content_scale();
+        let width = f64::from(self.width);
+        let margin = self.page.margin * s;
+        let available = (width - 2.0 * margin).max(1.0);
+        let page_width = match self.page.max_width {
+            Some(max) => (max * s).min(available),
+            None => available,
+        };
+        let page_x = ((width - page_width) / 2.0).floor();
+        let padding = (self.page.padding * s).min(page_width / 8.0);
+        (page_x, page_width, padding)
+    }
+
+    fn geometry(&mut self) -> Geometry {
+        let s = self.content_scale();
+        let margin = self.page.margin * s;
+        let (page_x, page_width, padding) = self.columns();
+        let text_height = f64::from(
+            self.editor
+                .layout(&mut self.font_cx, &mut self.layout_cx)
+                .height(),
+        );
+        let height = f64::from(self.height);
+        let min_height = match self.page.min_aspect {
+            Some(aspect) => page_width * aspect,
+            None => height - 2.0 * margin,
+        };
+        let page_height = (text_height + 2.0 * padding).max(min_height).max(1.0);
+        let max_scroll = (page_height + 2.0 * margin - height).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let page_y = margin - self.scroll;
+        Geometry {
+            page_x,
+            page_y,
+            page_width,
+            page_height,
+            text_x: page_x + padding,
+            text_y: page_y + padding,
+            max_scroll,
+        }
+    }
+
+    /// Push the current size and zoom into the editor.
+    fn relayout(&mut self) {
+        self.editor.set_scale(self.scale * self.zoom);
+        let (_, page_width, padding) = self.columns();
+        let text_width = page_width - 2.0 * padding;
+        self.editor.set_width(Some(text_width.max(1.0) as f32));
     }
 
     /// Resize the backing buffer. Sizes are physical pixels.
@@ -161,13 +294,84 @@ impl Surface {
         self.scale = scale;
         self.ctx = RenderContext::new(width, height);
         self.pixmap = Pixmap::new(width, height);
-        self.editor.set_scale(scale);
-        let text_width = f64::from(width) - 2.0 * self.text_origin();
-        self.editor.set_width(Some(text_width.max(1.0) as f32));
+        self.relayout();
     }
 
     pub fn size(&self) -> (u16, u16, f32) {
         (self.width, self.height, self.scale)
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        if palette == self.palette {
+            return;
+        }
+        self.palette = palette;
+        self.editor
+            .edit_styles()
+            .insert(StyleProperty::Brush(Brush(color(palette.ink))));
+    }
+
+    pub fn set_page_layout(&mut self, page: PageLayout) {
+        if page == self.page {
+            return;
+        }
+        self.page = page;
+        self.relayout();
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Set the zoom factor, 1.0 being 100 %. Returns the value actually used.
+    pub fn set_zoom(&mut self, zoom: f32) -> f32 {
+        let zoom = zoom.clamp(ZOOM_RANGE.0, ZOOM_RANGE.1);
+        if zoom != self.zoom {
+            // Keep the same part of the document at the top of the view.
+            self.scroll *= f64::from(zoom / self.zoom);
+            self.zoom = zoom;
+            self.relayout();
+            self.reveal_caret();
+        }
+        zoom
+    }
+
+    /// Scroll by a distance in physical pixels; positive moves down the document.
+    /// Returns whether the view moved.
+    pub fn scroll_by(&mut self, delta: f64) -> bool {
+        let before = self.scroll;
+        self.scroll += delta;
+        self.geometry();
+        self.scroll != before
+    }
+
+    /// Scroll offset and its upper bound, in physical pixels.
+    pub fn scroll_range(&mut self) -> (f64, f64) {
+        let geometry = self.geometry();
+        (self.scroll, geometry.max_scroll)
+    }
+
+    /// Scroll just far enough to bring the caret, or the composition text, into
+    /// the view.
+    fn reveal_caret(&mut self) {
+        if self.height == 0 {
+            return;
+        }
+        let geometry = self.geometry();
+        let area = match self.editor.cursor_geometry(CARET_WIDTH * self.scale) {
+            Some(caret) => caret,
+            None => self.editor.ime_cursor_area(),
+        };
+        let height = f64::from(self.height);
+        let keep = (CARET_SCROLL_MARGIN * f64::from(self.scale)).min(height / 4.0);
+        let top = geometry.text_y + area.y0;
+        let bottom = geometry.text_y + area.y1;
+        if top < keep {
+            self.scroll -= keep - top;
+        } else if bottom > height - keep {
+            self.scroll += bottom - (height - keep);
+        }
+        self.scroll = self.scroll.clamp(0.0, geometry.max_scroll);
     }
 
     /// The committed text. Composition text is not part of it.
@@ -203,6 +407,7 @@ impl Surface {
             ImeEvent::Disabled => self.driver().clear_compose(),
         }
         self.caret_on = true;
+        self.reveal_caret();
     }
 
     pub fn apply(&mut self, action: Action) {
@@ -259,6 +464,7 @@ impl Surface {
             Action::SelectAll => drv.select_all(),
         }
         self.caret_on = true;
+        self.reveal_caret();
     }
 
     /// Pointer press at a position in physical pixels relative to the surface.
@@ -266,8 +472,8 @@ impl Surface {
         if self.editor.is_composing() {
             return;
         }
-        let origin = self.text_origin();
-        let (x, y) = ((x - origin) as f32, (y - origin) as f32);
+        let geometry = self.geometry();
+        let (x, y) = ((x - geometry.text_x) as f32, (y - geometry.text_y) as f32);
         let mut drv = self.driver();
         if extend {
             drv.shift_click_extension(x, y);
@@ -282,9 +488,9 @@ impl Surface {
         if self.editor.is_composing() {
             return;
         }
-        let origin = self.text_origin();
+        let geometry = self.geometry();
         self.driver()
-            .extend_selection_to_point((x - origin) as f32, (y - origin) as f32);
+            .extend_selection_to_point((x - geometry.text_x) as f32, (y - geometry.text_y) as f32);
         self.caret_on = true;
     }
 
@@ -293,13 +499,11 @@ impl Surface {
     /// when there is one, otherwise the caret.
     pub fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
         // Make sure the layout reflects the latest edit before measuring it.
-        self.editor
-            .refresh_layout(&mut self.font_cx, &mut self.layout_cx);
+        let geometry = self.geometry();
         let area = self.editor.ime_cursor_area();
-        let origin = self.text_origin();
         (
-            area.x0 + origin,
-            area.y0 + origin,
+            area.x0 + geometry.text_x,
+            area.y0 + geometry.text_y,
             (area.x1 - area.x0).max(1.0),
             (area.y1 - area.y0).max(1.0),
         )
@@ -308,6 +512,7 @@ impl Surface {
     /// Draw the current state into the backing buffer and return it.
     /// Pixels are premultiplied RGBA8.
     pub fn render(&mut self) -> &Pixmap {
+        let geometry = self.geometry();
         let Self {
             font_cx,
             layout_cx,
@@ -319,29 +524,48 @@ impl Surface {
             height,
             scale,
             caret_on,
+            palette,
+            ..
         } = self;
-        let scale_f = f64::from(*scale);
         let (w, h) = (f64::from(*width), f64::from(*height));
 
         ctx.reset();
         ctx.set_fill_rule(Fill::NonZero);
         ctx.set_transform(Affine::IDENTITY);
-        ctx.set_paint(DESK);
+        ctx.set_paint(color(palette.desk));
         ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
-        let margin = PAGE_MARGIN * scale_f;
-        ctx.set_paint(PAGE);
-        ctx.fill_rect(&Rect::new(margin, margin, (w - margin).max(margin), h));
 
-        let origin = (PAGE_MARGIN + PAGE_PADDING) * scale_f;
-        ctx.set_transform(Affine::translate((origin, origin)));
+        let page = Rect::new(
+            geometry.page_x,
+            geometry.page_y,
+            geometry.page_x + geometry.page_width,
+            geometry.page_y + geometry.page_height,
+        );
+        if palette.page_edge[3] != 0 {
+            let edge = f64::from(*scale).round().max(1.0);
+            ctx.set_paint(color(palette.page_edge));
+            ctx.fill_rect(&page.inflate(edge, edge));
+        }
+        ctx.set_paint(color(palette.page));
+        ctx.fill_rect(&page);
 
-        ctx.set_paint(SELECTION);
+        ctx.set_transform(Affine::translate((geometry.text_x, geometry.text_y)));
+
+        ctx.set_paint(color(palette.selection));
         editor.selection_geometry_with(|rect, _| {
             ctx.fill_rect(&Rect::new(rect.x0, rect.y0, rect.x1, rect.y1));
         });
 
+        // Lines outside the view are skipped; the range is in layout coordinates.
+        let visible = (-geometry.text_y, h - geometry.text_y);
         let layout = editor.layout(font_cx, layout_cx);
         for line in layout.lines() {
+            let metrics = line.metrics();
+            let (baseline, line_height) =
+                (f64::from(metrics.baseline), f64::from(metrics.line_height));
+            if baseline + line_height < visible.0 || baseline - 2.0 * line_height > visible.1 {
+                continue;
+            }
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
@@ -377,7 +601,7 @@ impl Surface {
         }
 
         if *caret_on && let Some(caret) = editor.cursor_geometry(CARET_WIDTH * *scale) {
-            ctx.set_paint(CARET);
+            ctx.set_paint(color(palette.caret));
             ctx.fill_rect(&Rect::new(caret.x0, caret.y0, caret.x1, caret.y1));
         }
 
@@ -387,7 +611,6 @@ impl Surface {
     }
 
     /// Number of glyphs in the current layout that the chosen fonts could not map.
-    /// Only the macOS test uses it: the fallback chain it checks names macOS fonts.
     #[cfg(all(test, target_os = "macos"))]
     fn missing_glyphs(&mut self) -> usize {
         let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
@@ -416,8 +639,8 @@ impl Surface {
 mod tests {
     use super::*;
 
-    fn surface(text: &str) -> Surface {
-        let mut s = Surface::new(text);
+    fn surface(text: &str) -> TextSurface {
+        let mut s = TextSurface::new(text);
         s.resize(800, 400, 2.0);
         s
     }
@@ -427,6 +650,14 @@ mod tests {
             text: text.to_owned(),
             cursor: Some((text.len(), text.len())),
         }
+    }
+
+    /// RGBA of the pixel at a position in physical pixels.
+    fn pixel(s: &mut TextSurface, x: usize, y: usize) -> [u8; 4] {
+        let width = usize::from(s.size().0);
+        let data = s.render().data_as_u8_slice();
+        let at = (y * width + x) * 4;
+        [data[at], data[at + 1], data[at + 2], data[at + 3]]
     }
 
     #[test]
@@ -522,5 +753,112 @@ mod tests {
         let inked = s.render().data().to_vec();
         let changed = blank.iter().zip(&inked).filter(|(a, b)| a != b).count();
         assert!(changed > 100, "only {changed} pixels changed");
+    }
+
+    #[test]
+    fn short_text_does_not_scroll() {
+        let mut s = surface("one line");
+        assert!(!s.scroll_by(500.0));
+        assert_eq!(s.scroll_range(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn typing_past_the_bottom_scrolls_the_caret_into_view() {
+        let mut s = surface("");
+        for _ in 0..40 {
+            s.apply(Action::Insert("line".to_owned()));
+            s.apply(Action::Newline);
+        }
+        let (scroll, max) = s.scroll_range();
+        assert!(max > 0.0);
+        assert!(scroll > 0.0, "view did not follow the caret");
+        let (_, y, _, h) = s.ime_cursor_area();
+        assert!(y >= 0.0 && y + h <= 400.0, "caret at {y}, outside the view");
+    }
+
+    #[test]
+    fn scrolling_is_clamped_to_the_page() {
+        let mut s = surface(&"line\n".repeat(60));
+        let (_, max) = s.scroll_range();
+        assert!(max > 0.0);
+        assert!(s.scroll_by(1.0e6));
+        assert_eq!(s.scroll_range().0, max);
+        assert!(!s.scroll_by(10.0));
+        assert!(s.scroll_by(-1.0e6));
+        assert_eq!(s.scroll_range().0, 0.0);
+        assert!(!s.scroll_by(-10.0));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_same_text_after_scrolling() {
+        let mut s = surface(&"line\n".repeat(60));
+        s.scroll_by(-1.0e6);
+        // Put the caret on a visible line, scroll, and click where that line
+        // now is: the caret must be on the same text, 30 pixels further up.
+        s.pointer_down(200.0, 120.0, false);
+        let (x0, y0, _, _) = s.ime_cursor_area();
+        assert!(s.scroll_by(30.0));
+        s.pointer_down(200.0, 120.0 - 30.0, false);
+        let (x1, y1, _, _) = s.ime_cursor_area();
+        assert_eq!(x0, x1);
+        assert_eq!(y0 - 30.0, y1);
+    }
+
+    #[test]
+    fn zoom_scales_the_text_and_is_clamped() {
+        let mut s = surface("hello");
+        let (_, _, _, h1) = s.ime_cursor_area();
+        assert_eq!(s.set_zoom(2.0), 2.0);
+        let (_, _, _, h2) = s.ime_cursor_area();
+        assert!(
+            (h2 / h1 - 2.0).abs() < 0.1,
+            "caret height {h1} -> {h2} at 200 %"
+        );
+        assert_eq!(s.set_zoom(100.0), ZOOM_RANGE.1);
+        assert_eq!(s.set_zoom(0.0), ZOOM_RANGE.0);
+    }
+
+    #[test]
+    fn a_capped_page_is_centred() {
+        let mut s = TextSurface::new("");
+        s.set_page_layout(PageLayout {
+            margin: 10.0,
+            padding: 20.0,
+            max_width: Some(200.0),
+            min_aspect: None,
+        });
+        s.set_caret_on(false);
+        s.resize(800, 400, 1.0);
+        let palette = Palette::default();
+        // Page from x = 300 to 500; desk on both sides.
+        assert_eq!(pixel(&mut s, 150, 200), palette.desk);
+        assert_eq!(pixel(&mut s, 400, 200), palette.page);
+        assert_eq!(pixel(&mut s, 650, 200), palette.desk);
+    }
+
+    #[test]
+    fn the_palette_recolours_page_and_text() {
+        let mut s = surface("");
+        let dark = Palette {
+            desk: [0x10, 0x10, 0x10, 0xff],
+            page: [0x20, 0x20, 0x20, 0xff],
+            page_edge: [0x40, 0x40, 0x40, 0xff],
+            ink: [0xf0, 0xf0, 0xf0, 0xff],
+            selection: [0x50, 0x40, 0x90, 0xff],
+            caret: [0x7c, 0x5c, 0xe0, 0xff],
+        };
+        s.set_palette(dark);
+        s.set_caret_on(false);
+        assert_eq!(pixel(&mut s, 2, 2), dark.desk);
+        assert_eq!(pixel(&mut s, 400, 300), dark.page);
+
+        // Plain capitals: every system font has them, and their stems are wide
+        // enough to hold pixels of the pure ink colour.
+        s.apply(Action::Insert("HHHHHHHH".to_owned()));
+        s.set_caret_on(false);
+        let data = s.render().data_as_u8_slice();
+        let (pixels, _) = data.as_chunks::<4>();
+        let ink = pixels.iter().filter(|px| **px == dark.ink).count();
+        assert!(ink > 50, "only {ink} pixels in the ink colour");
     }
 }

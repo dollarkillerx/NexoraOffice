@@ -19,6 +19,7 @@
 | G2 | `spikes/g2-frame` | CPU 渲染加整帧交给界面框架，滚动和打字是否够快 |
 | G3 | `spikes/g3-cjk` | 能否自己实现中日文断行规则，并在三个系统上断出相同的行 |
 | G4 | `spikes/g4-ooxml` | DOCX、XLSX、PPTX 打开再保存之后还剩多少，用哪个库做解析层 |
+| G5 | `spikes/g5-formula` | 10 万个公式的工作簿里改一格，哪个公式引擎能在 100 毫秒内算对 |
 | G6 | `spikes/g6-storage` | 进程被杀之后，命令日志能否把文档完整带回来 |
 | G7 | `packaging/` | 三个平台能否构建、打包并通过许可证检查 |
 
@@ -35,7 +36,7 @@ python3 packaging/licenses.py --check
 
 Linux 上还需要这些系统库：`libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev`。
 
-G4 不在这个工作区里。它要编译三个待评估的 OOXML 库，耗时几分钟、占用内存 7 GB 以上，所以是独立的工作区，有自己的 `Cargo.lock`。进到 `spikes/g4-ooxml` 里运行同样的命令即可。
+G4 和 G5 不在这个工作区里。它们要编译待评估的 OOXML 库和公式引擎，耗时几分钟，G4 还要占用 7 GB 以上内存，所以各是一个独立的工作区，有自己的 `Cargo.lock`。进到 `spikes/g4-ooxml` 或 `spikes/g5-formula` 里运行同样的命令即可。
 
 ## 版本与分支
 

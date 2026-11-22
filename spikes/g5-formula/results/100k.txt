@@ -1,0 +1,44 @@
+rows: 100000 formulas, one edit reaches 8 cells: 4 in the row, and 4 totals that each read a whole column
+  engine             load ms  first ms  edits    p50 ms    p95 ms    max ms  wrong   mem MB  gate
+  by hand                6.0       0.0    100     0.048     0.073     0.086      0       34  within 100 ms
+  ironcalc             225.8      23.7    100    21.198    23.932    27.499      0       43  within 100 ms
+  formualizer           97.9      12.9    100     1.816     2.136     2.359      0       96  within 100 ms
+                   note: computed 8 to 8 cells per edit
+  formualizer/1        102.9      11.8    100     2.039     2.417     2.735      0       92  within 100 ms
+                   note: computed 8 to 8 cells per edit
+  betteroffice         800.5     227.8    100    10.901    13.684    17.943      0      366  within 100 ms
+  betteroffice/calc     784.8     197.2    100     9.932    13.081    14.087      0      301  within 100 ms
+
+chain: 100000 formulas, one edit reaches every formula, each depending on the one before
+  engine             load ms  first ms  edits    p50 ms    p95 ms    max ms  wrong   mem MB  gate
+  by hand                8.6       0.1    100     0.060     0.087     0.113      0       42  within 100 ms
+  ironcalc             200.9      10.0    100     8.952    10.183    11.046      0       52  within 100 ms
+  formualizer          103.7       8.8    100    11.796    14.182    15.270      0       99  within 100 ms
+                   note: computed 100000 to 100000 cells per edit
+  formualizer/1        101.1       9.5    100    11.917    13.656    14.765      0       97  within 100 ms
+                   note: computed 100000 to 100000 cells per edit
+  betteroffice         943.6     168.9    100   103.311   116.422   141.118      0      413  over 100 ms
+  betteroffice/calc     942.1     150.5    100   101.542   117.197   145.983      0      332  over 100 ms
+
+lookup: 100000 formulas, one edit reaches about 1 line in 1,000 by value; every lookup by the range it names
+  engine             load ms  first ms  edits    p50 ms    p95 ms    max ms  wrong   mem MB  gate
+  by hand                9.8       0.5    100     0.453     0.579     0.804      0       50  within 100 ms
+  ironcalc             311.4    2095.9     28  2122.714  2351.344  3537.612      0       46  over 100 ms
+  formualizer          114.9      16.6    100    15.737    19.022    20.465      0      110  within 100 ms
+                   note: computed 100000 to 100000 cells per edit
+  formualizer/1        130.5      44.5    100    43.184    49.763    52.267      0      103  within 100 ms
+                   note: computed 100000 to 100000 cells per edit
+  betteroffice        1005.2     763.0     97   617.539   649.657   656.929     97      458  WRONG RESULTS
+                   after the first calculation: D1323 should be Number(598.5), is Number(0.0)
+                   note: ran out of its cell-read budget: 80113 formulas left uncalculated at first, 7770961 over the edits
+  betteroffice/calc    1202.0    1105.2     94   629.517   763.494   924.511     94      148  WRONG RESULTS
+                   after the first calculation: D1323 should be Number(598.5), is Number(0.0)
+                   note: ran out of its cell-read budget: 80113 formulas left uncalculated at first, 7530622 over the edits
+
+engines
+  by hand          the same arithmetic in plain Rust, everything recomputed on each edit
+  ironcalc         every formula on every evaluation, one thread
+  formualizer      what depends on the edit, layers spread over a thread pool
+  formualizer/1    the same on one thread
+  betteroffice     what depends on the edit, one thread, with the facade's bookkeeping
+  betteroffice/calc the same engine driven directly, without undo or collaboration records

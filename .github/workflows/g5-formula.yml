@@ -1,0 +1,58 @@
+# The G5 spike is a workspace of its own because the formula engines it
+# compares take minutes to build. It is checked only when it changes, and on
+# one system: nothing in it depends on the platform.
+name: G5 formula engines
+
+on:
+  push:
+    branches: [main]
+    paths: ["spikes/g5-formula/**", ".github/workflows/g5-formula.yml"]
+  pull_request:
+    paths: ["spikes/g5-formula/**", ".github/workflows/g5-formula.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: g4-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check the engines
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spikes/g5-formula
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/g5-formula
+
+      - name: Format
+        run: cargo fmt --check
+
+      # The workbooks, the expected values and the hand-written arithmetic,
+      # without the engines under evaluation.
+      - name: Lint and test the harness alone
+        run: |
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo test --locked --no-default-features
+
+      # Includes the recorded answers of each engine to a set of formulas whose
+      # results in Excel are known. Timings are not checked here: a shared
+      # build machine is no place to measure them.
+      - name: Lint and test with every engine
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked

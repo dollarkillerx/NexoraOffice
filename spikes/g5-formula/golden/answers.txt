@@ -1,0 +1,71 @@
+group            formula                                    Excel        ironcalc           formualizer        betteroffice      
+operators        1+2*3                                      7            ok                 ok                 ok                
+operators        -2^2                                       4            ok                 ok                 ok                
+operators        2^3^2                                      64           ok                 ok                 ok                
+operators        10%*200                                    20           ok                 ok                 ok                
+operators        "10"+5                                     15           ok                 ok                 ok                
+operators        "a"&1+1                                    "a2"         ok                 ok                 ok                
+operators        "a"="A"                                    TRUE         ok                 ok                 ok                
+operators        0.1+0.2=0.3                                TRUE         ok                 ✗ FALSE            ✗ FALSE           
+operators        "a"+1                                      #VALUE!      ok                 ok                 ok                
+operators        1/0                                        #DIV/0!      ok                 ok                 ok                
+rounding         ROUND(2.5,0)                               3            ok                 ok                 ok                
+rounding         ROUND(-2.5,0)                              -3           ok                 ok                 ok                
+rounding         ROUND(1.005,2)                             1.01         ok                 ok                 ✗ 1               
+rounding         ROUNDUP(1.01,1)                            1.1          ok                 ok                 ok                
+rounding         ROUNDDOWN(-1.19,1)                         -1.1         ok                 ok                 ok                
+rounding         INT(-1.5)                                  -2           ok                 ok                 ok                
+rounding         MOD(-1,3)                                  2            ok                 ok                 ok                
+rounding         CEILING(2.1,1)                             3            ok                 ok                 ok                
+rounding         FLOOR(-2.1,1)                              -3           ok                 ok                 ok                
+aggregates       SUM(A1:A5)                                 7.5          ok                 ok                 ok                
+aggregates       COUNT(A1:A5)                               3            ok                 ok                 ok                
+aggregates       COUNTA(A1:A5)                              5            ok                 ok                 ok                
+aggregates       AVERAGE(A1:A5)                             2.5          ok                 ok                 ok                
+aggregates       MAX(A1:A5)                                 4.5          ok                 ok                 ok                
+aggregates       SUM(1,"2",TRUE)                            4            ok                 ok                 ok                
+aggregates       SUMIF(A1:A5,">1")                          6.5          ok                 ok                 ok                
+aggregates       COUNTIF(A1:A5,"大*")                        1            ok                 ok                 ok                
+aggregates       SUMPRODUCT(A1:A2,A1:A2)                    5            ok                 ok                 ok                
+aggregates       SUM({1,2;3,4})                             10           ok                 ok                 ok                
+lookup           INDEX(A1:A5,MATCH(4.5,A1:A5,0))            4.5          ok                 ok                 ok                
+lookup           VLOOKUP(2,A1:B5,2,FALSE)                   "two"        ok                 ok                 ok                
+lookup           VLOOKUP(9,A1:B5,2,FALSE)                   #N/A         ok                 ok                 ok                
+lookup           XLOOKUP(4.5,A1:A5,B1:B5)                   "four"       ok                 ok                 ok                
+lookup           MATCH("b",{"a","b","c"},0)                 2            ok                 ok                 ok                
+logic            IF(1,"y","n")                              "y"          ok                 ok                 ok                
+logic            IFERROR(1/0,"x")                           "x"          ok                 ok                 ok                
+logic            AND(TRUE,1)                                TRUE         ok                 ok                 ok                
+logic            NOT(0)                                     TRUE         ok                 ok                 ok                
+logic            IFS(FALSE,1,TRUE,2)                        2            ok                 ok                 ok                
+logic            SWITCH(2,1,"a",2,"b")                      "b"          ok                 ok                 ok                
+text             LEN("大阪")                                  2            ok                 ok                 ok                
+text             LEN(A5)                                    2            ok                 ok                 ok                
+text             MID("東京都港区",3,2)                           "都港"         ok                 ok                 ok                
+text             LEFT("東京都",2)                              "東京"         ok                 ok                 ok                
+text             FIND("都","東京都")                            3            ok                 ok                 ok                
+text             REPT("あ",3)                                "あああ"        ok                 ok                 ok                
+text             UPPER("abc")                               "ABC"        ok                 ok                 ok                
+text             PROPER("hello world")                      "Hello World" ok                 ok                 ok                
+text             TRIM("  a  b ")                            "a b"        ok                 ok                 ok                
+text             SUBSTITUTE("a-b-c","-","+")                "a+b+c"      ok                 ok                 ok                
+text             CONCAT("a","b")                            "ab"         ok                 ok                 ok                
+text             TEXTJOIN("-",TRUE,"a","","b")              "a-b"        ✗ "a--b"           ok                 ok                
+text             VALUE("1,234")                             1234         ok                 ✗ #VALUE!          ✗ #VALUE!         
+text             TEXT(1234.5,"#,##0.00")                    "1,234.50"   ok                 ok                 ok                
+text             TEXT(0.125,"0.0%")                         "12.5%"      ok                 ok                 ok                
+dates            DATE(2026,11,22)                           46348        ok                 ok                 ok                
+dates            DATE(1900,3,1)                             61           ok                 ok                 ok                
+dates            YEAR(46348)                                2026         ok                 ok                 ok                
+dates            MONTH(46348)                               11           ok                 ok                 ok                
+dates            DAY(46348)                                 22           ok                 ok                 ok                
+dates            WEEKDAY(46348)                             1            ok                 ok                 ok                
+dates            EDATE(46053,1)                             46081        ok                 ok                 ok                
+dates            DATEDIF(46053,46348,"d")                   295          ok                 ok                 ok                
+dates            TEXT(46348,"yyyy-mm-dd")                   "2026-11-22" ok                 ok                 ok                
+newer functions  SUM(SEQUENCE(5))                           15           ok                 ok                 ok                
+newer functions  LET(x,2,x*3)                               6            ok                 ok                 ok                
+newer functions  COUNTA(UNIQUE({1;1;2}))                    2            ok                 ok                 ok                
+newer functions  SUM(FILTER({1;2;3},{TRUE;FALSE;TRUE}))     4            ok                 ok                 ok                
+newer functions  LAMBDA(x,x+1)(2)                           3            ok                 ✗ #N/IMPL!         ✗ 0               
+                 agree with Excel                                     69 68                 66                 65                

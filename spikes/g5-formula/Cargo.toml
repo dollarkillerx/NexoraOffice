@@ -1,0 +1,35 @@
+# A workspace of its own, like G4: the engines under evaluation are heavy to
+# build and are not dependencies of the product.
+[workspace]
+
+[package]
+name = "g5-formula"
+version = "0.0.1"
+license = "AGPL-3.0-only"
+description = "Phase 0 gate G5: how fast three formula engines recalculate after one cell changes"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[features]
+default = ["ironcalc", "formualizer", "betteroffice"]
+ironcalc = ["dep:ironcalc", "dep:ironcalc_base"]
+formualizer = ["dep:formualizer"]
+betteroffice = ["dep:betteroffice-xlsx", "dep:betteroffice-xlsx-calc", "dep:betteroffice-xlsx-model"]
+
+[dependencies]
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+ironcalc = { version = "=0.9.1", optional = true }
+ironcalc_base = { version = "=0.9.1", optional = true }
+formualizer = { version = "=0.15.0", optional = true }
+betteroffice-xlsx = { version = "=0.5.1", optional = true, default-features = false }
+betteroffice-xlsx-calc = { version = "=0.5.1", optional = true }
+betteroffice-xlsx-model = { version = "=0.5.1", optional = true }
+
+# Timings are taken from optimised builds only.
+[profile.release]
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"

@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check and package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            fonts-dejavu-core fonts-noto-cjk
+
+      # rust-toolchain.toml names the compiler; this installs it.
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Includes the G3 line-breaking digest, which has to come out identical on
+      # all three systems, and forty kills of the G6 crash test per setting.
+      - name: Test
+        run: cargo test --locked --workspace
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos.sh
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: packaging/linux.sh
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aster-office-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            target/dist-packages/*.dmg
+            target/dist-packages/*.tar.gz
+            target/dist-packages/*.deb
+            target/dist-packages/*.zip
+
+  licenses:
+    name: Licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Licence allow list
+        run: python3 packaging/licenses.py --check
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "g1-ime"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytemuck",
  "parley 0.13.0",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "g2-frame"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytemuck",
  "parley 0.13.0",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "g3-cjk"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytemuck",
  "icu_locale_core",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "g6-storage"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "rusqlite",
  "tempfile",

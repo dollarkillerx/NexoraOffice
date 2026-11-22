@@ -1,6 +1,6 @@
 [package]
 name = "g6-storage"
-version = "0.0.0"
+version.workspace = true
 description = "Phase 0 gate G6: command journal, checkpoints and crash recovery on SQLite"
 edition.workspace = true
 rust-version.workspace = true

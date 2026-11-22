@@ -1,6 +1,6 @@
 [package]
 name = "g2-frame"
-version = "0.0.0"
+version.workspace = true
 description = "Phase 0 gate G2: frame time of the layout -> render -> present path for a custom-drawn document surface"
 edition.workspace = true
 rust-version.workspace = true

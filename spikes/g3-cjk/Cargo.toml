@@ -1,6 +1,6 @@
 [package]
 name = "g3-cjk"
-version = "0.0.0"
+version.workspace = true
 description = "Phase 0 gate G3: our own line breaker with Chinese and Japanese rules on top of Parley's shaping"
 edition.workspace = true
 rust-version.workspace = true

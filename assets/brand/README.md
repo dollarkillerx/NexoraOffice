@@ -14,6 +14,7 @@
 | `logo/aster-mark-mono.svg` | 单色标志，用在只能印一种颜色的场合 |
 | `logo/aster-lockup.svg` | 标志加文字的横排组合 |
 | `logo/png/aster-icon-<尺寸>.png` | 深色底图标的位图，16 到 1024 像素，透明圆角 |
+| `logo/aster.icns`、`logo/aster.ico` | macOS 和 Windows 的图标文件，由 `logo/make-icons.sh` 从上面的 PNG 生成 |
 | `logo-concepts/` | 定稿前的四套概念稿和 C 方案的配色对比，仅作记录 |
 
 ## 颜色
@@ -43,7 +44,7 @@
 swift assets/brand/logo/export-png.swift assets/brand/logo/aster-icon.svg out.png 256
 ```
 
-这个脚本只能在 macOS 上运行。三端打包需要的 `icns`、`ico` 和 Linux 图标集还没有生成，留到打包关卡时用跨平台的方式统一产出。
+这个脚本只能在 macOS 上运行。改动图标后，先重新导出各尺寸的 PNG，再运行 `logo/make-icons.sh` 重新生成 `icns` 和 `ico`。Linux 直接使用 PNG。
 
 ## 尚未完成
 

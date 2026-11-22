@@ -1,0 +1,5 @@
+# Everyone and every CI runner builds with the same compiler. Raise this
+# deliberately, in its own commit, and re-run the Phase 0 gate tests when doing so.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

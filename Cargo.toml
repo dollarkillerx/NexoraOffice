@@ -8,6 +8,8 @@ members = [
 ]
 
 [workspace.package]
+# The one place the product version is written. Packaging reads it from here.
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -45,6 +47,14 @@ tempfile = "3.27"
 
 [profile.dev]
 opt-level = 1
+
+# What gets shipped. Thin LTO and one codegen unit trade build time for size and
+# speed; symbols are stripped because crash reports will use separate debug files.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [profile.dev.package."*"]
 opt-level = 3

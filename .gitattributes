@@ -1,0 +1,21 @@
+# Text is stored with LF and checked out with LF on every platform, so files
+# hash the same everywhere and golden files compare byte for byte.
+* text=auto eol=lf
+
+# Batch files are the exception: cmd.exe needs CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch these.
+*.png  binary
+*.icns binary
+*.ico  binary
+*.ttf  binary
+*.otf  binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.pdf  binary
+
+# Generated, but committed so builds are reproducible.
+Cargo.lock linguist-generated=true

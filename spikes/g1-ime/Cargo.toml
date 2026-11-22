@@ -1,6 +1,6 @@
 [package]
 name = "g1-ime"
-version = "0.0.0"
+version.workspace = true
 description = "Phase 0 gate G1: CJK input method inside a custom-drawn document surface hosted in a Slint window"
 edition.workspace = true
 rust-version.workspace = true

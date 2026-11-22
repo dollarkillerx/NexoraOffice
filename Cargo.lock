@@ -148,6 +148,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-shell"
+version = "0.0.1"
+dependencies = [
+ "aster-surface",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "aster-surface"
 version = "0.0.1"
 dependencies = [

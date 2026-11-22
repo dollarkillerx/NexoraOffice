@@ -1,0 +1,287 @@
+import { Tokens, Icons, Strings } from "tokens.slint";
+import { Icon, KindGlyph, Badge, Hairline, VHairline } from "widgets.slint";
+
+// Faint wireframes of where each editor's parts will go. They are drawings:
+// nothing in them reacts.
+
+component Bar inherits Rectangle {
+    height: 8px;
+    border-radius: 4px;
+    background: Tokens.hairline;
+}
+
+component SheetsSketch inherits Rectangle {
+    property <length> row-height: 24px;
+    property <length> column-width: 96px;
+    property <length> gutter: 44px;
+    clip: true;
+    // Name box and formula bar.
+    Rectangle {
+        y: 0;
+        height: 30px;
+        Rectangle {
+            x: Tokens.space-sm;
+            y: 4px;
+            width: 72px;
+            height: 22px;
+            border-radius: Tokens.radius-sm;
+            border-width: 1px;
+            border-color: Tokens.hairline;
+        }
+
+        Rectangle {
+            x: 72px + 2 * Tokens.space-sm;
+            y: 4px;
+            width: parent.width - 72px - 3 * Tokens.space-sm;
+            height: 22px;
+            border-radius: Tokens.radius-sm;
+            border-width: 1px;
+            border-color: Tokens.hairline;
+        }
+    }
+
+    Rectangle {
+        y: 30px;
+        height: root.row-height;
+        background: Tokens.panel;
+    }
+
+    Rectangle {
+        x: 0;
+        y: 30px;
+        width: root.gutter;
+        height: parent.height - 30px - 30px;
+        background: Tokens.panel;
+    }
+
+    for index in 60: Rectangle {
+        x: 0;
+        y: 30px + (index + 1) * root.row-height;
+        width: parent.width;
+        height: 1px;
+        background: Tokens.hairline;
+    }
+    for index in 40: Rectangle {
+        x: root.gutter + index * root.column-width;
+        y: 30px;
+        width: 1px;
+        height: parent.height - 30px - 30px;
+        background: Tokens.hairline;
+    }
+    // Sheet tabs.
+    Rectangle {
+        y: parent.height - 30px;
+        height: 30px;
+        background: Tokens.panel;
+        Hairline {
+            y: 0;
+        }
+
+        Rectangle {
+            x: Tokens.space-md;
+            y: 6px;
+            width: 72px;
+            height: 18px;
+            border-radius: Tokens.radius-sm;
+            background: Tokens.hairline;
+        }
+
+        Rectangle {
+            x: Tokens.space-md + 84px;
+            y: 6px;
+            width: 56px;
+            height: 18px;
+            border-radius: Tokens.radius-sm;
+            border-width: 1px;
+            border-color: Tokens.hairline;
+        }
+    }
+}
+
+component SlidesSketch inherits Rectangle {
+    property <length> rail: 176px;
+    property <length> notes: 72px;
+    property <length> stage-width: min(self.width - rail - 96px, (self.height - notes - 64px) * 16 / 9);
+    clip: true;
+    background: Tokens.desk;
+    Rectangle {
+        x: 0;
+        width: root.rail;
+        background: Tokens.panel;
+        for index in 4: Rectangle {
+            x: Tokens.space-lg + Tokens.space-sm;
+            y: Tokens.space-lg + index * 96px;
+            width: root.rail - 2 * Tokens.space-lg - Tokens.space-sm;
+            height: self.width * 9 / 16;
+            border-radius: Tokens.radius-sm;
+            border-width: index == 0 ? 2px : 1px;
+            border-color: index == 0 ? Tokens.text-tertiary : Tokens.hairline;
+            background: Tokens.page;
+        }
+        VHairline {
+            x: parent.width - 1px;
+        }
+    }
+
+    Rectangle {
+        x: root.rail + (parent.width - root.rail - self.width) / 2;
+        y: (parent.height - root.notes - self.height) / 2;
+        width: root.stage-width;
+        height: self.width * 9 / 16;
+        background: Tokens.page;
+        border-width: 1px;
+        border-color: Tokens.page-edge;
+    }
+
+    Rectangle {
+        x: root.rail;
+        y: parent.height - root.notes;
+        width: parent.width - root.rail;
+        height: root.notes;
+        background: Tokens.surface;
+        Hairline {
+            y: 0;
+        }
+
+        Bar {
+            x: Tokens.space-lg;
+            y: Tokens.space-lg;
+            width: 96px;
+        }
+    }
+}
+
+component MarkdownSketch inherits Rectangle {
+    clip: true;
+    for index in 14: Bar {
+        x: Tokens.space-xl + 8px;
+        y: 36px + index * 26px;
+        width: (parent.width / 2 - 96px) * (Math.mod(index * 7, 5) + 4) / 9;
+    }
+    VHairline {
+        x: parent.width / 2;
+    }
+
+    Rectangle {
+        x: parent.width / 2 + 1px;
+        width: parent.width / 2 - 1px;
+        background: Tokens.panel;
+        Bar {
+            x: Tokens.space-xl + 8px;
+            y: 36px;
+            width: 220px;
+            height: 14px;
+        }
+
+        for index in 11: Bar {
+            x: Tokens.space-xl + 8px;
+            y: 76px + index * 26px;
+            width: (parent.width - 96px) * (Math.mod(index * 5, 4) + 5) / 9;
+        }
+    }
+}
+
+component PdfSketch inherits Rectangle {
+    property <length> rail: 148px;
+    property <length> sheet-height: self.height - 48px;
+    clip: true;
+    background: Tokens.desk;
+    Rectangle {
+        x: 0;
+        width: root.rail;
+        background: Tokens.panel;
+        for index in 3: Rectangle {
+            x: (root.rail - self.width) / 2;
+            y: Tokens.space-lg + index * 148px;
+            width: 92px;
+            height: 130px;
+            border-width: index == 0 ? 2px : 1px;
+            border-color: index == 0 ? Tokens.text-tertiary : Tokens.hairline;
+            background: Tokens.page;
+        }
+        VHairline {
+            x: parent.width - 1px;
+        }
+    }
+
+    Rectangle {
+        x: root.rail + (parent.width - root.rail - self.width) / 2;
+        y: Tokens.space-xl;
+        width: min(parent.width - root.rail - 96px, root.sheet-height * 210 / 297);
+        height: self.width * 297 / 210;
+        background: Tokens.page;
+        border-width: 1px;
+        border-color: Tokens.page-edge;
+    }
+}
+
+// What a tab shows when its editor does not exist yet.
+export component Placeholder inherits Rectangle {
+    // 1 Sheets, 2 Slides, 3 Markdown, 4 PDF.
+    in property <int> kind;
+    in property <string> title;
+    in property <string> plan;
+    background: Tokens.surface;
+
+    Rectangle {
+        opacity: 0.75;
+        if root.kind == 1: SheetsSketch { }
+        if root.kind == 2: SlidesSketch { }
+        if root.kind == 3: MarkdownSketch { }
+        if root.kind == 4: PdfSketch { }
+    }
+
+    Rectangle {
+        width: 380px;
+        height: card.preferred-height;
+        border-radius: Tokens.radius-lg;
+        border-width: 1px;
+        border-color: Tokens.hairline;
+        background: Tokens.surface;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: #0000001f;
+        card := VerticalLayout {
+            padding: Tokens.space-xl;
+            spacing: Tokens.space-md;
+            HorizontalLayout {
+                spacing: Tokens.space-md;
+                alignment: start;
+                KindGlyph {
+                    kind: root.kind;
+                    size: 32px;
+                    ink: Tokens.text;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Badge {
+                        text: Strings.placeholder-view;
+                    }
+                }
+            }
+
+            Text {
+                text: root.title;
+                font-size: Tokens.font-xl;
+                font-weight: 600;
+                color: Tokens.text;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: Strings.placeholder-body;
+                font-size: Tokens.font-md;
+                color: Tokens.text-secondary;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.plan;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

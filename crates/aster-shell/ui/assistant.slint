@@ -1,0 +1,114 @@
+import { Tokens, Icons, Strings } from "tokens.slint";
+import { Icon, Badge, VHairline } from "widgets.slint";
+
+component Point inherits HorizontalLayout {
+    in property <string> text;
+    spacing: Tokens.space-sm;
+    VerticalLayout {
+        alignment: start;
+        padding-top: 7px;
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: Tokens.text-tertiary;
+        }
+    }
+
+    Text {
+        text: root.text;
+        font-size: Tokens.font-md;
+        color: Tokens.text-secondary;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+// Where the built-in assistant will live. Nothing here works: there is no model
+// behind it and no MCP server. The panel exists so the layout has room for it
+// from the start, and it says so.
+export component AssistantPanel inherits Rectangle {
+    // Width when open; the caller animates the actual width.
+    in property <length> panel-width: 320px;
+    background: Tokens.panel;
+    clip: true;
+
+    VHairline {
+        x: 0;
+    }
+
+    // Laid out at the full width even while the panel is sliding shut.
+    VerticalLayout {
+        x: 1px;
+        width: root.panel-width - 1px;
+        padding: Tokens.space-lg;
+        spacing: Tokens.space-md;
+
+        HorizontalLayout {
+            spacing: Tokens.space-sm;
+            alignment: start;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    data: Icons.assistant;
+                    tint: Tokens.accent;
+                }
+            }
+
+            Text {
+                text: Strings.ai-title;
+                font-size: Tokens.font-lg;
+                font-weight: 600;
+                color: Tokens.text;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Badge {
+                    text: Strings.placeholder-view;
+                }
+            }
+        }
+
+        Text {
+            text: Strings.ai-body;
+            font-size: Tokens.font-md;
+            color: Tokens.text-secondary;
+            wrap: word-wrap;
+        }
+
+        Point {
+            text: Strings.ai-point-tools;
+        }
+
+        Point {
+            text: Strings.ai-point-approval;
+        }
+
+        Point {
+            text: Strings.ai-point-keys;
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+        }
+
+        // Shows where the prompt goes. It does not take input.
+        Rectangle {
+            height: 2 * Tokens.control-height + Tokens.space-sm;
+            border-radius: Tokens.radius-lg;
+            border-width: 1px;
+            border-color: Tokens.hairline;
+            Text {
+                x: Tokens.space-md;
+                y: Tokens.space-sm + 2px;
+                width: parent.width - 2 * Tokens.space-md;
+                text: Strings.ai-input;
+                font-size: Tokens.font-md;
+                color: Tokens.text-disabled;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

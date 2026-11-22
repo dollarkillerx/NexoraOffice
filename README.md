@@ -1,11 +1,13 @@
 # Aster Office
 
-用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。
+用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。`crates/aster-shell` 是应用外壳的第一版原型，可以打开看界面，但只有纯文本输入是真的。
 
 ## 仓库结构
 
 | 路径 | 内容 |
 | --- | --- |
+| `crates/aster-shell` | 应用外壳原型：窗口、标签、工具栏、侧边栏、设计令牌、界面语言。说明里写明了哪些是占位 |
+| `crates/aster-surface` | 文档表面：自绘的纯文本表面和它接入窗口的胶水，G1 关卡也用它 |
 | `spikes/` | Phase 0 的验证工程，每道关卡一个，各自带说明和结果 |
 | `assets/brand/` | Logo、图标和品牌说明 |
 | `docs/decisions/` | 选型决定的记录，一项一份 |

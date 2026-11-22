@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/aster-shell",
     "crates/aster-surface",
     "spikes/g1-ime",
     "spikes/g2-frame",

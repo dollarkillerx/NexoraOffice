@@ -1,0 +1,220 @@
+import { Tokens, Icons, Strings, KindItem, RecentItem } from "tokens.slint";
+import { Icon, KindGlyph, AsterMark, Badge, Hairline } from "widgets.slint";
+
+component KindTile inherits Rectangle {
+    in property <KindItem> item;
+    callback clicked;
+    height: 148px;
+    min-width: 112px;
+    horizontal-stretch: 1;
+    border-radius: Tokens.radius-lg;
+    border-width: 1px;
+    border-color: touch.has-hover ? Tokens.accent : Tokens.hairline;
+    background: touch.pressed ? Tokens.accent-soft : touch.has-hover ? Tokens.fill : transparent;
+    animate background, border-color { duration: Tokens.quick; }
+
+    KindGlyph {
+        x: Tokens.space-lg;
+        y: Tokens.space-lg;
+        kind: root.item.kind;
+        size: 32px;
+        ink: touch.has-hover ? Tokens.accent : Tokens.text;
+        animate ink { duration: Tokens.quick; }
+    }
+
+    if !root.item.implemented: Badge {
+        x: parent.width - self.width - Tokens.space-md;
+        y: Tokens.space-md;
+        text: Strings.placeholder;
+    }
+
+    Text {
+        x: Tokens.space-lg;
+        y: parent.height - 72px;
+        width: parent.width - 2 * Tokens.space-lg;
+        text: root.item.name;
+        font-size: Tokens.font-lg;
+        font-weight: 600;
+        color: Tokens.text;
+    }
+
+    // Two lines: the taglines of some languages do not fit on one.
+    Text {
+        x: Tokens.space-lg;
+        y: parent.height - 49px;
+        width: parent.width - 2 * Tokens.space-lg;
+        height: 34px;
+        text: root.item.tagline;
+        font-size: Tokens.font-sm;
+        color: Tokens.text-secondary;
+        wrap: word-wrap;
+        overflow: elide;
+        vertical-alignment: top;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component RecentRow inherits Rectangle {
+    in property <RecentItem> item;
+    callback clicked;
+    height: 40px;
+    border-radius: Tokens.radius-md;
+    background: touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+    animate background { duration: Tokens.quick; }
+    HorizontalLayout {
+        padding-left: Tokens.space-md;
+        padding-right: Tokens.space-md;
+        spacing: Tokens.space-md;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            KindGlyph {
+                kind: root.item.kind;
+                ink: Tokens.text-secondary;
+            }
+        }
+
+        Text {
+            text: root.item.title;
+            font-size: Tokens.font-md;
+            color: Tokens.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 3;
+            min-width: 80px;
+        }
+
+        Text {
+            text: root.item.location;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 2;
+            min-width: 0px;
+        }
+
+        Text {
+            text: root.item.opened;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-tertiary;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            horizontal-stretch: 0;
+            min-width: 76px;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Shown when no document is in front: one tile per editor and the recent files.
+export component StartPage inherits Rectangle {
+    in property <[KindItem]> kinds;
+    in property <[RecentItem]> recent;
+    callback new-document(int);
+    callback open-recent(int);
+    background: Tokens.surface;
+
+    Flickable {
+        content-height: max(self.height, column.preferred-height);
+        column := VerticalLayout {
+            y: 0;
+            x: max(Tokens.space-xl, (parent.width - self.width) / 2);
+            width: min(parent.width - 2 * Tokens.space-xl, 820px);
+            alignment: start;
+            padding-top: 56px;
+            padding-bottom: Tokens.space-xl;
+            spacing: 0px;
+
+            HorizontalLayout {
+                alignment: start;
+                spacing: Tokens.space-md;
+                AsterMark {
+                    size: 48px;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: "Aster Office";
+                        font-size: Tokens.font-display;
+                        font-weight: 600;
+                        color: Tokens.text;
+                    }
+
+                    Text {
+                        text: Strings.tagline;
+                        font-size: Tokens.font-md;
+                        color: Tokens.text-secondary;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 40px;
+            }
+
+            Text {
+                text: Strings.new-document;
+                font-size: Tokens.font-sm;
+                font-weight: 600;
+                color: Tokens.text-secondary;
+                height: 28px;
+            }
+
+            HorizontalLayout {
+                spacing: Tokens.space-md;
+                for entry in root.kinds: KindTile {
+                    item: entry;
+                    clicked => {
+                        root.new-document(entry.kind);
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 36px;
+            }
+
+            HorizontalLayout {
+                height: 28px;
+                spacing: Tokens.space-sm;
+                alignment: start;
+                Text {
+                    text: Strings.recent;
+                    font-size: Tokens.font-sm;
+                    font-weight: 600;
+                    color: Tokens.text-secondary;
+                }
+
+                Badge {
+                    text: Strings.sample-data;
+                }
+            }
+
+            Hairline { }
+
+            Rectangle {
+                height: Tokens.space-xs;
+            }
+
+            for item[index] in root.recent: RecentRow {
+                item: item;
+                clicked => {
+                    root.open-recent(index);
+                }
+            }
+        }
+    }
+}

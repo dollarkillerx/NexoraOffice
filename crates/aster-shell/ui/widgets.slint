@@ -1,0 +1,207 @@
+import { Tokens, Icons, Strings } from "tokens.slint";
+
+// A line icon drawn from path data on a 20 × 20 grid.
+export component Icon inherits Rectangle {
+    in property <string> data;
+    in property <brush> tint: Tokens.text-secondary;
+    in property <length> size: Tokens.icon-size;
+    width: size;
+    height: size;
+    Path {
+        width: 100%;
+        height: 100%;
+        commands: root.data;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        stroke: root.tint;
+        stroke-width: 1.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+    }
+}
+
+// A square button holding one icon. Disabled buttons keep their place but do
+// not react, so unfinished commands read as unavailable rather than broken.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> enabled: true;
+    in property <bool> checked;
+    in property <length> size: Tokens.control-height;
+    in property <length> icon-size: Tokens.icon-size;
+    in property <brush> tint: Tokens.text-secondary;
+    out property <bool> has-hover: touch.has-hover;
+    callback clicked;
+    width: size;
+    height: size;
+    border-radius: Tokens.radius-md;
+    background: !root.enabled ? transparent : touch.pressed || root.checked ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+    animate background { duration: Tokens.quick; }
+    Icon {
+        data: root.icon;
+        size: root.icon-size;
+        tint: root.enabled ? root.tint : Tokens.text-disabled;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// A one-pixel separator. Outside a layout, say where it goes: an element with
+// a fixed size is centred by default.
+export component Hairline inherits Rectangle {
+    background: Tokens.hairline;
+    height: 1px;
+}
+
+export component VHairline inherits Rectangle {
+    background: Tokens.hairline;
+    width: 1px;
+}
+
+// A small label marking content that is sample data or not built yet.
+export component Badge inherits Rectangle {
+    in property <string> text;
+    height: 18px;
+    width: label.preferred-width + 12px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+    label := Text {
+        text: root.text;
+        font-size: Tokens.font-xs;
+        color: Tokens.text-tertiary;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+// The five document kinds, drawn from the shapes of the logo: a page with a cut
+// corner, table cells, a slide block. Solid, on a 16 × 16 grid.
+export component KindGlyph inherits Rectangle {
+    in property <int> kind;
+    in property <length> size: 16px;
+    in property <brush> ink: Tokens.text-secondary;
+    width: size;
+    height: size;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        fill: root.ink;
+        fill-rule: evenodd;
+        stroke-width: 0px;
+        commands: root.kind == 0 ? "M3 1 H10 L13 4 V15 H3 Z M5 6 H11 V7 H5 Z M5 9 H11 V10 H5 Z M5 12 H9 V13 H5 Z" : root.kind == 1 ? "M2 2 H7 V7 H2 Z M9 2 H14 V7 H9 Z M2 9 H7 V14 H2 Z M9 9 H14 V14 H9 Z" : root.kind == 2 ? "M1 3 H15 V13 H1 Z" : root.kind == 3 ? "M3 1 H10 L13 4 V15 H3 Z M7 6 H9 V10 H11 L8 13 L5 10 H7 Z" : "M3 1 H10 L13 4 V15 H3 Z M5 8 H11 V12 H5 Z";
+    }
+}
+
+// The Aster mark: page, four cells, and the slide block in the accent colour.
+// Same geometry as assets/brand/logo/aster-mark.svg, on its 16 × 16 grid.
+export component AsterMark inherits Rectangle {
+    in property <length> size: 24px;
+    width: size;
+    height: size;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        fill: Tokens.text;
+        stroke-width: 0px;
+        commands: "M3 3 H6 L7 4 V13 H3 Z M8 3 H10 V5 H8 Z M11 3 H13 V5 H11 Z M8 6 H10 V8 H8 Z M11 6 H13 V8 H11 Z";
+    }
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        fill: Tokens.accent;
+        stroke-width: 0px;
+        commands: "M8 9 H13 V13 H8 Z";
+    }
+}
+
+// A row in a popup menu. `kind` draws a document glyph; -1 leaves it out.
+export component MenuRow inherits Rectangle {
+    in property <int> kind: -1;
+    in property <string> text;
+    in property <string> detail;
+    in property <bool> checked;
+    callback clicked;
+    height: Tokens.control-height + 4px;
+    border-radius: Tokens.radius-sm;
+    background: touch.has-hover ? Tokens.hover : transparent;
+    HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        padding-right: Tokens.space-sm;
+        spacing: Tokens.space-sm;
+        if root.kind >= 0: VerticalLayout {
+            alignment: center;
+            KindGlyph {
+                kind: root.kind;
+            }
+        }
+
+        Text {
+            text: root.text;
+            font-size: Tokens.font-md;
+            color: Tokens.text;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: root.detail;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-tertiary;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+
+        if root.checked: VerticalLayout {
+            alignment: center;
+            Icon {
+                data: Icons.check;
+                size: 14px;
+                tint: Tokens.accent;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The frame every popup menu sits in.
+export component MenuFrame inherits Rectangle {
+    background: Tokens.surface;
+    border-radius: Tokens.radius-lg;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: #00000026;
+}
+
+component MenuHeading inherits HorizontalLayout {
+    in property <string> text;
+    padding-left: Tokens.space-sm;
+    Text {
+        text: root.text;
+        font-size: Tokens.font-xs;
+        color: Tokens.text-tertiary;
+        height: 22px;
+        vertical-alignment: center;
+    }
+}
+
+export { MenuHeading }

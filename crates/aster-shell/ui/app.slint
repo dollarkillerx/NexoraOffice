@@ -1,0 +1,266 @@
+// The Aster Office main window: tab strip, toolbar, sidebar, document area and
+// status bar. Everything here is chrome; the document area of a Writer tab is
+// one image that the Rust side draws itself, and Slint only forwards input to it.
+
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem } from "tokens.slint";
+import { TabStrip } from "tabstrip.slint";
+import { Toolbar } from "toolbar.slint";
+import { Sidebar } from "sidebar.slint";
+import { StartPage } from "start.slint";
+import { Placeholder } from "placeholder.slint";
+import { StatusBar } from "statusbar.slint";
+import { AssistantPanel } from "assistant.slint";
+import { Hairline } from "widgets.slint";
+
+export { Tokens, Icons, Strings }
+
+export component AppWindow inherits Window {
+    title: root.active-title == "" ? "Aster Office" : root.active-title + " — Aster Office";
+    // Window and taskbar icon on Windows and X11. macOS takes the Dock icon from
+    // the bundle and Wayland from the desktop entry, so this does nothing there.
+    icon: @image-url("../../../assets/brand/logo/png/aster-icon-256.png");
+    preferred-width: 1240px;
+    preferred-height: 800px;
+    min-width: 640px;
+    min-height: 420px;
+    background: Tokens.surface;
+    default-font-size: Tokens.font-md;
+
+    in property <[TabItem]> tabs;
+    // -1 while the start page is showing.
+    in property <int> active-index: -1;
+    // Kind of the document in front, -1 on the start page.
+    in property <int> active-kind: -1;
+    in property <string> active-title;
+    in property <string> placeholder-title;
+    in property <string> placeholder-plan;
+    in property <[ToolItem]> toolbar-items;
+    in property <[KindItem]> kinds;
+    in property <[RecentItem]> recent;
+    in property <[TreeItem]> tree;
+    in-out property <bool> sidebar-open: true;
+    in-out property <bool> assistant-open;
+    in property <[string]> languages;
+    in property <int> language-index;
+    // Room for the window buttons where the tab strip doubles as the title bar.
+    in property <length> leading-inset;
+
+    in property <string> status-kind;
+    in property <string> status-note;
+    in property <string> status-words;
+    in property <string> status-chars;
+    in property <string> status-ime;
+    in property <bool> status-composing;
+    in property <string> status-zoom;
+    in property <bool> zoom-enabled;
+
+    // The frame the Rust side rendered for the document surface.
+    in property <image> frame;
+    // Scroll position of the surface, for the scroll indicator.
+    in property <length> scroll-offset;
+    in property <length> scroll-max;
+
+    // Geometry the Rust side needs to size its buffer and place the candidate window.
+    out property <length> surface-width: surface.width;
+    out property <length> surface-height: surface.height;
+    out property <length> surface-x: surface.absolute-position.x;
+    out property <length> surface-y: surface.absolute-position.y;
+    out property <bool> surface-focused: scope.has-focus;
+    property <bool> surface-active: root.active-kind == 0;
+
+    callback tab-activate(int);
+    callback tab-close(int);
+    callback new-document(int);
+    callback show-start();
+    callback open-recent(int);
+    callback toggle-theme();
+    callback set-language(int);
+    callback toolbar-command(int);
+    callback zoom-out();
+    callback zoom-reset();
+    callback zoom-in();
+    callback drag-window();
+    callback toggle-maximize();
+    // text, shift, primary (Cmd on macOS, Ctrl elsewhere), alt. Returns true when handled.
+    callback key-pressed(string, bool, bool, bool) -> bool;
+    callback pointer-down(length, length, bool);
+    callback pointer-drag(length, length);
+    callback scrolled(length);
+
+    // Give the keyboard to the document surface.
+    public function focus-document() {
+        scope.focus();
+    }
+
+    VerticalLayout {
+        TabStrip {
+            tabs: root.tabs;
+            active-index: root.active-index;
+            kinds: root.kinds;
+            leading-inset: root.leading-inset;
+            sidebar-open: root.sidebar-open;
+            assistant-open: root.assistant-open;
+            languages: root.languages;
+            language-index: root.language-index;
+            activate(index) => {
+                root.tab-activate(index);
+            }
+            close(index) => {
+                root.tab-close(index);
+            }
+            new-document(kind) => {
+                root.new-document(kind);
+            }
+            show-start => {
+                root.show-start();
+            }
+            toggle-sidebar => {
+                root.sidebar-open = !root.sidebar-open;
+            }
+            toggle-theme => {
+                root.toggle-theme();
+            }
+            toggle-assistant => {
+                root.assistant-open = !root.assistant-open;
+            }
+            set-language(index) => {
+                root.set-language(index);
+            }
+            drag-window => {
+                root.drag-window();
+            }
+            toggle-maximize => {
+                root.toggle-maximize();
+            }
+        }
+
+        if root.active-kind >= 0: Toolbar {
+            items: root.toolbar-items;
+            command(id) => {
+                root.toolbar-command(id);
+            }
+        }
+
+        Hairline { }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+
+            Sidebar {
+                width: root.sidebar-open ? Tokens.sidebar-width : 0px;
+                animate width {
+                    duration: 140ms;
+                    easing: ease-out;
+                }
+                recent: root.recent;
+                tree: root.tree;
+                open-recent(index) => {
+                    root.open-recent(index);
+                }
+            }
+
+            content := Rectangle {
+                horizontal-stretch: 1;
+                background: Tokens.desk;
+                clip: true;
+
+                // Always present so its size is known before the first Writer
+                // tab opens; other views are stacked on top of it.
+                surface := Rectangle {
+                    visible: root.surface-active;
+
+                    Image {
+                        source: root.frame;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: fill;
+                    }
+
+                    scope := FocusScope {
+                        enabled: root.surface-active;
+                        key-pressed(event) => {
+                            return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                        }
+
+                        TouchArea {
+                            enabled: root.surface-active;
+                            mouse-cursor: text;
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                    scope.focus();
+                                    root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
+                                }
+                            }
+                            moved => {
+                                if (self.pressed) {
+                                    root.pointer-drag(self.mouse-x, self.mouse-y);
+                                }
+                            }
+                            scroll-event(event) => {
+                                root.scrolled(event.delta-y);
+                                return accept;
+                            }
+                        }
+                    }
+
+                    // Shows where the view is in the document. Not draggable yet.
+                    if root.scroll-max > 0: Rectangle {
+                        property <length> track: parent.height - 2 * Tokens.space-xs;
+                        property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
+                        x: parent.width - self.width - 3px;
+                        y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
+                        width: 6px;
+                        height: self.thumb;
+                        border-radius: 3px;
+                        background: Tokens.text-disabled;
+                    }
+                }
+
+                if root.active-kind > 0: Placeholder {
+                    kind: root.active-kind;
+                    title: root.placeholder-title;
+                    plan: root.placeholder-plan;
+                }
+
+                if root.active-kind < 0: StartPage {
+                    kinds: root.kinds;
+                    recent: root.recent;
+                    new-document(kind) => {
+                        root.new-document(kind);
+                    }
+                    open-recent(index) => {
+                        root.open-recent(index);
+                    }
+                }
+            }
+
+            AssistantPanel {
+                width: root.assistant-open ? self.panel-width : 0px;
+                animate width {
+                    duration: 140ms;
+                    easing: ease-out;
+                }
+            }
+        }
+
+        StatusBar {
+            kind-label: root.status-kind;
+            note: root.status-note;
+            words: root.status-words;
+            chars: root.status-chars;
+            ime-label: root.status-ime;
+            ime-composing: root.status-composing;
+            zoom-label: root.status-zoom;
+            zoom-enabled: root.zoom-enabled;
+            zoom-out => {
+                root.zoom-out();
+            }
+            zoom-reset => {
+                root.zoom-reset();
+            }
+            zoom-in => {
+                root.zoom-in();
+            }
+        }
+    }
+}

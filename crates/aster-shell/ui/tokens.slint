@@ -1,0 +1,135 @@
+// Design tokens as the UI sees them. The values are written once, in
+// src/theme.rs and src/icons.rs, and copied in at start-up and whenever the
+// theme changes. Nothing in ui/ may use a colour, length or font size that is
+// not one of these.
+
+export global Tokens {
+    in property <bool> dark;
+
+    in property <color> surface;
+    in property <color> sunken;
+    in property <color> panel;
+    in property <color> fill;
+    in property <color> hover;
+    in property <color> pressed;
+    in property <color> hairline;
+    in property <color> text;
+    in property <color> text-secondary;
+    in property <color> text-tertiary;
+    in property <color> text-disabled;
+    in property <color> accent;
+    in property <color> on-accent;
+    in property <color> accent-soft;
+    in property <color> desk;
+    in property <color> page;
+    in property <color> page-edge;
+
+    in property <length> space-xs;
+    in property <length> space-sm;
+    in property <length> space-md;
+    in property <length> space-lg;
+    in property <length> space-xl;
+    in property <length> radius-sm;
+    in property <length> radius-md;
+    in property <length> radius-lg;
+    in property <length> control-height;
+    in property <length> tab-strip-height;
+    in property <length> toolbar-height;
+    in property <length> status-bar-height;
+    in property <length> sidebar-width;
+    in property <length> icon-size;
+    in property <length> font-xs;
+    in property <length> font-sm;
+    in property <length> font-md;
+    in property <length> font-lg;
+    in property <length> font-xl;
+    in property <length> font-display;
+
+    // How long a hover or selection change takes to settle.
+    out property <duration> quick: 90ms;
+}
+
+// Interface text in the current language. Written once, in src/i18n.rs, and
+// copied in at start-up and whenever the language changes. No .slint file may
+// hold interface text of its own.
+export global Strings {
+    in property <string> tagline;
+    in property <string> new-document;
+    in property <string> recent;
+    in property <string> files;
+    in property <string> sample;
+    in property <string> sample-data;
+    in property <string> placeholder;
+    in property <string> placeholder-view;
+    in property <string> search-files;
+    in property <string> language;
+    in property <string> placeholder-body;
+    in property <string> ai-title;
+    in property <string> ai-body;
+    in property <string> ai-point-tools;
+    in property <string> ai-point-approval;
+    in property <string> ai-point-keys;
+    in property <string> ai-input;
+}
+
+// Path data for the icons the chrome itself uses. Toolbar icons arrive with the
+// toolbar model instead.
+export global Icons {
+    in property <string> close;
+    in property <string> plus;
+    in property <string> minus;
+    in property <string> chevron-down;
+    in property <string> chevron-right;
+    in property <string> sidebar;
+    in property <string> sun;
+    in property <string> moon;
+    in property <string> folder;
+    in property <string> clock;
+    in property <string> search;
+    in property <string> globe;
+    in property <string> assistant;
+    in property <string> check;
+}
+
+export struct TabItem {
+    title: string,
+    // Index into the document kinds: 0 Writer, 1 Sheets, 2 Slides, 3 Markdown, 4 PDF.
+    kind: int,
+}
+
+export struct ToolItem {
+    // 0 icon button, 1 letter button, 2 select, 3 value, 4 separator, 5 spacer.
+    control: int,
+    icon: string,
+    text: string,
+    width: length,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    enabled: bool,
+    command: int,
+}
+
+export struct KindItem {
+    kind: int,
+    name: string,
+    tagline: string,
+    // False for the kinds that only open a placeholder.
+    implemented: bool,
+}
+
+export struct RecentItem {
+    title: string,
+    kind: int,
+    location: string,
+    opened: string,
+}
+
+export struct TreeItem {
+    name: string,
+    depth: int,
+    // -1 for a folder.
+    kind: int,
+    expanded: bool,
+}

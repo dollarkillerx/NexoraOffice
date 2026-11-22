@@ -1,0 +1,180 @@
+import { Tokens, Icons, Strings, RecentItem, TreeItem } from "tokens.slint";
+import { Icon, KindGlyph, Badge, Hairline, VHairline } from "widgets.slint";
+
+component SectionHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> badge;
+    height: 30px;
+    HorizontalLayout {
+        padding-left: Tokens.space-md + 2px;
+        padding-right: Tokens.space-md;
+        spacing: Tokens.space-sm;
+        Text {
+            text: root.title;
+            font-size: Tokens.font-xs;
+            font-weight: 600;
+            letter-spacing: 0.4px;
+            color: Tokens.text-tertiary;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            if root.badge != "": Badge {
+                text: root.badge;
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// The workspace panel: recent files and the file tree.
+export component Sidebar inherits Rectangle {
+    in property <[RecentItem]> recent;
+    in property <[TreeItem]> tree;
+    callback open-recent(int);
+    background: Tokens.panel;
+    clip: true;
+
+    // Laid out at the full width even while the panel is sliding shut.
+    VerticalLayout {
+        x: 0;
+        width: Tokens.sidebar-width;
+        padding-top: Tokens.space-sm;
+        spacing: 0px;
+        alignment: start;
+
+        // Search is not built; the field shows where it goes.
+        Rectangle {
+            height: Tokens.control-height + Tokens.space-sm;
+            Rectangle {
+                x: Tokens.space-md;
+                y: 0;
+                width: parent.width - 2 * Tokens.space-md;
+                height: Tokens.control-height;
+                border-radius: Tokens.radius-md;
+                border-width: 1px;
+                border-color: Tokens.hairline;
+                HorizontalLayout {
+                    padding-left: Tokens.space-sm;
+                    spacing: Tokens.space-xs + 2px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            data: Icons.search;
+                            size: 14px;
+                            tint: Tokens.text-disabled;
+                        }
+                    }
+
+                    Text {
+                        text: Strings.search-files;
+                        font-size: Tokens.font-md;
+                        color: Tokens.text-disabled;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        SectionHeader {
+            title: Strings.recent;
+            badge: Strings.sample;
+        }
+
+        for item[index] in root.recent: Rectangle {
+            height: Tokens.control-height;
+            Rectangle {
+                x: Tokens.space-xs + 2px;
+                width: parent.width - 2 * (Tokens.space-xs + 2px);
+                border-radius: Tokens.radius-md;
+                background: row-touch.pressed ? Tokens.pressed : row-touch.has-hover ? Tokens.hover : transparent;
+                animate background { duration: Tokens.quick; }
+            }
+
+            HorizontalLayout {
+                padding-left: Tokens.space-md + 2px;
+                padding-right: Tokens.space-md;
+                spacing: Tokens.space-sm;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    KindGlyph {
+                        kind: item.kind;
+                        size: 14px;
+                        ink: Tokens.text-tertiary;
+                    }
+                }
+
+                Text {
+                    text: item.title;
+                    font-size: Tokens.font-md;
+                    color: Tokens.text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+            }
+
+            row-touch := TouchArea {
+                clicked => {
+                    root.open-recent(index);
+                }
+            }
+        }
+
+        Rectangle {
+            height: Tokens.space-sm;
+        }
+
+        SectionHeader {
+            title: Strings.files;
+            badge: Strings.sample;
+        }
+
+        // Not a real tree: the rows are fixed and do not react.
+        for item in root.tree: Rectangle {
+            height: Tokens.control-height;
+            HorizontalLayout {
+                padding-left: Tokens.space-md + 2px + item.depth * 14px;
+                padding-right: Tokens.space-md;
+                spacing: Tokens.space-xs + 2px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    if item.kind < 0: Icon {
+                        data: item.expanded ? Icons.chevron-down : Icons.chevron-right;
+                        size: 14px;
+                        tint: Tokens.text-tertiary;
+                    }
+                    if item.kind >= 0: KindGlyph {
+                        kind: item.kind;
+                        size: 14px;
+                        ink: Tokens.text-tertiary;
+                    }
+                }
+
+                Text {
+                    text: item.name;
+                    font-size: Tokens.font-md;
+                    color: Tokens.text-secondary;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+            }
+        }
+    }
+
+    VHairline {
+        x: parent.width - 1px;
+    }
+}

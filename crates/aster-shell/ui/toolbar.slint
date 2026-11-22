@@ -1,0 +1,137 @@
+import { Tokens, Icons, ToolItem } from "tokens.slint";
+import { Icon } from "widgets.slint";
+
+component ToolControl inherits Rectangle {
+    in property <ToolItem> item;
+    callback activated;
+    property <bool> is-button: item.control == 0 || item.control == 1;
+    property <bool> is-gap: item.control == 4 || item.control == 5;
+    property <length> fixed-width: is-button ? Tokens.control-height : item.control == 4 ? 9px : item.control == 5 ? 0px : item.width;
+    property <brush> ink: item.enabled ? Tokens.text : Tokens.text-disabled;
+    min-width: fixed-width;
+    max-width: item.control == 5 ? 100000px : fixed-width;
+    horizontal-stretch: item.control == 5 ? 1 : 0;
+    height: Tokens.control-height;
+
+    Rectangle {
+        border-radius: Tokens.radius-md;
+        background: root.is-gap || !root.item.enabled ? transparent : touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+        animate background { duration: Tokens.quick; }
+    }
+
+    if item.control == 0: Icon {
+        data: root.item.icon;
+        tint: root.item.enabled ? Tokens.text-secondary : Tokens.text-disabled;
+    }
+
+    if item.control == 1: Text {
+        text: root.item.text;
+        font-size: Tokens.font-lg - 1px;
+        font-weight: root.item.bold ? 700 : 500;
+        font-italic: root.item.italic;
+        color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if item.control == 1 && item.underline: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 6px;
+        width: 11px;
+        height: 1.5px;
+        background: root.ink;
+    }
+
+    if item.control == 1 && item.strike: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height / 2;
+        width: 13px;
+        height: 1.5px;
+        background: root.ink;
+    }
+
+    if item.control == 2: HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        padding-right: Tokens.space-xs;
+        spacing: 2px;
+        Text {
+            text: root.item.text;
+            font-size: Tokens.font-md;
+            color: root.ink;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            min-width: 0px;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Icon {
+                data: Icons.chevron-down;
+                size: 14px;
+                tint: root.item.enabled ? Tokens.text-tertiary : Tokens.text-disabled;
+            }
+        }
+    }
+
+    if item.control == 3: Text {
+        text: root.item.text;
+        font-size: Tokens.font-md;
+        color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if item.control == 4: Rectangle {
+        x: 4px;
+        y: (parent.height - self.height) / 2;
+        width: 1px;
+        height: 16px;
+        background: Tokens.hairline;
+    }
+
+    touch := TouchArea {
+        enabled: root.item.enabled && !root.is-gap;
+        clicked => {
+            root.activated();
+        }
+    }
+}
+
+// The single-row toolbar: one capsule, groups divided by thin rules.
+export component Toolbar inherits Rectangle {
+    in property <[ToolItem]> items;
+    callback command(int);
+    height: Tokens.toolbar-height + 2 * Tokens.space-xs + 2px;
+    background: Tokens.surface;
+
+    // Sized by hand rather than by a layout, so that a toolbar wider than the
+    // window is clipped instead of forcing the window to grow.
+    Rectangle {
+        x: Tokens.space-sm;
+        y: Tokens.space-xs + 1px;
+        width: parent.width - 2 * Tokens.space-sm;
+        height: Tokens.toolbar-height;
+        border-radius: self.height / 2;
+        background: Tokens.fill;
+        clip: true;
+        HorizontalLayout {
+            x: 0;
+            width: max(parent.width, self.min-width);
+            padding-left: Tokens.space-md;
+            padding-right: Tokens.space-md;
+            spacing: 1px;
+            for item in root.items: VerticalLayout {
+                alignment: center;
+                horizontal-stretch: item.control == 5 ? 1 : 0;
+                ToolControl {
+                    item: item;
+                    activated => {
+                        root.command(item.command);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,265 @@
+import { Tokens, Icons, Strings, TabItem, KindItem } from "tokens.slint";
+import { Icon, IconButton, KindGlyph, AsterMark, MenuRow, MenuFrame, MenuHeading } from "widgets.slint";
+
+component Tab inherits Rectangle {
+    in property <TabItem> item;
+    in property <bool> active;
+    callback activate;
+    callback close;
+    min-width: 64px;
+    preferred-width: 196px;
+    max-width: 196px;
+    horizontal-stretch: 0;
+
+    // The active tab is a piece of the toolbar row reaching up into the strip.
+    Rectangle {
+        y: 6px;
+        height: parent.height - 6px;
+        border-top-left-radius: Tokens.radius-md;
+        border-top-right-radius: Tokens.radius-md;
+        background: root.active ? Tokens.surface : touch.has-hover || close-button.has-hover ? Tokens.hover : transparent;
+        animate background { duration: Tokens.quick; }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.activate();
+        }
+        // Middle click closes, as in a browser.
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up && event.button == PointerEventButton.middle) {
+                root.close();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-top: 6px;
+        padding-left: Tokens.space-md;
+        padding-right: Tokens.space-xs + 2px;
+        spacing: Tokens.space-sm;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            KindGlyph {
+                kind: root.item.kind;
+                size: 14px;
+                ink: root.active ? Tokens.text : Tokens.text-tertiary;
+            }
+        }
+
+        Text {
+            text: root.item.title;
+            font-size: Tokens.font-md;
+            color: root.active ? Tokens.text : Tokens.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            min-width: 0px;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            close-button := IconButton {
+                icon: Icons.close;
+                size: 20px;
+                icon-size: 12px;
+                opacity: root.active || touch.has-hover || self.has-hover ? 1 : 0;
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+    }
+}
+
+// Document tabs. On macOS the strip is also the title bar: the window buttons
+// sit in `leading-inset` and empty parts of the strip drag the window.
+export component TabStrip inherits Rectangle {
+    in property <[TabItem]> tabs;
+    // -1 while the start page is showing.
+    in property <int> active-index: -1;
+    in property <[KindItem]> kinds;
+    in property <length> leading-inset;
+    in property <bool> sidebar-open;
+    in property <bool> assistant-open;
+    // Native names of the interface languages, and which one is in use.
+    in property <[string]> languages;
+    in property <int> language-index;
+    callback activate(int);
+    callback close(int);
+    callback new-document(int);
+    callback show-start();
+    callback toggle-sidebar();
+    callback toggle-theme();
+    callback toggle-assistant();
+    callback set-language(int);
+    callback drag-window();
+    callback toggle-maximize();
+    height: Tokens.tab-strip-height;
+    background: Tokens.sunken;
+
+    TouchArea {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.drag-window();
+            }
+        }
+        double-clicked => {
+            root.toggle-maximize();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: root.leading-inset + Tokens.space-sm;
+        padding-right: Tokens.space-sm;
+        spacing: 2px;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            IconButton {
+                icon: Icons.sidebar;
+                clicked => {
+                    root.toggle-sidebar();
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            home := Rectangle {
+                width: Tokens.control-height + 4px;
+                height: Tokens.control-height;
+                border-radius: Tokens.radius-md;
+                background: root.active-index < 0 ? Tokens.surface : home-touch.has-hover ? Tokens.hover : transparent;
+                animate background { duration: Tokens.quick; }
+                AsterMark {
+                    size: 24px;
+                }
+
+                home-touch := TouchArea {
+                    clicked => {
+                        root.show-start();
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            width: Tokens.space-xs;
+        }
+
+        for tab[index] in root.tabs: Tab {
+            item: tab;
+            active: index == root.active-index;
+            activate => {
+                root.activate(index);
+            }
+            close => {
+                root.close(index);
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            padding-left: 2px;
+            plus := IconButton {
+                icon: Icons.plus;
+                checked: menu.is-open;
+                clicked => {
+                    menu.show();
+                }
+                menu := PopupWindow {
+                    x: 0;
+                    y: parent.height + 6px;
+                    width: 232px;
+                    MenuFrame { }
+
+                    VerticalLayout {
+                        padding: Tokens.space-xs + 2px;
+                        spacing: 1px;
+                        MenuHeading {
+                            text: Strings.new-document;
+                        }
+
+                        for entry in root.kinds: MenuRow {
+                            kind: entry.kind;
+                            text: entry.name;
+                            detail: entry.implemented ? "" : Strings.placeholder;
+                            clicked => {
+                                root.new-document(entry.kind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Empty strip: drags the window through the TouchArea underneath.
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: Tokens.space-xl;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            IconButton {
+                icon: Icons.globe;
+                checked: language-menu.is-open;
+                clicked => {
+                    language-menu.show();
+                }
+                language-menu := PopupWindow {
+                    x: parent.width - self.width;
+                    y: parent.height + 6px;
+                    width: 176px;
+                    MenuFrame { }
+
+                    VerticalLayout {
+                        padding: Tokens.space-xs + 2px;
+                        spacing: 1px;
+                        MenuHeading {
+                            text: Strings.language;
+                        }
+
+                        for name[index] in root.languages: MenuRow {
+                            text: name;
+                            checked: index == root.language-index;
+                            clicked => {
+                                root.set-language(index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            IconButton {
+                icon: Tokens.dark ? Icons.sun : Icons.moon;
+                clicked => {
+                    root.toggle-theme();
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            IconButton {
+                icon: Icons.assistant;
+                checked: root.assistant-open;
+                clicked => {
+                    root.toggle-assistant();
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,607 @@
+//! What the single-row toolbar shows for each kind of document.
+//!
+//! The model is plain data. A control is enabled only when its command is in
+//! [`Command::is_available`] for the view that is in front; everything else is
+//! laid out where it will live but drawn disabled, so the toolbar shows the
+//! intended design without pretending to work.
+
+use crate::i18n::Strings;
+use crate::icons::Icon;
+use crate::tabs::DocKind;
+
+/// Everything a toolbar or status-bar control can ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Command {
+    Undo,
+    Redo,
+    Print,
+    ZoomOut,
+    ZoomReset,
+    ZoomIn,
+    ParagraphStyle,
+    FontFamily,
+    FontSizeDown,
+    FontSize,
+    FontSizeUp,
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    TextColor,
+    Highlight,
+    InsertLink,
+    InsertImage,
+    InsertTable,
+    InsertComment,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignJustify,
+    BulletList,
+    NumberedList,
+    Checklist,
+    LineSpacing,
+    ClearFormat,
+    Heading,
+    Quote,
+    InlineCode,
+    ViewSource,
+    ViewSplit,
+    ViewPreview,
+    NumberFormat,
+    Currency,
+    Percent,
+    FillColor,
+    Borders,
+    MergeCells,
+    WrapText,
+    AutoSum,
+    SortRange,
+    FilterRange,
+    InsertChart,
+    SelectTool,
+    InsertTextBox,
+    InsertShape,
+    NewSlide,
+    SlideLayout,
+    Present,
+    PageThumbnails,
+    PageNumber,
+    FitWidth,
+    RotatePage,
+    Annotate,
+    FindInDocument,
+    More,
+}
+
+impl Command {
+    pub const ALL: &'static [Command] = &[
+        Command::Undo,
+        Command::Redo,
+        Command::Print,
+        Command::ZoomOut,
+        Command::ZoomReset,
+        Command::ZoomIn,
+        Command::ParagraphStyle,
+        Command::FontFamily,
+        Command::FontSizeDown,
+        Command::FontSize,
+        Command::FontSizeUp,
+        Command::Bold,
+        Command::Italic,
+        Command::Underline,
+        Command::Strikethrough,
+        Command::TextColor,
+        Command::Highlight,
+        Command::InsertLink,
+        Command::InsertImage,
+        Command::InsertTable,
+        Command::InsertComment,
+        Command::AlignLeft,
+        Command::AlignCenter,
+        Command::AlignRight,
+        Command::AlignJustify,
+        Command::BulletList,
+        Command::NumberedList,
+        Command::Checklist,
+        Command::LineSpacing,
+        Command::ClearFormat,
+        Command::Heading,
+        Command::Quote,
+        Command::InlineCode,
+        Command::ViewSource,
+        Command::ViewSplit,
+        Command::ViewPreview,
+        Command::NumberFormat,
+        Command::Currency,
+        Command::Percent,
+        Command::FillColor,
+        Command::Borders,
+        Command::MergeCells,
+        Command::WrapText,
+        Command::AutoSum,
+        Command::SortRange,
+        Command::FilterRange,
+        Command::InsertChart,
+        Command::SelectTool,
+        Command::InsertTextBox,
+        Command::InsertShape,
+        Command::NewSlide,
+        Command::SlideLayout,
+        Command::Present,
+        Command::PageThumbnails,
+        Command::PageNumber,
+        Command::FitWidth,
+        Command::RotatePage,
+        Command::Annotate,
+        Command::FindInDocument,
+        Command::More,
+    ];
+
+    /// Stable number, used to hand the command to the UI layer and back.
+    pub fn id(self) -> i32 {
+        Self::ALL
+            .iter()
+            .position(|command| *command == self)
+            .expect("ALL lists every command") as i32
+    }
+
+    pub fn from_id(id: i32) -> Option<Self> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| Self::ALL.get(index))
+            .copied()
+    }
+
+    /// Whether this build can carry the command out on a view of this kind.
+    /// Today that is zooming the plain-text surface behind Writer tabs, and
+    /// nothing else.
+    pub fn is_available(self, kind: DocKind) -> bool {
+        kind == DocKind::Writer
+            && matches!(
+                self,
+                Command::ZoomOut | Command::ZoomReset | Command::ZoomIn
+            )
+    }
+}
+
+/// How a letter button draws its letter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LetterStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Control {
+    /// A square button with a line icon.
+    Button(Icon),
+    /// A square button drawn as a letter, such as B for bold.
+    Letter(&'static str, LetterStyle),
+    /// A field that opens a list, such as the font family. `width` is in
+    /// logical pixels.
+    Select { value: String, width: f32 },
+    /// A value shown between two stepper buttons, such as the font size.
+    /// Activating it resets the value.
+    Value { text: String, width: f32 },
+    /// A thin vertical rule between groups.
+    Separator,
+    /// Pushes what follows to the right-hand end.
+    Spacer,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    pub control: Control,
+    /// `None` for separators and spacers.
+    pub command: Option<Command>,
+    pub enabled: bool,
+}
+
+/// What the toolbar needs to know about the view in front.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewState {
+    pub zoom_percent: u32,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self { zoom_percent: 100 }
+    }
+}
+
+/// The family name shown in the font field until real font handling exists.
+/// It is the bundled interface and body face the plan names.
+const DEFAULT_FONT: &str = "Noto Sans CJK";
+
+struct Builder {
+    kind: DocKind,
+    items: Vec<Item>,
+}
+
+impl Builder {
+    fn push(&mut self, control: Control, command: Command) -> &mut Self {
+        self.items.push(Item {
+            control,
+            command: Some(command),
+            enabled: command.is_available(self.kind),
+        });
+        self
+    }
+
+    fn icon(&mut self, icon: Icon, command: Command) -> &mut Self {
+        self.push(Control::Button(icon), command)
+    }
+
+    fn letter(&mut self, text: &'static str, style: LetterStyle, command: Command) -> &mut Self {
+        self.push(Control::Letter(text, style), command)
+    }
+
+    fn select(&mut self, value: &str, width: f32, command: Command) -> &mut Self {
+        let value = value.to_owned();
+        self.push(Control::Select { value, width }, command)
+    }
+
+    fn value(&mut self, text: String, width: f32, command: Command) -> &mut Self {
+        self.push(Control::Value { text, width }, command)
+    }
+
+    fn layout(&mut self, control: Control) -> &mut Self {
+        self.items.push(Item {
+            control,
+            command: None,
+            enabled: false,
+        });
+        self
+    }
+
+    fn sep(&mut self) -> &mut Self {
+        self.layout(Control::Separator)
+    }
+
+    fn spacer(&mut self) -> &mut Self {
+        self.layout(Control::Spacer)
+    }
+
+    fn history(&mut self) -> &mut Self {
+        self.icon(Icon::Undo, Command::Undo)
+            .icon(Icon::Redo, Command::Redo)
+    }
+
+    fn zoom(&mut self, view: ViewState) -> &mut Self {
+        self.icon(Icon::Minus, Command::ZoomOut)
+            .value(format!("{}%", view.zoom_percent), 48.0, Command::ZoomReset)
+            .icon(Icon::Plus, Command::ZoomIn)
+    }
+
+    fn font(&mut self, size: &str) -> &mut Self {
+        self.select(DEFAULT_FONT, 132.0, Command::FontFamily)
+            .sep()
+            .icon(Icon::Minus, Command::FontSizeDown)
+            .value(size.to_owned(), 32.0, Command::FontSize)
+            .icon(Icon::Plus, Command::FontSizeUp)
+    }
+
+    fn emphasis(&mut self) -> &mut Self {
+        let plain = LetterStyle::default();
+        let bold = LetterStyle {
+            bold: true,
+            ..plain
+        };
+        let italic = LetterStyle {
+            italic: true,
+            ..plain
+        };
+        let underline = LetterStyle {
+            underline: true,
+            ..plain
+        };
+        let strike = LetterStyle {
+            strike: true,
+            ..plain
+        };
+        self.letter("B", bold, Command::Bold)
+            .letter("I", italic, Command::Italic)
+            .letter("U", underline, Command::Underline)
+            .letter("S", strike, Command::Strikethrough)
+    }
+
+    fn alignment(&mut self) -> &mut Self {
+        self.icon(Icon::AlignLeft, Command::AlignLeft)
+            .icon(Icon::AlignCenter, Command::AlignCenter)
+            .icon(Icon::AlignRight, Command::AlignRight)
+    }
+}
+
+/// The toolbar for a document of this kind. `strings` supplies the values
+/// shown in its fields.
+pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
+    let mut b = Builder {
+        kind,
+        items: Vec::new(),
+    };
+    let plain = LetterStyle::default();
+    match kind {
+        DocKind::Writer => {
+            b.history()
+                .icon(Icon::Print, Command::Print)
+                .sep()
+                .zoom(view)
+                .sep()
+                .select(strings.style_body, 92.0, Command::ParagraphStyle)
+                .sep()
+                .font("12")
+                .sep()
+                .emphasis()
+                .letter(
+                    "A",
+                    LetterStyle {
+                        underline: true,
+                        ..plain
+                    },
+                    Command::TextColor,
+                )
+                .icon(Icon::Highlight, Command::Highlight)
+                .sep()
+                .alignment()
+                .icon(Icon::AlignJustify, Command::AlignJustify)
+                .icon(Icon::LineSpacing, Command::LineSpacing)
+                .sep()
+                .icon(Icon::BulletList, Command::BulletList)
+                .icon(Icon::NumberedList, Command::NumberedList)
+                .sep()
+                .icon(Icon::Link, Command::InsertLink)
+                .icon(Icon::Image, Command::InsertImage)
+                .icon(Icon::Table, Command::InsertTable)
+                .icon(Icon::Comment, Command::InsertComment)
+                .spacer()
+                .icon(Icon::More, Command::More);
+        }
+        DocKind::Markdown => {
+            b.history()
+                .sep()
+                .select(strings.style_body, 92.0, Command::Heading)
+                .sep()
+                .emphasis()
+                .icon(Icon::Code, Command::InlineCode)
+                .sep()
+                .icon(Icon::BulletList, Command::BulletList)
+                .icon(Icon::NumberedList, Command::NumberedList)
+                .icon(Icon::Checklist, Command::Checklist)
+                .icon(Icon::Quote, Command::Quote)
+                .sep()
+                .icon(Icon::Link, Command::InsertLink)
+                .icon(Icon::Image, Command::InsertImage)
+                .icon(Icon::Table, Command::InsertTable)
+                .spacer()
+                .icon(Icon::Pen, Command::ViewSource)
+                .icon(Icon::SplitView, Command::ViewSplit)
+                .icon(Icon::Eye, Command::ViewPreview);
+        }
+        DocKind::Sheets => {
+            b.history()
+                .icon(Icon::Print, Command::Print)
+                .sep()
+                .zoom(view)
+                .sep()
+                .letter("¥", plain, Command::Currency)
+                .letter("%", plain, Command::Percent)
+                .select(strings.number_general, 76.0, Command::NumberFormat)
+                .sep()
+                .font("11")
+                .sep()
+                .emphasis()
+                .icon(Icon::FillColor, Command::FillColor)
+                .icon(Icon::Borders, Command::Borders)
+                .icon(Icon::MergeCells, Command::MergeCells)
+                .sep()
+                .alignment()
+                .icon(Icon::WrapText, Command::WrapText)
+                .sep()
+                .icon(Icon::Sum, Command::AutoSum)
+                .icon(Icon::Sort, Command::SortRange)
+                .icon(Icon::Filter, Command::FilterRange)
+                .icon(Icon::Chart, Command::InsertChart)
+                .spacer()
+                .icon(Icon::More, Command::More);
+        }
+        DocKind::Slides => {
+            b.history()
+                .sep()
+                .icon(Icon::NewSlide, Command::NewSlide)
+                .icon(Icon::Layout, Command::SlideLayout)
+                .sep()
+                .icon(Icon::Pointer, Command::SelectTool)
+                .icon(Icon::TextBox, Command::InsertTextBox)
+                .icon(Icon::Shapes, Command::InsertShape)
+                .icon(Icon::Image, Command::InsertImage)
+                .icon(Icon::Table, Command::InsertTable)
+                .icon(Icon::Chart, Command::InsertChart)
+                .sep()
+                .font("24")
+                .sep()
+                .emphasis()
+                .sep()
+                .alignment()
+                .icon(Icon::BulletList, Command::BulletList)
+                .spacer()
+                .icon(Icon::Play, Command::Present);
+        }
+        DocKind::Pdf => {
+            b.icon(Icon::Thumbnails, Command::PageThumbnails)
+                .sep()
+                .value("1 / 1".to_owned(), 56.0, Command::PageNumber)
+                .sep()
+                .zoom(view)
+                .icon(Icon::FitWidth, Command::FitWidth)
+                .icon(Icon::Rotate, Command::RotatePage)
+                .sep()
+                .icon(Icon::Highlight, Command::Highlight)
+                .icon(Icon::Pen, Command::Annotate)
+                .icon(Icon::Comment, Command::InsertComment)
+                .spacer()
+                .icon(Icon::Search, Command::FindInDocument)
+                .icon(Icon::Print, Command::Print);
+        }
+    }
+    b.items
+}
+
+/// Zoom steps the zoom-in and zoom-out commands move between, in percent.
+pub const ZOOM_STEPS: [u32; 11] = [50, 67, 80, 90, 100, 110, 125, 150, 175, 200, 300];
+
+/// The zoom level one step up or down from the current one.
+pub fn zoom_step(current: u32, zoom_in: bool) -> u32 {
+    if zoom_in {
+        ZOOM_STEPS
+            .into_iter()
+            .find(|step| *step > current)
+            .unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
+    } else {
+        ZOOM_STEPS
+            .into_iter()
+            .rev()
+            .find(|step| *step < current)
+            .unwrap_or(ZOOM_STEPS[0])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{EN, ZH_HANS};
+
+    fn all_toolbars() -> impl Iterator<Item = (DocKind, Vec<Item>)> {
+        DocKind::ALL
+            .into_iter()
+            .map(|kind| (kind, toolbar(kind, ViewState::default(), &ZH_HANS)))
+    }
+
+    #[test]
+    fn command_ids_round_trip() {
+        for (index, command) in Command::ALL.iter().enumerate() {
+            assert_eq!(command.id(), index as i32);
+            assert_eq!(Command::from_id(index as i32), Some(*command));
+        }
+        assert_eq!(Command::from_id(-1), None);
+        assert_eq!(Command::from_id(Command::ALL.len() as i32), None);
+    }
+
+    #[test]
+    fn every_kind_has_a_toolbar_that_starts_with_a_control() {
+        for (kind, items) in all_toolbars() {
+            assert!(items.len() >= 8, "{kind:?} toolbar is nearly empty");
+            assert!(items[0].command.is_some(), "{kind:?} starts with a gap");
+            assert!(
+                items[items.len() - 1].command.is_some(),
+                "{kind:?} ends with a gap"
+            );
+        }
+    }
+
+    #[test]
+    fn separators_never_touch() {
+        for (kind, items) in all_toolbars() {
+            for pair in items.windows(2) {
+                let gap =
+                    |item: &Item| matches!(item.control, Control::Separator | Control::Spacer);
+                assert!(
+                    !(gap(&pair[0]) && gap(&pair[1])),
+                    "{kind:?} has two separators in a row"
+                );
+            }
+            let spacers = items
+                .iter()
+                .filter(|item| item.control == Control::Spacer)
+                .count();
+            assert!(spacers <= 1, "{kind:?} has {spacers} spacers");
+        }
+    }
+
+    #[test]
+    fn a_control_is_enabled_exactly_when_its_command_is_available() {
+        for (kind, items) in all_toolbars() {
+            for item in &items {
+                match item.command {
+                    Some(command) => {
+                        assert_eq!(
+                            item.enabled,
+                            command.is_available(kind),
+                            "{kind:?} {command:?}"
+                        );
+                    }
+                    None => assert!(!item.enabled),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_writer_zoom_works_today() {
+        for (kind, items) in all_toolbars() {
+            let enabled: Vec<_> = items
+                .iter()
+                .filter(|item| item.enabled)
+                .filter_map(|item| item.command)
+                .collect();
+            if kind == DocKind::Writer {
+                assert_eq!(
+                    enabled,
+                    [Command::ZoomOut, Command::ZoomReset, Command::ZoomIn]
+                );
+            } else {
+                assert_eq!(enabled, [], "{kind:?} is a placeholder");
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_appears_once_per_toolbar() {
+        for (kind, items) in all_toolbars() {
+            let mut seen = std::collections::HashSet::new();
+            for command in items.iter().filter_map(|item| item.command) {
+                assert!(seen.insert(command), "{kind:?} repeats {command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_zoom_readout_follows_the_view() {
+        let items = toolbar(DocKind::Writer, ViewState { zoom_percent: 125 }, &ZH_HANS);
+        let readout = items
+            .iter()
+            .find(|item| item.command == Some(Command::ZoomReset))
+            .expect("Writer has a zoom readout");
+        assert!(
+            matches!(&readout.control, Control::Value { text, .. } if text == "125%"),
+            "{:?}",
+            readout.control
+        );
+    }
+
+    #[test]
+    fn field_values_follow_the_language() {
+        let value = |strings: &Strings| {
+            toolbar(DocKind::Writer, ViewState::default(), strings)
+                .into_iter()
+                .find(|item| item.command == Some(Command::ParagraphStyle))
+                .map(|item| item.control)
+        };
+        assert!(matches!(value(&ZH_HANS), Some(Control::Select { value, .. }) if value == "正文"));
+        assert!(matches!(value(&EN), Some(Control::Select { value, .. }) if value == "Body"));
+    }
+
+    #[test]
+    fn zoom_steps_walk_the_scale_and_stop_at_the_ends() {
+        assert_eq!(zoom_step(100, true), 110);
+        assert_eq!(zoom_step(100, false), 90);
+        // From a value between two steps.
+        assert_eq!(zoom_step(95, true), 100);
+        assert_eq!(zoom_step(95, false), 90);
+        assert_eq!(zoom_step(300, true), 300);
+        assert_eq!(zoom_step(50, false), 50);
+        assert!(ZOOM_STEPS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}

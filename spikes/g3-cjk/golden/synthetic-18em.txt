@@ -1,0 +1,31 @@
+== zh-prose · 18 em
+S--  18.00 |排版引擎需要处理“禁则”：句号、逗号|
+S-J  18.00 |和后引号（」』）》等）不能出现在行首，|
+S--  18.00 |前引号（「『（《等）不能出现在行尾。连续|
+S-J  18.00 |的标点，例如“」，「”或者“）。”，中间|
+EG-  18.00 |的空白应当被挤压，否则版面会显得松散。|
+== ja-prose · 18 em
+S--  18.00 |日本語の組版では、行頭に句読点や閉じ|
+S-J  18.00 |括弧（」）、小書きの仮名|
+S-J  18.00 |（ゃ・ゅ・ょ・っ）、長音記号「ー」な|
+S--  18.00 |どを置くことはできません。これを「行|
+S--  18.00 |頭禁則」と呼びます。コンピューターで|
+E--  10.00 |チェックしましょう。|
+== mixed · 18 em
+S--  18.00 |Aster Office 使用 Rust 1.95 和 Slint |
+S-J  18.00 |1.19 开发，在 macOS、Windows 11 与 |
+S--  18.00 |Linux 上运行。打开一个 10 MB 的 DOCX |
+S-J  18.00 |文件不应超过 1.5 秒，网址 https://|
+S-J  18.00 |example.com/docs/long-path 只能在斜|
+E--   6.00 |杠之后断开。|
+== dialogue · 18 em
+H--  16.50 |他说：“今天的会议改到下午三点。”|
+S-J  18.00 |她问：“（真的吗？）那我们还来得及|
+H--   3.00 |吗？”|
+E--  16.00 |“来得及。”他回答，“放心吧……”|
+== english · 18 em
+S-J  18.00 |Line breaking for Latin text must |
+S-J  18.00 |keep words whole, break after |
+S--  18.00 |hyphens in well-known compounds, and |
+S-J  18.00 |never strand punctuation at the |
+E--   8.00 |start of a line.|

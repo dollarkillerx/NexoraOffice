@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["spikes/g1-ime", "spikes/g2-frame"]
+members = ["spikes/g1-ime", "spikes/g2-frame", "spikes/g3-cjk"]
 
 [workspace.package]
 edition = "2024"
@@ -31,6 +31,9 @@ vello_cpu = { version = "=0.2.0", default-features = false, features = [
     "multithreading",
 ] }
 bytemuck = "1.25"
+# The same ICU4X release Parley 0.13 uses, so only one copy of its data is linked.
+icu_segmenter = "~2.3.0"
+icu_locale_core = "2.3"
 
 [profile.dev]
 opt-level = 1

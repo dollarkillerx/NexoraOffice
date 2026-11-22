@@ -10,6 +10,7 @@ members = [
 [workspace.package]
 # The one place the product version is written. Packaging reads it from here.
 version = "0.0.1"
+license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.95"
 publish = false

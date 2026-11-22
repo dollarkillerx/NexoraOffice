@@ -1,6 +1,6 @@
 # Aster Office
 
-用 Rust 编写的原生、离线优先的办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。
+用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。
 
 ## 仓库结构
 
@@ -47,6 +47,16 @@ Linux 上还需要这些系统库：`libfontconfig1-dev libfreetype6-dev libxkbc
 
 **提交说明**用英文，第一行写这次改动做了什么，正文写为什么这样做、怎样验证的、还有什么没做。
 
-**依赖**：`Cargo.lock` 入库，所有命令带 `--locked`。Slint、Parley、vello 的版本是有意固定的，升级要单独提交，并重跑受影响的关卡测试。新增依赖的许可证必须已经在 `deny.toml` 的允许列表里；往列表里加新许可证是法务决定。
+**依赖**：`Cargo.lock` 入库，所有命令带 `--locked`。Slint、Parley、vello 的版本是有意固定的，升级要单独提交，并重跑受影响的关卡测试。新增依赖的许可证必须能与 AGPL-3.0 合并使用，并且已经在 `deny.toml` 的允许列表里；往列表里加新许可证是法务决定。
 
 **不入库的东西**：`target/` 下的全部产物，包括安装包。安装包由持续集成生成并作为构建产物保存。
+
+## 许可证
+
+Aster Office 以 [GNU Affero 通用公共许可证第 3 版](LICENSE)（AGPL-3.0-only）发布。
+
+这是一个著作权传染性的许可证：你可以自由使用、研究、修改和分发本软件，但分发修改后的版本，或者把修改后的版本作为网络服务提供给他人使用时，必须以同样的许可证公开对应的完整源代码。
+
+界面框架 Slint 以它的 GPL-3.0 选项使用。其余依赖都是宽松许可证，清单由 `python3 packaging/licenses.py --report <文件>` 生成。
+
+Copyright (C) 2026 Aster Office contributors

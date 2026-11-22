@@ -1,6 +1,11 @@
 # Dependency policy, enforced by cargo-deny in CI.
-# The licence list is deliberately short. Adding to it is a legal decision, not
-# a way to make CI pass.
+#
+# This project is licensed AGPL-3.0-only. A dependency is acceptable when its
+# licence lets its code be combined into an AGPL-3.0 work: the permissive
+# licences below, and GPL-3.0, which section 13 of both licences allows to be
+# linked with AGPL-3.0 code. GPL-2.0-only code is not compatible and is not
+# listed. The list is deliberately short. Adding to it is a legal decision, not a
+# way to make CI pass.
 
 [graph]
 targets = [
@@ -31,9 +36,16 @@ allow = [
     "BSL-1.0",
     # Unicode data tables used by ICU4X.
     "Unicode-3.0",
-    # Slint is offered under GPL-3.0, a commercial licence, or this one.
-    "LicenseRef-Slint-Royalty-free-2.0",
+    # Slint is offered under GPL-3.0-only, a royalty-free licence with usage
+    # restrictions, or a commercial one. An AGPL project has to take the GPL
+    # option: the royalty-free licence restricts fields of use, which the AGPL
+    # does not allow us to pass on.
+    "GPL-3.0-only",
 ]
+
+# Our own crates are not published and carry the project licence.
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"

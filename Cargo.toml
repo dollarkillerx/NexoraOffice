@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["spikes/g1-ime"]
+members = ["spikes/g1-ime", "spikes/g2-frame"]
 
 [workspace.package]
 edition = "2024"
@@ -28,6 +28,7 @@ vello_cpu = { version = "=0.2.0", default-features = false, features = [
     "text",
     "u8_pipeline",
     "png",
+    "multithreading",
 ] }
 bytemuck = "1.25"
 

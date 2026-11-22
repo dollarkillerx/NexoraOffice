@@ -1,0 +1,19 @@
+// Phase 0 gate G2: the whole window is one image drawn by the Rust side.
+
+export component BenchWindow inherits Window {
+    title: "G2 · 帧路径测量";
+    background: #ffffff;
+    in property <image> frame;
+    // Bumped with every new frame. Its only job is to make the binding below
+    // dirty so that Slint calls `frame-drawn` while it draws that frame.
+    in property <int> frame-no;
+    pure callback frame-drawn(int) -> length;
+
+    Image {
+        x: root.frame-drawn(root.frame-no);
+        source: root.frame;
+        width: 100%;
+        height: 100%;
+        image-fit: fill;
+    }
+}

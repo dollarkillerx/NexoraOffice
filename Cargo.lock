@@ -1270,6 +1270,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "g2-frame"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "parley 0.13.0",
+ "slint",
+ "slint-build",
+ "vello_cpu",
+]
+
+[[package]]
 name = "gbm"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2954,6 +2965,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordered-channel"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95be4d57809897b5a7539fc15a7dfe0e84141bc3dfaa2e9b1b27caa90acf61ab"
+dependencies = [
+ "crossbeam-channel",
+]
+
+[[package]]
 name = "ordered-float"
 version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4232,6 +4252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "tiny-skia"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4593,9 +4622,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace506ca414548966fcf3c283be94eb1cad8254de488791ee698bf438b0890a9"
 dependencies = [
  "bytemuck",
+ "crossbeam-channel",
  "glifo",
  "hashbrown 0.17.2",
+ "ordered-channel",
  "png",
+ "rayon",
+ "thread_local",
  "vello_common",
 ]
 

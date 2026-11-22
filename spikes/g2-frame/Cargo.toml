@@ -1,0 +1,16 @@
+[package]
+name = "g2-frame"
+version = "0.0.0"
+description = "Phase 0 gate G2: frame time of the layout -> render -> present path for a custom-drawn document surface"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+slint = { workspace = true }
+parley = { workspace = true }
+vello_cpu = { workspace = true }
+bytemuck = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

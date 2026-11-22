@@ -18,7 +18,7 @@ cargo run -p g1-ime
 cargo test -p g1-ime                              # 表面层的单元测试，不开窗口
 cargo run -p g1-ime -- --dump out.png             # 不开窗口渲染一帧
 cargo run -p g1-ime --example fallback_probe      # 打印汉字实际回退到哪款系统字体
-spikes/g1-ime/bundle-macos.sh                     # macOS：打成最小 .app 包
+spikes/bundle-macos.sh g1-ime                     # macOS：打成最小 .app 包
 ```
 
 ## 测试清单

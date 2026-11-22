@@ -1,0 +1,16 @@
+[package]
+name = "g1-ime"
+version = "0.0.0"
+description = "Phase 0 gate G1: CJK input method inside a custom-drawn document surface hosted in a Slint window"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+slint = { workspace = true }
+parley = { workspace = true }
+vello_cpu = { workspace = true }
+bytemuck = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

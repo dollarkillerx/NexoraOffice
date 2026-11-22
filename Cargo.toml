@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["spikes/g1-ime"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# Versions are pinned on purpose. Slint's `unstable-*` features and Parley's 0.x
+# API both change between minor releases; upgrading means re-running the Phase 0
+# gate tests (G1 input method, G2 frame path).
+[workspace.dependencies]
+slint = { version = "~1.19.0", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-skia",
+    "unstable-winit-030",
+    "unstable-fontique-012",
+] }
+slint-build = "~1.19.0"
+parley = { version = "=0.13.0", features = ["bytemuck", "complex-scripts"] }
+# 0.2.0 is the version Parley 0.13's own examples build against; newer vello_cpu
+# releases exist but their font types have not been checked against Parley 0.13.
+vello_cpu = { version = "=0.2.0", default-features = false, features = [
+    "std",
+    "text",
+    "u8_pipeline",
+    "png",
+] }
+bytemuck = "1.25"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

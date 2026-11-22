@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Aster Office - Concept D: Radial aster monochrome mark</title>
+  <g fill="#0b0b0b">
+    <circle cx="512" cy="512" r="144"/>
+    <ellipse cx="736" cy="512" rx="152" ry="64"/>
+    <ellipse cx="670.4" cy="670.4" rx="152" ry="64" transform="rotate(45 670.4 670.4)"/>
+    <ellipse cx="512" cy="736" rx="152" ry="64" transform="rotate(90 512 736)"/>
+    <ellipse cx="353.6" cy="670.4" rx="152" ry="64" transform="rotate(135 353.6 670.4)"/>
+    <ellipse cx="288" cy="512" rx="152" ry="64"/>
+    <ellipse cx="353.6" cy="353.6" rx="152" ry="64" transform="rotate(225 353.6 353.6)"/>
+    <ellipse cx="512" cy="288" rx="152" ry="64" transform="rotate(90 512 288)"/>
+    <ellipse cx="670.4" cy="353.6" rx="152" ry="64" transform="rotate(315 670.4 353.6)"/>
+  </g>
+</svg>

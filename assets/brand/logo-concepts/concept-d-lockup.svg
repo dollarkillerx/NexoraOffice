@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1600" height="400" viewBox="0 0 1600 400">
+  <title>Aster Office - Concept D: Radial aster horizontal lockup</title>
+  <g transform="translate(72.4 46.4) scale(0.3)" fill="#0b0b0b">
+    <circle cx="512" cy="512" r="144"/>
+    <ellipse cx="736" cy="512" rx="152" ry="64"/>
+    <ellipse cx="670.4" cy="670.4" rx="152" ry="64" transform="rotate(45 670.4 670.4)"/>
+    <ellipse cx="512" cy="736" rx="152" ry="64" transform="rotate(90 512 736)"/>
+    <ellipse cx="353.6" cy="670.4" rx="152" ry="64" transform="rotate(135 353.6 670.4)"/>
+    <ellipse cx="288" cy="512" rx="152" ry="64"/>
+    <ellipse cx="353.6" cy="353.6" rx="152" ry="64" transform="rotate(225 353.6 353.6)"/>
+    <ellipse cx="512" cy="288" rx="152" ry="64" transform="rotate(90 512 288)"/>
+    <ellipse cx="670.4" cy="353.6" rx="152" ry="64" transform="rotate(315 670.4 353.6)"/>
+  </g>
+  <text x="448" y="267" fill="#0b0b0b" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="192" font-weight="500">Aster Office</text>
+</svg>

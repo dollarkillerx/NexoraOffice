@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Aster Office - Concept A: Page compass app icon</title>
+  <rect width="1024" height="1024" rx="224" fill="#0b0b0b"/>
+  <g fill="#93A0EB">
+    <polygon points="432,400 432,208 496,144 592,144 592,400"/>
+    <polygon points="624,432 816,432 880,496 880,592 624,592"/>
+    <polygon points="592,624 592,816 528,880 432,880 432,624"/>
+    <polygon points="400,592 208,592 144,528 144,432 400,432"/>
+  </g>
+</svg>

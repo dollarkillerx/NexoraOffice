@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["spikes/g1-ime", "spikes/g2-frame", "spikes/g3-cjk"]
+members = [
+    "spikes/g1-ime",
+    "spikes/g2-frame",
+    "spikes/g3-cjk",
+    "spikes/g6-storage",
+]
 
 [workspace.package]
 edition = "2024"
@@ -34,6 +39,9 @@ bytemuck = "1.25"
 # The same ICU4X release Parley 0.13 uses, so only one copy of its data is linked.
 icu_segmenter = "~2.3.0"
 icu_locale_core = "2.3"
+# SQLite is compiled in, so every platform runs the same version.
+rusqlite = { version = "0.43", features = ["bundled"] }
+tempfile = "3.27"
 
 [profile.dev]
 opt-level = 1

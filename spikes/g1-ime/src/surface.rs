@@ -387,7 +387,8 @@ impl Surface {
     }
 
     /// Number of glyphs in the current layout that the chosen fonts could not map.
-    #[cfg(test)]
+    /// Only the macOS test uses it: the fallback chain it checks names macOS fonts.
+    #[cfg(all(test, target_os = "macos"))]
     fn missing_glyphs(&mut self) -> usize {
         let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
         let mut missing = 0;

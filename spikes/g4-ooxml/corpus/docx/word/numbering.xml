@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15">
+  <w:abstractNum w:abstractNumId="0" w15:restartNumberingAfterBreak="0">
+    <w:nsid w:val="1A2B3C4D"/>
+    <w:multiLevelType w:val="hybridMultilevel"/>
+    <w:tmpl w:val="5E6F7A8B"/>
+    <w:lvl w:ilvl="0" w:tplc="04090011">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="chineseCountingThousand"/>
+      <w:lvlText w:val="%1、"/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr>
+        <w:ind w:left="420" w:hanging="420"/>
+      </w:pPr>
+    </w:lvl>
+    <w:lvl w:ilvl="1" w:tplc="04090019">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="aiueoFullWidth"/>
+      <w:lvlText w:val="(%2)"/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr>
+        <w:ind w:left="840" w:hanging="420"/>
+      </w:pPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>

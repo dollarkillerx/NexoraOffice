@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac" mc:Ignorable="x14ac">
+  <dimension ref="A1:B3"/>
+  <sheetViews>
+    <sheetView workbookViewId="0"/>
+  </sheetViews>
+  <sheetFormatPr defaultRowHeight="14.25" x14ac:dyDescent="0.2"/>
+  <sheetData>
+    <row r="1" spans="1:2" x14ac:dyDescent="0.2">
+      <c r="A1" t="s"><v>10</v></c>
+      <c r="B1" s="4"><v>0.1</v></c>
+    </row>
+    <row r="2" spans="1:2" x14ac:dyDescent="0.2">
+      <c r="A2" t="s"><v>8</v></c>
+      <c r="B2"><f>销售!D5</f><v>15966</v></c>
+    </row>
+    <row r="3" spans="1:2" x14ac:dyDescent="0.2">
+      <c r="A3" t="s"><v>11</v></c>
+      <c r="B3"><f>ROUND(B2*(1+TaxRate),2)</f><v>17562.599999999999</v></c>
+    </row>
+  </sheetData>
+  <pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>
+</worksheet>

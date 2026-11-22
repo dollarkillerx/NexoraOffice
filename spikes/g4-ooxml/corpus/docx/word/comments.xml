@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15">
+  <w:comment w:id="0" w:author="Aster Tester" w:date="2026-11-22T04:00:00Z" w:initials="AT">
+    <w:p w14:paraId="1C000001" w14:textId="77777777">
+      <w:pPr>
+        <w:pStyle w:val="Normal"/>
+      </w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rStyle w:val="CommentReference"/>
+        </w:rPr>
+        <w:annotationRef/>
+      </w:r>
+      <w:r>
+        <w:t>批注：这一句需要核对。コメントです。</w:t>
+      </w:r>
+    </w:p>
+  </w:comment>
+</w:comments>

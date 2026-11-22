@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision" xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3" mc:Ignorable="xr xr3" id="1" xr:uid="{11111111-2222-4333-8444-555555555555}" name="销售表" displayName="销售表" ref="A1:E4" totalsRowShown="0">
+  <autoFilter ref="A1:E4" xr:uid="{11111111-2222-4333-8444-666666666666}"/>
+  <tableColumns count="5">
+    <tableColumn id="1" xr3:uid="{11111111-2222-4333-8444-000000000001}" name="品名"/>
+    <tableColumn id="2" xr3:uid="{11111111-2222-4333-8444-000000000002}" name="单价" dataDxfId="0"/>
+    <tableColumn id="3" xr3:uid="{11111111-2222-4333-8444-000000000003}" name="数量"/>
+    <tableColumn id="4" xr3:uid="{11111111-2222-4333-8444-000000000004}" name="金额">
+      <calculatedColumnFormula>B2*C2</calculatedColumnFormula>
+    </tableColumn>
+    <tableColumn id="5" xr3:uid="{11111111-2222-4333-8444-000000000005}" name="日期"/>
+  </tableColumns>
+  <tableStyleInfo name="TableStyleMedium2" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>
+</table>

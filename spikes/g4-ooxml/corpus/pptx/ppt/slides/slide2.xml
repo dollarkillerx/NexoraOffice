@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="1" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr>
+        <a:xfrm>
+          <a:off x="0" y="0"/>
+          <a:ext cx="0" cy="0"/>
+          <a:chOff x="0" y="0"/>
+          <a:chExt cx="0" cy="0"/>
+        </a:xfrm>
+      </p:grpSpPr>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="标题 1"/>
+          <p:cNvSpPr>
+            <a:spLocks noGrp="1"/>
+          </p:cNvSpPr>
+          <p:nvPr>
+            <p:ph type="title"/>
+          </p:nvPr>
+        </p:nvSpPr>
+        <p:spPr/>
+        <p:txBody>
+          <a:bodyPr/>
+          <a:lstStyle/>
+          <a:p>
+            <a:r>
+              <a:rPr lang="zh-CN" altLang="en-US"/>
+              <a:t>内容页 コンテンツ</a:t>
+            </a:r>
+          </a:p>
+        </p:txBody>
+      </p:sp>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="3" name="内容占位符 2"/>
+          <p:cNvSpPr>
+            <a:spLocks noGrp="1"/>
+          </p:cNvSpPr>
+          <p:nvPr>
+            <p:ph idx="1"/>
+          </p:nvPr>
+        </p:nvSpPr>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="838200" y="1825625"/>
+            <a:ext cx="5181600" cy="2200000"/>
+          </a:xfrm>
+        </p:spPr>
+        <p:txBody>
+          <a:bodyPr>
+            <a:normAutofit/>
+          </a:bodyPr>
+          <a:lstStyle/>
+          <a:p>
+            <a:r>
+              <a:rPr lang="zh-CN" altLang="en-US" b="1">
+                <a:solidFill>
+                  <a:srgbClr val="7C5CE0"/>
+                </a:solidFill>
+              </a:rPr>
+              <a:t>第一点</a:t>
+            </a:r>
+            <a:r>
+              <a:rPr lang="zh-CN" altLang="en-US"/>
+              <a:t>：包级保真</a:t>
+            </a:r>
+          </a:p>
+          <a:p>
+            <a:pPr lvl="1"/>
+            <a:r>
+              <a:rPr lang="ja-JP" altLang="en-US"/>
+              <a:t>二階層目の箇条書き</a:t>
+            </a:r>
+            <a:br>
+              <a:rPr lang="ja-JP" altLang="en-US"/>
+            </a:br>
+            <a:fld id="{B8A7C6D5-E4F3-4021-9180-7A6B5C4D3E2F}" type="slidenum">
+              <a:rPr lang="en-US" altLang="zh-CN"/>
+              <a:t>2</a:t>
+            </a:fld>
+            <a:endParaRPr lang="zh-CN" altLang="en-US"/>
+          </a:p>
+        </p:txBody>
+      </p:sp>
+      <p:pic>
+        <p:nvPicPr>
+          <p:cNvPr id="4" name="图片 3" descr="Aster 图标"/>
+          <p:cNvPicPr>
+            <a:picLocks noChangeAspect="1"/>
+          </p:cNvPicPr>
+          <p:nvPr/>
+        </p:nvPicPr>
+        <p:blipFill>
+          <a:blip r:embed="rId2">
+            <a:extLst>
+              <a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}">
+                <a14:useLocalDpi xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" val="0"/>
+              </a:ext>
+            </a:extLst>
+          </a:blip>
+          <a:stretch>
+            <a:fillRect/>
+          </a:stretch>
+        </p:blipFill>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="6400800" y="1825625"/>
+            <a:ext cx="914400" cy="914400"/>
+          </a:xfrm>
+          <a:prstGeom prst="rect">
+            <a:avLst/>
+          </a:prstGeom>
+        </p:spPr>
+      </p:pic>
+      <p:graphicFrame>
+        <p:nvGraphicFramePr>
+          <p:cNvPr id="5" name="表格 4"/>
+          <p:cNvGraphicFramePr>
+            <a:graphicFrameLocks noGrp="1"/>
+          </p:cNvGraphicFramePr>
+          <p:nvPr/>
+        </p:nvGraphicFramePr>
+        <p:xfrm>
+          <a:off x="838200" y="4300000"/>
+          <a:ext cx="6096000" cy="741680"/>
+        </p:xfrm>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+            <a:tbl>
+              <a:tblPr firstRow="1" bandRow="1">
+                <a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId>
+              </a:tblPr>
+              <a:tblGrid>
+                <a:gridCol w="3048000"/>
+                <a:gridCol w="3048000"/>
+              </a:tblGrid>
+              <a:tr h="370840">
+              <a:tc>
+                <a:txBody>
+                  <a:bodyPr/>
+                  <a:lstStyle/>
+                  <a:p>
+                    <a:r>
+                      <a:rPr lang="zh-CN" altLang="en-US"/>
+                      <a:t>项目</a:t>
+                    </a:r>
+                  </a:p>
+                </a:txBody>
+                <a:tcPr/>
+              </a:tc>
+              <a:tc>
+                <a:txBody>
+                  <a:bodyPr/>
+                  <a:lstStyle/>
+                  <a:p>
+                    <a:r>
+                      <a:rPr lang="zh-CN" altLang="en-US"/>
+                      <a:t>結果</a:t>
+                    </a:r>
+                  </a:p>
+                </a:txBody>
+                <a:tcPr/>
+              </a:tc>
+              </a:tr>
+              <a:tr h="370840">
+              <a:tc>
+                <a:txBody>
+                  <a:bodyPr/>
+                  <a:lstStyle/>
+                  <a:p>
+                    <a:r>
+                      <a:rPr lang="zh-CN" altLang="en-US"/>
+                      <a:t>往返</a:t>
+                    </a:r>
+                  </a:p>
+                </a:txBody>
+                <a:tcPr/>
+              </a:tc>
+              <a:tc>
+                <a:txBody>
+                  <a:bodyPr/>
+                  <a:lstStyle/>
+                  <a:p>
+                    <a:r>
+                      <a:rPr lang="zh-CN" altLang="en-US"/>
+                      <a:t>通过 &amp; 記録</a:t>
+                    </a:r>
+                  </a:p>
+                </a:txBody>
+                <a:tcPr/>
+              </a:tc>
+              </a:tr>
+            </a:tbl>
+          </a:graphicData>
+        </a:graphic>
+      </p:graphicFrame>
+      <p:grpSp>
+        <p:nvGrpSpPr>
+          <p:cNvPr id="6" name="组合 5"/>
+          <p:cNvGrpSpPr/>
+          <p:nvPr/>
+        </p:nvGrpSpPr>
+        <p:grpSpPr>
+          <a:xfrm>
+            <a:off x="7620000" y="1825625"/>
+            <a:ext cx="1828800" cy="914400"/>
+            <a:chOff x="7620000" y="1825625"/>
+            <a:chExt cx="1828800" cy="914400"/>
+          </a:xfrm>
+        </p:grpSpPr>
+        <p:sp>
+          <p:nvSpPr>
+            <p:cNvPr id="7" name="椭圆 6"/>
+            <p:cNvSpPr/>
+            <p:nvPr/>
+          </p:nvSpPr>
+          <p:spPr>
+            <a:xfrm>
+              <a:off x="7620000" y="1825625"/>
+              <a:ext cx="914400" cy="914400"/>
+            </a:xfrm>
+            <a:prstGeom prst="ellipse">
+              <a:avLst/>
+            </a:prstGeom>
+            <a:solidFill>
+              <a:schemeClr val="accent1"/>
+            </a:solidFill>
+          </p:spPr>
+          <p:style>
+            <a:lnRef idx="2">
+              <a:schemeClr val="accent1">
+                <a:shade val="50000"/>
+              </a:schemeClr>
+            </a:lnRef>
+            <a:fillRef idx="1">
+              <a:schemeClr val="accent1"/>
+            </a:fillRef>
+            <a:effectRef idx="0">
+              <a:schemeClr val="accent1"/>
+            </a:effectRef>
+            <a:fontRef idx="minor">
+              <a:schemeClr val="lt1"/>
+            </a:fontRef>
+          </p:style>
+          <p:txBody>
+            <a:bodyPr rtlCol="0" anchor="ctr"/>
+            <a:lstStyle/>
+            <a:p>
+              <a:pPr algn="ctr"/>
+              <a:endParaRPr lang="zh-CN" altLang="en-US"/>
+            </a:p>
+          </p:txBody>
+        </p:sp>
+        <p:cxnSp>
+          <p:nvCxnSpPr>
+            <p:cNvPr id="8" name="直接连接符 7"/>
+            <p:cNvCxnSpPr/>
+            <p:nvPr/>
+          </p:nvCxnSpPr>
+          <p:spPr>
+            <a:xfrm>
+              <a:off x="8534400" y="2282825"/>
+              <a:ext cx="914400" cy="0"/>
+            </a:xfrm>
+            <a:prstGeom prst="line">
+              <a:avLst/>
+            </a:prstGeom>
+            <a:ln w="19050">
+              <a:solidFill>
+                <a:srgbClr val="0B0B0B"/>
+              </a:solidFill>
+              <a:tailEnd type="triangle"/>
+            </a:ln>
+          </p:spPr>
+        </p:cxnSp>
+      </p:grpSp>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr>
+    <a:masterClrMapping/>
+  </p:clrMapOvr>
+  <p:timing>
+    <p:tnLst>
+      <p:par>
+        <p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot"/>
+      </p:par>
+    </p:tnLst>
+  </p:timing>
+</p:sld>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{8F2C1B5A-3D44-4E0B-9B1C-6A7D2E5F9C10}">
+  <ds:schemaRefs>
+    <ds:schemaRef ds:uri="https://aster.example/schemas/order"/>
+  </ds:schemaRefs>
+</ds:datastoreItem>

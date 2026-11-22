@@ -1,0 +1,56 @@
+# The G4 spike is a workspace of its own because the OOXML libraries it
+# compares take minutes and several gigabytes of memory to build. It is checked
+# only when it changes, and on one system: nothing in it depends on the platform.
+name: G4 OOXML round trip
+
+on:
+  push:
+    branches: [main]
+    paths: ["spikes/g4-ooxml/**", ".github/workflows/g4-ooxml.yml"]
+  pull_request:
+    paths: ["spikes/g4-ooxml/**", ".github/workflows/g4-ooxml.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: g4-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Compare the candidates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spikes/g4-ooxml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/g4-ooxml
+
+      - name: Format
+        run: cargo fmt --check
+
+      # The harness and our own layer, without the libraries under evaluation.
+      - name: Lint and test the harness alone
+        run: |
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo test --locked --no-default-features
+
+      # Includes the recorded results: a candidate that behaves differently
+      # from golden/built-in.txt fails here.
+      - name: Lint and test with every candidate
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked

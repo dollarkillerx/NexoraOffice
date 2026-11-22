@@ -1,0 +1,172 @@
+candidate     kind  scenario  files   pass  rewritten  lossy  invalid  failed
+own layer     docx  resave      105    105          0      0        0       0
+own layer     docx  edit        105    105          0      0        0       0
+own layer     xlsx  resave        4      4          0      0        0       0
+own layer     xlsx  edit          4      3          0      0        0       1
+own layer     pptx  resave       22     22          0      0        0       0
+own layer     pptx  edit         22     17          0      0        0       5
+betteroffice  docx  resave      105      0         83     22        0       0
+betteroffice  docx  edit        105      0          0      3        0     102
+betteroffice  xlsx  resave        4      4          0      0        0       0
+betteroffice  xlsx  edit          4      0          0      3        0       1
+betteroffice  pptx  resave       22     22          0      0        0       0
+betteroffice  pptx  edit         22     15          0      0        0       7
+ooxmlsdk      docx  resave      105      0        105      0        0       0
+ooxmlsdk      docx  edit        105      0        100      5        0       0
+ooxmlsdk      xlsx  resave        4      0          4      0        0       0
+ooxmlsdk      xlsx  edit          4      0          3      0        0       1
+ooxmlsdk      pptx  resave       22      0         22      0        0       0
+ooxmlsdk      pptx  edit         22      0         15      0        0       7
+ooxmlsdk/all  docx  resave      105      0        100      5        0       0
+ooxmlsdk/all  docx  edit        105      0        100      5        0       0
+ooxmlsdk/all  xlsx  resave        4      0          4      0        0       0
+ooxmlsdk/all  xlsx  edit          4      0          3      0        0       1
+ooxmlsdk/all  pptx  resave       22      0         13      0        0       9
+ooxmlsdk/all  pptx  edit         22      0         11      0        0      11
+office_oxide  docx  resave      105      0        105      0        0       0
+office_oxide  docx  edit        105      0        104      1        0       0
+office_oxide  xlsx  resave        4      0          4      0        0       0
+office_oxide  xlsx  edit          4      0          3      0        0       1
+office_oxide  pptx  resave       22      0         22      0        0       0
+office_oxide  pptx  edit         22      0         17      0        0       5
+
+own layer · edit
+  failed    5×  ppt/slides/slide1.xml holds nothing to edit
+  failed    1×  xl/worksheets/sheet1.xml holds nothing to edit
+betteroffice · resave
+  lost in   7 file(s),    9×  main:cantSplit
+  lost in   7 file(s),    9×  main:trPr
+  lost in   4 file(s),   14×  main:pPr
+  lost in   3 file(s),    7×  main:rPr
+  lost in   3 file(s),    5×  main:sz
+  lost in   2 file(s),    4×  main:rFonts
+  lost in   1 file(s),    5×  main:tcPr
+  lost in   1 file(s),    3×  main:r
+  lost in   1 file(s),    3×  main:t
+  lost in   1 file(s),    2×  main:noProof
+  lost in   1 file(s),    1×  2006:AlternateContent
+  lost in   1 file(s),    1×  2006:Choice
+  lost in   1 file(s),    1×  2006:Fallback
+  lost in   1 file(s),    1×  main:hps
+  … and 18 more element names
+  attribute lost in   7 file(s),    9×  main:cantSplit @main:val
+  attribute lost in   7 file(s),    7×  picture:cNvPr @id changed, e.g. "0" to "1"
+  attribute lost in   4 file(s),    4×  picture:cNvPr @name changed, e.g. "p1" to "image1.png"
+  attribute lost in   3 file(s),    5×  main:sz @main:val
+  attribute lost in   3 file(s),    3×  picture:cNvPr @name changed, e.g. "p2" to "image1.png"
+  attribute lost in   2 file(s),    4×  main:rFonts @main:ascii
+  attribute lost in   2 file(s),    4×  main:rFonts @main:hAnsi
+  attribute lost in   1 file(s),    1×  2006:Choice @Requires
+  attribute lost in   1 file(s),    1×  main:hps @main:val
+  attribute lost in   1 file(s),    1×  main:hpsBaseText @main:val
+  attribute lost in   1 file(s),    1×  main:hpsRaise @main:val
+  attribute lost in   1 file(s),    1×  main:lid @main:val
+  attribute lost in   1 file(s),    1×  main:p @wordml:paraId
+  attribute lost in   1 file(s),    1×  main:p @wordml:textId
+  … and 23 more attribute names
+betteroffice · edit
+  failed  102×  no paragraph carries a w14:paraId, which the edit API needs
+  failed    6×  no shape with text
+  failed    1×  the edit is not in the output
+  failed    1×  xl/worksheets/sheet1.xml holds no plain number
+  lost in   1 file(s),    5×  main:tcPr
+  lost in   1 file(s),    3×  main:r
+  lost in   1 file(s),    3×  main:rPr
+  lost in   1 file(s),    3×  main:t
+  lost in   1 file(s),    2×  main:noProof
+  lost in   1 file(s),    1×  2006:AlternateContent
+  lost in   1 file(s),    1×  2006:Choice
+  lost in   1 file(s),    1×  2006:Fallback
+  lost in   1 file(s),    1×  content-types:Override
+  lost in   1 file(s),    1×  main:hps
+  lost in   1 file(s),    1×  main:hpsBaseText
+  lost in   1 file(s),    1×  main:hpsRaise
+  lost in   1 file(s),    1×  main:lid
+  lost in   1 file(s),    1×  main:p
+  … and 16 more element names
+  attribute lost in   2 file(s),    2×  main:t @namespace:space
+  attribute lost in   2 file(s),    2×  main:workbookPr @date1904
+  attribute lost in   1 file(s),    1×  2006:Choice @Requires
+  attribute lost in   1 file(s),    1×  content-types:Override @ContentType
+  attribute lost in   1 file(s),    1×  content-types:Override @PartName
+  attribute lost in   1 file(s),    1×  main:hps @main:val
+  attribute lost in   1 file(s),    1×  main:hpsBaseText @main:val
+  attribute lost in   1 file(s),    1×  main:hpsRaise @main:val
+  attribute lost in   1 file(s),    1×  main:lid @main:val
+  attribute lost in   1 file(s),    1×  main:p @wordml:paraId
+  attribute lost in   1 file(s),    1×  main:p @wordml:textId
+  attribute lost in   1 file(s),    1×  main:rPr @cap changed, e.g. "small" to "all"
+  attribute lost in   1 file(s),    1×  main:rPr @sz changed, e.g. "3300" to "3200"
+  attribute lost in   1 file(s),    1×  main:rubyAlign @main:val
+  … and 27 more attribute names
+ooxmlsdk · edit
+  failed    5×  the first slide has no text run
+  failed    1×  missing field `effect_reference` while parsing ShapeStyle
+  failed    1×  missing field `path_list` while parsing CustomGeometry
+  failed    1×  the first worksheet holds no plain number
+  lost in   2 file(s),    4×  main:rFonts
+  lost in   2 file(s),    4×  main:rPr
+  lost in   2 file(s),    4×  main:sz
+  lost in   1 file(s),    1×  markup:marker
+  lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker
+  lost in   1 file(s),    1×  urn:fidelity:block
+  lost in   1 file(s),    1×  urn:fidelity:child
+  attribute lost in   2 file(s),    4×  main:rFonts @main:ascii
+  attribute lost in   2 file(s),    4×  main:rFonts @main:hAnsi
+  attribute lost in   2 file(s),    4×  main:sz @main:val
+  attribute lost in   1 file(s),    1×  main:p @urn:betteroffice-fixture-x:origin
+  attribute lost in   1 file(s),    1×  markup:marker @markup:id
+  attribute lost in   1 file(s),    1×  markup:marker @markup:kind
+  attribute lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker @urn:betteroffice-fixture-x:kind
+  attribute lost in   1 file(s),    1×  urn:fidelity:block @urn:fidelity:value
+ooxmlsdk/all · resave
+  failed    2×  missing field `body_properties` while parsing RichText
+  failed    2×  missing field `color_map` while parsing SlideMaster
+  failed    1×  invalid field `complete` while parsing Comment: …
+  failed    1×  missing field `east_asian_font` while parsing MajorFont
+  failed    1×  missing field `effect_reference` while parsing ShapeStyle
+  failed    1×  missing field `notes_size` while parsing Presentation
+  failed    1×  missing field `path_list` while parsing CustomGeometry
+  lost in   2 file(s),    4×  main:rFonts
+  lost in   2 file(s),    4×  main:rPr
+  lost in   2 file(s),    4×  main:sz
+  lost in   1 file(s),    1×  markup:marker
+  lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker
+  lost in   1 file(s),    1×  urn:fidelity:block
+  lost in   1 file(s),    1×  urn:fidelity:child
+  attribute lost in   2 file(s),    4×  main:rFonts @main:ascii
+  attribute lost in   2 file(s),    4×  main:rFonts @main:hAnsi
+  attribute lost in   2 file(s),    4×  main:sz @main:val
+  attribute lost in   1 file(s),    1×  main:p @urn:betteroffice-fixture-x:origin
+  attribute lost in   1 file(s),    1×  markup:marker @markup:id
+  attribute lost in   1 file(s),    1×  markup:marker @markup:kind
+  attribute lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker @urn:betteroffice-fixture-x:kind
+  attribute lost in   1 file(s),    1×  urn:fidelity:block @urn:fidelity:value
+ooxmlsdk/all · edit
+  failed    2×  missing field `body_properties` while parsing RichText
+  failed    2×  missing field `color_map` while parsing SlideMaster
+  failed    2×  the first slide has no text run
+  failed    1×  invalid field `complete` while parsing Comment: …
+  failed    1×  missing field `east_asian_font` while parsing MajorFont
+  failed    1×  missing field `effect_reference` while parsing ShapeStyle
+  failed    1×  missing field `notes_size` while parsing Presentation
+  failed    1×  missing field `path_list` while parsing CustomGeometry
+  failed    1×  the first worksheet holds no plain number
+  lost in   2 file(s),    4×  main:rFonts
+  lost in   2 file(s),    4×  main:rPr
+  lost in   2 file(s),    4×  main:sz
+  lost in   1 file(s),    1×  markup:marker
+  lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker
+  lost in   1 file(s),    1×  urn:fidelity:block
+  lost in   1 file(s),    1×  urn:fidelity:child
+  attribute lost in   2 file(s),    4×  main:rFonts @main:ascii
+  attribute lost in   2 file(s),    4×  main:rFonts @main:hAnsi
+  attribute lost in   2 file(s),    4×  main:sz @main:val
+  attribute lost in   1 file(s),    1×  main:p @urn:betteroffice-fixture-x:origin
+  attribute lost in   1 file(s),    1×  markup:marker @markup:id
+  attribute lost in   1 file(s),    1×  markup:marker @markup:kind
+  attribute lost in   1 file(s),    1×  urn:betteroffice-fixture-x:marker @urn:betteroffice-fixture-x:kind
+  attribute lost in   1 file(s),    1×  urn:fidelity:block @urn:fidelity:value
+office_oxide · edit
+  failed    5×  ppt/slides/slide1.xml holds no text
+  failed    1×  xl/worksheets/sheet1.xml holds no plain number

@@ -1,0 +1,33 @@
+# A workspace of its own: see the note next to `exclude` in the root manifest.
+[workspace]
+
+[package]
+name = "g4-ooxml"
+version = "0.0.1"
+license = "AGPL-3.0-only"
+description = "Phase 0 gate G4: what survives when a DOCX, XLSX or PPTX file is opened and saved again"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[features]
+# Each library under evaluation can be left out, which also makes it possible
+# to measure what each one costs to build.
+default = ["betteroffice", "ooxmlsdk", "office-oxide"]
+betteroffice = ["dep:betteroffice-docx", "dep:betteroffice-xlsx", "dep:betteroffice-pptx"]
+ooxmlsdk = ["dep:ooxmlsdk"]
+office-oxide = ["dep:office_oxide"]
+
+[dependencies]
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+betteroffice-docx = { version = "=0.5.1", optional = true }
+betteroffice-xlsx = { version = "=0.5.1", optional = true, default-features = false }
+betteroffice-pptx = { version = "=0.5.1", optional = true }
+ooxmlsdk = { version = "=0.15.0", optional = true, features = ["parts"] }
+office_oxide = { version = "=0.1.17", optional = true }
+
+[profile.dev]
+# The generated schema code in the candidates is slow unoptimised.
+opt-level = 1
+debug = "line-tables-only"

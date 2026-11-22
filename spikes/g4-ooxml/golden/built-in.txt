@@ -1,0 +1,63 @@
+sample      candidate     scenario  verdict    parts  same/eq/resh/dmg/miss/add  lost el/at/tx  chg  errs  remark
+aster.docx  own layer     resave    pass          24               24/0/0/0/0/0          0/0/0    0     0  
+aster.docx  own layer     edit      pass          24               23/0/0/0/0/0          0/0/0    0     0  
+aster.docx  betteroffice  resave    LOSSY         24               17/0/5/2/0/3        34/29/3    1     0  
+aster.docx  betteroffice  edit      LOSSY         24               17/0/5/2/0/3        34/29/0    1     0  refused 3 earlier paragraph(s), first with: paragraph "10000001" is not a plain single-ru…
+aster.docx  ooxmlsdk      resave    rewritten     24               20/4/0/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.docx  ooxmlsdk      edit      LOSSY         24               19/4/0/1/0/0          1/2/0    0     0  
+aster.docx  ooxmlsdk/all  resave    LOSSY         24               3/18/2/1/0/0          1/2/0    0     0  
+aster.docx  ooxmlsdk/all  edit      LOSSY         24               3/18/2/1/0/0          1/2/0    0     0  
+aster.docx  office_oxide  resave    rewritten     24               20/3/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.docx  office_oxide  edit      rewritten     24               19/3/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.xlsx  own layer     resave    pass          20               20/0/0/0/0/0          0/0/0    0     0  
+aster.xlsx  own layer     edit      pass          20               19/0/0/0/0/0          0/0/0    0     0  cached formula results are left stale
+aster.xlsx  betteroffice  resave    pass          20               20/0/0/0/0/0          0/0/0    0     0  
+aster.xlsx  betteroffice  edit      LOSSY         20               12/1/4/1/0/0          0/0/1    0     0  recalculated: 5 cell(s) changed
+aster.xlsx  ooxmlsdk      resave    rewritten     20               15/5/0/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.xlsx  ooxmlsdk      edit      rewritten     20               14/5/0/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.xlsx  ooxmlsdk/all  resave    rewritten     20               2/12/6/0/0/0          0/0/0    0     0  
+aster.xlsx  ooxmlsdk/all  edit      rewritten     20               2/12/5/0/0/0          0/0/0    0     0  
+aster.xlsx  office_oxide  resave    rewritten     20               15/4/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.xlsx  office_oxide  edit      rewritten     20               14/4/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.pptx  own layer     resave    pass          26               26/0/0/0/0/0          0/0/0    0     0  
+aster.pptx  own layer     edit      pass          26               25/0/0/0/0/0          0/0/0    0     0  
+aster.pptx  betteroffice  resave    pass          26               26/0/0/0/0/0          0/0/0    0     0  
+aster.pptx  betteroffice  edit      pass          26               25/0/0/0/0/0          0/0/0    0     0  
+aster.pptx  ooxmlsdk      resave    rewritten     26              16/10/0/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.pptx  ooxmlsdk      edit      rewritten     26              15/10/0/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.pptx  ooxmlsdk/all  resave    rewritten     26               1/23/2/0/0/0          0/0/0    0     0  
+aster.pptx  ooxmlsdk/all  edit      rewritten     26               1/22/2/0/0/0          0/0/0    0     0  
+aster.pptx  office_oxide  resave    rewritten     26               16/9/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+aster.pptx  office_oxide  edit      rewritten     26               15/9/1/0/0/0          0/0/0    0     0  only relationships and content types were rewritten
+
+candidate     kind  scenario  files   pass  rewritten  lossy  invalid  failed
+own layer     docx  resave        1      1          0      0        0       0
+own layer     docx  edit          1      1          0      0        0       0
+own layer     xlsx  resave        1      1          0      0        0       0
+own layer     xlsx  edit          1      1          0      0        0       0
+own layer     pptx  resave        1      1          0      0        0       0
+own layer     pptx  edit          1      1          0      0        0       0
+betteroffice  docx  resave        1      0          0      1        0       0
+betteroffice  docx  edit          1      0          0      1        0       0
+betteroffice  xlsx  resave        1      1          0      0        0       0
+betteroffice  xlsx  edit          1      0          0      1        0       0
+betteroffice  pptx  resave        1      1          0      0        0       0
+betteroffice  pptx  edit          1      1          0      0        0       0
+ooxmlsdk      docx  resave        1      0          1      0        0       0
+ooxmlsdk      docx  edit          1      0          0      1        0       0
+ooxmlsdk      xlsx  resave        1      0          1      0        0       0
+ooxmlsdk      xlsx  edit          1      0          1      0        0       0
+ooxmlsdk      pptx  resave        1      0          1      0        0       0
+ooxmlsdk      pptx  edit          1      0          1      0        0       0
+ooxmlsdk/all  docx  resave        1      0          0      1        0       0
+ooxmlsdk/all  docx  edit          1      0          0      1        0       0
+ooxmlsdk/all  xlsx  resave        1      0          1      0        0       0
+ooxmlsdk/all  xlsx  edit          1      0          1      0        0       0
+ooxmlsdk/all  pptx  resave        1      0          1      0        0       0
+ooxmlsdk/all  pptx  edit          1      0          1      0        0       0
+office_oxide  docx  resave        1      0          1      0        0       0
+office_oxide  docx  edit          1      0          1      0        0       0
+office_oxide  xlsx  resave        1      0          1      0        0       0
+office_oxide  xlsx  edit          1      0          1      0        0       0
+office_oxide  pptx  resave        1      0          1      0        0       0
+office_oxide  pptx  edit          1      0          1      0        0       0

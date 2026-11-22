@@ -6,6 +6,10 @@ members = [
     "spikes/g3-cjk",
     "spikes/g6-storage",
 ]
+# G4 builds the OOXML libraries under evaluation. They take minutes to compile
+# and are not dependencies of the product, so the spike is a workspace of its
+# own with its own lock file.
+exclude = ["spikes/g4-ooxml"]
 
 [workspace.package]
 # The one place the product version is written. Packaging reads it from here.

@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: g4-${{ github.ref }}
+  group: g5-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

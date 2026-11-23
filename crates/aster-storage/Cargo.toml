@@ -1,0 +1,11 @@
+[package]
+name = "aster-storage"
+version.workspace = true
+license.workspace = true
+description = "Durable file access for Aster Office: atomic writes now, journal and recovery later"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+tempfile = { workspace = true }

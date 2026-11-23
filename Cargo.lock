@@ -157,6 +157,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-storage"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "aster-surface"
 version = "0.0.1"
 dependencies = [
@@ -1334,6 +1341,7 @@ dependencies = [
 name = "g6-storage"
 version = "0.0.1"
 dependencies = [
+ "aster-storage",
  "rusqlite",
  "tempfile",
 ]

@@ -13,10 +13,12 @@
 //! and renamed, so a reader sees either the old file or the new one.
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+// The atomic write proved here now lives in the product's storage crate.
+pub use aster_storage::write_atomically;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::doc::{Command, Snapshot};
@@ -101,26 +103,6 @@ const CHECKPOINT_SUFFIX: &str = ".snap";
 
 fn checkpoint_name(rev: u64) -> String {
     format!("{CHECKPOINT_PREFIX}{rev}{CHECKPOINT_SUFFIX}")
-}
-
-/// Make a rename or a new file in `dir` durable. Directories cannot be synced on
-/// Windows, where the rename itself is what the file system journals.
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    if cfg!(unix) {
-        File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
-/// Replace `path` with `bytes` so that a crash at any point leaves either the
-/// previous file or the complete new one.
-pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|err| err.error)?;
-    sync_dir(dir)
 }
 
 pub struct Store {

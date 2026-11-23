@@ -79,3 +79,5 @@ macOS 27.0.1，Apple M6，2026-11-22，SQLite 3.54（随 rusqlite 编译进来�
 - 检查点和文档保存用 `fullfsync`，日志用 `full`。
 - 命令的编码从第一天起就带版本号，恢复时遇到不认识的版本要明确报错。
 - 恢复失败时保留现场，不要覆盖或删除任何文件。
+
+原子写入 `write_atomically` 已经搬到 `crates/aster-storage`，产品和这个工程用的是同一份。

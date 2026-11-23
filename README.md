@@ -10,7 +10,8 @@
 | `assets/brand/` | Logo、图标和品牌说明 |
 | `docs/decisions/` | 选型决定的记录，一项一份 |
 | `packaging/` | 三个平台的打包脚本和许可证检查 |
-| `.github/workflows/` | 持续集成 |
+| `.github/workflows/` | 持续集成的工作流，开发阶段停用 |
+| `scripts/ci.sh` | 在本机运行同样的检查 |
 | `deny.toml` | 依赖与许可证策略 |
 
 | 关卡 | 工程 | 回答的问题 |
@@ -28,10 +29,28 @@
 需要 Rust，版本由 `rust-toolchain.toml` 指定，安装了 rustup 就会自动使用。
 
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+scripts/ci.sh             # 格式、clippy、测试、许可证，几秒到一两分钟
+scripts/ci.sh --spikes    # 加上 G4 和 G5，首次要编译几分钟
+scripts/ci.sh --package   # 加上本机的安装包
+```
+
+脚本做的就是下面这几条，遇到第一处失败即停止：
+
+```sh
 cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 python3 packaging/licenses.py --check
+```
+
+**开发阶段的检查在本地跑。** GitHub 上的三个工作流（`CI`、`G4 OOXML round trip`、`G5 formula engines`）目前在仓库设置里停用了，推送和开 PR 都不会触发它们。合并进 `main` 之前，在本机运行 `scripts/ci.sh` 并通过。
+
+这样做省掉了每次推送十几分钟的等待，代价是只检查了一个系统：另外两个系统上才会出现的编译错误和测试失败，本地发现不了。到需要三端验证的时候，重新启用即可，工作流文件没有改动：
+
+```sh
+gh workflow enable CI
+gh workflow enable "G4 OOXML round trip"
+gh workflow enable "G5 formula engines"
 ```
 
 Linux 上还需要这些系统库：`libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev`。
@@ -48,13 +67,13 @@ G4 和 G5 不在这个工作区里。它们要编译待评估的 OOXML 库和公
 **分支**：
 
 - `main` 始终可以构建并通过全部检查。不直接向它提交。
-- 工作在短分支上进行，经持续集成通过后合并。验证工程用 `spike/` 前缀，功能用 `feat/`，修复用 `fix/`。
+- 工作在短分支上进行，`scripts/ci.sh` 在本机通过后合并。验证工程用 `spike/` 前缀，功能用 `feat/`，修复用 `fix/`。
 
 **提交说明**用英文，第一行写这次改动做了什么，正文写为什么这样做、怎样验证的、还有什么没做。
 
 **依赖**：`Cargo.lock` 入库，所有命令带 `--locked`。Slint、Parley、vello 的版本是有意固定的，升级要单独提交，并重跑受影响的关卡测试。新增依赖的许可证必须能与 AGPL-3.0 合并使用，并且已经在 `deny.toml` 的允许列表里；往列表里加新许可证是法务决定。
 
-**不入库的东西**：`target/` 下的全部产物，包括安装包。安装包由持续集成生成并作为构建产物保存。
+**不入库的东西**：`target/` 下的全部产物，包括安装包。安装包由打包脚本在本机生成；持续集成启用时由它生成并作为构建产物保存。
 
 ## 许可证
 

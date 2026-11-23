@@ -1147,7 +1147,13 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
         ui.set_status_ime(SharedString::new());
         ui.set_status_composing(false);
     } else if let Some(tab) = shell.active_slides() {
-        let position = if tab.view.count() == 0 {
+        let hidden = tab
+            .view
+            .presentation()
+            .slides
+            .get(tab.view.current())
+            .is_some_and(|slide| slide.hidden);
+        let mut position = if tab.view.count() == 0 {
             String::new()
         } else {
             i18n::fill(
@@ -1160,6 +1166,9 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                 &tab.view.count().to_string(),
             )
         };
+        if hidden {
+            position = format!("{position} · {}", strings.slide_hidden);
+        }
         ui.set_status_words(position.into());
         ui.set_status_chars(SharedString::new());
         ui.set_status_ime(SharedString::new());

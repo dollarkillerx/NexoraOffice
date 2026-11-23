@@ -330,6 +330,7 @@ dependencies = [
 name = "aster-calc"
 version = "0.0.1"
 dependencies = [
+ "aster-ooxml",
  "aster-sheets",
  "formualizer",
 ]

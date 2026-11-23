@@ -42,12 +42,25 @@ impl Formualizer {
         };
         let mut config = WorkbookConfig::ephemeral();
         config.eval = config.eval.with_date_system(date_system);
+        // Formulas are staged as text and the dependency graph is built once,
+        // at the first calculation: adding them one by one to a live graph
+        // costs seconds on a workbook of 60,000 formulas.
+        config.eval.defer_graph_building = true;
         let mut engine = Engine::new_with_config(config);
         let mut sheets = Vec::with_capacity(workbook.sheets.len());
         let mut formulas = Vec::new();
         for (index, sheet) in workbook.sheets.iter().enumerate() {
             engine.add_sheet(&sheet.name).map_err(engine_error)?;
             sheets.push(sheet.name.clone());
+            // Room for every row at once: grown a row at a time, the
+            // engine's column store copies itself over and over.
+            if let Some(used) = sheet.used_range() {
+                engine.ensure_sheet_capacity(
+                    &sheet.name,
+                    used.last.row as usize + 1,
+                    used.last.col as usize + 1,
+                );
+            }
             for row in sheet.rows() {
                 // Runs of plain values in one call each.
                 let mut run: Vec<LiteralValue> = Vec::new();
@@ -291,6 +304,25 @@ mod tests {
         let cancel = Cancel::new();
         cancel.cancel();
         assert_eq!(engine.apply(&[], &cancel), Err(CalcError::Cancelled));
+    }
+
+    #[test]
+    fn a_cell_in_the_far_corner() {
+        let mut sheet = SheetBuilder::new("Far", SheetKind::Worksheet);
+        sheet.push(0, Cell::new(0, Value::Number(2.0)));
+        sheet.push(
+            aster_sheets::MAX_ROWS - 1,
+            Cell::new(aster_sheets::MAX_COLUMNS - 1, Value::Number(3.0)),
+        );
+        sheet.push(1, formula(0, "A1*XFD1048576", Value::Empty));
+        let workbook = Workbook {
+            sheets: vec![sheet.finish()],
+            ..Workbook::default()
+        };
+        let started = std::time::Instant::now();
+        let results = results(&workbook);
+        assert_eq!(at(&results, 0, "A2"), Value::Number(6.0));
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     }
 
     #[test]

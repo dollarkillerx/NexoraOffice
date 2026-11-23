@@ -56,8 +56,6 @@ pub struct SlideStyle {
     pub table: String,
     pub chart: String,
     pub graphic: String,
-    /// Under the number of a slide that is skipped in a show.
-    pub hidden: String,
 }
 
 impl Default for SlideStyle {
@@ -73,7 +71,6 @@ impl Default for SlideStyle {
             table: "Table".to_owned(),
             chart: "Chart".to_owned(),
             graphic: "Graphic".to_owned(),
-            hidden: "Hidden".to_owned(),
         }
     }
 }
@@ -414,10 +411,7 @@ impl SlideView {
             return found.clone();
         }
         let style = &self.style;
-        let mut text = (index + 1).to_string();
-        if self.presentation.slides[index].hidden {
-            text = format!("{text}\n{}", style.hidden);
-        }
+        let text = (index + 1).to_string();
         let paragraph = Arc::new(simple(
             &mut self.shaper,
             &text,
@@ -660,6 +654,30 @@ fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64
             .map(|span| span.style.clone())
             .unwrap_or_else(|| style(size, false, false, false));
         let language = aster_text::segment::guess_language(&text, DEFAULT_LANGUAGE);
+        // The bullet hangs in the indent; text starts after it when the
+        // bullet is wider than the indent leaves room for.
+        let mut margin = margin;
+        if let Some(bullet) = &paragraph.bullet {
+            let first_size = paragraph
+                .runs
+                .first()
+                .map_or(size, |run| (f64::from(run.size) * points_to_px) as f32);
+            let mark = shaper.lay_out(&Spec {
+                text: bullet,
+                base: style(first_size, false, false, false),
+                spans: &[],
+                language,
+                width: None,
+                scale: 1.0,
+                line_height: LINE_HEIGHT,
+                align: Align::Start,
+                rules: Rules::for_language(language),
+            });
+            let bullet_x = (margin + indent).max(0.0);
+            let after = bullet_x + f64::from(mark.width()) + f64::from(first_size) * 0.3;
+            margin = margin.max(after);
+            out.push((left + bullet_x, top + y, mark));
+        }
         let text_width = (width - margin).max(1.0);
         // Sizes in `Style` are logical; the layout here is already in
         // physical pixels, so scale is 1.
@@ -678,24 +696,6 @@ fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64
             },
             rules: Rules::for_language(language),
         });
-        if let Some(bullet) = &paragraph.bullet {
-            let first_size = paragraph
-                .runs
-                .first()
-                .map_or(size, |run| (f64::from(run.size) * points_to_px) as f32);
-            let mark = shaper.lay_out(&Spec {
-                text: bullet,
-                base: style(first_size, false, false, false),
-                spans: &[],
-                language,
-                width: None,
-                scale: 1.0,
-                line_height: LINE_HEIGHT,
-                align: Align::Start,
-                rules: Rules::for_language(language),
-            });
-            out.push((left + (margin + indent).max(0.0), top + y, mark));
-        }
         let x = left + margin;
         let h = f64::from(laid.height());
         out.push((x, top + y, laid));

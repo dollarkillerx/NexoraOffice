@@ -10,3 +10,6 @@ publish.workspace = true
 [dependencies]
 aster-sheets = { workspace = true }
 formualizer = { workspace = true }
+
+[dev-dependencies]
+aster-ooxml = { workspace = true }

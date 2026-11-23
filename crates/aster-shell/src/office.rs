@@ -204,7 +204,6 @@ pub fn slide_style(tokens: &theme::Tokens, strings: &Strings) -> SlideStyle {
         table: strings.shape_table.to_owned(),
         chart: strings.shape_chart.to_owned(),
         graphic: strings.shape_graphic.to_owned(),
-        hidden: strings.slide_hidden.to_owned(),
     }
 }
 

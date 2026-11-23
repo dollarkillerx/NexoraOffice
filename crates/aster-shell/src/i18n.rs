@@ -384,7 +384,7 @@ strings! {
     /// Over the grid of a sheet that holds a chart.
     chart_sheet,
     no_slides,
-    /// Under the number of a slide skipped in a show.
+    /// In the status bar on a slide that is skipped in a show.
     slide_hidden,
     /// On the boxes where slide content is not drawn yet.
     shape_picture,

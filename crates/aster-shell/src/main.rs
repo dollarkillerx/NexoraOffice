@@ -980,7 +980,9 @@ fn finish_save(
 }
 
 /// Save the document in tab `id`, asking where to if it has no file yet or if
-/// `ask` is set. The shell is not borrowed while the system dialog is open.
+/// `ask` is set. The shell is not borrowed while the system dialog is open, and
+/// the dialog is awaited in a task of its own, never inside the event handler
+/// that asked for it: see `dialogs`.
 fn save_document(
     ui: &AppWindow,
     shell: &Rc<RefCell<Shell>>,
@@ -997,17 +999,32 @@ fn save_document(
     let Some((existing, suggested)) = target else {
         return;
     };
-    let path = match existing {
-        Some(path) if !ask => path,
+    match existing {
+        Some(path) if !ask => start_save(ui, shell, id, path, after),
         _ => {
-            let types = text_file_types(strings);
-            match dialogs::pick_file_to_save(strings.save_dialog, &suggested, &types) {
-                Some(path) => path,
+            let (weak, shell) = (ui.as_weak(), shell.clone());
+            let _ = slint::spawn_local(async move {
+                let types = text_file_types(strings);
+                let chosen =
+                    dialogs::pick_file_to_save(strings.save_dialog, &suggested, &types).await;
                 // Cancelled: nothing is saved and nothing is closed.
-                None => return,
-            }
+                if let Some(path) = chosen
+                    && let Some(ui) = weak.upgrade()
+                {
+                    start_save(&ui, &shell, id, path, after);
+                }
+            });
         }
-    };
+    }
+}
+
+fn start_save(
+    ui: &AppWindow,
+    shell: &Rc<RefCell<Shell>>,
+    id: TabId,
+    path: PathBuf,
+    after: AfterSave,
+) {
     let Ok(mut shell) = shell.try_borrow_mut() else {
         return;
     };
@@ -1286,17 +1303,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let shell = shell.clone();
         let weak = ui.as_weak();
         move || {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
             // The shell is not borrowed while the system dialog is open.
             let Ok(strings) = shell.try_borrow().map(|shell| shell.language.strings()) else {
                 return;
             };
-            let types = text_file_types(strings);
-            if let Some(path) = dialogs::pick_file_to_open(strings.open_dialog, &types) {
-                spawn_load(&ui, path);
-            }
+            let weak = weak.clone();
+            // Never block on a dialog inside an event handler: see `dialogs`.
+            let _ = slint::spawn_local(async move {
+                let types = text_file_types(strings);
+                if let Some(path) = dialogs::pick_file_to_open(strings.open_dialog, &types).await
+                    && let Some(ui) = weak.upgrade()
+                {
+                    spawn_load(&ui, path);
+                }
+            });
         }
     });
 

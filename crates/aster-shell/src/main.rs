@@ -14,6 +14,10 @@
 //! waits for the disk. A record is deleted when its document is saved or
 //! closed, so the records found at start-up are what a crash left behind, and
 //! the user is asked what to do with them.
+//!
+//! A Markdown tab shows its source, its preview, or both side by side. The
+//! source is highlighted as it is typed; the preview is laid out on a worker
+//! thread shortly after typing stops, and only drawn here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,9 +37,10 @@ use aster_shell::sample::{RECENT_FILES, WORKSPACE_TREE};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
-use aster_shell::toolbar::{self, Command, Control, ViewState, zoom_step};
+use aster_shell::toolbar::{self, Command, Control, ViewMode, ViewState, zoom_step};
 use aster_storage::{Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot};
 use aster_surface::host::{self, to_px};
+use aster_surface::preview::{PreviewLayout, PreviewWorker};
 use aster_surface::{Action, ImeEvent, TextSurface};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{
@@ -51,6 +56,8 @@ mod content;
 mod macos;
 
 const CARET_BLINK: Duration = Duration::from_millis(530);
+/// How long typing has to pause before the preview is laid out again.
+const PREVIEW_DELAY: Duration = Duration::from_millis(250);
 /// Width kept free for the window buttons when the tab strip is the title bar.
 const WINDOW_BUTTONS_INSET: f32 = 76.0;
 /// Extensions offered in the open and save dialogs.
@@ -129,6 +136,10 @@ struct Shell {
     next_key: RecordKey,
     /// Records found at start-up that the user has not decided about yet.
     candidates: Vec<Candidate>,
+    /// Lays out Markdown previews. `None` in tests.
+    previews: Option<PreviewWorker>,
+    /// Runs once typing has paused, to bring the preview up to date.
+    preview_timer: Timer,
 }
 
 impl Shell {
@@ -145,6 +156,8 @@ impl Shell {
             writer: None,
             next_key: 0,
             candidates: Vec::new(),
+            previews: None,
+            preview_timer: Timer::default(),
         }
     }
 
@@ -461,6 +474,21 @@ impl Shell {
             (Some(Content::Markdown(editor)), Command::Undo) => editor.undo(),
             (Some(Content::Markdown(editor)), Command::Redo) => editor.redo(),
             (
+                Some(Content::Markdown(editor)),
+                Command::ViewSource | Command::ViewSplit | Command::ViewPreview,
+            ) => {
+                let mode = ViewMode::of(command).unwrap_or_default();
+                if editor.view_mode == mode {
+                    return false;
+                }
+                // The preview takes no typing, so a composition cannot go on.
+                if !mode.shows_source() {
+                    editor.ime(ImeEvent::Disabled);
+                }
+                editor.set_view_mode(mode);
+                true
+            }
+            (
                 Some(Content::Writer(view)),
                 Command::ZoomIn | Command::ZoomOut | Command::ZoomReset,
             ) => {
@@ -762,6 +790,7 @@ fn apply_static_models(ui: &AppWindow) {
 fn tool_item(item: &toolbar::Item) -> ToolItem {
     let mut out = ToolItem {
         enabled: item.enabled,
+        active: item.active,
         command: item.command.map_or(-1, Command::id),
         ..ToolItem::default()
     };
@@ -851,6 +880,9 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         zoom_percent: shell.active_writer().map_or(100, |view| view.zoom_percent),
         can_undo,
         can_redo,
+        view_mode: shell
+            .active_markdown()
+            .map_or(ViewMode::Edit, |editor| editor.view_mode),
     };
     ui.set_toolbar_items(model(
         toolbar::toolbar(kind, view, shell.language.strings())
@@ -908,6 +940,8 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     DiskWarning::Changed => strings.notice_disk_changed.to_owned(),
                     DiskWarning::Missing => strings.notice_disk_missing.to_owned(),
                 }
+            } else if editor.link_refused {
+                strings.notice_link_refused.to_owned()
             } else if editor.format.mixed_line_endings {
                 i18n::fill(
                     strings.mixed_line_endings,
@@ -950,13 +984,31 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
 }
 
 /// Render the document in front, hand the frame to Slint, and move the
-/// candidate window.
+/// candidate window. A Markdown tab also gets its preview drawn, and the two
+/// views lined up.
 fn present(ui: &AppWindow, shell: &mut Shell) {
     let scale = ui.window().scale_factor();
     let width = to_px(ui.get_surface_width(), scale);
     let height = to_px(ui.get_surface_height(), scale);
     let focused = ui.get_surface_focused();
     let caret_on = shell.caret_on && focused;
+    let mode = shell
+        .active_markdown()
+        .map_or(ViewMode::Edit, |editor| editor.view_mode);
+    ui.set_view_mode(match mode {
+        ViewMode::Edit => 0,
+        ViewMode::Split => 1,
+        ViewMode::Preview => 2,
+    });
+    if mode.shows_preview() {
+        present_preview(ui, shell);
+    }
+    if !mode.shows_source() {
+        return;
+    }
+    if let Some(editor) = shell.active_markdown() {
+        editor.decorate();
+    }
     let Some(surface) = shell.active_surface() else {
         return;
     };
@@ -978,6 +1030,92 @@ fn present(ui: &AppWindow, shell: &mut Shell) {
     }
 }
 
+/// Draw the preview of the Markdown tab in front, asking for a new layout
+/// if its size or colours changed, or if typing has paused since the text
+/// changed.
+fn present_preview(ui: &AppWindow, shell: &mut Shell) {
+    let scale = ui.window().scale_factor();
+    let width = to_px(ui.get_preview_width(), scale);
+    let height = to_px(ui.get_preview_height(), scale);
+    if width == 0 || height == 0 {
+        return;
+    }
+    request_preview(shell, !shell.preview_timer.running());
+    let Some(editor) = shell.active_markdown() else {
+        return;
+    };
+    editor.preview.resize(width, height, scale);
+    editor.follow_editor();
+    // A caret blink in the source does not change the preview: keep the
+    // frame Slint already has.
+    if !editor.preview.needs_render() {
+        return;
+    }
+    let frame = {
+        let pixmap = editor.preview.render();
+        let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            pixmap.data_as_u8_slice(),
+            u32::from(width),
+            u32::from(height),
+        );
+        slint::Image::from_rgba8_premultiplied(buffer)
+    };
+    ui.set_preview_frame(frame);
+    let (offset, max) = editor.preview.scroll_range();
+    ui.set_preview_scroll_offset(offset as f32 / scale);
+    ui.set_preview_scroll_max(max as f32 / scale);
+}
+
+/// Hand the preview of the tab in front to the worker if it is out of date.
+/// Changes to the text count only when `text_changes` is set.
+fn request_preview(shell: &mut Shell, text_changes: bool) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let style = content::preview_style(&shell.tokens);
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    if let Some(job) = editor.preview_job(u64::from(id.0), text_changes, style)
+        && let Some(worker) = &shell.previews
+    {
+        worker.request(job);
+    }
+}
+
+/// The text of the tab in front changed: lay out its preview again once
+/// typing pauses.
+fn schedule_preview(ui: &AppWindow, shell: &mut Shell) {
+    if !shell
+        .active_markdown()
+        .is_some_and(|editor| editor.preview_is_behind())
+    {
+        return;
+    }
+    let weak = ui.as_weak();
+    shell
+        .preview_timer
+        .start(TimerMode::SingleShot, PREVIEW_DELAY, move || {
+            if let Some(ui) = weak.upgrade() {
+                deliver(ui, Box::new(|_, shell| request_preview(shell, true)));
+            }
+        });
+}
+
+/// A layout arrived from the preview worker.
+fn finish_preview(ui: &AppWindow, shell: &mut Shell, key: u64, layout: PreviewLayout) {
+    let Ok(id) = u32::try_from(key).map(TabId) else {
+        return;
+    };
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    editor.show_preview(layout);
+    if shell.tabs.active_id() == Some(id) {
+        present(ui, shell);
+    }
+}
+
 /// Tell the platform to drop any composition it is holding. The input method
 /// is switched on again by `present` once a document has the keyboard.
 fn stop_platform_composition(ui: &AppWindow) {
@@ -993,6 +1131,10 @@ fn after_tab_change(ui: &AppWindow, shell: &mut Shell) {
     // The document a composition was typed into may be gone or behind another
     // tab; without this its candidate window would stay on screen.
     stop_platform_composition(ui);
+    // The preview frame on screen belongs to the tab that was in front.
+    if let Some(editor) = shell.active_markdown() {
+        editor.preview.invalidate();
+    }
     shell.wake_caret();
     refresh_chrome(ui, shell);
     if shell.active_surface().is_some() && shell.pending.is_none() {
@@ -1019,6 +1161,7 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         if (can_undo, can_redo) != (ui.get_can_undo(), ui.get_can_redo()) {
             refresh_toolbar(ui, shell);
         }
+        schedule_preview(ui, shell);
     }
     refresh_status(ui, shell);
     present(ui, shell);
@@ -1440,6 +1583,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Previews are laid out on their own thread.
+    {
+        let weak = ui.as_weak();
+        let worker = PreviewWorker::spawn(move |key, _generation, layout| {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| finish_preview(ui, shell, key, layout)),
+                );
+            });
+        });
+        shell.borrow_mut().previews = Some(worker);
+    }
+
     // Most handlers below follow the same shape: get the window and the shell,
     // change the shell, then push what changed back into the window.
     macro_rules! handler {
@@ -1477,6 +1634,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             if !ui.get_surface_focused() {
                 return EventResult::Propagate;
             }
+            if shell
+                .active_markdown()
+                .is_some_and(|editor| !editor.view_mode.shows_source())
+            {
+                return EventResult::Propagate;
+            }
             let text_changed = match shell.active_content() {
                 Some(Content::Writer(view)) => {
                     let committed = matches!(event, ImeEvent::Commit(_));
@@ -1503,6 +1666,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let Some(action) = host::decode_key(text.as_str(), shift, primary, alt) else {
             return false;
         };
+        // With only the preview on screen there is nothing to type into.
+        if shell
+            .active_markdown()
+            .is_some_and(|editor| !editor.view_mode.shows_source())
+        {
+            return false;
+        }
         let text_changed = match shell.active_content() {
             Some(Content::Writer(view)) => {
                 view.surface.apply(action);
@@ -1544,6 +1714,51 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         {
             present(&ui, shell);
         }
+    }));
+
+    ui.on_preview_scrolled(handler!(|ui, shell, delta| {
+        let scale = f64::from(ui.window().scale_factor());
+        if let Some(editor) = shell.active_markdown()
+            && editor.scroll_preview(-f64::from(delta) * scale)
+        {
+            present(&ui, shell);
+        }
+    }));
+
+    ui.on_preview_moved(handler!(|ui, shell, x, y| {
+        let scale = f64::from(ui.window().scale_factor());
+        let over_link = shell.active_markdown().is_some_and(|editor| {
+            editor
+                .preview
+                .link_at(f64::from(x) * scale, f64::from(y) * scale)
+                .is_some()
+        });
+        if over_link != ui.get_preview_link_hover() {
+            ui.set_preview_link_hover(over_link);
+        }
+    }));
+
+    ui.on_preview_clicked(handler!(|ui, shell, x, y| {
+        let scale = f64::from(ui.window().scale_factor());
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        let Some(url) = editor
+            .preview
+            .link_at(f64::from(x) * scale, f64::from(y) * scale)
+        else {
+            return;
+        };
+        let refused = match aster_platform::links::open(&url) {
+            Ok(()) => false,
+            Err(aster_platform::links::OpenError::Refused) => true,
+            Err(err) => {
+                eprintln!("aster-shell: {err}");
+                false
+            }
+        };
+        editor.link_refused = refused;
+        refresh_status(&ui, shell);
     }));
 
     ui.on_tab_activate(handler!(|ui, shell, index| {
@@ -1594,6 +1809,16 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(command) = Command::from_id(id)
             && shell.run(command)
         {
+            if ViewMode::of(command).is_some() {
+                if command == Command::ViewPreview {
+                    stop_platform_composition(&ui);
+                }
+                refresh_toolbar(&ui, shell);
+                refresh_status(&ui, shell);
+                ui.invoke_focus_document();
+                present(&ui, shell);
+                return;
+            }
             refresh_toolbar(&ui, shell);
             after_edit(&ui, shell, true);
         }
@@ -1886,18 +2111,32 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 to_px(ui.get_surface_height(), scale),
                 scale,
             );
+            let preview_size = (
+                to_px(ui.get_preview_width(), scale),
+                to_px(ui.get_preview_height(), scale),
+                scale,
+            );
+            let mode = shell
+                .active_markdown()
+                .map_or(ViewMode::Edit, |editor| editor.view_mode);
+            let preview_moved = shell.active_markdown().is_some_and(|editor| {
+                mode.shows_preview() && editor.preview.size() != preview_size
+            });
             let focused = ui.get_surface_focused();
             let blink_due = shell.last_blink.elapsed() >= CARET_BLINK;
             let caret_on = shell.caret_on;
             let Some(surface) = shell.active_surface() else {
                 return;
             };
-            let mut dirty = size != surface.size() || focused != was_focused;
+            // With the preview alone on screen, the source has no size and
+            // no caret to blink.
+            let editor_moved = mode.shows_source() && size != surface.size();
+            let mut dirty = editor_moved || focused != was_focused || preview_moved;
             was_focused = focused;
             if blink_due {
                 shell.last_blink = Instant::now();
                 shell.caret_on = !caret_on;
-                dirty = dirty || focused;
+                dirty = dirty || (focused && mode.shows_source());
             }
             if dirty {
                 present(&ui, shell);

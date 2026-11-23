@@ -924,6 +924,9 @@ pub struct PreviewView {
     height: u16,
     scale: f32,
     glyphs: Vec<Glyph>,
+    /// What the pixels show: scroll offset, layout and background. `None`
+    /// until the first render.
+    drawn: Option<(f64, usize, Rgba8)>,
 }
 
 impl Default for PreviewView {
@@ -945,7 +948,28 @@ impl PreviewView {
             height: 0,
             scale: 1.0,
             glyphs: Vec::new(),
+            drawn: None,
         }
+    }
+
+    /// What a render would draw now, to compare with what was drawn.
+    fn state(&self) -> (f64, usize, Rgba8) {
+        let layout = self
+            .layout
+            .as_ref()
+            .map_or(0, |layout| Arc::as_ptr(layout) as usize);
+        (self.scroll, layout, self.background)
+    }
+
+    /// Forget what was drawn, so the next [`Self::needs_render`] says yes:
+    /// for when the host's copy of the pixels was replaced by something else.
+    pub fn invalidate(&mut self) {
+        self.drawn = None;
+    }
+
+    /// Whether [`Self::render`] would draw anything different from last time.
+    pub fn needs_render(&self) -> bool {
+        self.drawn != Some(self.state())
     }
 
     /// Resize the pixel buffer; sizes are physical pixels.
@@ -958,6 +982,7 @@ impl PreviewView {
         self.scale = scale;
         self.ctx = RenderContext::new(width.max(1), height.max(1));
         self.pixmap = Pixmap::new(width.max(1), height.max(1));
+        self.drawn = None;
         self.clamp();
     }
 
@@ -1036,6 +1061,7 @@ impl PreviewView {
 
     /// Draw the visible part and return the pixels, premultiplied RGBA8.
     pub fn render(&mut self) -> &Pixmap {
+        self.drawn = Some(self.state());
         let Self {
             layout,
             background,
@@ -1047,6 +1073,7 @@ impl PreviewView {
             height,
             scale,
             glyphs: buffer,
+            ..
         } = self;
         let (w, h) = (f64::from(*width), f64::from(*height));
         ctx.reset();
@@ -1325,6 +1352,25 @@ mod tests {
         let (pixels, _) = data.as_chunks::<4>();
         let accent = pixels.iter().filter(|px| **px == style().accent).count();
         assert!(accent > 100, "links are not in the accent colour: {accent}");
+    }
+
+    #[test]
+    fn an_unchanged_view_is_not_drawn_again() {
+        let mut view = view("# 一\n\n二", 800, 600);
+        assert!(view.needs_render());
+        view.render();
+        assert!(!view.needs_render());
+        view.scroll_by(10.0);
+        // The document fits: nothing moved.
+        assert!(!view.needs_render());
+        view.set_background([0, 0, 0, 0xff]);
+        assert!(view.needs_render());
+        view.render();
+        view.resize(700, 600, 2.0);
+        assert!(view.needs_render());
+        view.render();
+        view.invalidate();
+        assert!(view.needs_render());
     }
 
     #[test]

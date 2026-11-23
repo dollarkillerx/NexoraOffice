@@ -15,13 +15,13 @@ component ToolControl inherits Rectangle {
 
     Rectangle {
         border-radius: Tokens.radius-md;
-        background: root.is-gap || !root.item.enabled ? transparent : touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+        background: root.is-gap || !root.item.enabled ? transparent : touch.pressed ? Tokens.pressed : root.item.active ? Tokens.accent-soft : touch.has-hover ? Tokens.hover : transparent;
         animate background { duration: Tokens.quick; }
     }
 
     if item.control == 0: Icon {
         data: root.item.icon;
-        tint: root.item.enabled ? Tokens.text-secondary : Tokens.text-disabled;
+        tint: !root.item.enabled ? Tokens.text-disabled : root.item.active ? Tokens.accent : Tokens.text-secondary;
     }
 
     if item.control == 1: Text {

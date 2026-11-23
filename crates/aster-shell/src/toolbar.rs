@@ -154,8 +154,8 @@ impl Command {
     }
 
     /// Whether this build can carry the command out on a view of this kind:
-    /// zoom on the plain-text surface behind Writer tabs, undo and redo in
-    /// Markdown tabs, and nothing else. Whether there is anything to undo right
+    /// zoom on the plain-text surface behind Writer tabs, undo, redo and the
+    /// three views in Markdown tabs, and nothing else. Whether there is anything to undo right
     /// now is a separate question, answered by [`ViewState`].
     pub fn is_available(self, kind: DocKind) -> bool {
         match kind {
@@ -163,7 +163,14 @@ impl Command {
                 self,
                 Command::ZoomOut | Command::ZoomReset | Command::ZoomIn
             ),
-            DocKind::Markdown => matches!(self, Command::Undo | Command::Redo),
+            DocKind::Markdown => matches!(
+                self,
+                Command::Undo
+                    | Command::Redo
+                    | Command::ViewSource
+                    | Command::ViewSplit
+                    | Command::ViewPreview
+            ),
             DocKind::Sheets | DocKind::Slides | DocKind::Pdf => false,
         }
     }
@@ -202,6 +209,49 @@ pub struct Item {
     /// `None` for separators and spacers.
     pub command: Option<Command>,
     pub enabled: bool,
+    /// Shown pressed: the choice in effect, such as the current view.
+    pub active: bool,
+}
+
+/// How a Markdown tab shows its document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The source only.
+    #[default]
+    Edit,
+    /// The source on the left, the preview on the right.
+    Split,
+    /// The preview only.
+    Preview,
+}
+
+impl ViewMode {
+    pub fn command(self) -> Command {
+        match self {
+            ViewMode::Edit => Command::ViewSource,
+            ViewMode::Split => Command::ViewSplit,
+            ViewMode::Preview => Command::ViewPreview,
+        }
+    }
+
+    pub fn of(command: Command) -> Option<ViewMode> {
+        match command {
+            Command::ViewSource => Some(ViewMode::Edit),
+            Command::ViewSplit => Some(ViewMode::Split),
+            Command::ViewPreview => Some(ViewMode::Preview),
+            _ => None,
+        }
+    }
+
+    /// The source is on screen.
+    pub fn shows_source(self) -> bool {
+        self != ViewMode::Preview
+    }
+
+    /// The preview is on screen.
+    pub fn shows_preview(self) -> bool {
+        self != ViewMode::Edit
+    }
 }
 
 /// What the toolbar needs to know about the view in front.
@@ -212,6 +262,7 @@ pub struct ViewState {
     pub can_undo: bool,
     /// There is an undone step to do again.
     pub can_redo: bool,
+    pub view_mode: ViewMode,
 }
 
 impl Default for ViewState {
@@ -220,6 +271,7 @@ impl Default for ViewState {
             zoom_percent: 100,
             can_undo: false,
             can_redo: false,
+            view_mode: ViewMode::Edit,
         }
     }
 }
@@ -247,10 +299,12 @@ struct Builder {
 
 impl Builder {
     fn push(&mut self, control: Control, command: Command) -> &mut Self {
+        let enabled = command.is_available(self.kind) && self.view.allows(command);
         self.items.push(Item {
             control,
             command: Some(command),
-            enabled: command.is_available(self.kind) && self.view.allows(command),
+            enabled,
+            active: enabled && ViewMode::of(command) == Some(self.view.view_mode),
         });
         self
     }
@@ -277,6 +331,7 @@ impl Builder {
             control,
             command: None,
             enabled: false,
+            active: false,
         });
         self
     }
@@ -570,7 +625,36 @@ mod tests {
     }
 
     #[test]
-    fn what_works_today_is_writer_zoom_and_markdown_history() {
+    fn the_current_view_is_shown_pressed() {
+        for mode in [ViewMode::Edit, ViewMode::Split, ViewMode::Preview] {
+            let view = ViewState {
+                view_mode: mode,
+                ..ViewState::default()
+            };
+            let active: Vec<_> = toolbar(DocKind::Markdown, view, &ZH_HANS)
+                .into_iter()
+                .filter(|item| item.active)
+                .filter_map(|item| item.command)
+                .collect();
+            assert_eq!(active, [mode.command()]);
+            assert_eq!(ViewMode::of(mode.command()), Some(mode));
+        }
+        // Nothing is pressed where the views do not exist.
+        for kind in DocKind::ALL {
+            if kind != DocKind::Markdown {
+                assert!(
+                    toolbar(kind, ViewState::default(), &ZH_HANS)
+                        .iter()
+                        .all(|item| !item.active)
+                );
+            }
+        }
+        assert!(ViewMode::Split.shows_source() && ViewMode::Split.shows_preview());
+        assert!(!ViewMode::Edit.shows_preview() && !ViewMode::Preview.shows_source());
+    }
+
+    #[test]
+    fn what_works_today_is_writer_zoom_and_markdown_history_and_views() {
         let busy = ViewState {
             can_undo: true,
             can_redo: true,
@@ -587,7 +671,16 @@ mod tests {
                     enabled,
                     [Command::ZoomOut, Command::ZoomReset, Command::ZoomIn]
                 ),
-                DocKind::Markdown => assert_eq!(enabled, [Command::Undo, Command::Redo]),
+                DocKind::Markdown => assert_eq!(
+                    enabled,
+                    [
+                        Command::Undo,
+                        Command::Redo,
+                        Command::ViewSource,
+                        Command::ViewSplit,
+                        Command::ViewPreview
+                    ]
+                ),
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }

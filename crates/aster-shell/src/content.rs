@@ -6,11 +6,16 @@
 
 use std::path::PathBuf;
 
+use aster_markdown::highlight::{Highlighter, Marks, Span};
 use aster_markdown::{Change, Document, EditCommand, SavePoint, Selection, TextFormat};
 use aster_shell::stats::TextStats;
 use aster_shell::theme;
+use aster_shell::toolbar::ViewMode;
 use aster_storage::{Fingerprint, RecordKey};
-use aster_surface::{Action, ImeEvent, PageLayout, Palette, TextSurface};
+use aster_surface::preview::{PreviewJob, PreviewLayout, PreviewStyle, PreviewView};
+use aster_surface::{
+    Action, Decoration, ImeEvent, PageLayout, Palette, Rgba8, TextStyle, TextSurface,
+};
 
 /// Body text size of the Markdown editor, in logical pixels.
 const MARKDOWN_FONT_SIZE: f32 = 15.0;
@@ -58,6 +63,106 @@ fn editor_layout(tokens: &theme::Tokens) -> PageLayout {
         max_width: Some(f64::from(tokens.page.width) + 4.0 * f64::from(m.space_xl)),
         min_aspect: None,
     }
+}
+
+/// The colours of highlighted Markdown source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SyntaxColors {
+    /// Punctuation that is syntax: `#`, `*`, fences, list markers, pipes.
+    marker: Rgba8,
+    /// Quotes and struck-out text.
+    secondary: Rgba8,
+    link: Rgba8,
+    /// Behind code.
+    fill: Rgba8,
+}
+
+impl SyntaxColors {
+    fn of(tokens: &theme::Tokens) -> Self {
+        let c = &tokens.colors;
+        Self {
+            marker: c.text_tertiary.to_array(),
+            secondary: c.text_secondary.to_array(),
+            link: c.link.to_array(),
+            fill: c.fill.to_array(),
+        }
+    }
+}
+
+/// How text with these marks is drawn in the editor. Only weight, slant,
+/// colour and backgrounds change: never the size or the font, so the text
+/// does not move while it is typed.
+fn text_style(marks: Marks, colors: &SyntaxColors) -> TextStyle {
+    let mut style = TextStyle {
+        bold: marks.intersects(Marks::HEADING | Marks::STRONG),
+        italic: marks.contains(Marks::EMPHASIS),
+        ..TextStyle::default()
+    };
+    if marks.intersects(Marks::CODE | Marks::MATH) {
+        style.background = Some(colors.fill);
+    }
+    if marks.contains(Marks::CODE_BLOCK) {
+        style.line_background = Some(colors.fill);
+    }
+    if marks.intersects(Marks::QUOTE | Marks::STRIKE) {
+        style.color = Some(colors.secondary);
+    }
+    if marks.contains(Marks::STRIKE) && !marks.is_syntax() {
+        style.strike = true;
+    }
+    if marks.contains(Marks::LINK) {
+        style.color = Some(colors.link);
+    }
+    if marks.is_syntax() || marks.intersects(Marks::URL | Marks::HTML) {
+        style.color = Some(colors.marker);
+    }
+    style
+}
+
+/// Decorations for highlighted spans, joined where neighbours look the same.
+fn decorations(spans: Vec<Span>, colors: &SyntaxColors) -> Vec<Decoration> {
+    let mut out: Vec<Decoration> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let style = text_style(span.marks, colors);
+        if style == TextStyle::default() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.range.end == span.range.start && last.style == style => {
+                last.range.end = span.range.end;
+            }
+            _ => out.push(Decoration {
+                range: span.range,
+                style,
+            }),
+        }
+    }
+    out
+}
+
+/// The preview's colours and column, matching the editor's.
+pub fn preview_style(tokens: &theme::Tokens) -> PreviewStyle {
+    let c = &tokens.colors;
+    PreviewStyle {
+        background: c.surface.to_array(),
+        text: c.ink.to_array(),
+        secondary: c.text_secondary.to_array(),
+        tertiary: c.text_tertiary.to_array(),
+        accent: c.link.to_array(),
+        fill: c.fill.to_array(),
+        line: c.page_edge.to_array(),
+        font_size: MARKDOWN_FONT_SIZE,
+        page: editor_layout(tokens),
+    }
+}
+
+/// What a preview was last asked for with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreviewRequest {
+    version: u64,
+    width: u16,
+    scale: f32,
+    style: PreviewStyle,
 }
 
 /// A Writer tab: the plain-text surface on its own, with no document model, no
@@ -117,6 +222,21 @@ pub struct MarkdownEditor {
     unjournaled: Vec<Vec<u8>>,
     /// Entries and bytes written to the record since its last checkpoint.
     since_checkpoint: (u64, usize),
+    highlighter: Highlighter,
+    syntax: SyntaxColors,
+    pub view_mode: ViewMode,
+    pub preview: PreviewView,
+    /// Goes up with every change to the text.
+    text_version: u64,
+    preview_request: Option<PreviewRequest>,
+    /// The editor's scroll offset when the preview was last lined up with
+    /// it, in split view.
+    synced_scroll: Option<f64>,
+    /// A source position the preview should scroll to once it has a layout.
+    preview_target: Option<f64>,
+    /// The last link clicked in the preview was not opened: it was not a web
+    /// or e-mail link.
+    pub link_refused: bool,
 }
 
 /// What became of a restored document's file.
@@ -162,7 +282,18 @@ impl MarkdownEditor {
         surface.set_page_layout(editor_layout(tokens));
         // A file opens at its beginning.
         surface.set_selection(0, 0);
+        let mut preview = PreviewView::new();
+        preview.set_background(tokens.colors.surface.to_array());
         Self {
+            highlighter: Highlighter::new(text),
+            syntax: SyntaxColors::of(tokens),
+            view_mode: ViewMode::default(),
+            preview,
+            text_version: 0,
+            preview_request: None,
+            synced_scroll: None,
+            preview_target: None,
+            link_refused: false,
             document: Document::new(text),
             surface,
             path,
@@ -235,6 +366,136 @@ impl MarkdownEditor {
     pub fn restyle(&mut self, tokens: &theme::Tokens) {
         self.surface.set_palette(editor_palette(tokens));
         self.surface.set_page_layout(editor_layout(tokens));
+        self.syntax = SyntaxColors::of(tokens);
+        self.preview
+            .set_background(tokens.colors.surface.to_array());
+    }
+
+    /// Highlight what the editor shows. Called before every frame: only the
+    /// visible lines are looked up, and the highlighter has already done the
+    /// parsing when the text changed.
+    pub fn decorate(&mut self) {
+        if !self.view_mode.shows_source() {
+            return;
+        }
+        let range = self.surface.visible_range();
+        let spans = self.highlighter.spans(range);
+        self.surface
+            .set_decorations(decorations(spans, &self.syntax));
+    }
+
+    /// Switch between source, split and preview. Both views keep showing the
+    /// same part of the document.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        let old = self.view_mode;
+        if mode == old {
+            return;
+        }
+        let position = if old.shows_source() {
+            self.surface.top_position()
+        } else {
+            self.preview.top_position()
+        };
+        self.view_mode = mode;
+        self.synced_scroll = None;
+        if mode.shows_source() && !old.shows_source() {
+            self.surface.scroll_to_position(position);
+        }
+        if mode.shows_preview() && !old.shows_preview() {
+            // The pane may show another tab's frame from before.
+            self.preview.invalidate();
+            if self.preview.layout().is_some() {
+                self.preview.scroll_to_position(position);
+            }
+            self.preview_target = Some(position);
+        }
+    }
+
+    /// A job for the preview worker, if the preview is on screen and what it
+    /// shows is out of date. A change of size or colours always asks for a
+    /// new layout; a change of the text only when `text_changes` is set,
+    /// which the caller does once typing has paused.
+    pub fn preview_job(
+        &mut self,
+        key: u64,
+        text_changes: bool,
+        style: PreviewStyle,
+    ) -> Option<PreviewJob> {
+        if !self.view_mode.shows_preview() {
+            return None;
+        }
+        let (width, height, scale) = self.preview.size();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if let Some(last) = &self.preview_request
+            && (last.width, last.scale, last.style) == (width, scale, style)
+            && (last.version == self.text_version || !text_changes)
+        {
+            return None;
+        }
+        self.preview_request = Some(PreviewRequest {
+            version: self.text_version,
+            width,
+            scale,
+            style,
+        });
+        Some(PreviewJob {
+            key,
+            generation: self.text_version,
+            source: self.document.text().to_owned(),
+            width,
+            scale,
+            style,
+        })
+    }
+
+    /// The text changed since the preview was last asked for.
+    pub fn preview_is_behind(&self) -> bool {
+        self.view_mode.shows_preview()
+            && self
+                .preview_request
+                .is_none_or(|last| last.version != self.text_version)
+    }
+
+    /// Show a layout from the worker, keeping the preview at the same place
+    /// in the document.
+    pub fn show_preview(&mut self, layout: PreviewLayout) {
+        let position = match (self.preview_target.take(), self.view_mode) {
+            (Some(target), _) => target,
+            (None, ViewMode::Split) => self.surface.top_position(),
+            (None, _) => self.preview.top_position(),
+        };
+        self.preview.set_layout(std::sync::Arc::new(layout));
+        self.preview.scroll_to_position(position);
+        self.synced_scroll = Some(self.surface.scroll_range().0);
+    }
+
+    /// In split view, bring the preview to where the editor is, if the
+    /// editor has moved since they were last lined up.
+    pub fn follow_editor(&mut self) {
+        if self.view_mode != ViewMode::Split {
+            return;
+        }
+        let scroll = self.surface.scroll_range().0;
+        if self.synced_scroll == Some(scroll) {
+            return;
+        }
+        self.preview.scroll_to_position(self.surface.top_position());
+        self.synced_scroll = Some(scroll);
+    }
+
+    /// Scroll the preview by physical pixels; in split view the editor
+    /// follows. Returns whether anything moved.
+    pub fn scroll_preview(&mut self, delta: f64) -> bool {
+        if !self.preview.scroll_by(delta) {
+            return false;
+        }
+        if self.view_mode == ViewMode::Split {
+            self.surface.scroll_to_position(self.preview.top_position());
+            self.synced_scroll = Some(self.surface.scroll_range().0);
+        }
+        true
     }
 
     /// Repeat on the surface an edit the document has made.
@@ -242,6 +503,13 @@ impl MarkdownEditor {
         let Some(change) = change else {
             return false;
         };
+        self.highlighter.edit(
+            self.document.text(),
+            change.range.clone(),
+            change.inserted.len(),
+        );
+        self.text_version += 1;
+        self.link_refused = false;
         self.unjournaled
             .push(aster_markdown::journal::encode(&change));
         self.surface.replace_range(change.range, &change.inserted);
@@ -285,6 +553,7 @@ impl MarkdownEditor {
     }
 
     pub fn pointer_down(&mut self, x: f64, y: f64, extend: bool) {
+        self.link_refused = false;
         self.surface.pointer_down(x, y, extend);
         if !self.surface.is_composing() {
             self.adopt_selection();
@@ -762,5 +1031,146 @@ mod tests {
         assert_eq!(editor_palette(&tokens).desk, editor_palette(&tokens).page);
         assert_eq!(page_layout(&tokens).max_width, Some(794.0));
         assert!(editor_layout(&tokens).min_aspect.is_none());
+    }
+
+    fn style() -> PreviewStyle {
+        preview_style(&theme::Tokens::of(ThemeMode::Light))
+    }
+
+    /// Lay out the preview here instead of on the worker thread.
+    fn lay_out(editor: &mut MarkdownEditor) {
+        let job = editor.preview_job(1, true, style()).expect("a preview job");
+        let layout = aster_surface::preview::PreviewBuilder::new().build(
+            &job.source,
+            job.width,
+            job.scale,
+            &job.style,
+        );
+        editor.show_preview(layout);
+    }
+
+    fn decorated(editor: &mut MarkdownEditor, needle: &str) -> TextStyle {
+        let at = editor.document.text().find(needle).expect("needle");
+        let spans = editor.highlighter.spans(at..at + 1);
+        decorations(spans, &editor.syntax)
+            .into_iter()
+            .find(|d| d.range.contains(&at))
+            .map_or_else(TextStyle::default, |d| d.style)
+    }
+
+    #[test]
+    fn highlighting_follows_typing() {
+        let mut e = editor("");
+        type_text(&mut e, "# 标题\n\n正文 **粗**");
+        assert!(decorated(&mut e, "标题").bold);
+        let marker = decorated(&mut e, "# ");
+        assert_eq!(marker.color, Some(e.syntax.marker));
+        assert!(decorated(&mut e, "粗").bold);
+        assert_eq!(decorated(&mut e, "正文"), TextStyle::default());
+        // Undo takes the highlighting back with the text.
+        e.undo();
+        assert!(!e.document.text().contains("**粗**"));
+        e.decorate();
+        assert_in_step(&e);
+    }
+
+    #[test]
+    fn code_and_links_are_coloured_from_the_tokens() {
+        let tokens = theme::Tokens::of(ThemeMode::Dark);
+        let mut e = MarkdownEditor::new(
+            "`code` [链接](https://a.example)\n\n```\nblock\n```\n",
+            TextFormat::default(),
+            None,
+            None,
+            &tokens,
+        );
+        let c = &tokens.colors;
+        assert_eq!(
+            decorated(&mut e, "code").background,
+            Some(c.fill.to_array())
+        );
+        assert_eq!(decorated(&mut e, "链接").color, Some(c.link.to_array()));
+        assert_eq!(
+            decorated(&mut e, "https").color,
+            Some(c.text_tertiary.to_array())
+        );
+        assert_eq!(
+            decorated(&mut e, "block").line_background,
+            Some(c.fill.to_array())
+        );
+    }
+
+    #[test]
+    fn composition_with_highlighting_commits_once() {
+        let mut e = editor("## ");
+        e.key(END);
+        e.ime(preedit("biao"));
+        e.decorate();
+        e.surface.render();
+        e.ime(preedit("标题"));
+        e.ime(ImeEvent::Commit("标题".to_owned()));
+        assert_eq!(e.document.text(), "## 标题");
+        assert_in_step(&e);
+        assert!(decorated(&mut e, "标题").bold);
+    }
+
+    #[test]
+    fn the_preview_is_asked_for_only_when_shown_and_out_of_date() {
+        let mut e = editor("# 一\n");
+        assert!(e.preview_job(1, true, style()).is_none(), "edit mode");
+        e.set_view_mode(ViewMode::Split);
+        assert!(e.preview_job(1, true, style()).is_none(), "no size yet");
+        e.preview.resize(800, 600, 2.0);
+        let job = e.preview_job(1, true, style()).expect("first layout");
+        assert_eq!(job.source, "# 一\n");
+        assert!(e.preview_job(1, true, style()).is_none(), "nothing changed");
+        type_text(&mut e, "二");
+        assert!(e.preview_is_behind());
+        assert!(e.preview_job(1, false, style()).is_none(), "still typing");
+        assert!(e.preview_job(1, true, style()).is_some(), "typing paused");
+        // A new size or theme asks again even while typing.
+        e.preview.resize(900, 600, 2.0);
+        assert!(e.preview_job(1, false, style()).is_some());
+        let dark = preview_style(&theme::Tokens::of(ThemeMode::Dark));
+        assert!(e.preview_job(1, false, dark).is_some());
+    }
+
+    #[test]
+    fn switching_views_keeps_the_same_part_of_the_document() {
+        let text: String = (0..300).map(|i| format!("第 {i} 段文字。\n\n")).collect();
+        let mut e = editor(&text);
+        let target = text.find("第 150 段").unwrap() as f64;
+        e.surface.scroll_to_position(target);
+
+        e.set_view_mode(ViewMode::Split);
+        e.preview.resize(1200, 600, 2.0);
+        lay_out(&mut e);
+        let near = |a: f64, b: f64| (a - b).abs() < 40.0;
+        assert!(
+            near(e.preview.top_position(), target),
+            "{}",
+            e.preview.top_position()
+        );
+
+        // Scrolling the preview takes the editor along, and the editor does
+        // not pull the preview back.
+        assert!(e.scroll_preview(2000.0));
+        let preview_top = e.preview.top_position();
+        assert!(near(e.surface.top_position(), preview_top));
+        e.follow_editor();
+        assert_eq!(e.preview.top_position(), preview_top);
+
+        // Scrolling the editor takes the preview along.
+        e.surface.scroll_by(-1500.0);
+        e.follow_editor();
+        assert!(near(e.preview.top_position(), e.surface.top_position()));
+
+        // Preview only, then back: the editor comes back where the preview was.
+        e.set_view_mode(ViewMode::Preview);
+        e.scroll_preview(3000.0);
+        let seen = e.preview.top_position();
+        e.set_view_mode(ViewMode::Edit);
+        assert!(near(e.surface.top_position(), seen));
+        assert!(e.preview_job(1, true, style()).is_none());
     }
 }

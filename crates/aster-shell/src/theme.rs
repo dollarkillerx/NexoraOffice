@@ -127,6 +127,9 @@ pub struct Colors {
     /// Selected text on the page. Opaque: the surface paints it under the glyphs.
     pub selection: Rgba,
     pub caret: Rgba,
+    /// Links in documents: the accent, lightened on dark backgrounds so it
+    /// stays readable as text.
+    pub link: Rgba,
 }
 
 impl Colors {
@@ -152,6 +155,7 @@ impl Colors {
             ink: INK,
             selection: Rgba::rgb(0xddd5f7),
             caret: ACCENT,
+            link: ACCENT,
         }
     }
 
@@ -177,6 +181,7 @@ impl Colors {
             ink: PAPER,
             selection: Rgba::rgb(0x40346f),
             caret: Rgba::rgb(0x9a80ee),
+            link: Rgba::rgb(0x9a80ee),
         }
     }
 
@@ -188,7 +193,7 @@ impl Colors {
     }
 
     /// Every colour with its token name, for checks that must cover all of them.
-    pub fn named(&self) -> [(&'static str, Rgba); 20] {
+    pub fn named(&self) -> [(&'static str, Rgba); 21] {
         [
             ("surface", self.surface),
             ("sunken", self.sunken),
@@ -210,6 +215,7 @@ impl Colors {
             ("ink", self.ink),
             ("selection", self.selection),
             ("caret", self.caret),
+            ("link", self.link),
         ]
     }
 }
@@ -315,7 +321,7 @@ mod tests {
     const MODES: [ThemeMode; 2] = [ThemeMode::Light, ThemeMode::Dark];
 
     /// Tokens that are allowed to carry the accent hue.
-    const VIOLET_TOKENS: [&str; 4] = ["accent", "accent-soft", "selection", "caret"];
+    const VIOLET_TOKENS: [&str; 5] = ["accent", "accent-soft", "selection", "caret", "link"];
 
     #[test]
     fn hex_and_alpha_helpers() {
@@ -387,6 +393,9 @@ mod tests {
             assert!(contrast(c.ink, c.page) >= 12.0);
             assert!(contrast(c.on_accent, c.accent) >= 4.5);
             assert!(contrast(c.caret, c.page) >= 4.0, "{mode:?} caret");
+            // Links are read as text, on the editor surface and on code.
+            assert!(contrast(c.link, c.surface) >= 4.5, "{mode:?} link");
+            assert!(contrast(c.link, c.fill) >= 4.0, "{mode:?} link on fill");
             // Selected text stays readable.
             assert!(contrast(c.ink, c.selection) >= 7.0, "{mode:?} selection");
         }
@@ -416,7 +425,15 @@ mod tests {
             assert_ne!(c.surface, c.sunken, "{mode:?} active tab vs strip");
             assert_ne!(c.page, c.desk, "{mode:?} page vs desk");
             // Colours handed to the document surface must be opaque.
-            for value in [c.desk, c.page, c.page_edge, c.ink, c.selection, c.caret] {
+            for value in [
+                c.desk,
+                c.page,
+                c.page_edge,
+                c.ink,
+                c.selection,
+                c.caret,
+                c.link,
+            ] {
                 assert_eq!(value.3, 0xff);
             }
         }

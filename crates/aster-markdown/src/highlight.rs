@@ -466,6 +466,7 @@ fn highlight_block(source: &str, labels: &HashMap<String, usize>) -> Vec<Span> {
     for (event, range) in parser.into_offset_iter() {
         marks.event(event, range);
     }
+    marks.definitions();
     flatten(marks.raw)
 }
 
@@ -746,6 +747,35 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// Link reference definitions produce no parser events: find them by
+    /// line, outside anything verbatim, and mark `[label]:` as syntax and
+    /// the rest as a destination.
+    fn definitions(&mut self) {
+        let verbatim: Vec<Range<usize>> = self
+            .raw
+            .iter()
+            .filter(|(_, marks)| marks.intersects(Marks::CODE_BLOCK | Marks::HTML))
+            .map(|(range, _)| range.clone())
+            .collect();
+        let mut at = 0;
+        for line in self.source.split_inclusive('\n') {
+            let start = at;
+            at += line.len();
+            if syntax::definition_label(line).is_none()
+                || verbatim.iter().any(|range| range.contains(&start))
+            {
+                continue;
+            }
+            let Some(colon) = line.find("]:") else {
+                continue;
+            };
+            let label_start = start + (line.len() - line.trim_start_matches(' ').len());
+            let end = start + line.trim_end().len();
+            self.mark(label_start..start + colon + 2, Marks::MARKER);
+            self.mark(start + colon + 2..end, Marks::URL);
+        }
+    }
+
     fn link_marks(&mut self, range: Range<usize>, link_type: LinkType, text_start: usize) {
         match link_type {
             LinkType::Autolink | LinkType::Email => {
@@ -918,6 +948,11 @@ mod tests {
         assert_eq!(marks_at(text, "[r]", 0), Marks::URL);
         // An undefined reference is plain text.
         assert_eq!(marks_at("[ref][nowhere]", "ref", 0), Marks::NONE);
+        // The definition itself.
+        assert_eq!(marks_at(text, "[r]:", 0), Marks::MARKER);
+        assert_eq!(marks_at(text, "/u", 0), Marks::URL);
+        // Not inside code.
+        assert_eq!(marks_at("```\n[a]: /b\n```", "[a]", 0), Marks::CODE_BLOCK);
     }
 
     #[test]

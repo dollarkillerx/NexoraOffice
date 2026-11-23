@@ -287,6 +287,8 @@ strings! {
     notice_disk_missing,
     /// `{reason}` is the system's message.
     notice_record_failed,
+    /// A link in the preview that is not a web or e-mail link was clicked.
+    notice_link_refused,
 }
 
 impl Strings {
@@ -439,7 +441,7 @@ Aster Office 外壳原型
     save_failed: "无法保存“{name}”",
     not_utf8: "这个文件不是 UTF-8 编码。Aster Office 目前只读写 UTF-8 文本；文件没有被改动。",
     is_utf16: "这个文件是 UTF-16 编码。Aster Office 目前只读写 UTF-8 文本；文件没有被改动。",
-    markdown_note: "纯文本编辑，尚无高亮和预览",
+    markdown_note: "语法高亮和预览；图片只显示占位框",
     mixed_line_endings: "换行符混用，保存时统一为 {style}",
     file_type_text: "Markdown 与纯文本",
     open_dialog: "打开",
@@ -462,6 +464,7 @@ Aster Office 外壳原型
     notice_disk_changed: "原文件在恢复前已被其他程序修改；保存时会先问你存到哪里",
     notice_disk_missing: "原文件已不存在；保存时会先问你存到哪里",
     notice_record_failed: "恢复记录无法写入（{reason}），崩溃后这个文档可能无法找回",
+    notice_link_refused: "只会打开网页和邮件链接，这个链接没有打开",
 };
 
 pub const JA: Strings = Strings {
@@ -558,7 +561,7 @@ Aster Office シェルの試作
     save_failed: "「{name}」を保存できません",
     not_utf8: "このファイルは UTF-8 ではありません。Aster Office は現在 UTF-8 のテキストだけを読み書きします。ファイルは変更されていません。",
     is_utf16: "このファイルは UTF-16 です。Aster Office は現在 UTF-8 のテキストだけを読み書きします。ファイルは変更されていません。",
-    markdown_note: "プレーンテキスト編集（ハイライトとプレビューは未対応）",
+    markdown_note: "構文ハイライトとプレビュー。画像は枠だけ表示します",
     mixed_line_endings: "改行コードが混在しています。保存時に {style} に統一されます",
     file_type_text: "Markdown とプレーンテキスト",
     open_dialog: "開く",
@@ -581,6 +584,7 @@ Aster Office シェルの試作
     notice_disk_changed: "元のファイルは復元前に別のプログラムで変更されています。保存するときは保存先を確認します",
     notice_disk_missing: "元のファイルはもうありません。保存するときは保存先を確認します",
     notice_record_failed: "復元用の記録を書き込めません（{reason}）。異常終了するとこの文書は取り戻せないかもしれません",
+    notice_link_refused: "開けるのはウェブとメールのリンクだけです。このリンクは開きませんでした",
 };
 
 pub const EN: Strings = Strings {
@@ -677,7 +681,7 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     save_failed: "“{name}” could not be saved",
     not_utf8: "This file is not UTF-8. For now Aster Office reads and writes UTF-8 text only. The file has not been changed.",
     is_utf16: "This file is UTF-16. For now Aster Office reads and writes UTF-8 text only. The file has not been changed.",
-    markdown_note: "Plain-text editing, no highlighting or preview yet",
+    markdown_note: "Syntax highlighting and preview; images show as placeholders",
     mixed_line_endings: "Mixed line endings: saving will unify them to {style}",
     file_type_text: "Markdown and plain text",
     open_dialog: "Open",
@@ -700,6 +704,7 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     notice_disk_changed: "The original file was changed by another program before recovery; saving will ask where to save",
     notice_disk_missing: "The original file no longer exists; saving will ask where to save",
     notice_record_failed: "The recovery record cannot be written ({reason}); this document may be lost if the app crashes",
+    notice_link_refused: "Only web and e-mail links are opened; this link was not",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -778,7 +783,7 @@ pub const ZH_HANT: Strings = Strings {
     save_failed: "無法儲存「{name}」",
     not_utf8: "這個檔案不是 UTF-8 編碼。Aster Office 目前只讀寫 UTF-8 文字；檔案沒有被更動。",
     is_utf16: "這個檔案是 UTF-16 編碼。Aster Office 目前只讀寫 UTF-8 文字；檔案沒有被更動。",
-    markdown_note: "純文字編輯，尚無語法標示和預覽",
+    markdown_note: "語法標示和預覽；圖片只顯示預留框",
     mixed_line_endings: "換行字元混用，儲存時統一為 {style}",
     file_type_text: "Markdown 與純文字",
     open_dialog: "開啟",
@@ -801,6 +806,7 @@ pub const ZH_HANT: Strings = Strings {
     notice_disk_changed: "原檔案在復原前已被其他程式修改；儲存時會先詢問你要存到哪裡",
     notice_disk_missing: "原檔案已不存在；儲存時會先詢問你要存到哪裡",
     notice_record_failed: "無法寫入復原記錄（{reason}），當機後這份文件可能無法找回",
+    notice_link_refused: "只會開啟網頁和郵件連結，這個連結沒有開啟",
 };
 
 pub const FR: Strings = Strings {
@@ -879,7 +885,7 @@ pub const FR: Strings = Strings {
     save_failed: "Impossible d’enregistrer « {name} »",
     not_utf8: "Ce fichier n’est pas en UTF-8. Pour l’instant, Aster Office ne lit et n’écrit que du texte UTF-8. Le fichier n’a pas été modifié.",
     is_utf16: "Ce fichier est en UTF-16. Pour l’instant, Aster Office ne lit et n’écrit que du texte UTF-8. Le fichier n’a pas été modifié.",
-    markdown_note: "Édition en texte brut, sans coloration ni aperçu pour l’instant",
+    markdown_note: "Coloration syntaxique et aperçu ; les images restent des cadres vides",
     mixed_line_endings: "Fins de ligne mélangées : l’enregistrement les unifiera en {style}",
     file_type_text: "Markdown et texte brut",
     open_dialog: "Ouvrir",
@@ -902,6 +908,7 @@ pub const FR: Strings = Strings {
     notice_disk_changed: "Le fichier d’origine a été modifié par un autre programme avant la récupération ; l’enregistrement demandera où enregistrer",
     notice_disk_missing: "Le fichier d’origine n’existe plus ; l’enregistrement demandera où enregistrer",
     notice_record_failed: "Impossible d’écrire l’enregistrement de récupération ({reason}) ; ce document pourrait être perdu en cas de plantage",
+    notice_link_refused: "Seuls les liens web et e-mail s’ouvrent ; ce lien n’a pas été ouvert",
 };
 
 pub const DE: Strings = Strings {
@@ -980,7 +987,7 @@ pub const DE: Strings = Strings {
     save_failed: "„{name}“ konnte nicht gespeichert werden",
     not_utf8: "Diese Datei ist nicht UTF-8-kodiert. Aster Office liest und schreibt vorerst nur UTF-8-Text. Die Datei wurde nicht verändert.",
     is_utf16: "Diese Datei ist UTF-16-kodiert. Aster Office liest und schreibt vorerst nur UTF-8-Text. Die Datei wurde nicht verändert.",
-    markdown_note: "Reine Textbearbeitung, noch ohne Hervorhebung und Vorschau",
+    markdown_note: "Syntaxhervorhebung und Vorschau; Bilder nur als Platzhalter",
     mixed_line_endings: "Gemischte Zeilenenden: Beim Speichern werden sie zu {style} vereinheitlicht",
     file_type_text: "Markdown und reiner Text",
     open_dialog: "Öffnen",
@@ -1003,6 +1010,7 @@ pub const DE: Strings = Strings {
     notice_disk_changed: "Die Originaldatei wurde vor der Wiederherstellung von einem anderen Programm geändert; beim Speichern wird nach dem Ort gefragt",
     notice_disk_missing: "Die Originaldatei existiert nicht mehr; beim Speichern wird nach dem Ort gefragt",
     notice_record_failed: "Der Wiederherstellungseintrag kann nicht geschrieben werden ({reason}); dieses Dokument könnte bei einem Absturz verloren gehen",
+    notice_link_refused: "Nur Web- und E-Mail-Links werden geöffnet; dieser Link nicht",
 };
 
 pub const ES: Strings = Strings {
@@ -1081,7 +1089,7 @@ pub const ES: Strings = Strings {
     save_failed: "No se pudo guardar «{name}»",
     not_utf8: "Este archivo no está en UTF-8. Por ahora Aster Office solo lee y escribe texto UTF-8. El archivo no se ha modificado.",
     is_utf16: "Este archivo está en UTF-16. Por ahora Aster Office solo lee y escribe texto UTF-8. El archivo no se ha modificado.",
-    markdown_note: "Edición de texto sin formato, aún sin resaltado ni vista previa",
+    markdown_note: "Resaltado de sintaxis y vista previa; las imágenes se muestran como marcos vacíos",
     mixed_line_endings: "Finales de línea mezclados: al guardar se unificarán a {style}",
     file_type_text: "Markdown y texto sin formato",
     open_dialog: "Abrir",
@@ -1104,6 +1112,7 @@ pub const ES: Strings = Strings {
     notice_disk_changed: "Otro programa modificó el archivo original antes de la recuperación; al guardar se te preguntará dónde",
     notice_disk_missing: "El archivo original ya no existe; al guardar se te preguntará dónde",
     notice_record_failed: "No se puede escribir el registro de recuperación ({reason}); este documento podría perderse si la aplicación falla",
+    notice_link_refused: "Solo se abren enlaces web y de correo; este enlace no se abrió",
 };
 
 pub const KO: Strings = Strings {
@@ -1182,7 +1191,7 @@ pub const KO: Strings = Strings {
     save_failed: "“{name}”을(를) 저장할 수 없습니다",
     not_utf8: "이 파일은 UTF-8이 아닙니다. Aster Office는 현재 UTF-8 텍스트만 읽고 씁니다. 파일은 변경되지 않았습니다.",
     is_utf16: "이 파일은 UTF-16입니다. Aster Office는 현재 UTF-8 텍스트만 읽고 씁니다. 파일은 변경되지 않았습니다.",
-    markdown_note: "일반 텍스트 편집(강조 표시와 미리 보기는 아직 없음)",
+    markdown_note: "구문 강조와 미리 보기. 이미지는 자리 표시만 합니다",
     mixed_line_endings: "줄 끝 문자가 섞여 있어 저장할 때 {style}(으)로 통일됩니다",
     file_type_text: "Markdown 및 일반 텍스트",
     open_dialog: "열기",
@@ -1205,6 +1214,7 @@ pub const KO: Strings = Strings {
     notice_disk_changed: "복구 전에 다른 프로그램이 원본 파일을 변경했습니다. 저장할 때 저장 위치를 묻습니다",
     notice_disk_missing: "원본 파일이 더 이상 없습니다. 저장할 때 저장 위치를 묻습니다",
     notice_record_failed: "복구 기록을 쓸 수 없습니다({reason}). 앱이 비정상 종료되면 이 문서를 되찾지 못할 수 있습니다",
+    notice_link_refused: "웹과 이메일 링크만 엽니다. 이 링크는 열지 않았습니다",
 };
 
 #[cfg(test)]

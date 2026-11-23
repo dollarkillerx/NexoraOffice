@@ -1,6 +1,7 @@
 // The Aster Office main window: tab strip, toolbar, sidebar, document area and
 // status bar. Everything here is chrome; the document area of a Writer tab is
 // one image that the Rust side draws itself, and Slint only forwards input to it.
+// A Markdown tab has up to two: the source and the preview.
 
 import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem } from "tokens.slint";
 import { TabStrip } from "tabstrip.slint";
@@ -75,12 +76,23 @@ export component AppWindow inherits Window {
     in property <length> scroll-offset;
     in property <length> scroll-max;
 
+    // How a Markdown tab shows its document: 0 the source, 1 source and
+    // preview side by side, 2 the preview. Always 0 for other tabs.
+    in property <int> view-mode;
+    in property <image> preview-frame;
+    in property <length> preview-scroll-offset;
+    in property <length> preview-scroll-max;
+    // The pointer is over a link in the preview.
+    in property <bool> preview-link-hover;
+
     // Geometry the Rust side needs to size its buffer and place the candidate window.
-    out property <length> surface-width: surface.width;
-    out property <length> surface-height: surface.height;
-    out property <length> surface-x: surface.absolute-position.x;
-    out property <length> surface-y: surface.absolute-position.y;
+    out property <length> surface-width: editor-pane.width;
+    out property <length> surface-height: editor-pane.height;
+    out property <length> surface-x: editor-pane.absolute-position.x;
+    out property <length> surface-y: editor-pane.absolute-position.y;
     out property <bool> surface-focused: scope.has-focus;
+    out property <length> preview-width: preview-pane.width;
+    out property <length> preview-height: preview-pane.height;
     // Writer and Markdown tabs both show the custom-drawn surface.
     property <bool> surface-active: root.active-kind == 0 || root.active-kind == 3;
 
@@ -121,6 +133,9 @@ export component AppWindow inherits Window {
     callback pointer-down(length, length, bool);
     callback pointer-drag(length, length);
     callback scrolled(length);
+    callback preview-scrolled(length);
+    callback preview-clicked(length, length);
+    callback preview-moved(length, length);
 
     // Give the keyboard to the document surface.
     public function focus-document() {
@@ -348,51 +363,116 @@ export component AppWindow inherits Window {
                 // tab opens; other views are stacked on top of it.
                 surface := Rectangle {
                     visible: root.surface-active;
+                    // The source takes the whole width, the left half, or
+                    // nothing; the preview the rest, after a hairline.
+                    property <length> editor-width: root.view-mode == 0 ? self.width : root.view-mode == 1 ? round((self.width - 1px) / 2 / 1px) * 1px : 0px;
 
-                    Image {
-                        source: root.frame;
-                        width: 100%;
-                        height: 100%;
-                        image-fit: fill;
+                    editor-pane := Rectangle {
+                        x: 0;
+                        width: parent.editor-width;
+                        height: parent.height;
+                        clip: true;
+
+                        // The frames are drawn at the pane's size; their pixel
+                        // size must not feed back into the window's layout.
+                        Image {
+                            source: root.frame;
+                            width: 100%;
+                            height: 100%;
+                            preferred-width: 0px;
+                            preferred-height: 0px;
+                            image-fit: fill;
+                            visible: root.view-mode != 2;
+                        }
+
+                        scope := FocusScope {
+                            enabled: root.surface-active;
+                            key-pressed(event) => {
+                                return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                            }
+
+                            TouchArea {
+                                enabled: root.surface-active && root.view-mode != 2;
+                                mouse-cursor: text;
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                        scope.focus();
+                                        root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed) {
+                                        root.pointer-drag(self.mouse-x, self.mouse-y);
+                                    }
+                                }
+                                scroll-event(event) => {
+                                    root.scrolled(event.delta-y);
+                                    return accept;
+                                }
+                            }
+                        }
+
+                        // Shows where the view is in the document. Not draggable yet.
+                        if root.scroll-max > 0 && root.view-mode != 2: Rectangle {
+                            property <length> track: parent.height - 2 * Tokens.space-xs;
+                            property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
+                            x: parent.width - self.width - 3px;
+                            y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
+                            width: 6px;
+                            height: self.thumb;
+                            border-radius: 3px;
+                            background: Tokens.text-disabled;
+                        }
                     }
 
-                    scope := FocusScope {
-                        enabled: root.surface-active;
-                        key-pressed(event) => {
-                            return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                    if root.view-mode == 1: Rectangle {
+                        x: parent.editor-width;
+                        width: 1px;
+                        height: parent.height;
+                        background: Tokens.hairline;
+                    }
+
+                    preview-pane := Rectangle {
+                        x: root.view-mode == 1 ? parent.editor-width + 1px : 0px;
+                        width: root.view-mode == 0 ? 0px : parent.width - self.x;
+                        height: parent.height;
+                        clip: true;
+                        visible: root.view-mode != 0;
+
+                        Image {
+                            source: root.preview-frame;
+                            width: 100%;
+                            height: 100%;
+                            preferred-width: 0px;
+                            preferred-height: 0px;
+                            image-fit: fill;
                         }
 
                         TouchArea {
-                            enabled: root.surface-active;
-                            mouse-cursor: text;
-                            pointer-event(event) => {
-                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                                    scope.focus();
-                                    root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
-                                }
+                            enabled: root.surface-active && root.view-mode != 0;
+                            mouse-cursor: root.preview-link-hover ? pointer : default;
+                            clicked => {
+                                root.preview-clicked(self.mouse-x, self.mouse-y);
                             }
                             moved => {
-                                if (self.pressed) {
-                                    root.pointer-drag(self.mouse-x, self.mouse-y);
-                                }
+                                root.preview-moved(self.mouse-x, self.mouse-y);
                             }
                             scroll-event(event) => {
-                                root.scrolled(event.delta-y);
+                                root.preview-scrolled(event.delta-y);
                                 return accept;
                             }
                         }
-                    }
 
-                    // Shows where the view is in the document. Not draggable yet.
-                    if root.scroll-max > 0: Rectangle {
-                        property <length> track: parent.height - 2 * Tokens.space-xs;
-                        property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
-                        x: parent.width - self.width - 3px;
-                        y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
-                        width: 6px;
-                        height: self.thumb;
-                        border-radius: 3px;
-                        background: Tokens.text-disabled;
+                        if root.preview-scroll-max > 0: Rectangle {
+                            property <length> track: parent.height - 2 * Tokens.space-xs;
+                            property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.preview-scroll-max)));
+                            x: parent.width - self.width - 3px;
+                            y: Tokens.space-xs + (self.track - self.thumb) * (root.preview-scroll-offset / root.preview-scroll-max);
+                            width: 6px;
+                            height: self.thumb;
+                            border-radius: 3px;
+                            background: Tokens.text-disabled;
+                        }
                     }
                 }
 

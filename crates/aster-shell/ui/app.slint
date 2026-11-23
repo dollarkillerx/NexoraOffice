@@ -67,6 +67,8 @@ export component AppWindow inherits Window {
     in property <bool> can-redo;
     // 0 while no question is open; see dialog.slint for the kinds.
     in property <int> dialog-kind;
+    // Files are being dragged over the window.
+    in property <bool> drop-hover;
     in property <string> dialog-title;
     in property <string> dialog-body;
     // Documents a crash left unsaved; the question is shown while any remain.
@@ -1063,6 +1065,30 @@ export component AppWindow inherits Window {
         }
         cancel => {
             root.dialog-cancel();
+        }
+    }
+
+    // Over everything while files are dragged onto the window. Draws only;
+    // the drop itself arrives from the window system.
+    if root.drop-hover: Rectangle {
+        background: Tokens.accent-soft;
+        opacity: 0.92;
+        border-width: 2px;
+        border-color: Tokens.accent;
+        border-radius: Tokens.radius-lg;
+        Rectangle {
+            width: drop-label.preferred-width + 2 * Tokens.space-lg;
+            height: 40px;
+            border-radius: self.height / 2;
+            background: Tokens.surface;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000026;
+            drop-label := Text {
+                text: Strings.drop-to-open;
+                font-size: Tokens.font-lg;
+                font-weight: 600;
+                color: Tokens.accent;
+            }
         }
     }
 }

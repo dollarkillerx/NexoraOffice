@@ -32,7 +32,7 @@ use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
 use aster_sheets::Cancel;
 use aster_shell::cli::{self, Options};
-use aster_shell::files::{self, LoadError};
+use aster_shell::files::{self, Dropped, LoadError};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
 use aster_shell::office::{self, SheetTab, SlidesTab};
@@ -54,7 +54,8 @@ use aster_workspace::{
 use chrono::Local;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{
-    CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
+    CloseRequestResponse, Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode,
+    VecModel,
 };
 
 use aster_shell::content::{
@@ -919,6 +920,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_no_folder(strings.no_folder.into());
     s.set_refresh(strings.refresh.into());
     s.set_unsupported(strings.unsupported.into());
+    s.set_drop_to_open(strings.drop_to_open.into());
     s.set_no_matches(strings.no_matches.into());
     s.set_menu_format(strings.menu_format.into());
     s.set_format_bold(strings.format_bold.into());
@@ -1964,6 +1966,36 @@ fn open_recent(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
     shell.pending = Some(Pending::MissingRecent(path));
 }
 
+/// A file or folder was dropped on the window: a folder goes in the
+/// sidebar, a file opens in a tab (or its tab comes to the front). Ignored
+/// while a question is on screen, which the new tab would hide.
+fn open_dropped(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
+    if ui.get_dialog_kind() != 0 || !shell.candidates.is_empty() {
+        return;
+    }
+    match files::dropped(&path) {
+        Dropped::Folder => {
+            let wanted = shell.open_folder(&path, Vec::new());
+            read_folders(ui, shell, wanted);
+            ui.set_sidebar_open(true);
+            refresh_sidebar(ui, shell);
+        }
+        Dropped::File => match shell.tab_of_file(&path) {
+            Some(id) => {
+                shell.tabs.activate(id);
+                after_tab_change(ui, shell);
+            }
+            None => start_load(ui, shell, path),
+        },
+        Dropped::Unsupported => {
+            let strings = shell.language.strings();
+            let name = files::display_name(&path);
+            let title = i18n::fill(strings.unsupported_title, "name", &name);
+            show_dialog(ui, shell, 2, title, strings.unsupported_body.to_owned());
+        }
+    }
+}
+
 /// A line of the tree was clicked.
 fn open_tree_row(ui: &AppWindow, shell: &mut Shell, row: Row) {
     let strings = shell.language.strings();
@@ -2822,6 +2854,33 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let shell = shell.clone();
         let weak = ui.as_weak();
         move |_window, event| {
+            match event {
+                // Only where a drop would be taken: not over a question.
+                winit::event::WindowEvent::HoveredFile(_) => {
+                    if let Some(ui) = weak.upgrade() {
+                        let asking =
+                            ui.get_dialog_kind() != 0 || ui.get_recovery_items().row_count() > 0;
+                        ui.set_drop_hover(!asking);
+                    }
+                    return EventResult::Propagate;
+                }
+                winit::event::WindowEvent::HoveredFileCancelled => {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_drop_hover(false);
+                    }
+                    return EventResult::Propagate;
+                }
+                // One event per file. Handled once the shell is free.
+                winit::event::WindowEvent::DroppedFile(path) => {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_drop_hover(false);
+                        let path = path.clone();
+                        deliver(ui, Box::new(move |ui, shell| open_dropped(ui, shell, path)));
+                    }
+                    return EventResult::Propagate;
+                }
+                _ => {}
+            }
             if let winit::event::WindowEvent::Focused(true) = event {
                 if let (Some(ui), Ok(mut shell)) = (weak.upgrade(), shell.try_borrow_mut()) {
                     refresh_workspace(&ui, &mut shell);

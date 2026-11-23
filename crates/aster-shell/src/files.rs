@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use aster_markdown::{DecodeError, Decoded, Rope, TextFormat};
 use aster_storage::Fingerprint;
+use aster_workspace::FileKind;
 
 /// Why a file could not be opened.
 #[derive(Debug)]
@@ -94,6 +95,29 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
+    }
+}
+
+/// What to do with something dragged onto the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dropped {
+    /// Show it in the sidebar.
+    Folder,
+    /// Open it in a tab: Markdown and text to edit, Excel and PowerPoint to
+    /// look at, as "Open..." does.
+    File,
+    /// Say this version cannot open it.
+    Unsupported,
+}
+
+/// Decide what a dropped path is. Reads whether it is a folder.
+pub fn dropped(path: &Path) -> Dropped {
+    if path.is_dir() {
+        return Dropped::Folder;
+    }
+    match FileKind::of(path) {
+        Some(kind) if kind.opens() => Dropped::File,
+        _ => Dropped::Unsupported,
     }
 }
 
@@ -195,5 +219,31 @@ mod tests {
         assert!(!same_file(&path, &dir.path().join("b.md")));
         // Neither exists: compared as written.
         assert!(same_file(Path::new("/no/such"), Path::new("/no/such")));
+    }
+
+    #[test]
+    fn dropped_paths_are_folders_files_or_not_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(dropped(dir.path()), Dropped::Folder);
+        // A folder whose name looks like a file is still a folder.
+        let odd = dir.path().join("notes.md");
+        std::fs::create_dir(&odd).unwrap();
+        assert_eq!(dropped(&odd), Dropped::Folder);
+        for name in [
+            "说明.md",
+            "README.MARKDOWN",
+            "todo.txt",
+            "预算.xlsx",
+            "发布会.PPTX",
+        ] {
+            assert_eq!(dropped(&write(&dir, name, b"x")), Dropped::File, "{name}");
+        }
+        for name in ["报告.docx", "photo.png", "no-extension"] {
+            assert_eq!(
+                dropped(&write(&dir, name, b"x")),
+                Dropped::Unsupported,
+                "{name}"
+            );
+        }
     }
 }

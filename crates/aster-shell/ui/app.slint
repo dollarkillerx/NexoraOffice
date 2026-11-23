@@ -40,8 +40,17 @@ export component AppWindow inherits Window {
     in property <string> placeholder-plan;
     in property <[ToolItem]> toolbar-items;
     in property <[KindItem]> kinds;
+    // Every recent file, for the start page.
     in property <[RecentItem]> recent;
+    // The few the sidebar lists, or every match while it filters.
+    in property <[RecentItem]> sidebar-recent;
     in property <[TreeItem]> tree;
+    // The folder shown in the sidebar; empty while none is open.
+    in property <string> folder-name;
+    in-out property <string> sidebar-filter;
+    in property <bool> sidebar-filtering;
+    // The document in front has a file on disk.
+    in property <bool> current-has-file;
     in-out property <bool> sidebar-open: true;
     in-out property <bool> assistant-open;
     in property <[string]> languages;
@@ -116,7 +125,16 @@ export component AppWindow inherits Window {
     callback tab-close(int);
     callback new-document(int);
     callback show-start();
-    callback open-recent(int);
+    // 0 open, 1 show in the file manager, 2 take off the list; from the
+    // sidebar's short list or the start page's full one.
+    callback recent-action(int, bool, int);
+    callback clear-recent();
+    // 0 open or expand, 1 show in the file manager.
+    callback tree-action(int, int);
+    callback open-folder();
+    callback refresh-folder();
+    callback reveal-current();
+    callback sidebar-filter-edited(string);
     callback toggle-theme();
     callback set-language(int);
     callback toolbar-command(int);
@@ -214,6 +232,29 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + O);
                 activated => {
                     root.file-open();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-open-folder;
+                shortcut: @keys(Control + Shift + O);
+                activated => {
+                    root.open-folder();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-clear-recent;
+                activated => {
+                    root.clear-recent();
+                }
+            }
+
+            MenuItem {
+                title: Strings.reveal;
+                enabled: root.current-has-file;
+                activated => {
+                    root.reveal-current();
                 }
             }
 
@@ -450,10 +491,37 @@ export component AppWindow inherits Window {
                     duration: 140ms;
                     easing: ease-out;
                 }
-                recent: root.recent;
+                recent: root.sidebar-recent;
                 tree: root.tree;
+                folder-name: root.folder-name;
+                filtering: root.sidebar-filtering;
+                filter <=> root.sidebar-filter;
+                filter-edited(text) => {
+                    root.sidebar-filter-edited(text);
+                }
                 open-recent(index) => {
-                    root.open-recent(index);
+                    root.recent-action(0, true, index);
+                }
+                reveal-recent(index) => {
+                    root.recent-action(1, true, index);
+                }
+                remove-recent(index) => {
+                    root.recent-action(2, true, index);
+                }
+                clear-recent => {
+                    root.clear-recent();
+                }
+                tree-clicked(index) => {
+                    root.tree-action(0, index);
+                }
+                reveal-tree(index) => {
+                    root.tree-action(1, index);
+                }
+                open-folder => {
+                    root.open-folder();
+                }
+                refresh => {
+                    root.refresh-folder();
                 }
             }
 
@@ -646,10 +714,22 @@ export component AppWindow inherits Window {
                         root.new-document(kind);
                     }
                     open-recent(index) => {
-                        root.open-recent(index);
+                        root.recent-action(0, false, index);
+                    }
+                    reveal-recent(index) => {
+                        root.recent-action(1, false, index);
+                    }
+                    remove-recent(index) => {
+                        root.recent-action(2, false, index);
+                    }
+                    clear-recent => {
+                        root.clear-recent();
                     }
                     open-file => {
                         root.file-open();
+                    }
+                    open-folder => {
+                        root.open-folder();
                     }
                 }
             }

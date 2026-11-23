@@ -6,6 +6,7 @@ members = [
     "crates/aster-shell",
     "crates/aster-storage",
     "crates/aster-surface",
+    "crates/aster-workspace",
     "spikes/g1-ime",
     "spikes/g2-frame",
     "spikes/g3-cjk",
@@ -32,6 +33,7 @@ aster-markdown = { path = "crates/aster-markdown" }
 aster-platform = { path = "crates/aster-platform" }
 aster-storage = { path = "crates/aster-storage" }
 aster-surface = { path = "crates/aster-surface" }
+aster-workspace = { path = "crates/aster-workspace" }
 slint = { version = "~1.19.0", default-features = false, features = [
     "std",
     "compat-1-2",
@@ -55,9 +57,13 @@ bytemuck = "1.25"
 # The same ICU4X release Parley 0.13 uses, so only one copy of its data is linked.
 icu_segmenter = "~2.3.0"
 icu_locale_core = "2.3"
+# Composing file names before comparing them: macOS may hand them out decomposed.
+icu_normalizer = "~2.3.0"
 # SQLite is compiled in, so every platform runs the same version.
 rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3.27"
+# Local time for "today 14:20" in the recent-files list. Slint already links it.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Native open and save dialogs on all three systems.
 rfd = "~0.18.0"
 # CommonMark and GitHub extensions. Without its HTML writer and command line.

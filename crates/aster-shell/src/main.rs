@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
@@ -33,7 +33,7 @@ use aster_shell::files::{self, LoadError};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
 use aster_shell::recovery::{self, Age, Candidate, RecordInfo};
-use aster_shell::sample::{RECENT_FILES, WORKSPACE_TREE};
+use aster_shell::sidebar::{self, Look, SIDEBAR_RECENT};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
@@ -44,6 +44,10 @@ use aster_storage::{
 use aster_surface::host::{self, to_px};
 use aster_surface::preview::{PreviewLayout, PreviewWorker};
 use aster_surface::{Action, ImeEvent, Surface};
+use aster_workspace::{
+    FileTree, Filter, RecentFiles, Row, RowKind, Store, WorkspaceState, read_folder,
+};
+use chrono::Local;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{
     CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
@@ -64,6 +68,9 @@ const CARET_BLINK: Duration = Duration::from_millis(530);
 const PREVIEW_DELAY: Duration = Duration::from_millis(250);
 /// Width kept free for the window buttons when the tab strip is the title bar.
 const WINDOW_BUTTONS_INSET: f32 = 76.0;
+/// Two clicks on the same folder closer together than this are one double
+/// click: the folder opens (or closes) once.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 /// Extensions offered in the open and save dialogs.
 const TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
 
@@ -91,12 +98,14 @@ impl Content {
 }
 
 /// What the question on screen is about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Pending {
     /// Closing a tab whose document has unsaved changes.
     CloseTab(TabId),
     /// Quitting while documents have unsaved changes.
     Quit,
+    /// A recent file is no longer there; it may be taken off the list.
+    MissingRecent(PathBuf),
 }
 
 /// What happens once a save has succeeded.
@@ -148,6 +157,27 @@ struct Shell {
     preview_timer: Timer,
     /// Runs once typing has paused, to search again with the find bar open.
     find_timer: Timer,
+    /// Files opened or saved lately. What is read from disk at start-up is
+    /// merged in when it arrives; until then nothing is written back.
+    recent: RecentFiles,
+    recent_loaded: bool,
+    /// The folder in the sidebar.
+    tree: Option<FileTree>,
+    /// Whether the remembered folder has been looked up; until then the
+    /// sidebar state is not written back.
+    workspace_loaded: bool,
+    /// What the sidebar's search field holds.
+    filter: Option<Filter>,
+    /// The files and tree lines behind the rows on screen, by index.
+    sidebar_recent: Vec<PathBuf>,
+    start_recent: Vec<PathBuf>,
+    tree_rows: Vec<Row>,
+    /// The folder last expanded or collapsed, and when: a double click
+    /// toggles it once, not open and shut again.
+    last_toggle: Option<(PathBuf, Instant)>,
+    /// Writes the recent list and the sidebar state. `None` in tests and
+    /// when the system gives no data folder.
+    store: Option<Store>,
 }
 
 impl Shell {
@@ -168,6 +198,16 @@ impl Shell {
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
+            recent: RecentFiles::default(),
+            recent_loaded: false,
+            tree: None,
+            workspace_loaded: false,
+            filter: None,
+            sidebar_recent: Vec::new(),
+            start_recent: Vec::new(),
+            tree_rows: Vec::new(),
+            last_toggle: None,
+            store: None,
         }
     }
 
@@ -241,31 +281,50 @@ impl Shell {
         id
     }
 
-    /// Open an entry of the sample list. These are not files: the tab gets text
-    /// that says so and has no path, so saving it asks where to.
-    fn open_recent(&mut self, index: usize) {
-        let Some(file) = RECENT_FILES.get(index) else {
+    /// Put a file at the top of the recent list, in its canonical spelling so
+    /// it is listed once however it was reached.
+    fn remember_file(&mut self, path: &Path) {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if self.recent.add(&path, SystemTime::now()) {
+            self.save_recent();
+        }
+    }
+
+    fn save_recent(&self) {
+        if !self.recent_loaded {
             return;
+        }
+        if let (Some(store), Some(file)) = (&self.store, aster_platform::paths::recent_files()) {
+            store.write(file, self.recent.encode().into_bytes());
+        }
+    }
+
+    fn save_workspace(&self) {
+        if !self.workspace_loaded {
+            return;
+        }
+        let state = match &self.tree {
+            Some(tree) => WorkspaceState {
+                folder: Some(tree.root().to_owned()),
+                expanded: tree.expanded(),
+            },
+            None => WorkspaceState::default(),
         };
-        self.leave_active_document();
-        if self.tabs.activate_existing(file.kind, file.title).is_some() {
-            return;
+        if let (Some(store), Some(file)) = (&self.store, aster_platform::paths::workspace_state()) {
+            store.write(file, state.encode().into_bytes());
         }
-        let id = self.tabs.open(file.kind, file.title);
-        let text = i18n::fill(self.language.strings().sample_document, "title", file.title);
-        match file.kind {
-            DocKind::Writer => {
-                let view = WriterView::new(&text, &self.tokens);
-                self.contents.insert(id, Content::Writer(Box::new(view)));
-            }
-            DocKind::Markdown => {
-                let editor =
-                    MarkdownEditor::new(&text, TextFormat::default(), None, None, &self.tokens);
-                self.contents
-                    .insert(id, Content::Markdown(Box::new(editor)));
-            }
-            DocKind::Sheets | DocKind::Slides | DocKind::Pdf => {}
-        }
+    }
+
+    /// Show `folder` in the sidebar with `expanded` folders open. Returns the
+    /// folders to read.
+    fn open_folder(&mut self, folder: &Path, expanded: Vec<PathBuf>) -> Vec<PathBuf> {
+        let root = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_owned());
+        let mut tree = FileTree::new(root);
+        tree.restore_expanded(expanded);
+        let wanted = tree.wanted();
+        self.tree = Some(tree);
+        self.save_workspace();
+        wanted
     }
 
     /// The tab that already shows this file, if any.
@@ -712,6 +771,7 @@ fn apply_icons(ui: &AppWindow) {
     icons.set_check(Icon::Check.path().into());
     icons.set_folder_open(Icon::FolderOpen.path().into());
     icons.set_chevron_up(Icon::ChevronUp.path().into());
+    icons.set_refresh(Icon::Refresh.path().into());
 }
 
 /// Copy the interface text of a language into the Slint globals, and rebuild
@@ -723,8 +783,6 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_new_document(strings.new_document.into());
     s.set_recent(strings.recent.into());
     s.set_files(strings.files.into());
-    s.set_sample(strings.sample.into());
-    s.set_sample_data(strings.sample_data.into());
     s.set_placeholder(strings.placeholder.into());
     s.set_placeholder_view(strings.placeholder_view.into());
     s.set_search_files(strings.search_files.into());
@@ -775,6 +833,16 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_recovery_discard(strings.recovery_discard.into());
     s.set_recovery_restore_all(strings.recovery_restore_all.into());
     s.set_recovery_later(strings.recovery_later.into());
+    s.set_menu_open_folder(strings.menu_open_folder.into());
+    s.set_menu_clear_recent(strings.menu_clear_recent.into());
+    s.set_reveal(sidebar::reveal_label(strings).into());
+    s.set_recent_remove(strings.recent_remove.into());
+    s.set_recent_empty(strings.recent_empty.into());
+    s.set_recent_missing(strings.recent_missing.into());
+    s.set_no_folder(strings.no_folder.into());
+    s.set_refresh(strings.refresh.into());
+    s.set_unsupported(strings.unsupported.into());
+    s.set_no_matches(strings.no_matches.into());
 
     ui.set_language_index(language.index() as i32);
     ui.set_kinds(model(
@@ -799,28 +867,6 @@ fn apply_static_models(ui: &AppWindow) {
         Language::ALL
             .into_iter()
             .map(|language| SharedString::from(language.native_name()))
-            .collect(),
-    ));
-    ui.set_recent(model(
-        RECENT_FILES
-            .iter()
-            .map(|file| RecentItem {
-                title: file.title.into(),
-                kind: file.kind.index() as i32,
-                location: file.location.into(),
-                opened: file.opened.into(),
-            })
-            .collect(),
-    ));
-    ui.set_tree(model(
-        WORKSPACE_TREE
-            .iter()
-            .map(|row| TreeItem {
-                name: row.name.into(),
-                depth: i32::from(row.depth),
-                kind: row.kind.map_or(-1, |kind| kind.index() as i32),
-                expanded: row.expanded,
-            })
             .collect(),
     ));
 }
@@ -1232,6 +1278,7 @@ fn after_tab_change(ui: &AppWindow, shell: &mut Shell) {
     }
     shell.wake_caret();
     refresh_chrome(ui, shell);
+    refresh_sidebar(ui, shell);
     if shell.active_surface().is_some() && shell.pending.is_none() {
         ui.invoke_focus_document();
     }
@@ -1333,6 +1380,339 @@ fn deliver(ui: AppWindow, job: Delivery) {
         Ok(mut shell) => job(&ui, &mut shell),
         Err(_) => Timer::single_shot(Duration::from_millis(30), move || deliver(ui, job)),
     };
+}
+
+// --- Files and folders: the recent list and the sidebar's tree -------------
+
+fn recent_item(row: &sidebar::RecentRow) -> RecentItem {
+    RecentItem {
+        title: row.title.as_str().into(),
+        kind: row.kind.index() as i32,
+        location: row.location.as_str().into(),
+        opened: row.opened.as_str().into(),
+        missing: row.missing,
+    }
+}
+
+/// Bring the recent lists and the tree on screen up to date.
+fn refresh_sidebar(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    let now = Local::now();
+    let home = sidebar::home_folder();
+    let all = sidebar::recent_rows(strings, &shell.recent, None, now, home.as_deref());
+    let short: Vec<_> = match &shell.filter {
+        Some(filter) => {
+            sidebar::recent_rows(strings, &shell.recent, Some(filter), now, home.as_deref())
+        }
+        None => all.iter().take(SIDEBAR_RECENT).cloned().collect(),
+    };
+    ui.set_recent(model(all.iter().map(recent_item).collect()));
+    ui.set_sidebar_recent(model(short.iter().map(recent_item).collect()));
+    shell.start_recent = all.into_iter().map(|row| row.path).collect();
+    shell.sidebar_recent = short.into_iter().map(|row| row.path).collect();
+    ui.set_sidebar_filtering(shell.filter.is_some());
+
+    // The file in front is marked in the tree.
+    let current = shell
+        .active_markdown()
+        .and_then(|editor| editor.path.clone())
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+    ui.set_current_has_file(current.is_some());
+    let Some(tree) = &shell.tree else {
+        ui.set_folder_name(SharedString::new());
+        ui.set_tree(model(Vec::new()));
+        shell.tree_rows.clear();
+        return;
+    };
+    ui.set_folder_name(files::display_name(tree.root()).into());
+    let rows = tree.rows(shell.filter.as_ref());
+    let items = sidebar::tree_lines(strings, &rows)
+        .into_iter()
+        .map(|line| {
+            let mut item = TreeItem {
+                name: line.label.into(),
+                depth: i32::try_from(line.depth).unwrap_or(i32::MAX),
+                ..TreeItem::default()
+            };
+            match line.look {
+                Look::Folder { expanded } => {
+                    item.kind = -1;
+                    item.expanded = expanded;
+                }
+                Look::Loop => item.kind = -2,
+                Look::File { kind, opens } => {
+                    item.kind = kind.index() as i32;
+                    item.opens = opens;
+                    item.current = current.as_deref() == Some(line.path.as_path());
+                }
+                Look::Note { problem } => {
+                    item.kind = -3;
+                    item.problem = problem;
+                }
+            }
+            item
+        })
+        .collect();
+    ui.set_tree(model(items));
+    shell.tree_rows = rows;
+}
+
+/// Read the recent list and the remembered folder on a worker thread, and
+/// show them when they arrive.
+fn spawn_workspace_load(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let recent = aster_platform::paths::recent_files()
+            .map(|file| RecentFiles::load(&file))
+            .unwrap_or_else(|| Ok(RecentFiles::default()));
+        let state = aster_platform::paths::workspace_state()
+            .map(|file| WorkspaceState::load(&file))
+            .unwrap_or_else(|| Ok(WorkspaceState::default()));
+        let found = recent
+            .as_ref()
+            .map(|recent| aster_workspace::recent::present(recent.paths()))
+            .unwrap_or_default();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    finish_workspace_load(ui, shell, recent, state, &found);
+                }),
+            );
+        });
+    });
+}
+
+fn finish_workspace_load(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    recent: std::io::Result<RecentFiles>,
+    state: std::io::Result<WorkspaceState>,
+    found: &[(PathBuf, bool)],
+) {
+    match recent {
+        Ok(mut loaded) => {
+            loaded.set_missing(found);
+            // Files opened since start-up go on top of what was stored.
+            let opened_since = std::mem::take(&mut shell.recent);
+            for file in opened_since.files().iter().rev() {
+                loaded.add(&file.path, file.opened);
+            }
+            shell.recent = loaded;
+            shell.recent_loaded = true;
+            if !opened_since.is_empty() {
+                shell.save_recent();
+            }
+        }
+        // Not overwritten: it may be readable next time.
+        Err(err) => eprintln!("aster-shell: cannot read the recent-files list: {err}"),
+    }
+    match state {
+        Ok(state) => {
+            shell.workspace_loaded = true;
+            // A folder opened since start-up wins.
+            if shell.tree.is_none()
+                && let Some(folder) = state.folder
+            {
+                let wanted = shell.open_folder(&folder, state.expanded);
+                read_folders(ui, shell, wanted);
+            }
+        }
+        Err(err) => eprintln!("aster-shell: cannot read the sidebar state: {err}"),
+    }
+    refresh_sidebar(ui, shell);
+}
+
+/// Read folders of the tree on a worker thread, one after another, and show
+/// each as it arrives.
+fn read_folders(ui: &AppWindow, shell: &Shell, dirs: Vec<PathBuf>) {
+    let Some(tree) = &shell.tree else {
+        return;
+    };
+    if dirs.is_empty() {
+        return;
+    }
+    let root = tree.root().to_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        for dir in dirs {
+            let result = read_folder(&dir);
+            let root = root.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| {
+                        let Some(tree) = shell.tree.as_mut().filter(|tree| tree.root() == root)
+                        else {
+                            return;
+                        };
+                        tree.finished(dir, result);
+                        // Expanded folders inside it are now on screen.
+                        let wanted = tree.wanted();
+                        read_folders(ui, shell, wanted);
+                        refresh_sidebar(ui, shell);
+                    }),
+                );
+            });
+        }
+    });
+}
+
+/// Look at the disk again: the folders on screen and whether the recent
+/// files are still there. The folder is not watched; this runs when the
+/// window comes back to the front and from the refresh button.
+fn refresh_workspace(ui: &AppWindow, shell: &mut Shell) {
+    if let Some(tree) = &mut shell.tree {
+        let again = tree.reread();
+        read_folders(ui, shell, again);
+    }
+    if shell.recent_loaded && !shell.recent.is_empty() {
+        let paths = shell.recent.paths();
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let found = aster_workspace::recent::present(paths);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| {
+                        if shell.recent.set_missing(&found) {
+                            refresh_sidebar(ui, shell);
+                        }
+                    }),
+                );
+            });
+        });
+    }
+    // "Today" may have become "yesterday".
+    refresh_sidebar(ui, shell);
+}
+
+/// Show a file or folder in Finder or the file manager, on a worker thread;
+/// say so if that fails.
+fn reveal(ui: &AppWindow, path: PathBuf) {
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Err(err) = aster_platform::reveal::show_in_file_manager(&path) else {
+            return;
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    let strings = shell.language.strings();
+                    let title =
+                        i18n::fill(strings.reveal_failed, "name", &files::display_name(&path));
+                    show_dialog(ui, shell, 2, title, err.to_string());
+                }),
+            );
+        });
+    });
+}
+
+/// A recent file was clicked.
+fn open_recent(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
+    if let Some(id) = shell.tab_of_file(&path) {
+        shell.tabs.activate(id);
+        after_tab_change(ui, shell);
+        return;
+    }
+    // Looked at again now: the list may be minutes old.
+    let present = path.is_file();
+    if shell.recent.set_missing(&[(path.clone(), present)]) {
+        refresh_sidebar(ui, shell);
+    }
+    if present {
+        start_load(ui, shell, path);
+        return;
+    }
+    let strings = shell.language.strings();
+    let title = i18n::fill(
+        strings.recent_missing_title,
+        "name",
+        &files::display_name(&path),
+    );
+    let folder = path
+        .parent()
+        .map(|folder| folder.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let body = i18n::fill(strings.recent_missing_body, "path", &folder);
+    show_dialog(ui, shell, 4, title, body);
+    shell.pending = Some(Pending::MissingRecent(path));
+}
+
+/// A line of the tree was clicked.
+fn open_tree_row(ui: &AppWindow, shell: &mut Shell, row: Row) {
+    let strings = shell.language.strings();
+    match row.kind {
+        RowKind::Folder { .. } => {
+            let Some(tree) = &mut shell.tree else {
+                return;
+            };
+            // The second click of a double click.
+            if shell
+                .last_toggle
+                .as_ref()
+                .is_some_and(|(path, at)| *path == row.path && at.elapsed() < DOUBLE_CLICK)
+            {
+                return;
+            }
+            shell.last_toggle = Some((row.path.clone(), Instant::now()));
+            tree.toggle(&row.path);
+            let wanted = tree.wanted();
+            shell.save_workspace();
+            read_folders(ui, shell, wanted);
+            refresh_sidebar(ui, shell);
+        }
+        RowKind::Loop => {
+            let title = i18n::fill(strings.loop_title, "name", &row.name);
+            show_dialog(ui, shell, 2, title, strings.loop_body.to_owned());
+        }
+        RowKind::File(kind) if kind.opens() => match shell.tab_of_file(&row.path) {
+            Some(id) => {
+                shell.tabs.activate(id);
+                after_tab_change(ui, shell);
+            }
+            None => start_load(ui, shell, row.path),
+        },
+        RowKind::File(_) => {
+            let title = i18n::fill(strings.unsupported_title, "name", &row.name);
+            show_dialog(ui, shell, 2, title, strings.unsupported_body.to_owned());
+        }
+        RowKind::Note(_) => {}
+    }
+}
+
+/// Ask for a folder and show it in the sidebar.
+fn choose_folder(ui: &AppWindow, shell: &Rc<RefCell<Shell>>) {
+    // The shell is not borrowed while the system dialog is open.
+    let Ok((strings, start)) = shell.try_borrow().map(|shell| {
+        (
+            shell.language.strings(),
+            shell.tree.as_ref().map(|tree| tree.root().to_owned()),
+        )
+    }) else {
+        return;
+    };
+    let weak = ui.as_weak();
+    // Never block on a dialog inside an event handler: see `dialogs`.
+    let _ = slint::spawn_local(async move {
+        let Some(folder) = dialogs::pick_folder(strings.open_folder_dialog, start.as_deref()).await
+        else {
+            return;
+        };
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        deliver(
+            ui.clone_strong(),
+            Box::new(move |ui, shell| {
+                let wanted = shell.open_folder(&folder, Vec::new());
+                read_folders(ui, shell, wanted);
+                ui.set_sidebar_open(true);
+                refresh_sidebar(ui, shell);
+            }),
+        );
+    });
 }
 
 // --- Find and replace --------------------------------------------------------
@@ -1514,15 +1894,23 @@ fn schedule_highlight(ui: &AppWindow, shell: &mut Shell) {
 
 /// Read a file on a worker thread and open it in a tab when it arrives.
 fn spawn_load(ui: &AppWindow, path: PathBuf) {
-    // Say so in the status bar while it takes: a large file takes seconds.
-    let opening = path.clone();
     deliver(
         ui.clone_strong(),
-        Box::new(move |ui, shell| {
-            shell.opening.push(opening);
-            refresh_status(ui, shell);
-        }),
+        Box::new(move |ui, shell| start_load(ui, shell, path)),
     );
+}
+
+/// [`spawn_load`] with the shell at hand. A file that is being read already
+/// is not read twice.
+fn start_load(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
+    if shell.opening.contains(&path) {
+        return;
+    }
+    // Say so in the status bar while it takes: a large file takes seconds.
+    // Noted before the reading starts, so that it is never noted after the
+    // file has arrived.
+    shell.opening.push(path.clone());
+    refresh_status(ui, shell);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         // Reading, decoding and preparing a large file all happen here.
@@ -1666,6 +2054,7 @@ fn finish_load(
     refresh_status(ui, shell);
     match result {
         Ok(opened) => {
+            shell.remember_file(&path);
             shell.open_file(path, opened);
             after_tab_change(ui, shell);
         }
@@ -1707,6 +2096,10 @@ fn finish_save(
     after: AfterSave,
 ) {
     shell.finish_save(id, &path, point, result.as_ref().ok().copied());
+    if result.is_ok() {
+        shell.remember_file(&path);
+        refresh_sidebar(ui, shell);
+    }
     match result {
         Ok(_) if after == AfterSave::CloseTab => {
             shell.force_close(id);
@@ -1883,6 +2276,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The recent list and the sidebar's folder: written on a thread of their
+    // own, read once at start-up.
+    shell.borrow_mut().store = Some(Store::spawn(|file, err| {
+        eprintln!("aster-shell: cannot write {}: {err}", file.display());
+    }));
+    spawn_workspace_load(&ui);
+
     // Previews are laid out on their own thread.
     {
         let weak = ui.as_weak();
@@ -1918,6 +2318,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let shell = shell.clone();
         let weak = ui.as_weak();
         move |_window, event| {
+            if let winit::event::WindowEvent::Focused(true) = event {
+                if let (Some(ui), Ok(mut shell)) = (weak.upgrade(), shell.try_borrow_mut()) {
+                    refresh_workspace(&ui, &mut shell);
+                }
+                return EventResult::Propagate;
+            }
             let winit::event::WindowEvent::Ime(ime) = event else {
                 return EventResult::Propagate;
             };
@@ -2087,9 +2493,78 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    ui.on_open_recent(handler!(|ui, shell, index| {
-        shell.open_recent(usize::try_from(index).unwrap_or(usize::MAX));
-        after_tab_change(&ui, shell);
+    ui.on_recent_action(handler!(|ui, shell, action, from_sidebar, index| {
+        let list = if from_sidebar {
+            &shell.sidebar_recent
+        } else {
+            &shell.start_recent
+        };
+        let Some(path) = usize::try_from(index)
+            .ok()
+            .and_then(|i| list.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        match action {
+            0 => open_recent(&ui, shell, path),
+            1 => reveal(&ui, path),
+            2 => {
+                shell.recent.remove(&path);
+                shell.save_recent();
+                refresh_sidebar(&ui, shell);
+            }
+            _ => {}
+        }
+    }));
+
+    ui.on_clear_recent(handler!(|ui, shell| {
+        shell.recent.clear();
+        shell.save_recent();
+        refresh_sidebar(&ui, shell);
+    }));
+
+    ui.on_tree_action(handler!(|ui, shell, action, index| {
+        let Some(row) = usize::try_from(index)
+            .ok()
+            .and_then(|i| shell.tree_rows.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        match action {
+            0 => open_tree_row(&ui, shell, row),
+            1 => reveal(&ui, row.path),
+            _ => {}
+        }
+    }));
+
+    ui.on_open_folder({
+        let shell = shell.clone();
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                choose_folder(&ui, &shell);
+            }
+        }
+    });
+
+    ui.on_refresh_folder(handler!(|ui, shell| {
+        refresh_workspace(&ui, shell);
+    }));
+
+    ui.on_reveal_current(handler!(|ui, shell| {
+        if let Some(path) = shell
+            .active_markdown()
+            .and_then(|editor| editor.path.clone())
+        {
+            reveal(&ui, path);
+        }
+    }));
+
+    ui.on_sidebar_filter_edited(handler!(|ui, shell, text| {
+        shell.filter = Filter::new(text.as_str());
+        refresh_sidebar(&ui, shell);
     }));
 
     ui.on_show_start(handler!(|ui, shell| {
@@ -2109,6 +2584,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             shell.language = language;
             apply_language(&ui, language);
             refresh_chrome(&ui, shell);
+            refresh_sidebar(&ui, shell);
             if !shell.candidates.is_empty() {
                 refresh_recovery(&ui, shell);
             }
@@ -2403,7 +2879,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let Ok(mut shell) = shell.try_borrow_mut() else {
                     return;
                 };
-                let pending = shell.pending;
+                let pending = shell.pending.clone();
                 hide_dialog(&ui, &mut shell);
                 pending
             };
@@ -2414,9 +2890,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     ui.on_dialog_discard(handler!(|ui, shell| {
-        let pending = shell.pending;
+        let pending = shell.pending.clone();
         hide_dialog(&ui, shell);
         match pending {
+            Some(Pending::MissingRecent(path)) => {
+                shell.recent.remove(&path);
+                shell.save_recent();
+                refresh_sidebar(&ui, shell);
+            }
             Some(Pending::CloseTab(id)) => {
                 shell.force_close(id);
                 after_tab_change(&ui, shell);
@@ -2583,6 +3064,10 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(mut shell) = shell.try_borrow_mut() {
         drop(shell.writer.take());
         shell.candidates.clear();
+        // The same for the recent list and the sidebar state.
+        if let Some(store) = shell.store.take() {
+            store.finish();
+        }
     }
     SHELL.with(|cell| cell.borrow_mut().take());
     Ok(())
@@ -2689,15 +3174,40 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_recent_file_reuses_its_tab() {
+    fn a_file_is_remembered_once_however_it_was_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("議事録.md");
+        std::fs::write(&path, "x").unwrap();
+        let other = dir.path().join("b.txt");
+        std::fs::write(&other, "y").unwrap();
+
         let mut shell = shell();
-        shell.open_recent(0);
-        shell.open_untitled(DocKind::Slides);
-        shell.open_recent(0);
-        assert_eq!(shell.tabs.len(), 2);
-        assert_eq!(shell.tabs.active_index(), Some(0));
-        shell.open_recent(RECENT_FILES.len());
-        assert_eq!(shell.tabs.len(), 2);
+        shell.remember_file(&path);
+        shell.remember_file(&other);
+        shell.remember_file(&dir.path().join(".").join("議事録.md"));
+        let names: Vec<String> = shell
+            .recent
+            .files()
+            .iter()
+            .map(|file| files::display_name(&file.path))
+            .collect();
+        assert_eq!(names, ["議事録.md", "b.txt"]);
+    }
+
+    #[test]
+    fn opening_a_folder_reads_it_and_its_expanded_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("第1章")).unwrap();
+        std::fs::write(dir.path().join("第1章").join("草稿.md"), "").unwrap();
+
+        let mut shell = shell();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let wanted = shell.open_folder(dir.path(), vec![root.join("第1章")]);
+        assert_eq!(wanted, std::slice::from_ref(&root));
+        let tree = shell.tree.as_mut().unwrap();
+        assert_eq!(tree.root(), root);
+        tree.finished(root.clone(), read_folder(&root));
+        assert_eq!(tree.wanted(), [root.join("第1章")]);
     }
 
     #[test]

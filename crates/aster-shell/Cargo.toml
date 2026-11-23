@@ -12,6 +12,8 @@ aster-markdown = { workspace = true }
 aster-platform = { workspace = true }
 aster-storage = { workspace = true }
 aster-surface = { workspace = true }
+aster-workspace = { workspace = true }
+chrono = { workspace = true }
 ropey = { workspace = true }
 slint = { workspace = true }
 

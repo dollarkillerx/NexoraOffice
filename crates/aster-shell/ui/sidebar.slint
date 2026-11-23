@@ -1,9 +1,9 @@
+import { ListView } from "std-widgets.slint";
 import { Tokens, Icons, Strings, RecentItem, TreeItem } from "tokens.slint";
-import { Icon, KindGlyph, Badge, Hairline, VHairline } from "widgets.slint";
+import { Icon, KindGlyph, IconButton, TextButton, VHairline } from "widgets.slint";
 
 component SectionHeader inherits Rectangle {
     in property <string> title;
-    in property <string> badge;
     height: 30px;
     HorizontalLayout {
         padding-left: Tokens.space-md + 2px;
@@ -16,40 +16,228 @@ component SectionHeader inherits Rectangle {
             letter-spacing: 0.4px;
             color: Tokens.text-tertiary;
             vertical-alignment: center;
-            horizontal-stretch: 0;
+            overflow: elide;
+            horizontal-stretch: 1;
+            min-width: 0px;
         }
 
+        @children
+    }
+}
+
+// The rounded hover and selection background of a row.
+component RowBackground inherits Rectangle {
+    in property <bool> current;
+    in property <bool> hover;
+    in property <bool> pressed;
+    border-radius: Tokens.radius-md;
+    background: root.current ? Tokens.accent-soft : root.pressed ? Tokens.pressed : root.hover ? Tokens.hover : transparent;
+    animate background { duration: Tokens.quick; }
+}
+
+component RecentRow inherits Rectangle {
+    in property <RecentItem> item;
+    callback clicked;
+    callback reveal;
+    callback remove;
+    callback clear;
+    height: Tokens.control-height;
+
+    RowBackground {
+        x: Tokens.space-xs + 2px;
+        width: parent.width - 2 * (Tokens.space-xs + 2px);
+        hover: touch.has-hover;
+        pressed: touch.pressed;
+    }
+
+    HorizontalLayout {
+        padding-left: Tokens.space-md + 2px;
+        padding-right: Tokens.space-md;
+        spacing: Tokens.space-sm;
         VerticalLayout {
             alignment: center;
             horizontal-stretch: 0;
-            if root.badge != "": Badge {
-                text: root.badge;
+            KindGlyph {
+                kind: root.item.kind;
+                size: 14px;
+                ink: root.item.missing ? Tokens.text-disabled : Tokens.text-tertiary;
             }
         }
 
-        Rectangle {
+        Text {
+            text: root.item.title;
+            font-size: Tokens.font-md;
+            color: root.item.missing ? Tokens.text-disabled : Tokens.text;
+            vertical-alignment: center;
+            overflow: elide;
             horizontal-stretch: 1;
+            min-width: 0px;
+        }
+
+        if root.item.missing: Text {
+            text: Strings.recent-missing;
+            font-size: Tokens.font-xs;
+            color: Tokens.text-tertiary;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Strings.reveal;
+                enabled: !root.item.missing;
+                activated => {
+                    root.reveal();
+                }
+            }
+
+            MenuItem {
+                title: Strings.recent-remove;
+                activated => {
+                    root.remove();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-clear-recent;
+                activated => {
+                    root.clear();
+                }
+            }
+        }
+
+        touch := TouchArea {
+            clicked => {
+                root.clicked();
+            }
         }
     }
 }
 
-// The workspace panel: recent files and the file tree.
+// One line of the folder tree. See `TreeItem` for the kinds.
+component TreeRow inherits Rectangle {
+    in property <TreeItem> item;
+    callback clicked;
+    callback reveal;
+    height: Tokens.control-height;
+    property <bool> note: root.item.kind == -3;
+    property <bool> dim: root.item.kind == -2 || (root.item.kind >= 0 && !root.item.opens);
+
+    RowBackground {
+        x: Tokens.space-xs + 2px;
+        width: parent.width - 2 * (Tokens.space-xs + 2px);
+        current: root.item.current;
+        hover: touch.has-hover && !root.note;
+        pressed: touch.pressed && !root.note;
+    }
+
+    HorizontalLayout {
+        padding-left: Tokens.space-md + 2px + root.item.depth * 14px;
+        padding-right: Tokens.space-md;
+        spacing: Tokens.space-xs + 2px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            if root.item.kind == -1: Icon {
+                data: root.item.expanded ? Icons.chevron-down : Icons.chevron-right;
+                size: 14px;
+                tint: Tokens.text-tertiary;
+            }
+            if root.item.kind == -2: Icon {
+                data: Icons.folder;
+                size: 14px;
+                tint: Tokens.text-disabled;
+            }
+            if root.item.kind >= 0: KindGlyph {
+                kind: root.item.kind;
+                size: 14px;
+                ink: root.item.current ? Tokens.accent : root.dim ? Tokens.text-disabled : Tokens.text-tertiary;
+            }
+            if root.note: Rectangle {
+                width: 14px;
+                height: 14px;
+            }
+        }
+
+        Text {
+            text: root.item.name;
+            font-size: root.note ? Tokens.font-sm : Tokens.font-md;
+            color: root.item.current ? Tokens.accent : root.note ? (root.item.problem ? Tokens.text-secondary : Tokens.text-tertiary) : root.dim ? Tokens.text-tertiary : Tokens.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            min-width: 0px;
+        }
+
+        if root.item.kind >= 0 && !root.item.opens: Text {
+            text: Strings.unsupported;
+            font-size: Tokens.font-xs;
+            color: Tokens.text-tertiary;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    ContextMenuArea {
+        enabled: !root.note;
+        Menu {
+            MenuItem {
+                title: Strings.reveal;
+                activated => {
+                    root.reveal();
+                }
+            }
+        }
+
+        touch := TouchArea {
+            clicked => {
+                if !root.note {
+                    root.clicked();
+                }
+            }
+        }
+    }
+}
+
+// The workspace panel: a filter, the recent files and the folder tree.
 export component Sidebar inherits Rectangle {
+    // At most a few, or every match while filtering.
     in property <[RecentItem]> recent;
     in property <[TreeItem]> tree;
+    // The open folder's name; empty while no folder is open.
+    in property <string> folder-name;
+    in property <bool> filtering;
+    in-out property <string> filter;
+    callback filter-edited(string);
     callback open-recent(int);
+    callback reveal-recent(int);
+    callback remove-recent(int);
+    callback clear-recent();
+    callback tree-clicked(int);
+    callback reveal-tree(int);
+    callback open-folder();
+    callback refresh();
     background: Tokens.panel;
     clip: true;
+
+    public function focus-filter() {
+        filter-input.focus();
+        filter-input.select-all();
+    }
 
     // Laid out at the full width even while the panel is sliding shut.
     VerticalLayout {
         x: 0;
         width: Tokens.sidebar-width;
+        height: parent.height;
         padding-top: Tokens.space-sm;
         spacing: 0px;
-        alignment: start;
 
-        // Search is not built; the field shows where it goes.
+        // Filters the recent files and what has been read of the folder by name.
         Rectangle {
             height: Tokens.control-height + Tokens.space-sm;
             Rectangle {
@@ -59,25 +247,75 @@ export component Sidebar inherits Rectangle {
                 height: Tokens.control-height;
                 border-radius: Tokens.radius-md;
                 border-width: 1px;
-                border-color: Tokens.hairline;
-                HorizontalLayout {
-                    padding-left: Tokens.space-sm;
-                    spacing: Tokens.space-xs + 2px;
-                    VerticalLayout {
-                        alignment: center;
-                        Icon {
-                            data: Icons.search;
-                            size: 14px;
-                            tint: Tokens.text-disabled;
+                border-color: filter-input.has-focus ? Tokens.accent : Tokens.hairline;
+                // Esc empties the field. Keys reach this scope before the
+                // field inside it.
+                FocusScope {
+                    capture-key-pressed(event) => {
+                        if (event.text == Key.Escape && filter-input.has-focus) {
+                            root.filter = "";
+                            root.filter-edited("");
+                            return accept;
                         }
+                        return reject;
                     }
 
-                    Text {
-                        text: Strings.search-files;
-                        font-size: Tokens.font-md;
-                        color: Tokens.text-disabled;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
+                    HorizontalLayout {
+                        padding-left: Tokens.space-sm;
+                        padding-right: Tokens.space-xs;
+                        spacing: Tokens.space-xs + 2px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 0;
+                            Icon {
+                                data: Icons.search;
+                                size: 14px;
+                                tint: Tokens.text-tertiary;
+                            }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                text: Strings.search-files;
+                                font-size: Tokens.font-md;
+                                color: Tokens.text-disabled;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                visible: filter-input.text == "";
+                            }
+
+                            filter-input := TextInput {
+                                width: 100%;
+                                height: 100%;
+                                text <=> root.filter;
+                                single-line: true;
+                                font-size: Tokens.font-md;
+                                color: Tokens.text;
+                                vertical-alignment: center;
+                                selection-background-color: Tokens.accent-soft;
+                                selection-foreground-color: Tokens.text;
+                                accessible-role: text-input;
+                                accessible-label: Strings.search-files;
+                                edited => {
+                                    root.filter-edited(self.text);
+                                }
+                            }
+                        }
+
+                        if root.filter != "": IconButton {
+                            icon: Icons.close;
+                            size: Tokens.control-height - 8px;
+                            icon-size: 12px;
+                            accessible-role: button;
+                            accessible-label: Strings.find-close;
+                            clicked => {
+                                root.filter = "";
+                                root.filter-edited("");
+                            }
+                        }
                     }
                 }
             }
@@ -85,48 +323,33 @@ export component Sidebar inherits Rectangle {
 
         SectionHeader {
             title: Strings.recent;
-            badge: Strings.sample;
         }
 
-        for item[index] in root.recent: Rectangle {
-            height: Tokens.control-height;
-            Rectangle {
-                x: Tokens.space-xs + 2px;
-                width: parent.width - 2 * (Tokens.space-xs + 2px);
-                border-radius: Tokens.radius-md;
-                background: row-touch.pressed ? Tokens.pressed : row-touch.has-hover ? Tokens.hover : transparent;
-                animate background { duration: Tokens.quick; }
+        if root.recent.length == 0: HorizontalLayout {
+            padding-left: Tokens.space-md + 2px;
+            padding-right: Tokens.space-md;
+            padding-bottom: Tokens.space-xs;
+            Text {
+                text: root.filtering ? Strings.no-matches : Strings.recent-empty;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                wrap: word-wrap;
             }
+        }
 
-            HorizontalLayout {
-                padding-left: Tokens.space-md + 2px;
-                padding-right: Tokens.space-md;
-                spacing: Tokens.space-sm;
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 0;
-                    KindGlyph {
-                        kind: item.kind;
-                        size: 14px;
-                        ink: Tokens.text-tertiary;
-                    }
-                }
-
-                Text {
-                    text: item.title;
-                    font-size: Tokens.font-md;
-                    color: Tokens.text;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                    min-width: 0px;
-                }
+        for item[index] in root.recent: RecentRow {
+            item: item;
+            clicked => {
+                root.open-recent(index);
             }
-
-            row-touch := TouchArea {
-                clicked => {
-                    root.open-recent(index);
-                }
+            reveal => {
+                root.reveal-recent(index);
+            }
+            remove => {
+                root.remove-recent(index);
+            }
+            clear => {
+                root.clear-recent();
             }
         }
 
@@ -135,42 +358,78 @@ export component Sidebar inherits Rectangle {
         }
 
         SectionHeader {
-            title: Strings.files;
-            badge: Strings.sample;
-        }
-
-        // Not a real tree: the rows are fixed and do not react.
-        for item in root.tree: Rectangle {
-            height: Tokens.control-height;
-            HorizontalLayout {
-                padding-left: Tokens.space-md + 2px + item.depth * 14px;
-                padding-right: Tokens.space-md;
-                spacing: Tokens.space-xs + 2px;
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 0;
-                    if item.kind < 0: Icon {
-                        data: item.expanded ? Icons.chevron-down : Icons.chevron-right;
-                        size: 14px;
-                        tint: Tokens.text-tertiary;
-                    }
-                    if item.kind >= 0: KindGlyph {
-                        kind: item.kind;
-                        size: 14px;
-                        ink: Tokens.text-tertiary;
-                    }
-                }
-
-                Text {
-                    text: item.name;
-                    font-size: Tokens.font-md;
-                    color: Tokens.text-secondary;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                    min-width: 0px;
+            title: root.folder-name != "" ? root.folder-name : Strings.files;
+            if root.folder-name != "": IconButton {
+                icon: Icons.refresh;
+                size: 24px;
+                icon-size: 14px;
+                accessible-role: button;
+                accessible-label: Strings.refresh;
+                clicked => {
+                    root.refresh();
                 }
             }
+            IconButton {
+                icon: Icons.folder-open;
+                size: 24px;
+                icon-size: 14px;
+                accessible-role: button;
+                accessible-label: Strings.menu-open-folder;
+                clicked => {
+                    root.open-folder();
+                }
+            }
+        }
+
+        if root.folder-name == "": VerticalLayout {
+            padding-left: Tokens.space-md + 2px;
+            padding-right: Tokens.space-md;
+            spacing: Tokens.space-sm;
+            Text {
+                text: Strings.no-folder;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                alignment: start;
+                TextButton {
+                    text: Strings.menu-open-folder;
+                    icon: Icons.folder-open;
+                    clicked => {
+                        root.open-folder();
+                    }
+                }
+            }
+        }
+
+        if root.folder-name != "" && root.filtering && root.tree.length == 0: HorizontalLayout {
+            padding-left: Tokens.space-md + 2px;
+            height: Tokens.control-height;
+            Text {
+                text: Strings.no-matches;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.folder-name != "": ListView {
+            vertical-stretch: 1;
+            for item[index] in root.tree: TreeRow {
+                item: item;
+                clicked => {
+                    root.tree-clicked(index);
+                }
+                reveal => {
+                    root.reveal-tree(index);
+                }
+            }
+        }
+
+        if root.folder-name == "": Rectangle {
+            vertical-stretch: 1;
         }
     }
 

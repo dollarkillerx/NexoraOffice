@@ -1,0 +1,15 @@
+[package]
+name = "aster-workspace"
+version.workspace = true
+license.workspace = true
+description = "The files around the documents: the recent-files list and the folder shown beside them"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aster-storage = { workspace = true }
+icu_normalizer = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

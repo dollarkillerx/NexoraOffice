@@ -33,6 +33,16 @@ pub async fn pick_file_to_open(title: &str, types: &[FileType]) -> Option<PathBu
     Some(chosen.path().to_path_buf())
 }
 
+/// Ask for a folder. `None` if the user cancelled.
+pub async fn pick_folder(title: &str, start: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new().set_title(title);
+    if let Some(dir) = start.filter(|dir| dir.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    let chosen = dialog.pick_folder().await?;
+    Some(chosen.path().to_path_buf())
+}
+
 /// Ask where to save. `suggested` pre-fills the folder and the name: a path the
 /// document already has, or just a file name for a new one. `None` if the user
 /// cancelled. The system asks about replacing an existing file itself.

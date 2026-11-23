@@ -62,6 +62,9 @@ component KindTile inherits Rectangle {
 component RecentRow inherits Rectangle {
     in property <RecentItem> item;
     callback clicked;
+    callback reveal;
+    callback remove;
+    callback clear;
     height: 40px;
     border-radius: Tokens.radius-md;
     background: touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
@@ -75,18 +78,19 @@ component RecentRow inherits Rectangle {
             horizontal-stretch: 0;
             KindGlyph {
                 kind: root.item.kind;
-                ink: Tokens.text-secondary;
+                ink: root.item.missing ? Tokens.text-disabled : Tokens.text-secondary;
             }
         }
 
         Text {
             text: root.item.title;
             font-size: Tokens.font-md;
-            color: Tokens.text;
+            color: root.item.missing ? Tokens.text-disabled : Tokens.text;
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 3;
-            min-width: 80px;
+            // The name matters more than the folder, which can be long.
+            min-width: min(self.preferred-width, 240px);
         }
 
         Text {
@@ -95,12 +99,12 @@ component RecentRow inherits Rectangle {
             color: Tokens.text-secondary;
             vertical-alignment: center;
             overflow: elide;
-            horizontal-stretch: 2;
+            horizontal-stretch: 1;
             min-width: 0px;
         }
 
         Text {
-            text: root.item.opened;
+            text: root.item.missing ? Strings.recent-missing : root.item.opened;
             font-size: Tokens.font-sm;
             color: Tokens.text-tertiary;
             vertical-alignment: center;
@@ -110,9 +114,37 @@ component RecentRow inherits Rectangle {
         }
     }
 
-    touch := TouchArea {
-        clicked => {
-            root.clicked();
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Strings.reveal;
+                enabled: !root.item.missing;
+                activated => {
+                    root.reveal();
+                }
+            }
+
+            MenuItem {
+                title: Strings.recent-remove;
+                activated => {
+                    root.remove();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-clear-recent;
+                activated => {
+                    root.clear();
+                }
+            }
+        }
+
+        touch := TouchArea {
+            clicked => {
+                root.clicked();
+            }
         }
     }
 }
@@ -123,7 +155,11 @@ export component StartPage inherits Rectangle {
     in property <[RecentItem]> recent;
     callback new-document(int);
     callback open-recent(int);
+    callback reveal-recent(int);
+    callback remove-recent(int);
+    callback clear-recent();
     callback open-file();
+    callback open-folder();
     background: Tokens.surface;
 
     Flickable {
@@ -188,14 +224,24 @@ export component StartPage inherits Rectangle {
                 height: Tokens.space-lg;
             }
 
-            // Opens a real file from disk, in a Markdown tab.
+            // Opens a real file from disk, in a Markdown tab, or a folder in
+            // the sidebar.
             HorizontalLayout {
                 alignment: start;
+                spacing: Tokens.space-sm;
                 TextButton {
                     text: Strings.open-file;
                     icon: Icons.folder-open;
                     clicked => {
                         root.open-file();
+                    }
+                }
+
+                TextButton {
+                    text: Strings.menu-open-folder;
+                    icon: Icons.folder;
+                    clicked => {
+                        root.open-folder();
                     }
                 }
             }
@@ -214,10 +260,6 @@ export component StartPage inherits Rectangle {
                     font-weight: 600;
                     color: Tokens.text-secondary;
                 }
-
-                Badge {
-                    text: Strings.sample-data;
-                }
             }
 
             Hairline { }
@@ -226,10 +268,27 @@ export component StartPage inherits Rectangle {
                 height: Tokens.space-xs;
             }
 
+            if root.recent.length == 0: Text {
+                height: 40px;
+                text: Strings.recent-empty;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                vertical-alignment: center;
+            }
+
             for item[index] in root.recent: RecentRow {
                 item: item;
                 clicked => {
                     root.open-recent(index);
+                }
+                reveal => {
+                    root.reveal-recent(index);
+                }
+                remove => {
+                    root.remove-recent(index);
+                }
+                clear => {
+                    root.clear-recent();
                 }
             }
         }

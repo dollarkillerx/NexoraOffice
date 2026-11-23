@@ -45,6 +45,16 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
+/// The file the recent-files list is kept in.
+pub fn recent_files() -> Option<PathBuf> {
+    Some(data_dir()?.join("recent-files"))
+}
+
+/// The file the sidebar's folder and its expanded folders are kept in.
+pub fn workspace_state() -> Option<PathBuf> {
+    Some(data_dir()?.join("workspace"))
+}
+
 /// The folder recovery records are kept in.
 pub fn recovery_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("recovery"))
@@ -67,6 +77,8 @@ mod tests {
             assert!(name == APP_ID || name == APP_DIR, "{dir:?}");
         }
         assert_eq!(recovery_dir().unwrap(), dir.join("recovery"));
+        assert_eq!(recent_files().unwrap(), dir.join("recent-files"));
+        assert_eq!(workspace_state().unwrap(), dir.join("workspace"));
     }
 
     #[cfg(target_os = "macos")]

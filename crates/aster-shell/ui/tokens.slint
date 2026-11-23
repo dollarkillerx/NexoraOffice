@@ -70,8 +70,6 @@ export global Strings {
     in property <string> new-document;
     in property <string> recent;
     in property <string> files;
-    in property <string> sample;
-    in property <string> sample-data;
     in property <string> placeholder;
     in property <string> placeholder-view;
     in property <string> search-files;
@@ -110,6 +108,17 @@ export global Strings {
     in property <string> recovery-discard;
     in property <string> recovery-restore-all;
     in property <string> recovery-later;
+    in property <string> menu-open-folder;
+    in property <string> menu-clear-recent;
+    // "Show in Finder" on macOS, "Show in File Manager" elsewhere.
+    in property <string> reveal;
+    in property <string> recent-remove;
+    in property <string> recent-empty;
+    in property <string> recent-missing;
+    in property <string> no-folder;
+    in property <string> refresh;
+    in property <string> unsupported;
+    in property <string> no-matches;
 }
 
 // Path data for the icons the chrome itself uses. Toolbar icons arrive with the
@@ -131,6 +140,7 @@ export global Icons {
     in property <string> check;
     in property <string> folder-open;
     in property <string> chevron-up;
+    in property <string> refresh;
 }
 
 export struct TabItem {
@@ -170,14 +180,24 @@ export struct RecentItem {
     kind: int,
     location: string,
     opened: string,
+    // The file was not there when last looked for.
+    missing: bool,
 }
 
 export struct TreeItem {
+    // The entry's name, or for a note what it says.
     name: string,
     depth: int,
-    // -1 for a folder.
+    // A document kind as in TabItem; -1 folder, -2 link to a folder above
+    // it, -3 a note about the folder above (reading, empty, cannot be read).
     kind: int,
     expanded: bool,
+    // Files only: this version can open it.
+    opens: bool,
+    // The document in front.
+    current: bool,
+    // Notes only: something went wrong.
+    problem: bool,
 }
 
 // One document the recovery question offers.

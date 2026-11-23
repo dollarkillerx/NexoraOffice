@@ -7,6 +7,7 @@ export component Dialog inherits Rectangle {
     // 1 unsaved changes: save, don't save, cancel.
     // 2 message: OK.
     // 3 quitting with unsaved changes: quit anyway, cancel.
+    // 4 a recent file is gone: take it off the list, cancel.
     in property <int> kind;
     in property <string> title;
     in property <string> body;
@@ -90,6 +91,12 @@ export component Dialog inherits Rectangle {
                 }
                 if root.kind == 3: TextButton {
                     text: Strings.button-quit-anyway;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+                if root.kind == 4: TextButton {
+                    text: Strings.recent-remove;
                     clicked => {
                         root.discard();
                     }

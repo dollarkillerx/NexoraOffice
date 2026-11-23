@@ -154,9 +154,6 @@ strings! {
     new_document,
     recent,
     files,
-    /// Marks lists that hold fixed sample entries.
-    sample,
-    sample_data,
     /// Marks an editor that only opens a placeholder.
     placeholder,
     placeholder_view,
@@ -213,8 +210,6 @@ strings! {
 
     /// What a new Writer tab starts with.
     writer_sample,
-    /// What a document opened from the sample list holds. `{title}` is its name.
-    sample_document,
 
     /// Menu bar. On macOS these are the system menu; elsewhere a bar in the window.
     menu_file,
@@ -318,6 +313,53 @@ strings! {
     /// `{count}` is how many places were replaced.
     notice_replaced,
     notice_replacing,
+    /// Files and folders: the File menu, the sidebar and the start page.
+    menu_open_folder,
+    menu_clear_recent,
+    /// Title of the folder dialog.
+    open_folder_dialog,
+    /// Shows an entry in Finder on macOS, in the file manager elsewhere.
+    reveal_finder,
+    reveal_other,
+    recent_remove,
+    recent_empty,
+    /// After a recent file that is no longer there.
+    recent_missing,
+    /// `{name}` is the file, `{path}` the folder it was in.
+    recent_missing_title,
+    recent_missing_body,
+    /// In the sidebar while no folder is open.
+    no_folder,
+    refresh,
+    /// Lines in the folder tree that are not files.
+    tree_reading,
+    tree_empty,
+    /// `{count}` is a number.
+    tree_omitted,
+    tree_omitted_at_least,
+    tree_missing,
+    tree_denied,
+    tree_not_folder,
+    /// `{reason}` is the system's message.
+    tree_failed,
+    /// After a file the tree shows but cannot open yet.
+    unsupported,
+    /// `{name}` is the file.
+    unsupported_title,
+    unsupported_body,
+    /// `{name}` is a link to a folder above it.
+    loop_title,
+    loop_body,
+    /// `{name}` is the file or folder.
+    reveal_failed,
+    /// The sidebar's filter matches nothing.
+    no_matches,
+    /// When a recent file was last opened. `{time}` is hours and minutes;
+    /// `{year}`, `{month}` and `{day}` are numbers.
+    opened_today,
+    opened_yesterday,
+    opened_this_year,
+    opened_other_year,
 }
 
 impl Strings {
@@ -381,8 +423,6 @@ pub const ZH_HANS: Strings = Strings {
     new_document: "新建",
     recent: "最近",
     files: "文件",
-    sample: "示例",
-    sample_data: "示例数据",
     placeholder: "占位",
     placeholder_view: "占位视图",
     search_files: "搜索文件",
@@ -440,7 +480,6 @@ Aster Office 外壳原型
 日本語の入力も試してください。English works too.
 
 ",
-    sample_document: "{title}\n\n这是示例文档，不是从磁盘读取的文件。最近文件列表目前是固定的示例数据，打开和保存还没有实现。\n\n",
 
     menu_file: "文件",
     menu_edit: "编辑",
@@ -516,6 +555,37 @@ Aster Office 外壳原型
     find_too_many: "{count} 个以上",
     notice_replaced: "已替换 {count} 处",
     notice_replacing: "正在全部替换…",
+    menu_open_folder: "打开文件夹…",
+    menu_clear_recent: "清除最近列表",
+    open_folder_dialog: "打开文件夹",
+    reveal_finder: "在访达中显示",
+    reveal_other: "在文件管理器中显示",
+    recent_remove: "从最近列表中移除",
+    recent_empty: "还没有打开过文件。打开或保存的文件会列在这里。",
+    recent_missing: "不可用",
+    recent_missing_title: "找不到“{name}”",
+    recent_missing_body: "它原来在 {path}，可能已被移动、改名或删除。",
+    no_folder: "打开一个文件夹，它里面的文档会列在这里。",
+    refresh: "刷新",
+    tree_reading: "正在读取…",
+    tree_empty: "没有可显示的文件",
+    tree_omitted: "还有 {count} 项没有列出",
+    tree_omitted_at_least: "还有至少 {count} 项没有列出",
+    tree_missing: "文件夹不在了",
+    tree_denied: "没有读取权限",
+    tree_not_folder: "这不是文件夹",
+    tree_failed: "无法读取：{reason}",
+    unsupported: "暂不支持",
+    unsupported_title: "暂不支持打开“{name}”",
+    unsupported_body: "这一版只能打开 Markdown 和纯文本文件（.md、.markdown、.txt）。Word、Excel、PowerPoint 和 PDF 文件会在以后的版本中支持。",
+    loop_title: "“{name}”不能展开",
+    loop_body: "它是一个链接，指向它所在的文件夹或更上层的文件夹，展开它会无穷无尽地重复下去。",
+    reveal_failed: "无法在文件管理器中显示“{name}”",
+    no_matches: "没有匹配的文件",
+    opened_today: "今天 {time}",
+    opened_yesterday: "昨天 {time}",
+    opened_this_year: "{month} 月 {day} 日",
+    opened_other_year: "{year} 年 {month} 月 {day} 日",
 };
 
 pub const JA: Strings = Strings {
@@ -523,8 +593,6 @@ pub const JA: Strings = Strings {
     new_document: "新規作成",
     recent: "最近使ったファイル",
     files: "ファイル",
-    sample: "サンプル",
-    sample_data: "サンプルデータ",
     placeholder: "未実装",
     placeholder_view: "プレースホルダー",
     search_files: "ファイルを検索",
@@ -582,7 +650,6 @@ Aster Office シェルの試作
 中文输入也请试一下。English works too.
 
 ",
-    sample_document: "{title}\n\nこれはサンプル文書で、ディスクから読み込んだファイルではありません。最近使ったファイルの一覧は固定のサンプルデータで、開く機能と保存機能はまだ実装されていません。\n\n",
 
     menu_file: "ファイル",
     menu_edit: "編集",
@@ -658,6 +725,37 @@ Aster Office シェルの試作
     find_too_many: "{count} 件以上",
     notice_replaced: "{count} 件置換しました",
     notice_replacing: "すべて置換しています…",
+    menu_open_folder: "フォルダを開く…",
+    menu_clear_recent: "最近使った項目を消去",
+    open_folder_dialog: "フォルダを開く",
+    reveal_finder: "Finder に表示",
+    reveal_other: "ファイルマネージャで表示",
+    recent_remove: "最近使った項目から削除",
+    recent_empty: "まだファイルを開いていません。開いたファイルや保存したファイルがここに並びます。",
+    recent_missing: "見つかりません",
+    recent_missing_title: "「{name}」が見つかりません",
+    recent_missing_body: "以前は {path} にありました。移動、名前の変更、または削除された可能性があります。",
+    no_folder: "フォルダを開くと、その中の書類がここに並びます。",
+    refresh: "再読み込み",
+    tree_reading: "読み込み中…",
+    tree_empty: "表示できるファイルはありません",
+    tree_omitted: "ほかに {count} 項目あります（表示していません）",
+    tree_omitted_at_least: "ほかに {count} 項目以上あります（表示していません）",
+    tree_missing: "フォルダが見つかりません",
+    tree_denied: "読み取る権限がありません",
+    tree_not_folder: "フォルダではありません",
+    tree_failed: "読み込めません：{reason}",
+    unsupported: "未対応",
+    unsupported_title: "「{name}」はまだ開けません",
+    unsupported_body: "このバージョンで開けるのは Markdown とテキストファイル（.md、.markdown、.txt）だけです。Word、Excel、PowerPoint、PDF のファイルは今後のバージョンで対応します。",
+    loop_title: "「{name}」は展開できません",
+    loop_body: "これは自分のあるフォルダか、その上位のフォルダを指すリンクです。展開すると同じフォルダが際限なく繰り返されます。",
+    reveal_failed: "「{name}」をファイルマネージャで表示できません",
+    no_matches: "一致するファイルはありません",
+    opened_today: "今日 {time}",
+    opened_yesterday: "昨日 {time}",
+    opened_this_year: "{month}月{day}日",
+    opened_other_year: "{year}年{month}月{day}日",
 };
 
 pub const EN: Strings = Strings {
@@ -665,8 +763,6 @@ pub const EN: Strings = Strings {
     new_document: "New",
     recent: "Recent",
     files: "Files",
-    sample: "Sample",
-    sample_data: "Sample data",
     placeholder: "Not built",
     placeholder_view: "Placeholder",
     search_files: "Search files",
@@ -724,7 +820,6 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
 中文输入也请试一下。日本語の入力も試してください。
 
 ",
-    sample_document: "{title}\n\nThis is a sample document, not a file read from disk. The list of recent files is fixed sample data for now; opening and saving are not built yet.\n\n",
 
     menu_file: "File",
     menu_edit: "Edit",
@@ -800,6 +895,37 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     find_too_many: "More than {count}",
     notice_replaced: "Replaced {count}",
     notice_replacing: "Replacing all…",
+    menu_open_folder: "Open Folder…",
+    menu_clear_recent: "Clear Recent Files",
+    open_folder_dialog: "Open Folder",
+    reveal_finder: "Show in Finder",
+    reveal_other: "Show in File Manager",
+    recent_remove: "Remove from Recent Files",
+    recent_empty: "No files opened yet. Files you open or save appear here.",
+    recent_missing: "Unavailable",
+    recent_missing_title: "“{name}” can’t be found",
+    recent_missing_body: "It was in {path}. It may have been moved, renamed or deleted.",
+    no_folder: "Open a folder to list the documents in it here.",
+    refresh: "Refresh",
+    tree_reading: "Reading…",
+    tree_empty: "No files to show",
+    tree_omitted: "{count} more not listed",
+    tree_omitted_at_least: "At least {count} more not listed",
+    tree_missing: "The folder is gone",
+    tree_denied: "No permission to read",
+    tree_not_folder: "Not a folder",
+    tree_failed: "Can’t read: {reason}",
+    unsupported: "Not yet supported",
+    unsupported_title: "“{name}” can’t be opened yet",
+    unsupported_body: "This version opens Markdown and plain text files only (.md, .markdown, .txt). Word, Excel, PowerPoint and PDF files will be supported in a later version.",
+    loop_title: "“{name}” doesn’t expand",
+    loop_body: "It is a link to the folder it is in, or to a folder above it. Expanding it would repeat the same folders without end.",
+    reveal_failed: "Can’t show “{name}” in the file manager",
+    no_matches: "No matching files",
+    opened_today: "Today {time}",
+    opened_yesterday: "Yesterday {time}",
+    opened_this_year: "{month}/{day}",
+    opened_other_year: "{month}/{day}/{year}",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -807,8 +933,6 @@ pub const ZH_HANT: Strings = Strings {
     new_document: "新增",
     recent: "最近",
     files: "檔案",
-    sample: "範例",
-    sample_data: "範例資料",
     placeholder: "未實作",
     placeholder_view: "預留畫面",
     search_files: "搜尋檔案",
@@ -848,7 +972,6 @@ pub const ZH_HANT: Strings = Strings {
     ai_point_keys: "服務供應商和金鑰由你自行設定，金鑰只儲存在本機。",
     ai_input: "向 AI 提問（尚未實作）",
     writer_sample: "Aster Office 外殼原型\n\n這一頁不是介面框架的文字元件。文字由 Parley 排版、vello_cpu 繪製，再當成一張圖貼進視窗，輸入法事件直接取自視窗系統。\n\n現在能做的：輸入中文、日文和英文，移動游標，選取，捲動，縮放。\n還不能做的：格式、復原、開啟和儲存。工具列上變灰的按鈕都還沒有接上功能。\n\n日本語の入力も試してください。English works too.\n\n",
-    sample_document: "{title}\n\n這是範例文件，不是從磁碟讀取的檔案。最近檔案清單目前是固定的範例資料，開啟和儲存尚未實作。\n\n",
 
     menu_file: "檔案",
     menu_edit: "編輯",
@@ -924,6 +1047,37 @@ pub const ZH_HANT: Strings = Strings {
     find_too_many: "{count} 個以上",
     notice_replaced: "已取代 {count} 處",
     notice_replacing: "正在全部取代…",
+    menu_open_folder: "開啟資料夾…",
+    menu_clear_recent: "清除最近清單",
+    open_folder_dialog: "開啟資料夾",
+    reveal_finder: "在 Finder 中顯示",
+    reveal_other: "在檔案管理員中顯示",
+    recent_remove: "從最近清單中移除",
+    recent_empty: "還沒有開啟過檔案。開啟或儲存的檔案會列在這裡。",
+    recent_missing: "無法使用",
+    recent_missing_title: "找不到「{name}」",
+    recent_missing_body: "它原本在 {path}，可能已被移動、重新命名或刪除。",
+    no_folder: "開啟一個資料夾，其中的文件會列在這裡。",
+    refresh: "重新整理",
+    tree_reading: "正在讀取…",
+    tree_empty: "沒有可顯示的檔案",
+    tree_omitted: "還有 {count} 項沒有列出",
+    tree_omitted_at_least: "還有至少 {count} 項沒有列出",
+    tree_missing: "資料夾已不存在",
+    tree_denied: "沒有讀取權限",
+    tree_not_folder: "這不是資料夾",
+    tree_failed: "無法讀取：{reason}",
+    unsupported: "尚不支援",
+    unsupported_title: "尚不支援開啟「{name}」",
+    unsupported_body: "這一版只能開啟 Markdown 和純文字檔（.md、.markdown、.txt）。Word、Excel、PowerPoint 和 PDF 檔案會在之後的版本中支援。",
+    loop_title: "「{name}」無法展開",
+    loop_body: "它是一個連結，指向它所在的資料夾或更上層的資料夾，展開它會無止盡地重複下去。",
+    reveal_failed: "無法在檔案管理員中顯示「{name}」",
+    no_matches: "沒有相符的檔案",
+    opened_today: "今天 {time}",
+    opened_yesterday: "昨天 {time}",
+    opened_this_year: "{month} 月 {day} 日",
+    opened_other_year: "{year} 年 {month} 月 {day} 日",
 };
 
 pub const FR: Strings = Strings {
@@ -931,8 +1085,6 @@ pub const FR: Strings = Strings {
     new_document: "Nouveau",
     recent: "Récents",
     files: "Fichiers",
-    sample: "Exemple",
-    sample_data: "Données d’exemple",
     placeholder: "À venir",
     placeholder_view: "Vue provisoire",
     search_files: "Rechercher des fichiers",
@@ -972,7 +1124,6 @@ pub const FR: Strings = Strings {
     ai_point_keys: "Vous choisissez le fournisseur et fournissez la clé ; les clés restent sur cet ordinateur.",
     ai_input: "Interroger l’IA (pas encore disponible)",
     writer_sample: "Prototype de l’interface d’Aster Office\n\nCette page n’est pas un champ de texte de la bibliothèque d’interface. Le texte est composé par Parley, dessiné par vello_cpu et placé dans la fenêtre sous forme d’image ; les événements de la méthode de saisie viennent directement du système de fenêtrage.\n\nCe qui fonctionne : saisir du français, du chinois et du japonais, déplacer le curseur, sélectionner, faire défiler, zoomer.\nCe qui ne fonctionne pas : la mise en forme, l’annulation, l’ouverture et l’enregistrement. Les boutons grisés de la barre d’outils ne sont reliés à rien pour l’instant.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
-    sample_document: "{title}\n\nCeci est un document d’exemple, pas un fichier lu sur le disque. La liste des fichiers récents contient pour l’instant des données d’exemple fixes ; l’ouverture et l’enregistrement ne sont pas encore disponibles.\n\n",
 
     menu_file: "Fichier",
     menu_edit: "Édition",
@@ -1048,6 +1199,37 @@ pub const FR: Strings = Strings {
     find_too_many: "Plus de {count}",
     notice_replaced: "{count} remplacement(s)",
     notice_replacing: "Remplacement en cours…",
+    menu_open_folder: "Ouvrir un dossier…",
+    menu_clear_recent: "Effacer les fichiers récents",
+    open_folder_dialog: "Ouvrir un dossier",
+    reveal_finder: "Afficher dans le Finder",
+    reveal_other: "Afficher dans le gestionnaire de fichiers",
+    recent_remove: "Retirer des fichiers récents",
+    recent_empty: "Aucun fichier ouvert pour l’instant. Les fichiers ouverts ou enregistrés apparaissent ici.",
+    recent_missing: "Indisponible",
+    recent_missing_title: "« {name} » est introuvable",
+    recent_missing_body: "Il se trouvait dans {path}. Il a peut-être été déplacé, renommé ou supprimé.",
+    no_folder: "Ouvrez un dossier pour afficher ici les documents qu’il contient.",
+    refresh: "Actualiser",
+    tree_reading: "Lecture…",
+    tree_empty: "Aucun fichier à afficher",
+    tree_omitted: "{count} autres non affichés",
+    tree_omitted_at_least: "Au moins {count} autres non affichés",
+    tree_missing: "Le dossier n’existe plus",
+    tree_denied: "Lecture non autorisée",
+    tree_not_folder: "Ce n’est pas un dossier",
+    tree_failed: "Lecture impossible : {reason}",
+    unsupported: "Pas encore pris en charge",
+    unsupported_title: "Impossible d’ouvrir « {name} » pour l’instant",
+    unsupported_body: "Cette version n’ouvre que les fichiers Markdown et texte (.md, .markdown, .txt). Les fichiers Word, Excel, PowerPoint et PDF seront pris en charge dans une version ultérieure.",
+    loop_title: "« {name} » ne se déplie pas",
+    loop_body: "C’est un lien vers le dossier qui le contient ou vers un dossier parent. Le déplier répéterait les mêmes dossiers sans fin.",
+    reveal_failed: "Impossible d’afficher « {name} » dans le gestionnaire de fichiers",
+    no_matches: "Aucun fichier correspondant",
+    opened_today: "Aujourd’hui {time}",
+    opened_yesterday: "Hier {time}",
+    opened_this_year: "{day}/{month}",
+    opened_other_year: "{day}/{month}/{year}",
 };
 
 pub const DE: Strings = Strings {
@@ -1055,8 +1237,6 @@ pub const DE: Strings = Strings {
     new_document: "Neu",
     recent: "Zuletzt verwendet",
     files: "Dateien",
-    sample: "Beispiel",
-    sample_data: "Beispieldaten",
     placeholder: "Geplant",
     placeholder_view: "Platzhalter",
     search_files: "Dateien suchen",
@@ -1096,7 +1276,6 @@ pub const DE: Strings = Strings {
     ai_point_keys: "Anbieter und Schlüssel legen Sie selbst fest; Schlüssel bleiben auf diesem Rechner.",
     ai_input: "KI fragen (noch nicht gebaut)",
     writer_sample: "Prototyp der Aster-Office-Oberfläche\n\nDiese Seite ist kein Textfeld des UI-Toolkits. Der Text wird von Parley gesetzt, von vello_cpu gezeichnet und als ein Bild ins Fenster gelegt; die Ereignisse der Eingabemethode kommen direkt vom Fenstersystem.\n\nWas geht: Deutsch, Chinesisch und Japanisch tippen, die Einfügemarke bewegen, markieren, scrollen, zoomen.\nWas nicht geht: Formatierung, Rückgängig, Öffnen und Speichern. Die ausgegrauten Schaltflächen der Symbolleiste sind noch mit nichts verbunden.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
-    sample_document: "{title}\n\nDies ist ein Beispieldokument, keine von der Festplatte gelesene Datei. Die Liste der zuletzt verwendeten Dateien enthält vorerst feste Beispieldaten; Öffnen und Speichern sind noch nicht gebaut.\n\n",
 
     menu_file: "Datei",
     menu_edit: "Bearbeiten",
@@ -1172,6 +1351,37 @@ pub const DE: Strings = Strings {
     find_too_many: "Mehr als {count}",
     notice_replaced: "{count}-mal ersetzt",
     notice_replacing: "Alle werden ersetzt …",
+    menu_open_folder: "Ordner öffnen …",
+    menu_clear_recent: "Liste „Zuletzt verwendet“ leeren",
+    open_folder_dialog: "Ordner öffnen",
+    reveal_finder: "Im Finder zeigen",
+    reveal_other: "Im Dateimanager zeigen",
+    recent_remove: "Aus „Zuletzt verwendet“ entfernen",
+    recent_empty: "Noch keine Dateien geöffnet. Geöffnete oder gesicherte Dateien erscheinen hier.",
+    recent_missing: "Nicht verfügbar",
+    recent_missing_title: "„{name}“ wurde nicht gefunden",
+    recent_missing_body: "Die Datei lag in {path}. Sie wurde vielleicht verschoben, umbenannt oder gelöscht.",
+    no_folder: "Öffnen Sie einen Ordner, um die Dokumente darin hier aufzulisten.",
+    refresh: "Aktualisieren",
+    tree_reading: "Wird gelesen …",
+    tree_empty: "Keine Dateien zum Anzeigen",
+    tree_omitted: "{count} weitere nicht aufgelistet",
+    tree_omitted_at_least: "Mindestens {count} weitere nicht aufgelistet",
+    tree_missing: "Der Ordner existiert nicht mehr",
+    tree_denied: "Keine Leseberechtigung",
+    tree_not_folder: "Kein Ordner",
+    tree_failed: "Kann nicht gelesen werden: {reason}",
+    unsupported: "Noch nicht unterstützt",
+    unsupported_title: "„{name}“ kann noch nicht geöffnet werden",
+    unsupported_body: "Diese Version öffnet nur Markdown- und Textdateien (.md, .markdown, .txt). Word-, Excel-, PowerPoint- und PDF-Dateien werden in einer späteren Version unterstützt.",
+    loop_title: "„{name}“ wird nicht aufgeklappt",
+    loop_body: "Es ist ein Link auf den Ordner, in dem er liegt, oder auf einen übergeordneten Ordner. Aufklappen würde dieselben Ordner endlos wiederholen.",
+    reveal_failed: "„{name}“ kann nicht im Dateimanager gezeigt werden",
+    no_matches: "Keine passenden Dateien",
+    opened_today: "Heute {time}",
+    opened_yesterday: "Gestern {time}",
+    opened_this_year: "{day}.{month}.",
+    opened_other_year: "{day}.{month}.{year}",
 };
 
 pub const ES: Strings = Strings {
@@ -1179,8 +1389,6 @@ pub const ES: Strings = Strings {
     new_document: "Nuevo",
     recent: "Recientes",
     files: "Archivos",
-    sample: "Ejemplo",
-    sample_data: "Datos de ejemplo",
     placeholder: "Pendiente",
     placeholder_view: "Vista provisional",
     search_files: "Buscar archivos",
@@ -1220,7 +1428,6 @@ pub const ES: Strings = Strings {
     ai_point_keys: "Tú eliges el proveedor y aportas la clave; las claves se quedan en este equipo.",
     ai_input: "Preguntar a la IA (aún no disponible)",
     writer_sample: "Prototipo de la interfaz de Aster Office\n\nEsta página no es un campo de texto de la biblioteca de interfaz. El texto lo compone Parley, lo dibuja vello_cpu y se coloca en la ventana como una sola imagen; los eventos del método de entrada llegan directamente del sistema de ventanas.\n\nLo que funciona: escribir en español, chino y japonés, mover el cursor, seleccionar, desplazarse, ampliar y reducir.\nLo que no: el formato, deshacer, abrir y guardar. Los botones atenuados de la barra de herramientas aún no están conectados a nada.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
-    sample_document: "{title}\n\nEste es un documento de ejemplo, no un archivo leído del disco. La lista de archivos recientes contiene por ahora datos de ejemplo fijos; abrir y guardar aún no están hechos.\n\n",
 
     menu_file: "Archivo",
     menu_edit: "Edición",
@@ -1296,6 +1503,37 @@ pub const ES: Strings = Strings {
     find_too_many: "Más de {count}",
     notice_replaced: "{count} reemplazos",
     notice_replacing: "Reemplazando todo…",
+    menu_open_folder: "Abrir carpeta…",
+    menu_clear_recent: "Borrar la lista de recientes",
+    open_folder_dialog: "Abrir carpeta",
+    reveal_finder: "Mostrar en el Finder",
+    reveal_other: "Mostrar en el gestor de archivos",
+    recent_remove: "Quitar de recientes",
+    recent_empty: "Todavía no has abierto ningún archivo. Los archivos que abras o guardes aparecerán aquí.",
+    recent_missing: "No disponible",
+    recent_missing_title: "No se encuentra «{name}»",
+    recent_missing_body: "Estaba en {path}. Puede que se haya movido, renombrado o eliminado.",
+    no_folder: "Abre una carpeta para ver aquí los documentos que contiene.",
+    refresh: "Actualizar",
+    tree_reading: "Leyendo…",
+    tree_empty: "No hay archivos que mostrar",
+    tree_omitted: "{count} más sin mostrar",
+    tree_omitted_at_least: "Al menos {count} más sin mostrar",
+    tree_missing: "La carpeta ya no existe",
+    tree_denied: "Sin permiso de lectura",
+    tree_not_folder: "No es una carpeta",
+    tree_failed: "No se puede leer: {reason}",
+    unsupported: "Aún no compatible",
+    unsupported_title: "Todavía no se puede abrir «{name}»",
+    unsupported_body: "Esta versión solo abre archivos Markdown y de texto (.md, .markdown, .txt). Los archivos de Word, Excel, PowerPoint y PDF serán compatibles en una versión posterior.",
+    loop_title: "«{name}» no se despliega",
+    loop_body: "Es un enlace a la carpeta que lo contiene o a una carpeta superior. Desplegarlo repetiría las mismas carpetas sin fin.",
+    reveal_failed: "No se puede mostrar «{name}» en el gestor de archivos",
+    no_matches: "Ningún archivo coincide",
+    opened_today: "Hoy {time}",
+    opened_yesterday: "Ayer {time}",
+    opened_this_year: "{day}/{month}",
+    opened_other_year: "{day}/{month}/{year}",
 };
 
 pub const KO: Strings = Strings {
@@ -1303,8 +1541,6 @@ pub const KO: Strings = Strings {
     new_document: "새로 만들기",
     recent: "최근 항목",
     files: "파일",
-    sample: "예시",
-    sample_data: "예시 데이터",
     placeholder: "미구현",
     placeholder_view: "자리 표시 화면",
     search_files: "파일 검색",
@@ -1344,7 +1580,6 @@ pub const KO: Strings = Strings {
     ai_point_keys: "제공자와 API 키는 직접 설정하며, 키는 이 기기에만 저장됩니다.",
     ai_input: "AI에게 질문하기(미구현)",
     writer_sample: "Aster Office 셸 프로토타입\n\n이 페이지는 UI 프레임워크의 텍스트 컨트롤이 아닙니다. 글자는 Parley가 조판하고 vello_cpu가 그린 뒤 한 장의 이미지로 창에 올라가며, 입력기 이벤트는 창 시스템에서 직접 받습니다.\n\n되는 것: 한국어, 중국어, 일본어, 영어 입력, 커서 이동, 선택, 스크롤, 확대와 축소.\n아직 안 되는 것: 서식, 실행 취소, 열기와 저장. 도구 모음의 회색 버튼은 아직 기능에 연결되어 있지 않습니다.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
-    sample_document: "{title}\n\n이 문서는 예시이며 디스크에서 읽은 파일이 아닙니다. 최근 파일 목록은 지금은 고정된 예시 데이터이고, 열기와 저장은 아직 구현되지 않았습니다.\n\n",
 
     menu_file: "파일",
     menu_edit: "편집",
@@ -1420,6 +1655,37 @@ pub const KO: Strings = Strings {
     find_too_many: "{count}개 이상",
     notice_replaced: "{count}곳을 바꿨습니다",
     notice_replacing: "모두 바꾸는 중…",
+    menu_open_folder: "폴더 열기…",
+    menu_clear_recent: "최근 항목 지우기",
+    open_folder_dialog: "폴더 열기",
+    reveal_finder: "Finder에서 보기",
+    reveal_other: "파일 관리자에서 보기",
+    recent_remove: "최근 항목에서 제거",
+    recent_empty: "아직 연 파일이 없습니다. 열거나 저장한 파일이 여기에 표시됩니다.",
+    recent_missing: "사용할 수 없음",
+    recent_missing_title: "“{name}”을(를) 찾을 수 없습니다",
+    recent_missing_body: "이 파일은 {path}에 있었습니다. 이동되었거나 이름이 바뀌었거나 삭제되었을 수 있습니다.",
+    no_folder: "폴더를 열면 그 안의 문서가 여기에 표시됩니다.",
+    refresh: "새로 고침",
+    tree_reading: "읽는 중…",
+    tree_empty: "표시할 파일이 없습니다",
+    tree_omitted: "{count}개 더 있음(표시하지 않음)",
+    tree_omitted_at_least: "{count}개 이상 더 있음(표시하지 않음)",
+    tree_missing: "폴더가 없습니다",
+    tree_denied: "읽기 권한이 없습니다",
+    tree_not_folder: "폴더가 아닙니다",
+    tree_failed: "읽을 수 없음: {reason}",
+    unsupported: "아직 지원되지 않음",
+    unsupported_title: "“{name}”은(는) 아직 열 수 없습니다",
+    unsupported_body: "이 버전에서는 Markdown 및 텍스트 파일(.md, .markdown, .txt)만 열 수 있습니다. Word, Excel, PowerPoint, PDF 파일은 이후 버전에서 지원됩니다.",
+    loop_title: "“{name}”은(는) 펼칠 수 없습니다",
+    loop_body: "자신이 들어 있는 폴더나 그 상위 폴더를 가리키는 링크입니다. 펼치면 같은 폴더가 끝없이 반복됩니다.",
+    reveal_failed: "“{name}”을(를) 파일 관리자에서 표시할 수 없습니다",
+    no_matches: "일치하는 파일이 없습니다",
+    opened_today: "오늘 {time}",
+    opened_yesterday: "어제 {time}",
+    opened_this_year: "{month}월 {day}일",
+    opened_other_year: "{year}. {month}. {day}.",
 };
 
 #[cfg(test)]
@@ -1591,12 +1857,9 @@ mod tests {
     }
 
     #[test]
-    fn sample_text_says_it_is_a_sample() {
+    fn the_writer_sample_ends_with_room_to_type() {
         for language in Language::ALL {
-            let strings = language.strings();
-            let text = fill(strings.sample_document, "title", "报告");
-            assert!(text.starts_with("报告\n"));
-            assert!(strings.writer_sample.ends_with("\n\n"));
+            assert!(language.strings().writer_sample.ends_with("\n\n"));
         }
     }
 }

@@ -187,6 +187,7 @@ dependencies = [
 name = "aster-surface"
 version = "0.0.1"
 dependencies = [
+ "aster-markdown",
  "bytemuck",
  "parley 0.13.0",
  "slint",

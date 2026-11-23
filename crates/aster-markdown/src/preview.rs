@@ -43,6 +43,8 @@ pub enum BlockKind {
     List {
         /// Number of the first item of an ordered list.
         start: Option<u64>,
+        /// No blank lines between the items: they sit close together.
+        tight: bool,
         items: Vec<Item>,
     },
     Table {
@@ -246,6 +248,8 @@ enum Frame {
     List {
         source: Range<usize>,
         start: Option<u64>,
+        /// An item held a paragraph of its own: the list is loose.
+        loose: bool,
         items: Vec<Item>,
     },
     Item {
@@ -453,6 +457,12 @@ impl Builder {
         }
         match tag {
             Tag::Paragraph => {
+                // Paragraph tags inside items are what makes a list loose.
+                if let [.., Frame::List { loose, .. }, Frame::Item { .. }] =
+                    self.frames.as_mut_slice()
+                {
+                    *loose = true;
+                }
                 self.leaf = Leaf::Inline {
                     builder: InlineBuilder::new(range),
                     heading: None,
@@ -490,6 +500,7 @@ impl Builder {
             Tag::List(start) => self.frames.push(Frame::List {
                 source: range,
                 start,
+                loose: false,
                 items: Vec::new(),
             }),
             Tag::Item => self.frames.push(Frame::Item {
@@ -726,9 +737,14 @@ fn frame_block(frame: Frame) -> Block {
         Frame::List {
             source,
             start,
+            loose,
             items,
         } => Block {
-            kind: BlockKind::List { start, items },
+            kind: BlockKind::List {
+                start,
+                tight: !loose,
+                items,
+            },
             source,
         },
         // Only reached for an item left open, which the parser never does;
@@ -736,6 +752,7 @@ fn frame_block(frame: Frame) -> Block {
         Frame::Item { source, blocks, .. } => Block {
             kind: BlockKind::List {
                 start: None,
+                tight: true,
                 items: vec![Item {
                     task: None,
                     blocks,
@@ -967,7 +984,12 @@ mod tests {
     #[test]
     fn lists_tight_loose_ordered_and_tasks() {
         let blocks = kinds("- 一\n- 二\n  - 嵌套\n\n3. 三\n4. 四\n\n- [ ] 待办\n- [x] 完成\n");
-        let BlockKind::List { start: None, items } = &blocks[0] else {
+        let BlockKind::List {
+            start: None,
+            tight: true,
+            items,
+        } = &blocks[0]
+        else {
             panic!("{blocks:?}");
         };
         assert_eq!(items.len(), 2);
@@ -986,6 +1008,8 @@ mod tests {
         let BlockKind::List { items, .. } = &blocks[2] else {
             panic!();
         };
+        let loose = kinds("- 一\n\n- 二\n");
+        assert!(matches!(loose[0], BlockKind::List { tight: false, .. }));
         assert_eq!(
             items.iter().map(|item| item.task).collect::<Vec<_>>(),
             [Some(false), Some(true)]

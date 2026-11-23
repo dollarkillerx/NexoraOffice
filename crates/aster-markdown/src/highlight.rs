@@ -397,11 +397,7 @@ type Cut = (Range<usize>, Vec<String>);
 /// `stop` is asked about every cut after the first block; when it says yes,
 /// cutting ends there and the second value is `true`. Each block comes with
 /// its link reference labels.
-fn cut(
-    text: &str,
-    from: usize,
-    mut stop: impl FnMut(usize) -> bool,
-) -> (Vec<Cut>, bool) {
+fn cut(text: &str, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut>, bool) {
     let mut blocks = Vec::new();
     let mut start = from;
     let mut labels = Vec::new();

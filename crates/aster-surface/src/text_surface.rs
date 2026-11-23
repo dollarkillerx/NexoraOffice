@@ -5,19 +5,24 @@
 //! architecture relies on: the shell can be replaced without touching anything
 //! here. The code started as the Phase 0 gate G1 spike and still backs it.
 
+use std::ops::Range;
+
 use parley::fontique::Script;
 use parley::layout::PositionedLayoutItem;
 use parley::{
-    FontContext, GenericFamily, LayoutContext, PlainEditor, PlainEditorDriver, StyleProperty,
+    Cursor, FontContext, GenericFamily, Layout, LayoutContext, PlainEditor, PlainEditorDriver,
+    StyleProperty,
 };
-use vello_cpu::kurbo::{Affine, Rect};
+use vello_cpu::kurbo::{Affine, Rect, RoundedRect, Shape};
 use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
+
+use crate::glyphs::{self, GlyphPaint, SYNTHETIC_SKEW_DEGREES};
 
 /// Body text size in logical pixels at 100 % zoom.
 const FONT_SIZE: f32 = 18.0;
 /// Language used to pick fallback fonts for Han characters.
-const DEFAULT_LANGUAGE: &str = "zh-Hans";
+pub(crate) const DEFAULT_LANGUAGE: &str = "zh-Hans";
 /// Caret width in logical pixels.
 const CARET_WIDTH: f32 = 1.5;
 /// Space kept between the caret and the top or bottom edge when the view
@@ -89,6 +94,31 @@ impl Default for PageLayout {
     }
 }
 
+/// How a stretch of text is drawn, on top of the surface's own style. None of
+/// it changes where glyphs are: bold and italic are drawn by thickening and
+/// slanting the regular face, so a decoration never moves the text, the caret
+/// or line breaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextStyle {
+    /// Text colour; `None` keeps the ink.
+    pub color: Option<Rgba8>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// Background behind the glyphs.
+    pub background: Option<Rgba8>,
+    /// Background across the whole text column on every line this touches.
+    pub line_background: Option<Rgba8>,
+}
+
+/// A style for a byte range of the committed text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decoration {
+    pub range: Range<usize>,
+    pub style: TextStyle,
+}
+
 /// The brush Parley carries on every glyph run. Solid colour only.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Brush(pub Color);
@@ -142,7 +172,7 @@ pub enum Action {
 pub const HAN_FALLBACK_FAMILIES: [&str; 4] =
     ["Hiragino Sans GB", "Heiti SC", "Songti SC", "Hiragino Sans"];
 
-fn configure_han_fallback(font_cx: &mut FontContext) {
+pub(crate) fn configure_han_fallback(font_cx: &mut FontContext) {
     let han = Script::from_bytes(*b"Hani");
     let families: Vec<_> = HAN_FALLBACK_FAMILIES
         .iter()
@@ -181,6 +211,59 @@ pub struct TextSurface {
     caret_on: bool,
     palette: Palette,
     page: PageLayout,
+    /// In order, not overlapping, in committed-text offsets.
+    decorations: Vec<Decoration>,
+}
+
+/// Where a byte offset of the text Parley lays out — committed text with any
+/// composition text spliced in at the caret — is in the committed text.
+/// `None` inside the composition text.
+fn committed_offset(compose: &Option<Range<usize>>, raw: usize) -> Option<usize> {
+    match compose {
+        Some(c) if raw >= c.end => Some(raw - c.len()),
+        Some(c) if raw >= c.start => None,
+        _ => Some(raw),
+    }
+}
+
+/// The reverse of [`committed_offset`].
+fn raw_offset(compose: &Option<Range<usize>>, committed: usize) -> usize {
+    match compose {
+        Some(c) if committed >= c.start => committed + c.len(),
+        _ => committed,
+    }
+}
+
+/// The style at a committed-text offset.
+fn style_at(decorations: &[Decoration], offset: usize) -> TextStyle {
+    let index = decorations.partition_point(|d| d.range.end <= offset);
+    match decorations.get(index) {
+        Some(d) if d.range.start <= offset => d.style,
+        _ => TextStyle::default(),
+    }
+}
+
+/// The line background for a committed-text range, if a decoration with
+/// one overlaps it.
+fn line_background_in(decorations: &[Decoration], range: Range<usize>) -> Option<Rgba8> {
+    let first = decorations.partition_point(|d| d.range.end <= range.start);
+    decorations[first..]
+        .iter()
+        .take_while(|d| d.range.start < range.end)
+        .find_map(|d| d.style.line_background)
+}
+
+/// Index of the line holding byte `index` of the laid-out text.
+fn line_index_of(layout: &Layout<Brush>, index: usize) -> usize {
+    let (mut low, mut high) = (0, layout.len());
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        match layout.get(mid) {
+            Some(line) if line.text_range().start <= index => low = mid,
+            _ => high = mid,
+        }
+    }
+    low
 }
 
 impl TextSurface {
@@ -217,6 +300,7 @@ impl TextSurface {
             caret_on: true,
             palette,
             page: PageLayout::default(),
+            decorations: Vec::new(),
         };
         surface.driver().move_to_text_end();
         surface
@@ -576,10 +660,96 @@ impl TextSurface {
         )
     }
 
+    /// Styles to draw ranges of the committed text with, in order and not
+    /// overlapping. They are kept until replaced; the host replaces them
+    /// after every edit, normally for [`Self::visible_range`] only.
+    pub fn set_decorations(&mut self, decorations: Vec<Decoration>) {
+        debug_assert!(
+            decorations
+                .windows(2)
+                .all(|pair| pair[0].range.end <= pair[1].range.start)
+        );
+        self.decorations = decorations;
+    }
+
+    /// The committed text on the lines inside the view, rounded out to whole
+    /// lines.
+    pub fn visible_range(&mut self) -> Range<usize> {
+        let geometry = self.geometry();
+        let top = -geometry.text_y as f32;
+        let bottom = top + f32::from(self.height);
+        let compose = self.editor.raw_compose().clone();
+        let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
+        let first = Cursor::from_point(layout, 0.0, top).index();
+        let last = Cursor::from_point(layout, 0.0, bottom).index();
+        let start = layout
+            .get(line_index_of(layout, first))
+            .map_or(0, |line| line.text_range().start);
+        let end = layout
+            .get(line_index_of(layout, last))
+            .map_or(start, |line| line.text_range().end);
+        let start = committed_offset(&compose, start)
+            .unwrap_or_else(|| compose.clone().map_or(0, |c| c.start));
+        let end = committed_offset(&compose, end)
+            .unwrap_or_else(|| compose.clone().map_or(0, |c| c.start));
+        start..end.max(start)
+    }
+
+    /// Which part of the text is at the top edge of the view, as a byte
+    /// offset into the committed text with a fraction for how far down its
+    /// line the edge is. For keeping another view at the same place.
+    pub fn top_position(&mut self) -> f64 {
+        let geometry = self.geometry();
+        let top = (-geometry.text_y).max(0.0);
+        let compose = self.editor.raw_compose().clone();
+        let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
+        let index = Cursor::from_point(layout, 0.0, top as f32).index();
+        let Some(line) = layout.get(line_index_of(layout, index)) else {
+            return 0.0;
+        };
+        let range = line.text_range();
+        let metrics = line.metrics();
+        let height = f64::from(metrics.block_max_coord - metrics.block_min_coord).max(1.0);
+        let fraction = ((top - f64::from(metrics.block_min_coord)) / height).clamp(0.0, 1.0);
+        let start = committed_offset(&compose, range.start).unwrap_or(range.start) as f64;
+        let end = committed_offset(&compose, range.end).unwrap_or(range.end) as f64;
+        start + fraction * (end - start)
+    }
+
+    /// Scroll so that a position from [`Self::top_position`] is at the top
+    /// edge of the view.
+    pub fn scroll_to_position(&mut self, position: f64) {
+        let margin = self.page.margin * self.content_scale();
+        let (_, _, padding) = self.columns();
+        let compose = self.editor.raw_compose().clone();
+        let layout = self.editor.layout(&mut self.font_cx, &mut self.layout_cx);
+        let offset = position.max(0.0) as usize;
+        let raw = raw_offset(&compose, offset).min(layout_text_len(layout));
+        let Some(line) = layout.get(line_index_of(layout, raw)) else {
+            return;
+        };
+        let range = line.text_range();
+        let metrics = line.metrics();
+        let start = committed_offset(&compose, range.start).unwrap_or(range.start) as f64;
+        let end = committed_offset(&compose, range.end).unwrap_or(range.end) as f64;
+        let fraction = if end > start {
+            ((position - start) / (end - start)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let height = f64::from(metrics.block_max_coord - metrics.block_min_coord);
+        let y = f64::from(metrics.block_min_coord) + fraction * height;
+        self.scroll = margin + padding + y;
+        // Clamp.
+        self.geometry();
+    }
+
     /// Draw the current state into the backing buffer and return it.
     /// Pixels are premultiplied RGBA8.
     pub fn render(&mut self) -> &Pixmap {
         let geometry = self.geometry();
+        let (_, page_width, padding) = self.columns();
+        let text_width = page_width - 2.0 * padding;
         let Self {
             font_cx,
             layout_cx,
@@ -592,6 +762,7 @@ impl TextSurface {
             scale,
             caret_on,
             palette,
+            decorations,
             ..
         } = self;
         let (w, h) = (f64::from(*width), f64::from(*height));
@@ -618,21 +789,66 @@ impl TextSurface {
 
         ctx.set_transform(Affine::translate((geometry.text_x, geometry.text_y)));
 
+        // Lines outside the view are skipped; the range is in layout coordinates.
+        let visible = (-geometry.text_y, h - geometry.text_y);
+        let compose = editor.raw_compose().clone();
+        let layout = editor.layout(font_cx, layout_cx);
+        let first_line = line_index_of(
+            layout,
+            Cursor::from_point(layout, 0.0, visible.0 as f32).index(),
+        );
+        let lines = || {
+            (first_line..layout.len())
+                .filter_map(|index| layout.get(index))
+                .take_while(|line| f64::from(line.metrics().block_min_coord) <= visible.1)
+        };
+
+        // Backgrounds first, so the selection and the text go over them.
+        if !decorations.is_empty() {
+            let inset =
+                (f64::from(CODE_INSET) * f64::from(*scale)).min(geometry.text_x - geometry.page_x);
+            for line in lines() {
+                let metrics = line.metrics();
+                let (top, bottom) = (
+                    f64::from(metrics.block_min_coord),
+                    f64::from(metrics.block_max_coord),
+                );
+                let range = line.text_range();
+                let start = committed_offset(&compose, range.start).unwrap_or(range.start);
+                let end = committed_offset(&compose, range.end).unwrap_or(range.end);
+                if let Some(background) = line_background_in(decorations, start..end.max(start + 1))
+                {
+                    ctx.set_paint(color(background));
+                    ctx.fill_rect(&Rect::new(-inset, top, text_width + inset, bottom));
+                }
+                let pad = (bottom - top) * 0.12;
+                for_each_cluster(&line, |cluster, x0, x1| {
+                    let Some(offset) = committed_offset(&compose, cluster.text_range().start)
+                    else {
+                        return;
+                    };
+                    if let Some(background) = style_at(decorations, offset).background {
+                        let radius = 3.0 * f64::from(*scale);
+                        let rect = RoundedRect::new(x0, top + pad, x1, bottom - pad, radius);
+                        ctx.set_paint(color(background));
+                        ctx.fill_path(&rect.to_path(0.1));
+                    }
+                });
+            }
+        }
+
         ctx.set_paint(color(palette.selection));
         editor.selection_geometry_with(|rect, _| {
             ctx.fill_rect(&Rect::new(rect.x0, rect.y0, rect.x1, rect.y1));
         });
 
-        // Lines outside the view are skipped; the range is in layout coordinates.
-        let visible = (-geometry.text_y, h - geometry.text_y);
         let layout = editor.layout(font_cx, layout_cx);
-        for line in layout.lines() {
-            let metrics = line.metrics();
-            let (baseline, line_height) =
-                (f64::from(metrics.baseline), f64::from(metrics.line_height));
-            if baseline + line_height < visible.0 || baseline - 2.0 * line_height > visible.1 {
-                continue;
-            }
+        let lines = (first_line..layout.len())
+            .filter_map(|index| layout.get(index))
+            .take_while(|line| f64::from(line.metrics().block_min_coord) <= visible.1);
+        let mut glyph_buffer: Vec<Glyph> = Vec::new();
+        for line in lines {
+            let mut previous_run: Option<Range<usize>> = None;
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
@@ -645,25 +861,55 @@ impl TextSurface {
                 if let Some(underline) = &style.underline {
                     let metrics = run.font_metrics();
                     let offset = underline.offset.unwrap_or(metrics.underline_offset);
-                    let size = underline.size.unwrap_or(metrics.underline_size).max(*scale);
-                    let y = f64::from(glyph_run.baseline() - offset);
+                    let size = underline.size.unwrap_or(metrics.underline_size);
                     let x0 = f64::from(glyph_run.offset());
                     let x1 = x0 + f64::from(glyph_run.advance());
-                    ctx.set_paint(underline.brush.0);
-                    ctx.fill_rect(&Rect::new(x0, y, x1, y + f64::from(size)));
+                    glyphs::line(
+                        ctx,
+                        underline.brush.0,
+                        (x0, x1),
+                        glyph_run.baseline(),
+                        offset,
+                        size,
+                        *scale,
+                    );
                 }
 
-                ctx.set_paint(style.brush.0);
-                let coords = bytemuck::cast_slice::<_, i16>(run.normalized_coords());
-                ctx.glyph_run(resources, run.font())
-                    .font_size(run.font_size())
-                    .hint(true)
-                    .normalized_coords(coords)
-                    .fill_glyphs(glyph_run.positioned_glyphs().map(|glyph| Glyph {
+                if decorations.is_empty() {
+                    glyph_buffer.clear();
+                    glyph_buffer.extend(glyph_run.positioned_glyphs().map(|glyph| Glyph {
                         id: glyph.id,
                         x: glyph.x,
                         y: glyph.y,
                     }));
+                    let paint = GlyphPaint {
+                        color: style.brush.0,
+                        embolden: false,
+                        skew: None,
+                    };
+                    glyphs::draw(ctx, resources, run, &glyph_buffer, paint);
+                    continue;
+                }
+
+                // With decorations the whole run is drawn at once, cluster by
+                // cluster, since its glyph runs only follow Parley's own
+                // styles. The composition splits a run into several.
+                if previous_run.as_ref() == Some(&run.text_range()) {
+                    continue;
+                }
+                previous_run = Some(run.text_range());
+                draw_decorated_run(
+                    ctx,
+                    resources,
+                    run,
+                    glyph_run.offset(),
+                    glyph_run.baseline(),
+                    style.brush.0,
+                    &compose,
+                    decorations,
+                    *scale,
+                    &mut glyph_buffer,
+                );
             }
         }
 
@@ -700,6 +946,118 @@ impl TextSurface {
             .into_png()
             .map_err(|err| err.to_string())
     }
+}
+
+/// Horizontal extra of a code block's background on each side of the text
+/// column, in logical pixels.
+const CODE_INSET: f32 = 12.0;
+
+fn layout_text_len(layout: &Layout<Brush>) -> usize {
+    layout
+        .len()
+        .checked_sub(1)
+        .and_then(|last| layout.get(last))
+        .map_or(0, |line| line.text_range().end)
+}
+
+/// Call `f` with every cluster of a line and its left and right edge.
+fn for_each_cluster(
+    line: &parley::Line<'_, Brush>,
+    mut f: impl FnMut(&parley::Cluster<'_, Brush>, f64, f64),
+) {
+    let mut previous_run: Option<Range<usize>> = None;
+    for item in line.items() {
+        let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+            continue;
+        };
+        let run = glyph_run.run();
+        if previous_run.as_ref() == Some(&run.text_range()) {
+            continue;
+        }
+        previous_run = Some(run.text_range());
+        let mut x = f64::from(glyph_run.offset());
+        for cluster in run.visual_clusters() {
+            let advance = f64::from(cluster.advance());
+            f(&cluster, x, x + advance);
+            x += advance;
+        }
+    }
+}
+
+/// Draw one run with the decorations that cover its clusters: consecutive
+/// clusters of the same style become one call.
+#[allow(clippy::too_many_arguments)]
+fn draw_decorated_run(
+    ctx: &mut RenderContext,
+    resources: &mut Resources,
+    run: &parley::Run<'_, Brush>,
+    offset: f32,
+    baseline: f32,
+    ink: Color,
+    compose: &Option<Range<usize>>,
+    decorations: &[Decoration],
+    scale: f32,
+    buffer: &mut Vec<Glyph>,
+) {
+    let metrics = *run.font_metrics();
+    let flush = |ctx: &mut RenderContext,
+                 resources: &mut Resources,
+                 buffer: &mut Vec<Glyph>,
+                 style: TextStyle,
+                 x: (f64, f64)| {
+        let paint = GlyphPaint {
+            color: style.color.map_or(ink, color),
+            embolden: style.bold,
+            skew: style.italic.then_some(SYNTHETIC_SKEW_DEGREES),
+        };
+        glyphs::draw(ctx, resources, run, buffer, paint);
+        buffer.clear();
+        if style.underline {
+            glyphs::line(
+                ctx,
+                paint.color,
+                x,
+                baseline,
+                metrics.underline_offset,
+                metrics.underline_size,
+                scale,
+            );
+        }
+        if style.strike {
+            glyphs::line(
+                ctx,
+                paint.color,
+                x,
+                baseline,
+                metrics.strikethrough_offset,
+                metrics.strikethrough_size,
+                scale,
+            );
+        }
+    };
+
+    buffer.clear();
+    let mut x = offset;
+    let mut current = TextStyle::default();
+    let mut from = f64::from(x);
+    for cluster in run.visual_clusters() {
+        let style = committed_offset(compose, cluster.text_range().start)
+            .map_or_else(TextStyle::default, |at| style_at(decorations, at));
+        if style != current {
+            flush(ctx, resources, buffer, current, (from, f64::from(x)));
+            current = style;
+            from = f64::from(x);
+        }
+        for glyph in cluster.glyphs() {
+            buffer.push(Glyph {
+                id: glyph.id,
+                x: x + glyph.x,
+                y: baseline + glyph.y,
+            });
+            x += glyph.advance;
+        }
+    }
+    flush(ctx, resources, buffer, current, (from, f64::from(x)));
 }
 
 #[cfg(test)]
@@ -985,5 +1343,166 @@ mod tests {
         let (pixels, _) = data.as_chunks::<4>();
         let ink = pixels.iter().filter(|px| **px == dark.ink).count();
         assert!(ink > 50, "only {ink} pixels in the ink colour");
+    }
+
+    fn count(s: &mut TextSurface, rgba: [u8; 4]) -> usize {
+        let data = s.render().data_as_u8_slice();
+        let (pixels, _) = data.as_chunks::<4>();
+        pixels.iter().filter(|px| **px == rgba).count()
+    }
+
+    const GREY: [u8; 4] = [0x80, 0x80, 0x80, 0xff];
+    const TINT: [u8; 4] = [0xe8, 0xe8, 0xe8, 0xff];
+
+    fn styled(range: Range<usize>, style: TextStyle) -> Vec<Decoration> {
+        vec![Decoration { range, style }]
+    }
+
+    #[test]
+    fn decorations_never_move_text_or_caret() {
+        let text = "# 标题 **粗体** *斜体* `code`\n第二行";
+        let mut s = surface(text);
+        s.set_selection(2, 11);
+        let caret = s.ime_cursor_area();
+        let visible = s.visible_range();
+        s.set_decorations(vec![
+            Decoration {
+                range: 0..10,
+                style: TextStyle {
+                    bold: true,
+                    italic: true,
+                    underline: true,
+                    strike: true,
+                    color: Some(GREY),
+                    background: Some(TINT),
+                    line_background: Some(TINT),
+                },
+            },
+            Decoration {
+                range: 20..text.len(),
+                style: TextStyle {
+                    bold: true,
+                    ..TextStyle::default()
+                },
+            },
+        ]);
+        s.render();
+        assert_eq!(s.ime_cursor_area(), caret);
+        assert_eq!(s.selection(), (2, 11));
+        assert_eq!(s.visible_range(), visible);
+        assert_eq!(s.text(), text);
+    }
+
+    #[test]
+    fn a_decoration_recolours_its_range_only() {
+        let mut s = surface("HHHHHHHH");
+        s.set_caret_on(false);
+        let ink = Palette::default().ink;
+        let plain_ink = count(&mut s, ink);
+        assert!(plain_ink > 50);
+        s.set_decorations(styled(
+            0..4,
+            TextStyle {
+                color: Some(GREY),
+                ..TextStyle::default()
+            },
+        ));
+        let grey = count(&mut s, GREY);
+        let ink_left = count(&mut s, ink);
+        assert!(grey > 20, "{grey} grey pixels");
+        assert!(
+            ink_left > 20 && ink_left < plain_ink,
+            "{ink_left} of {plain_ink}"
+        );
+    }
+
+    #[test]
+    fn bold_is_heavier_and_a_line_background_spans_the_column() {
+        let mut s = surface("HHHH\nHHHH");
+        s.set_caret_on(false);
+        let ink = Palette::default().ink;
+        let regular = count(&mut s, ink);
+        s.set_decorations(styled(
+            0..4,
+            TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+        ));
+        assert!(count(&mut s, ink) > regular, "bold is not heavier");
+
+        s.set_decorations(styled(
+            5..9,
+            TextStyle {
+                line_background: Some(TINT),
+                ..TextStyle::default()
+            },
+        ));
+        // The second line's band reaches the right of the text column.
+        let (_, y, _, height) = {
+            s.set_selection(6, 6);
+            s.ime_cursor_area()
+        };
+        let row = (y + height / 2.0) as usize;
+        assert_eq!(pixel(&mut s, 700, row), TINT);
+        let (_, y0, _, _) = {
+            s.set_selection(1, 1);
+            s.ime_cursor_area()
+        };
+        assert_ne!(pixel(&mut s, 700, (y0 + 2.0) as usize), TINT);
+    }
+
+    #[test]
+    fn decorations_stay_on_committed_text_while_composing() {
+        let compose = Some(2..5);
+        assert_eq!(committed_offset(&compose, 1), Some(1));
+        assert_eq!(committed_offset(&compose, 3), None);
+        assert_eq!(committed_offset(&compose, 5), Some(2));
+        assert_eq!(raw_offset(&compose, 1), 1);
+        assert_eq!(raw_offset(&compose, 2), 5);
+        assert_eq!(committed_offset(&None, 7), Some(7));
+
+        let mut s = surface("ab**cd**");
+        s.set_selection(2, 2);
+        s.compose("中文", Some((6, 6)));
+        s.set_decorations(styled(
+            2..8,
+            TextStyle {
+                bold: true,
+                color: Some(GREY),
+                ..TextStyle::default()
+            },
+        ));
+        s.render();
+        assert_eq!(s.text(), "ab**cd**");
+        assert!(s.is_composing());
+    }
+
+    #[test]
+    fn the_top_position_round_trips() {
+        let text: String = (0..200).map(|i| format!("第 {i} 行 line\n")).collect();
+        let mut s = surface(&text);
+        s.set_selection(0, 0);
+        s.reveal_caret();
+        assert_eq!(s.top_position(), 0.0);
+        let line_100 = text.find("第 100 行").unwrap();
+        s.scroll_to_position(line_100 as f64);
+        let top = s.top_position();
+        assert!((top - line_100 as f64).abs() < 2.0, "{top} vs {line_100}");
+        let visible = s.visible_range();
+        assert!(visible.contains(&line_100), "{visible:?}");
+        assert!(visible.start > 0 && visible.end < text.len());
+        // Past the end clamps to the bottom.
+        s.scroll_to_position(1.0e12);
+        let (scroll, max) = s.scroll_range();
+        assert_eq!(scroll, max);
+    }
+
+    #[test]
+    fn visible_range_of_short_and_empty_text() {
+        let mut s = surface("");
+        assert_eq!(s.visible_range(), 0..0);
+        let mut s = surface("一\n二");
+        assert_eq!(s.visible_range(), 0.."一\n二".len());
     }
 }

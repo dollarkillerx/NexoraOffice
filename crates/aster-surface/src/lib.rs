@@ -8,9 +8,12 @@
 //! input-method gate. The editors will plug in here through the `EditorView`
 //! contract once `aster-model` and `aster-render` exist.
 
+mod glyphs;
 pub mod host;
+pub mod preview;
 pub mod text_surface;
 
 pub use text_surface::{
-    Action, HAN_FALLBACK_FAMILIES, ImeEvent, PageLayout, Palette, Rgba8, TextSurface, ZOOM_RANGE,
+    Action, Decoration, HAN_FALLBACK_FAMILIES, ImeEvent, PageLayout, Palette, Rgba8, TextStyle,
+    TextSurface, ZOOM_RANGE,
 };

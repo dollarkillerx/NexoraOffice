@@ -473,13 +473,6 @@ export component AppWindow inherits Window {
             }
         }
 
-        if root.active-kind >= 0: Toolbar {
-            items: root.toolbar-items;
-            command(id) => {
-                root.toolbar-command(id);
-            }
-        }
-
         Hairline { }
 
         HorizontalLayout {
@@ -525,211 +518,224 @@ export component AppWindow inherits Window {
                 }
             }
 
-            content := Rectangle {
+            // The toolbar belongs to the document: it sits over the document
+            // area only, so the sidebar does not move when the first
+            // document opens.
+            VerticalLayout {
                 horizontal-stretch: 1;
-                background: Tokens.desk;
-                clip: true;
-
-                findbar := FindBar {
-                    x: 0;
-                    y: 0;
-                    width: parent.width;
-                    visible: root.find-open && root.active-kind == 3;
-                    replace-visible: root.find-replace;
-                    query <=> root.find-query;
-                    replacement <=> root.find-replacement;
-                    position: root.find-position;
-                    error: root.find-error;
-                    match-case: root.find-case;
-                    whole-word: root.find-whole;
-                    use-regex: root.find-regex;
-                    busy: root.find-busy;
-                    query-edited(text) => {
-                        root.find-query-edited(text);
-                    }
-                    replacement-edited(text) => {
-                        root.find-replacement-edited(text);
-                    }
-                    next => {
-                        root.find-next();
-                    }
-                    previous => {
-                        root.find-previous();
-                    }
-                    close => {
-                        root.find-close();
-                    }
-                    toggle(option) => {
-                        root.find-toggle(option);
-                    }
-                    replace-one => {
-                        root.replace-one();
-                    }
-                    replace-all => {
-                        root.replace-all();
+                if root.active-kind >= 0: Toolbar {
+                    items: root.toolbar-items;
+                    command(id) => {
+                        root.toolbar-command(id);
                     }
                 }
 
-                // Always present so its size is known before the first Writer
-                // tab opens; other views are stacked on top of it.
-                surface := Rectangle {
-                    y: findbar.visible ? findbar.height : 0px;
-                    height: parent.height - self.y;
-                    visible: root.surface-active;
-                    // The source takes the whole width, the left half, or
-                    // nothing; the preview the rest, after a hairline.
-                    property <length> editor-width: root.view-mode == 0 ? self.width : root.view-mode == 1 ? round((self.width - 1px) / 2 / 1px) * 1px : 0px;
+                content := Rectangle {
+                    vertical-stretch: 1;
+                    background: Tokens.desk;
+                    clip: true;
 
-                    editor-pane := Rectangle {
+                    findbar := FindBar {
                         x: 0;
-                        width: parent.editor-width;
-                        height: parent.height;
-                        clip: true;
+                        y: 0;
+                        width: parent.width;
+                        visible: root.find-open && root.active-kind == 3;
+                        replace-visible: root.find-replace;
+                        query <=> root.find-query;
+                        replacement <=> root.find-replacement;
+                        position: root.find-position;
+                        error: root.find-error;
+                        match-case: root.find-case;
+                        whole-word: root.find-whole;
+                        use-regex: root.find-regex;
+                        busy: root.find-busy;
+                        query-edited(text) => {
+                            root.find-query-edited(text);
+                        }
+                        replacement-edited(text) => {
+                            root.find-replacement-edited(text);
+                        }
+                        next => {
+                            root.find-next();
+                        }
+                        previous => {
+                            root.find-previous();
+                        }
+                        close => {
+                            root.find-close();
+                        }
+                        toggle(option) => {
+                            root.find-toggle(option);
+                        }
+                        replace-one => {
+                            root.replace-one();
+                        }
+                        replace-all => {
+                            root.replace-all();
+                        }
+                    }
 
-                        // The frames are drawn at the pane's size; their pixel
-                        // size must not feed back into the window's layout.
-                        Image {
-                            source: root.frame;
-                            width: 100%;
-                            height: 100%;
-                            preferred-width: 0px;
-                            preferred-height: 0px;
-                            image-fit: fill;
-                            visible: root.view-mode != 2;
+                    // Always present so its size is known before the first Writer
+                    // tab opens; other views are stacked on top of it.
+                    surface := Rectangle {
+                        y: findbar.visible ? findbar.height : 0px;
+                        height: parent.height - self.y;
+                        visible: root.surface-active;
+                        // The source takes the whole width, the left half, or
+                        // nothing; the preview the rest, after a hairline.
+                        property <length> editor-width: root.view-mode == 0 ? self.width : root.view-mode == 1 ? round((self.width - 1px) / 2 / 1px) * 1px : 0px;
+
+                        editor-pane := Rectangle {
+                            x: 0;
+                            width: parent.editor-width;
+                            height: parent.height;
+                            clip: true;
+
+                            // The frames are drawn at the pane's size; their pixel
+                            // size must not feed back into the window's layout.
+                            Image {
+                                source: root.frame;
+                                width: 100%;
+                                height: 100%;
+                                preferred-width: 0px;
+                                preferred-height: 0px;
+                                image-fit: fill;
+                                visible: root.view-mode != 2;
+                            }
+
+                            scope := FocusScope {
+                                enabled: root.surface-active;
+                                key-pressed(event) => {
+                                    return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                                }
+
+                                TouchArea {
+                                    enabled: root.surface-active && root.view-mode != 2;
+                                    mouse-cursor: text;
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                            scope.focus();
+                                            root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
+                                        }
+                                    }
+                                    moved => {
+                                        if (self.pressed) {
+                                            root.pointer-drag(self.mouse-x, self.mouse-y);
+                                        }
+                                    }
+                                    scroll-event(event) => {
+                                        root.scrolled(event.delta-y);
+                                        return accept;
+                                    }
+                                }
+                            }
+
+                            // Shows where the view is in the document. Not draggable yet.
+                            if root.scroll-max > 0 && root.view-mode != 2: Rectangle {
+                                property <length> track: parent.height - 2 * Tokens.space-xs;
+                                property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
+                                x: parent.width - self.width - 3px;
+                                y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
+                                width: 6px;
+                                height: self.thumb;
+                                border-radius: 3px;
+                                background: Tokens.text-disabled;
+                            }
                         }
 
-                        scope := FocusScope {
-                            enabled: root.surface-active;
-                            key-pressed(event) => {
-                                return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                        if root.view-mode == 1: Rectangle {
+                            x: parent.editor-width;
+                            width: 1px;
+                            height: parent.height;
+                            background: Tokens.hairline;
+                        }
+
+                        preview-pane := Rectangle {
+                            x: root.view-mode == 1 ? parent.editor-width + 1px : 0px;
+                            width: root.view-mode == 0 ? 0px : parent.width - self.x;
+                            height: parent.height;
+                            clip: true;
+                            visible: root.view-mode != 0;
+
+                            Image {
+                                source: root.preview-frame;
+                                width: 100%;
+                                height: 100%;
+                                preferred-width: 0px;
+                                preferred-height: 0px;
+                                image-fit: fill;
                             }
 
                             TouchArea {
-                                enabled: root.surface-active && root.view-mode != 2;
-                                mouse-cursor: text;
-                                pointer-event(event) => {
-                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                                        scope.focus();
-                                        root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
-                                    }
+                                enabled: root.surface-active && root.view-mode != 0;
+                                mouse-cursor: root.preview-link-hover ? pointer : default;
+                                clicked => {
+                                    root.preview-clicked(self.mouse-x, self.mouse-y);
                                 }
                                 moved => {
-                                    if (self.pressed) {
-                                        root.pointer-drag(self.mouse-x, self.mouse-y);
-                                    }
+                                    root.preview-moved(self.mouse-x, self.mouse-y);
                                 }
                                 scroll-event(event) => {
-                                    root.scrolled(event.delta-y);
+                                    root.preview-scrolled(event.delta-y);
                                     return accept;
                                 }
                             }
-                        }
 
-                        // Shows where the view is in the document. Not draggable yet.
-                        if root.scroll-max > 0 && root.view-mode != 2: Rectangle {
-                            property <length> track: parent.height - 2 * Tokens.space-xs;
-                            property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
-                            x: parent.width - self.width - 3px;
-                            y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
-                            width: 6px;
-                            height: self.thumb;
-                            border-radius: 3px;
-                            background: Tokens.text-disabled;
-                        }
-                    }
-
-                    if root.view-mode == 1: Rectangle {
-                        x: parent.editor-width;
-                        width: 1px;
-                        height: parent.height;
-                        background: Tokens.hairline;
-                    }
-
-                    preview-pane := Rectangle {
-                        x: root.view-mode == 1 ? parent.editor-width + 1px : 0px;
-                        width: root.view-mode == 0 ? 0px : parent.width - self.x;
-                        height: parent.height;
-                        clip: true;
-                        visible: root.view-mode != 0;
-
-                        Image {
-                            source: root.preview-frame;
-                            width: 100%;
-                            height: 100%;
-                            preferred-width: 0px;
-                            preferred-height: 0px;
-                            image-fit: fill;
-                        }
-
-                        TouchArea {
-                            enabled: root.surface-active && root.view-mode != 0;
-                            mouse-cursor: root.preview-link-hover ? pointer : default;
-                            clicked => {
-                                root.preview-clicked(self.mouse-x, self.mouse-y);
+                            if root.preview-note != "": Text {
+                                x: Tokens.space-xl;
+                                width: parent.width - 2 * Tokens.space-xl;
+                                height: parent.height;
+                                text: root.preview-note;
+                                color: Tokens.text-secondary;
+                                font-size: Tokens.font-md;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
                             }
-                            moved => {
-                                root.preview-moved(self.mouse-x, self.mouse-y);
-                            }
-                            scroll-event(event) => {
-                                root.preview-scrolled(event.delta-y);
-                                return accept;
+
+                            if root.preview-scroll-max > 0: Rectangle {
+                                property <length> track: parent.height - 2 * Tokens.space-xs;
+                                property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.preview-scroll-max)));
+                                x: parent.width - self.width - 3px;
+                                y: Tokens.space-xs + (self.track - self.thumb) * (root.preview-scroll-offset / root.preview-scroll-max);
+                                width: 6px;
+                                height: self.thumb;
+                                border-radius: 3px;
+                                background: Tokens.text-disabled;
                             }
                         }
+                    }
 
-                        if root.preview-note != "": Text {
-                            x: Tokens.space-xl;
-                            width: parent.width - 2 * Tokens.space-xl;
-                            height: parent.height;
-                            text: root.preview-note;
-                            color: Tokens.text-secondary;
-                            font-size: Tokens.font-md;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            wrap: word-wrap;
+                    if root.active-kind > 0 && root.active-kind != 3: Placeholder {
+                        kind: root.active-kind;
+                        title: root.placeholder-title;
+                        plan: root.placeholder-plan;
+                    }
+
+                    if root.active-kind < 0: StartPage {
+                        kinds: root.kinds;
+                        recent: root.recent;
+                        new-document(kind) => {
+                            root.new-document(kind);
                         }
-
-                        if root.preview-scroll-max > 0: Rectangle {
-                            property <length> track: parent.height - 2 * Tokens.space-xs;
-                            property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.preview-scroll-max)));
-                            x: parent.width - self.width - 3px;
-                            y: Tokens.space-xs + (self.track - self.thumb) * (root.preview-scroll-offset / root.preview-scroll-max);
-                            width: 6px;
-                            height: self.thumb;
-                            border-radius: 3px;
-                            background: Tokens.text-disabled;
+                        open-recent(index) => {
+                            root.recent-action(0, false, index);
                         }
-                    }
-                }
-
-                if root.active-kind > 0 && root.active-kind != 3: Placeholder {
-                    kind: root.active-kind;
-                    title: root.placeholder-title;
-                    plan: root.placeholder-plan;
-                }
-
-                if root.active-kind < 0: StartPage {
-                    kinds: root.kinds;
-                    recent: root.recent;
-                    new-document(kind) => {
-                        root.new-document(kind);
-                    }
-                    open-recent(index) => {
-                        root.recent-action(0, false, index);
-                    }
-                    reveal-recent(index) => {
-                        root.recent-action(1, false, index);
-                    }
-                    remove-recent(index) => {
-                        root.recent-action(2, false, index);
-                    }
-                    clear-recent => {
-                        root.clear-recent();
-                    }
-                    open-file => {
-                        root.file-open();
-                    }
-                    open-folder => {
-                        root.open-folder();
+                        reveal-recent(index) => {
+                            root.recent-action(1, false, index);
+                        }
+                        remove-recent(index) => {
+                            root.recent-action(2, false, index);
+                        }
+                        clear-recent => {
+                            root.clear-recent();
+                        }
+                        open-file => {
+                            root.file-open();
+                        }
+                        open-folder => {
+                            root.open-folder();
+                        }
                     }
                 }
             }

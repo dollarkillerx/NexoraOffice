@@ -325,31 +325,44 @@ export component Sidebar inherits Rectangle {
             title: Strings.recent;
         }
 
-        if root.recent.length == 0: HorizontalLayout {
-            padding-left: Tokens.space-md + 2px;
-            padding-right: Tokens.space-md;
-            padding-bottom: Tokens.space-xs;
-            Text {
-                text: root.filtering ? Strings.no-matches : Strings.recent-empty;
-                font-size: Tokens.font-sm;
-                color: Tokens.text-tertiary;
-                wrap: word-wrap;
+        // Always the height of five rows, however many there are: a file
+        // joining the list must not move the tree under the pointer.
+        Rectangle {
+            height: 5 * Tokens.control-height;
+            if root.recent.length == 0: HorizontalLayout {
+                y: 0;
+                height: self.preferred-height;
+                padding-left: Tokens.space-md + 2px;
+                padding-right: Tokens.space-md;
+                Text {
+                    text: root.filtering ? Strings.no-matches : Strings.recent-empty;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-tertiary;
+                    wrap: word-wrap;
+                }
             }
-        }
 
-        for item[index] in root.recent: RecentRow {
-            item: item;
-            clicked => {
-                root.open-recent(index);
-            }
-            reveal => {
-                root.reveal-recent(index);
-            }
-            remove => {
-                root.remove-recent(index);
-            }
-            clear => {
-                root.clear-recent();
+            // More than five only while filtering; they scroll in place.
+            Flickable {
+                viewport-height: recent-rows.preferred-height;
+                recent-rows := VerticalLayout {
+                    alignment: start;
+                    for item[index] in root.recent: RecentRow {
+                        item: item;
+                        clicked => {
+                            root.open-recent(index);
+                        }
+                        reveal => {
+                            root.reveal-recent(index);
+                        }
+                        remove => {
+                            root.remove-recent(index);
+                        }
+                        clear => {
+                            root.clear-recent();
+                        }
+                    }
+                }
             }
         }
 

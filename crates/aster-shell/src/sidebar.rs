@@ -16,9 +16,9 @@ use crate::i18n::{Strings, fill};
 use crate::stats::group_digits;
 use crate::tabs::DocKind;
 
-/// How many recent files the sidebar lists while not filtering. The start
-/// page lists them all.
-pub const SIDEBAR_RECENT: usize = 8;
+/// How many recent files the sidebar lists while not filtering, and how many
+/// rows its recent section is always tall. The start page lists them all.
+pub const SIDEBAR_RECENT: usize = 5;
 
 /// The editor a kind of file belongs to, for its icon.
 pub fn doc_kind(kind: FileKind) -> DocKind {

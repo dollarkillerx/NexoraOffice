@@ -84,6 +84,9 @@ export component AppWindow inherits Window {
     in property <length> preview-scroll-max;
     // The pointer is over a link in the preview.
     in property <bool> preview-link-hover;
+    // Shown in the preview pane instead of a preview, such as for a document
+    // too large to preview.
+    in property <string> preview-note;
 
     // Geometry the Rust side needs to size its buffer and place the candidate window.
     out property <length> surface-width: editor-pane.width;
@@ -461,6 +464,18 @@ export component AppWindow inherits Window {
                                 root.preview-scrolled(event.delta-y);
                                 return accept;
                             }
+                        }
+
+                        if root.preview-note != "": Text {
+                            x: Tokens.space-xl;
+                            width: parent.width - 2 * Tokens.space-xl;
+                            height: parent.height;
+                            text: root.preview-note;
+                            color: Tokens.text-secondary;
+                            font-size: Tokens.font-md;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
                         }
 
                         if root.preview-scroll-max > 0: Rectangle {

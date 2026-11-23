@@ -13,7 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use aster_markdown::{LineEnding, TextFormat};
+use aster_markdown::{LineEnding, Rope, TextFormat};
 use aster_storage::{FileState, Fingerprint, FoundRecord, RecoveryRoot};
 
 const KIND: &str = "markdown";
@@ -154,7 +154,10 @@ pub struct Candidate {
     pub record: FoundRecord,
     pub info: Option<RecordInfo>,
     /// The text the record replays to, or why it could not be read.
-    pub text: Result<String, String>,
+    pub text: Result<Rope, String>,
+    /// Whatever the shell computed from the text in advance, on the thread
+    /// that found the record, so restoring a large document is quick.
+    pub prepared: Option<Box<dyn std::any::Any + Send>>,
     /// How the document's file compares with what it held; `None` for a
     /// document that has no file.
     pub disk: Option<FileState>,
@@ -171,7 +174,7 @@ impl Candidate {
 /// result, so the user can still see and discard a damaged record.
 pub fn load(record: FoundRecord) -> Candidate {
     let last_written = record.last_written();
-    let read = || -> Result<(RecordInfo, String), String> {
+    let read = || -> Result<(RecordInfo, Rope), String> {
         let journal = record.open_journal().map_err(|err| err.to_string())?;
         journal.integrity().map_err(|err| err.to_string())?;
         let info = RecordInfo::from_meta(&journal.meta().map_err(|err| err.to_string())?)?;
@@ -197,6 +200,7 @@ pub fn load(record: FoundRecord) -> Candidate {
         record,
         info,
         text,
+        prepared: None,
         disk,
         last_written,
     }
@@ -306,6 +310,7 @@ mod tests {
             let change = aster_markdown::Change {
                 range: *at..*at,
                 inserted: (*insert).to_owned(),
+                removed: String::new(),
                 selection: aster_markdown::Selection::caret(at + insert.len()),
             };
             current.insert_str(*at, insert);
@@ -335,7 +340,10 @@ mod tests {
         let candidate = &candidates[0];
         assert!(candidate.is_readable());
         assert_eq!(candidate.info.as_ref(), Some(&with_file));
-        assert_eq!(candidate.text.as_deref(), Ok("# 会议\n第一项\n日本語"));
+        assert_eq!(
+            candidate.text.as_ref().map(Rope::to_string).as_deref(),
+            Ok("# 会议\n第一项\n日本語")
+        );
         assert_eq!(candidate.disk, Some(FileState::Unchanged));
         assert!(candidate.last_written.is_some());
         drop(candidates);
@@ -355,7 +363,10 @@ mod tests {
         let root = RecoveryRoot::new(dir.path());
         write_record(&root, &info(None), "", &[(0, "草稿")]);
         let candidates = find(&root).unwrap();
-        assert_eq!(candidates[0].text.as_deref(), Ok("草稿"));
+        assert_eq!(
+            candidates[0].text.as_ref().map(Rope::to_string).as_deref(),
+            Ok("草稿")
+        );
         assert_eq!(candidates[0].disk, None);
     }
 

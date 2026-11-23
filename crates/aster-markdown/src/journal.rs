@@ -6,7 +6,9 @@
 //! top of a checkpoint gives back the text, and nothing else: the selection and
 //! the undo history are not recovered.
 
-use crate::document::Change;
+use ropey::Rope;
+
+use crate::document::{Change, is_char_boundary, replace};
 
 /// Version byte at the start of every entry. An entry with another version is
 /// refused rather than guessed at.
@@ -53,28 +55,29 @@ pub fn decode(bytes: &[u8]) -> Result<Edit, String> {
 impl Edit {
     /// Apply to `text`. Fails, leaving `text` alone, if the edit does not fit:
     /// the journal and the checkpoint then disagree.
-    pub fn apply(&self, text: &mut String) -> Result<(), String> {
+    pub fn apply(&self, text: &mut Rope) -> Result<(), String> {
         let fits = self.start <= self.end
-            && self.end <= text.len()
-            && text.is_char_boundary(self.start)
-            && text.is_char_boundary(self.end);
+            && self.end <= text.len_bytes()
+            && is_char_boundary(text, self.start)
+            && is_char_boundary(text, self.end);
         if !fits {
             return Err(format!(
                 "{}..{} does not fit a {} byte text",
                 self.start,
                 self.end,
-                text.len()
+                text.len_bytes()
             ));
         }
-        text.replace_range(self.start..self.end, &self.text);
+        replace(text, self.start..self.end, &self.text);
         Ok(())
     }
 }
 
 /// The text a checkpoint and the entries after it amount to.
-pub fn rebuild(checkpoint: &[u8], entries: &[Vec<u8>]) -> Result<String, String> {
-    let mut text =
-        String::from_utf8(checkpoint.to_vec()).map_err(|_| "checkpoint is not UTF-8".to_owned())?;
+pub fn rebuild(checkpoint: &[u8], entries: &[Vec<u8>]) -> Result<Rope, String> {
+    let checkpoint =
+        std::str::from_utf8(checkpoint).map_err(|_| "checkpoint is not UTF-8".to_owned())?;
+    let mut text = Rope::from_str(checkpoint);
     for (index, bytes) in entries.iter().enumerate() {
         decode(bytes)
             .and_then(|edit| edit.apply(&mut text))
@@ -93,6 +96,7 @@ mod tests {
         let change = Change {
             range: 3..9,
             inserted: "日本語\n".to_owned(),
+            removed: String::new(),
             selection: Selection::caret(0),
         };
         let edit = decode(&encode(&change)).unwrap();
@@ -111,6 +115,7 @@ mod tests {
         let good = encode(&Change {
             range: 0..1,
             inserted: "x".to_owned(),
+            removed: String::new(),
             selection: Selection::caret(1),
         });
         assert!(decode(&good[..5]).is_err());
@@ -124,7 +129,7 @@ mod tests {
 
     #[test]
     fn edits_that_do_not_fit_leave_the_text_alone() {
-        let mut text = "中文".to_owned();
+        let mut text = Rope::from_str("中文");
         let past_end = Edit {
             start: 0,
             end: 99,
@@ -151,14 +156,14 @@ mod tests {
     #[test]
     fn replaying_a_documents_changes_rebuilds_its_text() {
         let mut document = Document::new("# 标题\n\nbody");
-        let checkpoint = document.text().as_bytes().to_vec();
+        let checkpoint = document.text().to_string().into_bytes();
         let mut entries = Vec::new();
         let mut record = |change: Option<Change>| {
             if let Some(change) = change {
                 entries.push(encode(&change));
             }
         };
-        document.set_selection(Selection::caret(document.text().len()));
+        document.set_selection(Selection::caret(document.len()));
         for c in "，追加".chars() {
             record(document.apply(EditCommand::Type(c.to_string())));
         }
@@ -176,7 +181,7 @@ mod tests {
         record(document.redo());
         record(document.apply(EditCommand::Paste("a\r\nb".to_owned())));
 
-        assert_eq!(rebuild(&checkpoint, &entries).unwrap(), document.text());
+        assert_eq!(&rebuild(&checkpoint, &entries).unwrap(), document.text());
     }
 
     #[test]
@@ -185,11 +190,13 @@ mod tests {
             encode(&Change {
                 range: 0..0,
                 inserted: "ok".to_owned(),
+                removed: String::new(),
                 selection: Selection::caret(2),
             }),
             encode(&Change {
                 range: 10..20,
                 inserted: String::new(),
+                removed: String::new(),
                 selection: Selection::caret(0),
             }),
         ];

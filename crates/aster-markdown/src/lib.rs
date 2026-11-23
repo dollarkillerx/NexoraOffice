@@ -21,4 +21,5 @@ pub mod preview;
 pub mod syntax;
 
 pub use document::{Change, Document, EditCommand, SavePoint, Selection};
-pub use file::{DecodeError, Decoded, LineEnding, TextFormat, decode, encode};
+pub use file::{DecodeError, Decoded, LineEnding, TextFormat, decode, encode, encode_rope};
+pub use ropey::Rope;

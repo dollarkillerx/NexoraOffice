@@ -62,6 +62,9 @@ tempfile = "3.27"
 rfd = "~0.18.0"
 # CommonMark and GitHub extensions. Without its HTML writer and command line.
 pulldown-cmark = { version = "~0.13.6", default-features = false }
+# The text of large documents. Only `\n` ends a line: files are normalised to
+# it when read.
+ropey = { version = "~1.6.1", default-features = false, features = ["simd"] }
 
 [profile.dev]
 opt-level = 1

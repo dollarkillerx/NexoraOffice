@@ -21,6 +21,33 @@ use crate::records::{FoundRecord, OwnedRecord, RecoveryRoot};
 /// Names a document for the writer. Chosen by the caller, unique per process.
 pub type RecordKey = u64;
 
+/// A whole document for a record: its bytes, or a way to produce them that
+/// runs on the writer thread. A 100 MB document is turned into bytes there,
+/// so the thread that asked never copies it.
+pub enum Contents {
+    Bytes(Vec<u8>),
+    Later(Box<dyn FnOnce() -> Vec<u8> + Send>),
+}
+
+impl Contents {
+    pub fn later(produce: impl FnOnce() -> Vec<u8> + Send + 'static) -> Self {
+        Contents::Later(Box::new(produce))
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Contents::Bytes(bytes) => bytes,
+            Contents::Later(produce) => produce(),
+        }
+    }
+}
+
+impl From<Vec<u8>> for Contents {
+    fn from(bytes: Vec<u8>) -> Self {
+        Contents::Bytes(bytes)
+    }
+}
+
 /// What the writer reports back, from its own thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -39,7 +66,7 @@ enum Request {
         key: RecordKey,
         found: Option<FoundRecord>,
         meta: Vec<(String, Vec<u8>)>,
-        document: Vec<u8>,
+        document: Contents,
     },
     Append {
         key: RecordKey,
@@ -47,7 +74,7 @@ enum Request {
     },
     Checkpoint {
         key: RecordKey,
-        document: Vec<u8>,
+        document: Contents,
     },
     Meta {
         key: RecordKey,
@@ -104,12 +131,17 @@ impl RecordWriter {
     /// Start a record for a document: `document` is its whole content now, and
     /// `meta` the named values that go with it. Edits appended afterwards are
     /// replayed on top of `document`.
-    pub fn open(&self, key: RecordKey, meta: Vec<(String, Vec<u8>)>, document: Vec<u8>) {
+    pub fn open(
+        &self,
+        key: RecordKey,
+        meta: Vec<(String, Vec<u8>)>,
+        document: impl Into<Contents>,
+    ) {
         self.send(Request::Open {
             key,
             found: None,
             meta,
-            document,
+            document: document.into(),
         });
     }
 
@@ -121,13 +153,13 @@ impl RecordWriter {
         key: RecordKey,
         found: FoundRecord,
         meta: Vec<(String, Vec<u8>)>,
-        document: Vec<u8>,
+        document: impl Into<Contents>,
     ) {
         self.send(Request::Open {
             key,
             found: Some(found),
             meta,
-            document,
+            document: document.into(),
         });
     }
 
@@ -138,8 +170,11 @@ impl RecordWriter {
 
     /// Store the whole document as it is after the edits sent so far, so the
     /// journal before it can be dropped.
-    pub fn checkpoint(&self, key: RecordKey, document: Vec<u8>) {
-        self.send(Request::Checkpoint { key, document });
+    pub fn checkpoint(&self, key: RecordKey, document: impl Into<Contents>) {
+        self.send(Request::Checkpoint {
+            key,
+            document: document.into(),
+        });
     }
 
     /// Change named values.
@@ -287,7 +322,7 @@ impl Worker {
                     let mut journal = record.open_journal().map_err(|err| err.to_string())?;
                     journal
                         .replace_meta(meta.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
-                        .and_then(|()| journal.checkpoint(&document))
+                        .and_then(|()| journal.checkpoint(&document.into_bytes()))
                         .map_err(|err| err.to_string())?;
                     Ok((record, journal))
                 });
@@ -302,7 +337,7 @@ impl Worker {
             }
             Request::Checkpoint { key, document } => {
                 if let Some((_, journal)) = self.records.get_mut(&key)
-                    && let Err(err) = journal.checkpoint(&document)
+                    && let Err(err) = journal.checkpoint(&document.into_bytes())
                 {
                     self.fail(key, err.to_string());
                 }

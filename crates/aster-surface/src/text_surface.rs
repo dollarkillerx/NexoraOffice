@@ -24,17 +24,17 @@ const FONT_SIZE: f32 = 18.0;
 /// Language used to pick fallback fonts for Han characters.
 pub(crate) const DEFAULT_LANGUAGE: &str = "zh-Hans";
 /// Caret width in logical pixels.
-const CARET_WIDTH: f32 = 1.5;
+pub(crate) const CARET_WIDTH: f32 = 1.5;
 /// Space kept between the caret and the top or bottom edge when the view
 /// scrolls to follow it, in logical pixels.
-const CARET_SCROLL_MARGIN: f64 = 24.0;
+pub(crate) const CARET_SCROLL_MARGIN: f64 = 24.0;
 /// Zoom is clamped to this range.
 pub const ZOOM_RANGE: (f32, f32) = (0.5, 3.0);
 
 /// A colour as straight (not premultiplied) 8-bit RGBA.
 pub type Rgba8 = [u8; 4];
 
-fn color(rgba: Rgba8) -> Color {
+pub(crate) fn color(rgba: Rgba8) -> Color {
     Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
@@ -235,7 +235,7 @@ fn raw_offset(compose: &Option<Range<usize>>, committed: usize) -> usize {
 }
 
 /// The style at a committed-text offset.
-fn style_at(decorations: &[Decoration], offset: usize) -> TextStyle {
+pub(crate) fn style_at(decorations: &[Decoration], offset: usize) -> TextStyle {
     let index = decorations.partition_point(|d| d.range.end <= offset);
     match decorations.get(index) {
         Some(d) if d.range.start <= offset => d.style,
@@ -245,7 +245,7 @@ fn style_at(decorations: &[Decoration], offset: usize) -> TextStyle {
 
 /// The line background for a committed-text range, if a decoration with
 /// one overlaps it.
-fn line_background_in(decorations: &[Decoration], range: Range<usize>) -> Option<Rgba8> {
+pub(crate) fn line_background_in(decorations: &[Decoration], range: Range<usize>) -> Option<Rgba8> {
     let first = decorations.partition_point(|d| d.range.end <= range.start);
     decorations[first..]
         .iter()
@@ -905,7 +905,7 @@ impl TextSurface {
                     glyph_run.offset(),
                     glyph_run.baseline(),
                     style.brush.0,
-                    &compose,
+                    &|raw| committed_offset(&compose, raw),
                     decorations,
                     *scale,
                     &mut glyph_buffer,
@@ -950,7 +950,7 @@ impl TextSurface {
 
 /// Horizontal extra of a code block's background on each side of the text
 /// column, in logical pixels.
-const CODE_INSET: f32 = 12.0;
+pub(crate) const CODE_INSET: f32 = 12.0;
 
 fn layout_text_len(layout: &Layout<Brush>) -> usize {
     layout
@@ -961,7 +961,7 @@ fn layout_text_len(layout: &Layout<Brush>) -> usize {
 }
 
 /// Call `f` with every cluster of a line and its left and right edge.
-fn for_each_cluster(
+pub(crate) fn for_each_cluster(
     line: &parley::Line<'_, Brush>,
     mut f: impl FnMut(&parley::Cluster<'_, Brush>, f64, f64),
 ) {
@@ -987,14 +987,14 @@ fn for_each_cluster(
 /// Draw one run with the decorations that cover its clusters: consecutive
 /// clusters of the same style become one call.
 #[allow(clippy::too_many_arguments)]
-fn draw_decorated_run(
+pub(crate) fn draw_decorated_run(
     ctx: &mut RenderContext,
     resources: &mut Resources,
     run: &parley::Run<'_, Brush>,
     offset: f32,
     baseline: f32,
     ink: Color,
-    compose: &Option<Range<usize>>,
+    committed: &dyn Fn(usize) -> Option<usize>,
     decorations: &[Decoration],
     scale: f32,
     buffer: &mut Vec<Glyph>,
@@ -1041,7 +1041,7 @@ fn draw_decorated_run(
     let mut current = TextStyle::default();
     let mut from = f64::from(x);
     for cluster in run.visual_clusters() {
-        let style = committed_offset(compose, cluster.text_range().start)
+        let style = committed(cluster.text_range().start)
             .map_or_else(TextStyle::default, |at| style_at(decorations, at));
         if style != current {
             flush(ctx, resources, buffer, current, (from, f64::from(x)));

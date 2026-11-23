@@ -145,18 +145,41 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
 
 /// Turn text back into the bytes of a file. `text` uses `\n`.
 pub fn encode(text: &str, format: &TextFormat) -> Vec<u8> {
+    encode_chunks(std::iter::once(text), text.len(), format)
+}
+
+/// [`encode`] for a rope: the same bytes, without first copying the text
+/// into one string.
+pub fn encode_rope(text: &ropey::Rope, format: &TextFormat) -> Vec<u8> {
+    encode_chunks(text.chunks(), text.len_bytes(), format)
+}
+
+fn encode_chunks<'a>(
+    chunks: impl Iterator<Item = &'a str> + Clone,
+    len: usize,
+    format: &TextFormat,
+) -> Vec<u8> {
     let ending = format.line_ending.as_str();
-    let breaks = text.bytes().filter(|byte| *byte == b'\n').count();
+    let breaks = if format.line_ending == LineEnding::Lf {
+        0
+    } else {
+        chunks
+            .clone()
+            .map(|chunk| chunk.bytes().filter(|byte| *byte == b'\n').count())
+            .sum()
+    };
     let mut bytes = Vec::with_capacity(
-        text.len() + breaks * (ending.len() - 1) + if format.bom { BOM.len() } else { 0 },
+        len + breaks * (ending.len() - 1) + if format.bom { BOM.len() } else { 0 },
     );
     if format.bom {
         bytes.extend_from_slice(BOM);
     }
-    if format.line_ending == LineEnding::Lf {
-        bytes.extend_from_slice(text.as_bytes());
-    } else {
-        let mut lines = text.split('\n');
+    for chunk in chunks {
+        if format.line_ending == LineEnding::Lf {
+            bytes.extend_from_slice(chunk.as_bytes());
+            continue;
+        }
+        let mut lines = chunk.split('\n');
         if let Some(first) = lines.next() {
             bytes.extend_from_slice(first.as_bytes());
         }

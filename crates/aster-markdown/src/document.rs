@@ -1,9 +1,15 @@
 //! A text document: the text, where the selection is, the commands that change
 //! it, and the way back.
+//!
+//! The text is a rope (`ropey`): an edit costs the logarithm of the length,
+//! not the length, so a 100 MB file edits as fast as a short one, and a copy
+//! of the whole text for saving or for the recovery record shares its pieces
+//! with the original instead of copying 100 MB.
 
 use std::ops::Range;
 
 use icu_segmenter::GraphemeClusterSegmenter;
+use ropey::Rope;
 
 use crate::history::{History, Kind};
 
@@ -63,6 +69,8 @@ pub enum EditCommand {
 pub struct Change {
     pub range: Range<usize>,
     pub inserted: String,
+    /// What was in `range` before.
+    pub removed: String,
     pub selection: Selection,
 }
 
@@ -73,7 +81,7 @@ pub struct SavePoint(u64);
 
 #[derive(Clone, Debug)]
 pub struct Document {
-    text: String,
+    text: Rope,
     selection: Selection,
     history: History,
     /// The state the file on disk holds, if the text has been in that state.
@@ -86,38 +94,89 @@ impl Default for Document {
     }
 }
 
+/// How far around the caret the grapheme rules look. A user-perceived
+/// character is a handful of bytes; a window keeps deleting one cheap on a
+/// line of a hundred megabytes.
+const GRAPHEME_WINDOW: usize = 256;
+
+/// Whether a byte offset of the rope falls between two characters.
+pub fn is_char_boundary(text: &Rope, at: usize) -> bool {
+    if at >= text.len_bytes() {
+        return at == text.len_bytes();
+    }
+    let (chunk, start, _, _) = text.chunk_at_byte(at);
+    chunk.is_char_boundary(at - start)
+}
+
+/// `at`, moved back to the nearest character boundary.
+pub fn floor_char_boundary(text: &Rope, at: usize) -> usize {
+    let at = at.min(text.len_bytes());
+    text.char_to_byte(text.byte_to_char(at))
+}
+
+/// The text of a byte range, which must be on character boundaries.
+pub fn slice(text: &Rope, range: Range<usize>) -> String {
+    text.byte_slice(range).to_string()
+}
+
+/// Replace a byte range of the rope, both ends on character boundaries.
+pub fn replace(text: &mut Rope, range: Range<usize>, inserted: &str) {
+    let start = text.byte_to_char(range.start);
+    let end = text.byte_to_char(range.end);
+    if end > start {
+        text.remove(start..end);
+    }
+    if !inserted.is_empty() {
+        text.insert(start, inserted);
+    }
+}
+
+/// The start of the line holding byte `at`.
+fn line_start(text: &Rope, at: usize) -> usize {
+    text.line_to_byte(text.byte_to_line(at))
+}
+
 /// The start of the grapheme cluster that ends at `at`.
-fn previous_boundary(text: &str, at: usize) -> usize {
+fn previous_boundary(text: &Rope, at: usize) -> usize {
     if at == 0 {
         return 0;
     }
     // Clusters never span a line break, so the line is enough context.
-    let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+    let line_start = line_start(text, at);
     if line_start == at {
         // The caret is at the start of a line: the break itself goes.
         return at - 1;
     }
-    let line = &text[line_start..at];
+    let from = floor_char_boundary(text, at.saturating_sub(GRAPHEME_WINDOW).max(line_start));
+    let line = slice(text, from..at);
     let last = GraphemeClusterSegmenter::new()
-        .segment_str(line)
+        .segment_str(&line)
         .filter(|boundary| *boundary < line.len())
         .last()
         .unwrap_or(0);
-    line_start + last
+    from + last
 }
 
 /// The end of the grapheme cluster that starts at `at`.
-fn next_boundary(text: &str, at: usize) -> usize {
-    if at >= text.len() {
-        return text.len();
+fn next_boundary(text: &Rope, at: usize) -> usize {
+    let len = text.len_bytes();
+    if at >= len {
+        return len;
     }
-    if text[at..].starts_with('\n') {
+    if text.byte(at) == b'\n' {
         return at + 1;
     }
-    let line_end = text[at..].find('\n').map_or(text.len(), |index| at + index);
-    let line = &text[at..line_end];
+    let line = text.byte_to_line(at);
+    let line_end = if line + 1 < text.len_lines() {
+        text.line_to_byte(line + 1) - 1
+    } else {
+        len
+    };
+    let to = floor_char_boundary(text, (at + GRAPHEME_WINDOW).min(line_end));
+    let to = if to <= at { line_end } else { to };
+    let line = slice(text, at..to);
     let first = GraphemeClusterSegmenter::new()
-        .segment_str(line)
+        .segment_str(&line)
         .find(|boundary| *boundary > 0)
         .unwrap_or(line.len());
     at + first
@@ -127,9 +186,15 @@ impl Document {
     /// A document holding `text`, with the caret at the start. Line endings
     /// must already be `\n`; [`crate::decode`] sees to that for files.
     pub fn new(text: &str) -> Self {
+        Self::from_rope(Rope::from_str(text))
+    }
+
+    /// A document holding a rope built elsewhere, for instance on the thread
+    /// that read the file.
+    pub fn from_rope(text: Rope) -> Self {
         let history = History::default();
         Self {
-            text: text.to_owned(),
+            text,
             selection: Selection::default(),
             saved: Some(history.state()),
             history,
@@ -139,32 +204,38 @@ impl Document {
     /// A document holding `text` that has never been saved in this state, such
     /// as one brought back from a recovery journal. It counts as modified until
     /// it is saved, and undoing cannot reach a saved state.
-    pub fn unsaved(text: &str) -> Self {
+    pub fn unsaved(text: Rope) -> Self {
         Self {
             saved: None,
-            ..Self::new(text)
+            ..Self::from_rope(text)
         }
     }
 
-    pub fn text(&self) -> &str {
+    /// The text. Cloning it is cheap: the clone shares the rope's pieces.
+    pub fn text(&self) -> &Rope {
         &self.text
+    }
+
+    /// Length of the text in bytes.
+    pub fn len(&self) -> usize {
+        self.text.len_bytes()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.len_bytes() == 0
     }
 
     pub fn selection(&self) -> Selection {
         self.selection
     }
 
-    pub fn selected_text(&self) -> &str {
-        &self.text[self.selection.range()]
+    pub fn selected_text(&self) -> String {
+        slice(&self.text, self.selection.range())
     }
 
     /// Move `offset` back to the nearest character boundary inside the text.
     fn clamp(&self, offset: usize) -> usize {
-        let mut offset = offset.min(self.text.len());
-        while !self.text.is_char_boundary(offset) {
-            offset -= 1;
-        }
-        offset
+        floor_char_boundary(&self.text, offset)
     }
 
     /// Record where the view put the selection. Moving it ends the current run
@@ -183,20 +254,20 @@ impl Document {
     pub fn select_all(&mut self) {
         self.set_selection(Selection {
             anchor: 0,
-            focus: self.text.len(),
+            focus: self.text.len_bytes(),
         });
     }
 
     /// Replace `range` with `inserted`, record it, and report it.
     fn replace(&mut self, kind: Kind, range: Range<usize>, inserted: &str) -> Change {
         let before = self.selection;
-        let removed = self.text[range.clone()].to_owned();
-        self.text.replace_range(range.clone(), inserted);
+        let removed = slice(&self.text, range.clone());
+        replace(&mut self.text, range.clone(), inserted);
         self.selection = Selection::caret(range.start + inserted.len());
         self.history.record(
             kind,
             range.start,
-            removed,
+            removed.clone(),
             inserted.to_owned(),
             before,
             self.selection,
@@ -204,6 +275,7 @@ impl Document {
         Change {
             range,
             inserted: inserted.to_owned(),
+            removed,
             selection: self.selection,
         }
     }
@@ -266,11 +338,12 @@ impl Document {
     pub fn undo(&mut self) -> Option<Change> {
         let entry = self.history.pop_undo()?;
         let range = entry.start..entry.start + entry.inserted.len();
-        self.text.replace_range(range.clone(), &entry.removed);
+        replace(&mut self.text, range.clone(), &entry.removed);
         self.selection = entry.before;
         Some(Change {
             range,
             inserted: entry.removed,
+            removed: entry.inserted,
             selection: self.selection,
         })
     }
@@ -279,11 +352,12 @@ impl Document {
     pub fn redo(&mut self) -> Option<Change> {
         let entry = self.history.pop_redo()?;
         let range = entry.start..entry.start + entry.removed.len();
-        self.text.replace_range(range.clone(), &entry.inserted);
+        replace(&mut self.text, range.clone(), &entry.inserted);
         self.selection = entry.after;
         Some(Change {
             range,
             inserted: entry.inserted,
+            removed: entry.removed,
             selection: self.selection,
         })
     }
@@ -343,6 +417,7 @@ mod tests {
             Some(Change {
                 range: 2..2,
                 inserted: "c".to_owned(),
+                removed: String::new(),
                 selection: Selection::caret(3),
             })
         );
@@ -608,7 +683,7 @@ mod tests {
             }
         }
         let mut document = at_end("start");
-        let mut mirror = document.text().to_owned();
+        let mut mirror = document.text().to_string();
         let commands = [
             EditCommand::Type("a".to_owned()),
             EditCommand::Type("b".to_owned()),
@@ -622,18 +697,18 @@ mod tests {
         for command in commands {
             let change = document.apply(command);
             replay(&mut mirror, change);
-            assert_eq!(mirror, document.text());
+            assert_eq!(mirror, document.text().to_string());
         }
         while document.can_undo() {
             let change = document.undo();
             replay(&mut mirror, change);
-            assert_eq!(mirror, document.text());
+            assert_eq!(mirror, document.text().to_string());
         }
         assert_eq!(mirror, "start");
         while document.can_redo() {
             let change = document.redo();
             replay(&mut mirror, change);
-            assert_eq!(mirror, document.text());
+            assert_eq!(mirror, document.text().to_string());
         }
         assert_eq!(mirror, "startab\n中p");
     }
@@ -686,7 +761,7 @@ mod tests {
 
     #[test]
     fn a_recovered_document_stays_modified_until_it_is_saved() {
-        let mut document = Document::unsaved("restored");
+        let mut document = Document::unsaved(Rope::from_str("restored"));
         assert!(document.is_modified());
         document.set_selection(Selection::caret(8));
         typed(&mut document, "!");

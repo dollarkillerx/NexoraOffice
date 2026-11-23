@@ -8,7 +8,8 @@ use slint::platform::Key;
 use slint::winit_030::{WinitWindowAccessor, winit};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 
-use crate::text_surface::{Action, HAN_FALLBACK_FAMILIES, ImeEvent, TextSurface};
+use crate::Surface;
+use crate::text_surface::{Action, HAN_FALLBACK_FAMILIES, ImeEvent};
 
 /// Convert a logical length to physical pixels for a buffer dimension.
 pub fn to_px(logical: f32, scale: f32) -> u16 {
@@ -138,7 +139,7 @@ fn han_fallback_order(language: &str) -> Vec<&'static str> {
 
 /// Render the surface at its current size and wrap the frame for a Slint `Image`.
 /// Returns `None` while the surface has no area.
-pub fn render_frame(surface: &mut TextSurface) -> Option<Image> {
+pub fn render_frame(surface: &mut dyn Surface) -> Option<Image> {
     let (width, height, _) = surface.size();
     if width == 0 || height == 0 {
         return None;
@@ -157,7 +158,7 @@ pub fn render_frame(surface: &mut TextSurface) -> Option<Image> {
 pub fn place_candidate_window(
     window: &slint::Window,
     origin: (f32, f32),
-    surface: &mut TextSurface,
+    surface: &mut dyn Surface,
 ) {
     let scale = f64::from(window.scale_factor());
     let (x, y, w, h) = surface.ime_cursor_area();

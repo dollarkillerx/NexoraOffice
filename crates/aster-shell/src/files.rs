@@ -7,7 +7,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aster_markdown::{DecodeError, Decoded, TextFormat};
+use aster_markdown::{DecodeError, Decoded, Rope, TextFormat};
 use aster_storage::Fingerprint;
 
 /// Why a file could not be opened.
@@ -51,8 +51,8 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
 /// Write a document's text to its file, in the format the file had. The file
 /// is replaced atomically: a failure leaves the previous contents in place.
 /// Returns the fingerprint of what was written.
-pub fn save(path: &Path, text: &str, format: &TextFormat) -> io::Result<Fingerprint> {
-    let bytes = aster_markdown::encode(text, format);
+pub fn save(path: &Path, text: &Rope, format: &TextFormat) -> io::Result<Fingerprint> {
+    let bytes = aster_markdown::encode_rope(text, format);
     aster_storage::write_atomically(path, &bytes)?;
     Ok(Fingerprint::of(path, &bytes))
 }
@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(loaded.format.line_ending, LineEnding::CrLf);
 
         let edited = format!("{}日本語の行\n", loaded.text);
-        save(&path, &edited, &loaded.format).unwrap();
+        save(&path, &Rope::from_str(&edited), &loaded.format).unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             "# 标题\r\n\r\n第一行\r\n日本語の行\r\n".as_bytes()
@@ -136,7 +136,8 @@ mod tests {
         for (index, sample) in samples.into_iter().enumerate() {
             let path = write(&dir, &format!("{index}.txt"), sample);
             let loaded = load(&path).unwrap();
-            let written = save(&path, &loaded.decoded.text, &loaded.decoded.format).unwrap();
+            let text = Rope::from_str(&loaded.decoded.text);
+            let written = save(&path, &text, &loaded.decoded.format).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), sample);
             // Same bytes, same fingerprint.
             assert!(written.same_content(&loaded.fingerprint));
@@ -169,7 +170,7 @@ mod tests {
     fn a_failed_save_keeps_the_old_contents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-folder").join("a.md");
-        assert!(save(&path, "text", &TextFormat::default()).is_err());
+        assert!(save(&path, &Rope::from_str("text"), &TextFormat::default()).is_err());
         assert!(!path.exists());
     }
 

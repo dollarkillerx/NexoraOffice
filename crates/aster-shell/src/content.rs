@@ -1,20 +1,21 @@
 //! What a tab holds: the view of a Writer tab, or the editor of a Markdown tab.
 //!
-//! This is the binary's side of the crate: it joins the document model from
+//! It joins the document model from
 //! `aster-markdown` to the text surface from `aster-surface`. Neither of those
 //! knows about the other.
 
 use std::path::PathBuf;
 
+use crate::stats::TextStats;
+use crate::theme;
+use crate::toolbar::ViewMode;
 use aster_markdown::highlight::{Highlighter, Marks, Span};
-use aster_markdown::{Change, Document, EditCommand, SavePoint, Selection, TextFormat};
-use aster_shell::stats::TextStats;
-use aster_shell::theme;
-use aster_shell::toolbar::ViewMode;
+use aster_markdown::{Change, Document, EditCommand, Rope, SavePoint, Selection, TextFormat};
 use aster_storage::{Fingerprint, RecordKey};
 use aster_surface::preview::{PreviewJob, PreviewLayout, PreviewStyle, PreviewView};
+use aster_surface::text_view::line_lengths;
 use aster_surface::{
-    Action, Decoration, ImeEvent, PageLayout, Palette, Rgba8, TextStyle, TextSurface,
+    Action, Decoration, ImeEvent, PageLayout, Palette, Rgba8, TextStyle, TextSurface, TextView,
 };
 
 /// Body text size of the Markdown editor, in logical pixels.
@@ -199,12 +200,18 @@ impl WriterView {
 /// so the two never disagree about the text.
 pub struct MarkdownEditor {
     pub document: Document,
-    pub surface: TextSurface,
+    pub surface: TextView,
     /// The file the document is saved in. `None` until it has been saved once.
     pub path: Option<PathBuf>,
     /// Line endings and byte-order mark to write the file with.
     pub format: TextFormat,
     pub stats: TextStats,
+    /// The counts could not be updated locally after an edit; the text has
+    /// to be counted again, which the shell does off this thread for large
+    /// documents.
+    pub stats_stale: bool,
+    /// A count of the whole text is running on another thread.
+    pub counting: bool,
     /// A save is running in the background.
     pub saving: bool,
     /// What the file held when it was last read or written. Stored in the
@@ -248,14 +255,15 @@ pub enum DiskWarning {
 }
 
 /// What the recovery record of a document needs next. See
-/// [`MarkdownEditor::journal_step`].
-#[derive(Debug, PartialEq, Eq)]
+/// [`MarkdownEditor::journal_step`]. Whole texts are ropes: cloning one
+/// shares its pieces, so handing it to the writer thread copies nothing here.
+#[derive(Debug, PartialEq)]
 pub enum JournalStep {
     Nothing,
     /// Start a record holding this whole text.
-    Open(String),
+    Open(Rope),
     /// Add these entries; then, if given, checkpoint this whole text.
-    Append(Vec<Vec<u8>>, Option<String>),
+    Append(Vec<Vec<u8>>, Option<Rope>),
     /// The document has nothing unsaved any more: delete the record.
     Discard,
 }
@@ -263,9 +271,73 @@ pub enum JournalStep {
 /// A record is checkpointed after this many entries...
 const CHECKPOINT_ENTRIES: u64 = 256;
 /// ...or this many bytes of entries, whichever comes first. A checkpoint
-/// copies the whole text, so it is not done on every key press; a replay after
-/// a crash then has at most this much to apply.
+/// writes the whole text, so it is not done on every key press; a replay
+/// after a crash then has at most this much to apply.
 const CHECKPOINT_BYTES: usize = 256 * 1024;
+/// For large documents both limits grow with the text, so that the writer
+/// thread spends a bounded share of its time on checkpoints: one per this
+/// many bytes of text in entries, and one entry per this many bytes of text.
+const CHECKPOINT_BYTES_PER_TEXT: usize = 16;
+const CHECKPOINT_TEXT_PER_ENTRY: usize = 64 * 1024;
+/// Documents up to this size are counted again in full when an edit cannot
+/// be counted locally; larger ones are counted on another thread.
+pub const RECOUNT_INLINE: usize = 1024 * 1024;
+/// Larger documents get no preview: laying out all of it would take seconds
+/// and hundreds of megabytes. The preview pane says so instead.
+pub const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
+
+/// The bytes of a rope, for the recovery writer.
+pub fn rope_bytes(text: &Rope) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len_bytes());
+    for chunk in text.chunks() {
+        bytes.extend_from_slice(chunk.as_bytes());
+    }
+    bytes
+}
+
+/// Everything about a document that takes time in proportion to its size,
+/// computed before the editor exists, on whatever thread read the file: the
+/// rope, the line lengths the view needs, the highlighting and the counts.
+pub struct Prepared {
+    pub text: Rope,
+    lens: Vec<u32>,
+    highlighter: Highlighter,
+    stats: TextStats,
+}
+
+/// A file read and prepared on a worker thread, ready for a tab.
+pub struct Opened {
+    pub prepared: Prepared,
+    pub format: TextFormat,
+    pub fingerprint: Fingerprint,
+}
+
+/// Prepare a file that was read. Slow for large files; call it off the
+/// interface thread.
+pub fn open(loaded: crate::files::Loaded) -> Opened {
+    let crate::files::Loaded {
+        decoded,
+        fingerprint,
+    } = loaded;
+    let text = Rope::from_str(&decoded.text);
+    drop(decoded.text);
+    Opened {
+        prepared: prepare(text),
+        format: decoded.format,
+        fingerprint,
+    }
+}
+
+/// Prepare a document's text. Slow for large documents; call it off the
+/// interface thread.
+pub fn prepare(text: Rope) -> Prepared {
+    Prepared {
+        lens: line_lengths(&text),
+        highlighter: Highlighter::new(&text),
+        stats: TextStats::of_rope(&text),
+        text,
+    }
+}
 
 impl MarkdownEditor {
     /// A document as read from `path`, or a new one when `path` is `None`.
@@ -276,7 +348,24 @@ impl MarkdownEditor {
         disk: Option<Fingerprint>,
         tokens: &theme::Tokens,
     ) -> Self {
-        let mut surface = TextSurface::new(text);
+        Self::from_prepared(prepare(Rope::from_str(text)), format, path, disk, tokens)
+    }
+
+    /// An editor for a document prepared with [`prepare`]. Quick at any size.
+    pub fn from_prepared(
+        prepared: Prepared,
+        format: TextFormat,
+        path: Option<PathBuf>,
+        disk: Option<Fingerprint>,
+        tokens: &theme::Tokens,
+    ) -> Self {
+        let Prepared {
+            text,
+            lens,
+            highlighter,
+            stats,
+        } = prepared;
+        let mut surface = TextView::with_line_lengths(text.clone(), lens);
         surface.set_font_size(MARKDOWN_FONT_SIZE);
         surface.set_palette(editor_palette(tokens));
         surface.set_page_layout(editor_layout(tokens));
@@ -285,7 +374,7 @@ impl MarkdownEditor {
         let mut preview = PreviewView::new();
         preview.set_background(tokens.colors.surface.to_array());
         Self {
-            highlighter: Highlighter::new(text),
+            highlighter,
             syntax: SyntaxColors::of(tokens),
             view_mode: ViewMode::default(),
             preview,
@@ -294,11 +383,13 @@ impl MarkdownEditor {
             synced_scroll: None,
             preview_target: None,
             link_refused: false,
-            document: Document::new(text),
+            document: Document::from_rope(text),
             surface,
             path,
             format,
-            stats: TextStats::of(text),
+            stats,
+            stats_stale: false,
+            counting: false,
             saving: false,
             disk,
             disk_warning: None,
@@ -312,17 +403,18 @@ impl MarkdownEditor {
     /// A document restored from a recovery record. It has unsaved changes from
     /// the start: what was recovered has never been saved.
     pub fn recovered(
-        text: &str,
+        prepared: Prepared,
         format: TextFormat,
         path: Option<PathBuf>,
         disk: Option<Fingerprint>,
         disk_warning: Option<DiskWarning>,
         tokens: &theme::Tokens,
     ) -> Self {
+        let text = prepared.text.clone();
         Self {
             document: Document::unsaved(text),
             disk_warning,
-            ..Self::new(text, format, path, disk, tokens)
+            ..Self::from_prepared(prepared, format, path, disk, tokens)
         }
     }
 
@@ -341,7 +433,7 @@ impl MarkdownEditor {
             (None, true) => {
                 self.record = Some(new_key());
                 self.since_checkpoint = (0, 0);
-                JournalStep::Open(self.document.text().to_owned())
+                JournalStep::Open(self.document.text().clone())
             }
             (Some(_), false) => {
                 self.record = None;
@@ -353,8 +445,11 @@ impl MarkdownEditor {
                 let (count, bytes) = &mut self.since_checkpoint;
                 *count += entries.len() as u64;
                 *bytes += entries.iter().map(Vec::len).sum::<usize>();
-                let checkpoint = (*count >= CHECKPOINT_ENTRIES || *bytes >= CHECKPOINT_BYTES)
-                    .then(|| self.document.text().to_owned());
+                let len = self.document.len();
+                let entry_limit = CHECKPOINT_ENTRIES.max((len / CHECKPOINT_TEXT_PER_ENTRY) as u64);
+                let byte_limit = CHECKPOINT_BYTES.max(len / CHECKPOINT_BYTES_PER_TEXT);
+                let checkpoint = (*count >= entry_limit || *bytes >= byte_limit)
+                    .then(|| self.document.text().clone());
                 if checkpoint.is_some() {
                     self.since_checkpoint = (0, 0);
                 }
@@ -421,7 +516,7 @@ impl MarkdownEditor {
         text_changes: bool,
         style: PreviewStyle,
     ) -> Option<PreviewJob> {
-        if !self.view_mode.shows_preview() {
+        if !self.view_mode.shows_preview() || self.preview_too_large() {
             return None;
         }
         let (width, height, scale) = self.preview.size();
@@ -443,7 +538,7 @@ impl MarkdownEditor {
         Some(PreviewJob {
             key,
             generation: self.text_version,
-            source: self.document.text().to_owned(),
+            source: self.document.text().to_string(),
             width,
             scale,
             style,
@@ -512,12 +607,41 @@ impl MarkdownEditor {
         self.link_refused = false;
         self.unjournaled
             .push(aster_markdown::journal::encode(&change));
-        self.surface.replace_range(change.range, &change.inserted);
+        self.surface
+            .replace_range(change.range.clone(), &change.inserted);
         self.surface
             .set_selection(change.selection.anchor, change.selection.focus);
         self.surface.reveal_caret();
-        self.stats = TextStats::of(self.document.text());
+        if !self.stats_stale
+            && !self.stats.edited(
+                self.document.text(),
+                change.range.start,
+                &change.removed,
+                &change.inserted,
+            )
+        {
+            if self.document.len() <= RECOUNT_INLINE {
+                self.stats = TextStats::of_rope(self.document.text());
+            } else {
+                self.stats_stale = true;
+            }
+        }
         true
+    }
+
+    /// The text version, for matching a count made elsewhere to the text it
+    /// was made of.
+    pub fn text_version(&self) -> u64 {
+        self.text_version
+    }
+
+    /// Counts made of the text at `version` on another thread. Ignored if
+    /// the text has changed since.
+    pub fn counted(&mut self, version: u64, stats: TextStats) {
+        if version == self.text_version {
+            self.stats = stats;
+            self.stats_stale = false;
+        }
     }
 
     /// Tell the document where the surface put the selection.
@@ -613,6 +737,19 @@ impl MarkdownEditor {
         self.show(change)
     }
 
+    /// Put the caret at a byte offset, as a click there would, and bring it
+    /// into view.
+    pub fn place_caret(&mut self, at: usize) {
+        if self.surface.is_composing() {
+            return;
+        }
+        self.document.set_selection(Selection::caret(at));
+        let selection = self.document.selection();
+        self.surface
+            .set_selection(selection.anchor, selection.focus);
+        self.surface.reveal_caret();
+    }
+
     pub fn select_all(&mut self) {
         if self.surface.is_composing() {
             return;
@@ -626,7 +763,7 @@ impl MarkdownEditor {
     /// The selected text, for the clipboard. `None` if nothing is selected.
     pub fn copy(&self) -> Option<String> {
         let text = self.document.selected_text();
-        (!text.is_empty()).then(|| text.to_owned())
+        (!text.is_empty()).then_some(text)
     }
 
     /// Remove the selected text and return it for the clipboard.
@@ -640,15 +777,20 @@ impl MarkdownEditor {
     }
 
     /// The text to write to disk, and the name of the state it is.
-    pub fn snapshot(&mut self) -> (String, SavePoint) {
-        (self.document.text().to_owned(), self.document.save_point())
+    pub fn snapshot(&mut self) -> (Rope, SavePoint) {
+        (self.document.text().clone(), self.document.save_point())
+    }
+
+    /// The document is too large for the preview; the pane says so.
+    pub fn preview_too_large(&self) -> bool {
+        self.document.len() > PREVIEW_LIMIT
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_shell::theme::ThemeMode;
+    use crate::theme::ThemeMode;
 
     fn editor(text: &str) -> MarkdownEditor {
         let tokens = theme::Tokens::of(ThemeMode::Light);
@@ -659,7 +801,7 @@ mod tests {
 
     /// The invariant everything rests on.
     fn assert_in_step(editor: &MarkdownEditor) {
-        assert_eq!(editor.surface.text(), editor.document.text());
+        assert_eq!(editor.surface.text(), editor.document.text().to_string());
         if !editor.surface.is_composing() {
             let selection = editor.document.selection();
             assert_eq!(
@@ -736,10 +878,7 @@ mod tests {
         assert_in_step(&editor);
         let selection = editor.document.selection();
         assert!(!selection.is_caret(), "the drag selected nothing");
-        assert_eq!(
-            editor.copy().as_deref(),
-            Some(editor.document.selected_text())
-        );
+        assert_eq!(editor.copy(), Some(editor.document.selected_text()));
     }
 
     #[test]
@@ -915,7 +1054,7 @@ mod tests {
                 JournalStep::Open(text) => {
                     *self = Record {
                         open: true,
-                        base: text,
+                        base: text.to_string(),
                         entries: Vec::new(),
                     };
                 }
@@ -923,7 +1062,7 @@ mod tests {
                     assert!(self.open, "appending to a record that is not open");
                     self.entries.extend(entries);
                     if let Some(text) = checkpoint {
-                        self.base = text;
+                        self.base = text.to_string();
                         self.entries.clear();
                     }
                 }
@@ -932,7 +1071,9 @@ mod tests {
         }
 
         fn text(&self) -> String {
-            aster_markdown::journal::rebuild(self.base.as_bytes(), &self.entries).unwrap()
+            aster_markdown::journal::rebuild(self.base.as_bytes(), &self.entries)
+                .unwrap()
+                .to_string()
         }
     }
 
@@ -956,7 +1097,7 @@ mod tests {
         sync(&mut editor, &mut record);
         assert!(record.open);
         assert_eq!(editor.record, Some(0));
-        assert_eq!(record.text(), editor.document.text());
+        assert_eq!(record.text(), editor.document.text().to_string());
 
         editor.ime(preedit("nihao"));
         // A composition is not an edit.
@@ -967,7 +1108,7 @@ mod tests {
         editor.redo();
         assert!(editor.paste("日本語"));
         sync(&mut editor, &mut record);
-        assert_eq!(record.text(), editor.document.text());
+        assert_eq!(record.text(), editor.document.text().to_string());
 
         // Saved: the record goes.
         let (_, point) = editor.snapshot();
@@ -979,7 +1120,7 @@ mod tests {
         type_text(&mut editor, "!");
         sync(&mut editor, &mut record);
         assert_eq!(editor.record, Some(1));
-        assert_eq!(record.text(), editor.document.text());
+        assert_eq!(record.text(), editor.document.text().to_string());
 
         // Undone back to the saved text: the record goes again.
         editor.undo();
@@ -1002,14 +1143,14 @@ mod tests {
             assert!(record.entries.len() as u64 <= CHECKPOINT_ENTRIES);
         }
         assert!(checkpoints >= 2, "{checkpoints} checkpoints");
-        assert_eq!(record.text(), editor.document.text());
+        assert_eq!(record.text(), editor.document.text().to_string());
     }
 
     #[test]
     fn a_restored_document_has_unsaved_changes_and_a_record_at_once() {
         let tokens = theme::Tokens::of(ThemeMode::Light);
         let mut editor = MarkdownEditor::recovered(
-            "restored",
+            prepare(Rope::from_str("restored")),
             TextFormat::default(),
             Some(PathBuf::from("/tmp/a.md")),
             None,
@@ -1020,7 +1161,7 @@ mod tests {
         assert_eq!(editor.disk_warning, Some(DiskWarning::Changed));
         assert_eq!(
             editor.journal_step(|| 3),
-            JournalStep::Open("restored".to_owned())
+            JournalStep::Open(Rope::from_str("restored"))
         );
     }
 
@@ -1050,7 +1191,12 @@ mod tests {
     }
 
     fn decorated(editor: &mut MarkdownEditor, needle: &str) -> TextStyle {
-        let at = editor.document.text().find(needle).expect("needle");
+        let at = editor
+            .document
+            .text()
+            .to_string()
+            .find(needle)
+            .expect("needle");
         let spans = editor.highlighter.spans(at..at + 1);
         decorations(spans, &editor.syntax)
             .into_iter()
@@ -1069,7 +1215,7 @@ mod tests {
         assert_eq!(decorated(&mut e, "正文"), TextStyle::default());
         // Undo takes the highlighting back with the text.
         e.undo();
-        assert!(!e.document.text().contains("**粗**"));
+        assert!(!e.document.text().to_string().contains("**粗**"));
         e.decorate();
         assert_in_step(&e);
     }

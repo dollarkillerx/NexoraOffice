@@ -289,6 +289,11 @@ strings! {
     notice_record_failed,
     /// A link in the preview that is not a web or e-mail link was clicked.
     notice_link_refused,
+    /// A file is being read. `{name}` is its name.
+    notice_opening,
+    /// In the preview pane of a document too large to preview. `{size}` is
+    /// the limit, such as "4 MB".
+    preview_too_large,
 }
 
 impl Strings {
@@ -465,6 +470,8 @@ Aster Office 外壳原型
     notice_disk_missing: "原文件已不存在；保存时会先问你存到哪里",
     notice_record_failed: "恢复记录无法写入（{reason}），崩溃后这个文档可能无法找回",
     notice_link_refused: "只会打开网页和邮件链接，这个链接没有打开",
+    notice_opening: "正在打开 {name}…",
+    preview_too_large: "文档超过 {size}，预览已关闭",
 };
 
 pub const JA: Strings = Strings {
@@ -585,6 +592,8 @@ Aster Office シェルの試作
     notice_disk_missing: "元のファイルはもうありません。保存するときは保存先を確認します",
     notice_record_failed: "復元用の記録を書き込めません（{reason}）。異常終了するとこの文書は取り戻せないかもしれません",
     notice_link_refused: "開けるのはウェブとメールのリンクだけです。このリンクは開きませんでした",
+    notice_opening: "{name} を開いています…",
+    preview_too_large: "{size} を超える文書のため、プレビューはオフです",
 };
 
 pub const EN: Strings = Strings {
@@ -705,6 +714,8 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     notice_disk_missing: "The original file no longer exists; saving will ask where to save",
     notice_record_failed: "The recovery record cannot be written ({reason}); this document may be lost if the app crashes",
     notice_link_refused: "Only web and e-mail links are opened; this link was not",
+    notice_opening: "Opening {name}…",
+    preview_too_large: "The preview is off for documents over {size}",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -807,6 +818,8 @@ pub const ZH_HANT: Strings = Strings {
     notice_disk_missing: "原檔案已不存在；儲存時會先詢問你要存到哪裡",
     notice_record_failed: "無法寫入復原記錄（{reason}），當機後這份文件可能無法找回",
     notice_link_refused: "只會開啟網頁和郵件連結，這個連結沒有開啟",
+    notice_opening: "正在開啟 {name}…",
+    preview_too_large: "文件超過 {size}，預覽已關閉",
 };
 
 pub const FR: Strings = Strings {
@@ -909,6 +922,8 @@ pub const FR: Strings = Strings {
     notice_disk_missing: "Le fichier d’origine n’existe plus ; l’enregistrement demandera où enregistrer",
     notice_record_failed: "Impossible d’écrire l’enregistrement de récupération ({reason}) ; ce document pourrait être perdu en cas de plantage",
     notice_link_refused: "Seuls les liens web et e-mail s’ouvrent ; ce lien n’a pas été ouvert",
+    notice_opening: "Ouverture de {name}…",
+    preview_too_large: "L’aperçu est désactivé au-delà de {size}",
 };
 
 pub const DE: Strings = Strings {
@@ -1011,6 +1026,8 @@ pub const DE: Strings = Strings {
     notice_disk_missing: "Die Originaldatei existiert nicht mehr; beim Speichern wird nach dem Ort gefragt",
     notice_record_failed: "Der Wiederherstellungseintrag kann nicht geschrieben werden ({reason}); dieses Dokument könnte bei einem Absturz verloren gehen",
     notice_link_refused: "Nur Web- und E-Mail-Links werden geöffnet; dieser Link nicht",
+    notice_opening: "{name} wird geöffnet …",
+    preview_too_large: "Die Vorschau ist bei Dokumenten über {size} ausgeschaltet",
 };
 
 pub const ES: Strings = Strings {
@@ -1113,6 +1130,8 @@ pub const ES: Strings = Strings {
     notice_disk_missing: "El archivo original ya no existe; al guardar se te preguntará dónde",
     notice_record_failed: "No se puede escribir el registro de recuperación ({reason}); este documento podría perderse si la aplicación falla",
     notice_link_refused: "Solo se abren enlaces web y de correo; este enlace no se abrió",
+    notice_opening: "Abriendo {name}…",
+    preview_too_large: "La vista previa está desactivada en documentos de más de {size}",
 };
 
 pub const KO: Strings = Strings {
@@ -1215,6 +1234,8 @@ pub const KO: Strings = Strings {
     notice_disk_missing: "원본 파일이 더 이상 없습니다. 저장할 때 저장 위치를 묻습니다",
     notice_record_failed: "복구 기록을 쓸 수 없습니다({reason}). 앱이 비정상 종료되면 이 문서를 되찾지 못할 수 있습니다",
     notice_link_refused: "웹과 이메일 링크만 엽니다. 이 링크는 열지 않았습니다",
+    notice_opening: "{name} 여는 중…",
+    preview_too_large: "{size}를 넘는 문서는 미리 보기를 끕니다",
 };
 
 #[cfg(test)]

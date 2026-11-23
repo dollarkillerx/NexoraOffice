@@ -22,4 +22,4 @@ pub use atomic::{read, write_atomically};
 pub use fingerprint::{FileState, Fingerprint, checksum, compare};
 pub use journal::{Durability, Journal, JournalError, Replay};
 pub use records::{FoundRecord, OwnedRecord, RECORD_DURABILITY, RecoveryRoot};
-pub use writer::{Event, RecordKey, RecordWriter};
+pub use writer::{Contents, Event, RecordKey, RecordWriter};

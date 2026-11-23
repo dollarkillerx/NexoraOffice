@@ -13,11 +13,20 @@
 //! block are given to the others through the broken-link callback, so
 //! `[text][label]` still highlights; footnotes are matched within a block only.
 //! Highlighting is a hint for the eye, so that is good enough.
+//!
+//! Built for large files: the text is a rope and only the lines near an edit
+//! are read; blocks are kept in groups, so an edit moves a few hundred of
+//! them rather than every block after it; a block over [`MAX_PARSED`] bytes
+//! (a single enormous line, a code fence that is never closed) is left
+//! unhighlighted instead of being parsed again on every key press.
 
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign, Range};
 
 use pulldown_cmark::{BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, TagEnd};
+use ropey::Rope;
+
+use crate::document::slice;
 
 use crate::syntax;
 
@@ -133,115 +142,240 @@ pub struct Span {
     pub marks: Marks,
 }
 
+/// Blocks larger than this are not highlighted: parsing one on every key
+/// press would cost more than a frame.
+pub const MAX_PARSED: usize = 256 * 1024;
+/// Blocks per group. An edit rewrites one group and moves the start of the
+/// groups after it.
+const GROUP: usize = if cfg!(test) { 4 } else { 512 };
+/// How much of a line is read to decide whether it is blank, opens a fence,
+/// defines a link label. Longer lines are judged on this much: the decisions
+/// err towards fewer cuts, which costs time but never correctness.
+const LINE_PREFIX: usize = 256;
+
+/// A span inside a block, packed: 100 MB of Markdown has millions of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Packed {
+    start: u32,
+    end: u32,
+    marks: Marks,
+}
+
 #[derive(Clone, Debug)]
 struct Block {
+    /// Relative to the start of the group while stored in one.
     start: usize,
     end: usize,
     /// Relative to `start`.
-    spans: Vec<Span>,
+    spans: Box<[Packed]>,
     /// Link reference definitions in this block, normalised.
-    labels: Vec<String>,
+    labels: Box<[String]>,
+    /// The parser asked about a label it did not find in the block: the
+    /// highlighting depends on labels defined elsewhere.
+    uses_labels: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Group {
+    start: usize,
+    blocks: Vec<Block>,
+}
+
+impl Group {
+    fn end(&self) -> usize {
+        self.start + self.blocks.last().map_or(0, |block| block.end)
+    }
 }
 
 /// The highlighting of one document. Tell it about every edit with
 /// [`Highlighter::edit`]; ask it with [`Highlighter::spans`].
 #[derive(Clone, Debug)]
 pub struct Highlighter {
-    /// In order, without gaps, covering the whole text. Never empty.
-    blocks: Vec<Block>,
+    /// In order, without gaps, covering the whole text. Never empty, and no
+    /// group is empty.
+    groups: Vec<Group>,
     /// Every link reference label defined somewhere, with how many times.
     labels: HashMap<String, usize>,
     /// Bytes parsed by the last call to `new` or `edit`.
     parsed: usize,
 }
 
+fn new_block(range: Range<usize>, labels: Vec<String>) -> Block {
+    Block {
+        start: range.start,
+        end: range.end,
+        spans: Box::new([]),
+        labels: labels.into_boxed_slice(),
+        uses_labels: false,
+    }
+}
+
 impl Highlighter {
-    pub fn new(text: &str) -> Self {
+    pub fn new(text: &Rope) -> Self {
         let (cuts, _) = cut(text, 0, |_| false);
         let mut highlighter = Self {
-            blocks: Vec::with_capacity(cuts.len()),
+            groups: Vec::new(),
             labels: HashMap::new(),
             parsed: 0,
         };
+        let mut blocks: Vec<Block> = Vec::with_capacity(cuts.len());
         for (range, labels) in cuts {
             highlighter.count_labels(&labels, true);
-            highlighter.blocks.push(Block {
-                start: range.start,
-                end: range.end,
-                spans: Vec::new(),
-                labels,
-            });
+            blocks.push(new_block(range, labels));
         }
-        highlighter.parse_blocks(text, 0..highlighter.blocks.len());
+        for block in &mut blocks {
+            highlighter.parsed += parse(block, text, &highlighter.labels);
+        }
+        highlighter.groups = regroup(blocks);
         highlighter
     }
 
     /// Bring the highlighting in line with an edit already made to the text:
     /// `old` is the byte range that was replaced, `inserted` how many bytes
     /// took its place, and `text` the text after the edit.
-    pub fn edit(&mut self, text: &str, old: Range<usize>, inserted: usize) {
+    pub fn edit(&mut self, text: &Rope, old: Range<usize>, inserted: usize) {
         let shift = |offset: usize| (offset + inserted) - old.len();
+        self.parsed = 0;
 
         // The block the edit starts in. An edit at the very start of a block
         // can join it to the one before (a space typed there indents it), so
         // start one block earlier.
-        let mut first = self
-            .blocks
-            .partition_point(|block| block.end <= old.start)
-            .min(self.blocks.len() - 1);
-        if first > 0 && self.blocks[first].start == old.start {
-            first -= 1;
+        let (mut g, mut b) = self.locate(old.start);
+        if (g, b) != (0, 0) && self.start_of(g, b) == old.start {
+            (g, b) = self.previous(g, b);
         }
-        let from = self.blocks[first].start;
+        let from = self.start_of(g, b);
 
         // Old blocks that start after the edit, and so are unchanged text.
         // Cutting stops at the first new cut that lands on one of them.
-        let mut next = self.blocks.partition_point(|block| block.start <= old.end);
-        let blocks = &self.blocks;
+        let (mut rg, mut rb) = self.first_starting_after(old.end);
+        let groups = &self.groups;
+        let start = |rg: usize, rb: usize| groups[rg].start + groups[rg].blocks[rb].start;
         let (cuts, resynced) = cut(text, from, |at| {
-            while next < blocks.len() && shift(blocks[next].start) < at {
-                next += 1;
+            while rg < groups.len() && shift(start(rg, rb)) < at {
+                rb += 1;
+                if rb == groups[rg].blocks.len() {
+                    (rg, rb) = (rg + 1, 0);
+                }
             }
-            next < blocks.len() && shift(blocks[next].start) == at
+            rg < groups.len() && shift(start(rg, rb)) == at
         });
-        let last = if resynced { next } else { self.blocks.len() };
 
-        // Swap the blocks in, and move the ones after them.
+        // The old blocks from (g, b) up to (rg, rb), or to the end, are
+        // replaced. Take the groups they are in out, in absolute offsets.
+        let (end_g, end_b) = if resynced {
+            (rg, rb)
+        } else {
+            (self.groups.len(), 0)
+        };
+        let last_touched = if end_b == 0 { end_g - 1 } else { end_g };
+        let before_end: usize = self.groups[g..end_g]
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum();
+        let mut blocks: Vec<Block> = Vec::new();
+        for group in self.groups.drain(g..=last_touched) {
+            for mut block in group.blocks {
+                block.start += group.start;
+                block.end += group.start;
+                blocks.push(block);
+            }
+        }
+        let end_index = before_end + end_b;
+
         let added = cuts.len();
-        let replaced: Vec<Block> = self
-            .blocks
+        let removed: Vec<Block> = blocks
             .splice(
-                first..last,
-                cuts.into_iter().map(|(range, labels)| Block {
-                    start: range.start,
-                    end: range.end,
-                    spans: Vec::new(),
-                    labels,
-                }),
+                b..end_index,
+                cuts.into_iter()
+                    .map(|(range, labels)| new_block(range, labels)),
             )
             .collect();
-        let new = first..first + added;
-        for block in &mut self.blocks[new.end..] {
+        for block in &mut blocks[b + added..] {
             block.start = shift(block.start);
             block.end = shift(block.end);
         }
 
-        // Link labels: if the set of defined labels changed, links anywhere
-        // may have appeared or gone, so everything is parsed again.
+        // Link labels: if the set of defined labels changed, blocks that use
+        // labels from elsewhere are parsed again.
         let mut set_changed = false;
-        for block in &replaced {
+        for block in &removed {
             set_changed |= self.count_labels(&block.labels, false);
         }
-        for index in new.clone() {
-            let labels = std::mem::take(&mut self.blocks[index].labels);
-            set_changed |= self.count_labels(&labels, true);
-            self.blocks[index].labels = labels;
+        for block in &blocks[b..b + added] {
+            set_changed |= self.count_labels(&block.labels, true);
         }
-        self.parsed = 0;
+        for block in &mut blocks[b..b + added] {
+            self.parsed += parse(block, text, &self.labels);
+        }
+
+        let regrouped = regroup(blocks);
+        let count = regrouped.len();
+        self.groups.splice(g..g, regrouped);
+        for group in &mut self.groups[g + count..] {
+            group.start = shift(group.start);
+        }
+
         if set_changed {
-            self.parse_blocks(text, 0..self.blocks.len());
+            let labels = &self.labels;
+            let mut parsed = 0;
+            for group in &mut self.groups {
+                for block in &mut group.blocks {
+                    if block.uses_labels {
+                        let mut absolute = block.clone();
+                        absolute.start += group.start;
+                        absolute.end += group.start;
+                        parsed += parse(&mut absolute, text, labels);
+                        block.spans = absolute.spans;
+                        block.uses_labels = absolute.uses_labels;
+                    }
+                }
+            }
+            self.parsed += parsed;
+        }
+    }
+
+    /// The group and block holding byte `offset`; the last block for the end
+    /// of the text.
+    fn locate(&self, offset: usize) -> (usize, usize) {
+        let g = self
+            .groups
+            .partition_point(|group| group.end() <= offset)
+            .min(self.groups.len() - 1);
+        let group = &self.groups[g];
+        let b = group
+            .blocks
+            .partition_point(|block| group.start + block.end <= offset)
+            .min(group.blocks.len() - 1);
+        (g, b)
+    }
+
+    fn start_of(&self, g: usize, b: usize) -> usize {
+        self.groups[g].start + self.groups[g].blocks[b].start
+    }
+
+    fn previous(&self, g: usize, b: usize) -> (usize, usize) {
+        if b > 0 {
+            (g, b - 1)
         } else {
-            self.parse_blocks(text, new);
+            (g - 1, self.groups[g - 1].blocks.len() - 1)
+        }
+    }
+
+    /// The first block that starts after `offset`, or one past the end.
+    fn first_starting_after(&self, offset: usize) -> (usize, usize) {
+        let g = self.groups.partition_point(|group| group.end() <= offset);
+        if g == self.groups.len() {
+            return (g, 0);
+        }
+        let group = &self.groups[g];
+        let b = group
+            .blocks
+            .partition_point(|block| group.start + block.start <= offset);
+        if b == group.blocks.len() {
+            (g + 1, 0)
+        } else {
+            (g, b)
         }
     }
 
@@ -265,35 +399,29 @@ impl Highlighter {
         changed
     }
 
-    fn parse_blocks(&mut self, text: &str, range: Range<usize>) {
-        for index in range {
-            let block = &self.blocks[index];
-            let source = &text[block.start..block.end];
-            let spans = highlight_block(source, &self.labels);
-            self.parsed += source.len();
-            self.blocks[index].spans = spans;
-        }
-    }
-
     /// The highlighted spans that overlap `range`, in document offsets.
     pub fn spans(&self, range: Range<usize>) -> Vec<Span> {
-        let first = self
-            .blocks
-            .partition_point(|block| block.end <= range.start);
+        let (g, b) = self.locate(range.start);
         let mut out = Vec::new();
-        for block in &self.blocks[first..] {
-            if block.start >= range.end && !(range.is_empty() && block.start == range.start) {
-                break;
-            }
-            for span in &block.spans {
-                let absolute = block.start + span.range.start..block.start + span.range.end;
-                if absolute.end > range.start && absolute.start < range.end {
-                    out.push(Span {
-                        range: absolute,
-                        marks: span.marks,
-                    });
+        let mut first = b;
+        for group in &self.groups[g..] {
+            for block in &group.blocks[first..] {
+                let block_start = group.start + block.start;
+                if block_start >= range.end && !(range.is_empty() && block_start == range.start) {
+                    return out;
+                }
+                for span in block.spans.iter() {
+                    let absolute =
+                        block_start + span.start as usize..block_start + span.end as usize;
+                    if absolute.end > range.start && absolute.start < range.end {
+                        out.push(Span {
+                            range: absolute,
+                            marks: span.marks,
+                        });
+                    }
                 }
             }
+            first = 0;
         }
         out
     }
@@ -307,11 +435,64 @@ impl Highlighter {
     /// Block ranges, for tests.
     #[cfg(test)]
     fn block_ranges(&self) -> Vec<Range<usize>> {
-        self.blocks
+        self.groups
             .iter()
-            .map(|block| block.start..block.end)
+            .flat_map(|group| {
+                group
+                    .blocks
+                    .iter()
+                    .map(move |block| group.start + block.start..group.start + block.end)
+            })
             .collect()
     }
+}
+
+/// Split blocks with absolute offsets into groups of even size.
+fn regroup(blocks: Vec<Block>) -> Vec<Group> {
+    let count = blocks.len().div_ceil(GROUP).max(1);
+    let size = blocks.len().div_ceil(count).max(1);
+    let mut groups = Vec::with_capacity(count);
+    let mut blocks = blocks.into_iter().peekable();
+    while blocks.peek().is_some() {
+        let chunk: Vec<Block> = blocks.by_ref().take(size).collect();
+        let start = chunk[0].start;
+        let chunk = chunk
+            .into_iter()
+            .map(|mut block| {
+                block.start -= start;
+                block.end -= start;
+                block
+            })
+            .collect();
+        groups.push(Group {
+            start,
+            blocks: chunk,
+        });
+    }
+    groups
+}
+
+/// Highlight one block with absolute offsets. Returns how many bytes were
+/// parsed: none for a block over [`MAX_PARSED`].
+fn parse(block: &mut Block, text: &Rope, labels: &HashMap<String, usize>) -> usize {
+    let len = block.end - block.start;
+    if len > MAX_PARSED {
+        block.spans = Box::new([]);
+        block.uses_labels = false;
+        return 0;
+    }
+    let source = slice(text, block.start..block.end);
+    let (spans, uses_labels) = highlight_block(&source, labels);
+    block.spans = spans
+        .into_iter()
+        .map(|span| Packed {
+            start: span.range.start as u32,
+            end: span.range.end as u32,
+            marks: span.marks,
+        })
+        .collect();
+    block.uses_labels = uses_labels;
+    len
 }
 
 /// What kind of multi-line construct a line leaves open, inside which a blank
@@ -397,22 +578,33 @@ type Cut = (Range<usize>, Vec<String>);
 /// `stop` is asked about every cut after the first block; when it says yes,
 /// cutting ends there and the second value is `true`. Each block comes with
 /// its link reference labels.
-fn cut(text: &str, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut>, bool) {
+fn cut(text: &Rope, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut>, bool) {
+    let len = text.len_bytes();
     let mut blocks = Vec::new();
     let mut start = from;
     let mut labels = Vec::new();
     let mut open = Open::Nothing;
     let mut previous_blank = false;
     let mut at = from;
-    while at < text.len() {
-        let end = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
-        let line = &text[at..end];
-        let blank = line.trim().is_empty();
+    for line in text.lines_at(text.byte_to_line(from)) {
+        if at >= len {
+            break;
+        }
+        let line_len = line.len_bytes();
+        // Short lines are read whole; of long ones only the start.
+        let whole = line_len <= LINE_PREFIX;
+        let prefix = if whole {
+            line.to_string()
+        } else {
+            let end = line.char_to_byte(line.byte_to_char(LINE_PREFIX));
+            line.byte_slice(..end).to_string()
+        };
+        let blank = whole && prefix.trim().is_empty();
         if at != start
             && previous_blank
             && open == Open::Nothing
             && !blank
-            && !line.starts_with([' ', '\t'])
+            && !prefix.starts_with([' ', '\t'])
         {
             blocks.push((start..at, std::mem::take(&mut labels)));
             if stop(at) {
@@ -422,22 +614,22 @@ fn cut(text: &str, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut
         }
         open = match open {
             Open::Nothing => {
-                if let Some(label) = syntax::definition_label(line) {
+                if let Some(label) = syntax::definition_label(&prefix) {
                     labels.push(label);
                 }
-                fence_open(line)
-                    .or_else(|| html_open(line))
+                fence_open(&prefix)
+                    .or_else(|| html_open(&prefix))
                     .unwrap_or(Open::Nothing)
             }
             Open::Fence { fence, len, indent } => {
-                if fence_closes(line, fence, len, indent) {
+                if whole && fence_closes(&prefix, fence, len, indent) {
                     Open::Nothing
                 } else {
                     open
                 }
             }
             Open::Html(closing) => {
-                if line.to_ascii_lowercase().contains(closing) {
+                if prefix.to_ascii_lowercase().contains(closing) {
                     Open::Nothing
                 } else {
                     open
@@ -445,18 +637,22 @@ fn cut(text: &str, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut
             }
         };
         previous_blank = blank;
-        at = end;
+        at += line_len;
     }
-    blocks.push((start..text.len(), labels));
+    blocks.push((start..len, labels));
     (blocks, false)
 }
 
 /// Highlight one block, parsed on its own. Offsets are relative to `source`.
-fn highlight_block(source: &str, labels: &HashMap<String, usize>) -> Vec<Span> {
+/// The second value says whether the parser looked for a label it did not
+/// find in the block.
+fn highlight_block(source: &str, labels: &HashMap<String, usize>) -> (Vec<Span>, bool) {
     if source.trim().is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
+    let asked = std::cell::Cell::new(false);
     let callback = |link: BrokenLink<'_>| {
+        asked.set(true);
         labels
             .contains_key(&syntax::normalize_label(&link.reference))
             .then_some((CowStr::Borrowed(""), CowStr::Borrowed("")))
@@ -467,7 +663,7 @@ fn highlight_block(source: &str, labels: &HashMap<String, usize>) -> Vec<Span> {
         marks.event(event, range);
     }
     marks.definitions();
-    flatten(marks.raw)
+    (flatten(marks.raw), asked.get())
 }
 
 /// Turns parser events into raw, possibly overlapping marks.
@@ -851,8 +1047,12 @@ fn flatten(raw: Vec<(Range<usize>, Marks)>) -> Vec<Span> {
 mod tests {
     use super::*;
 
+    fn rope(text: &str) -> Rope {
+        Rope::from_str(text)
+    }
+
     fn all(text: &str) -> Vec<Span> {
-        Highlighter::new(text).spans(0..text.len())
+        Highlighter::new(&rope(text)).spans(0..text.len())
     }
 
     /// The marks on the first byte of the `nth` occurrence of `needle`.
@@ -924,7 +1124,7 @@ mod tests {
         assert_eq!(marks_at(text, "代码", 0), Marks::CODE_BLOCK);
         assert_eq!(marks_at(text, "# 不是", 0), Marks::CODE_BLOCK);
         assert_eq!(marks_at(text, "也不是", 0), Marks::CODE_BLOCK);
-        let highlighter = Highlighter::new(text);
+        let highlighter = Highlighter::new(&rope(text));
         assert_eq!(highlighter.block_ranges().len(), 2);
     }
 
@@ -1009,20 +1209,20 @@ mod tests {
     #[test]
     fn empty_and_blank_documents() {
         for text in ["", "\n", "\n\n\n", "   "] {
-            let highlighter = Highlighter::new(text);
+            let highlighter = Highlighter::new(&rope(text));
             assert!(highlighter.spans(0..text.len()).is_empty());
             assert_eq!(highlighter.block_ranges(), vec![0..text.len()]);
         }
-        let mut highlighter = Highlighter::new("");
-        highlighter.edit("*a*", 0..0, 3);
+        let mut highlighter = Highlighter::new(&rope(""));
+        highlighter.edit(&rope("*a*"), 0..0, 3);
         assert_eq!(highlighter.spans(0..3).len(), 3);
-        highlighter.edit("", 0..3, 0);
+        highlighter.edit(&rope(""), 0..3, 0);
         assert!(highlighter.spans(0..0).is_empty());
     }
 
     #[test]
     fn a_very_long_line() {
-        let mut text = "长".repeat(100_000);
+        let mut text = "长".repeat(50_000);
         text.push_str(" **尾巴** https://example.com");
         let spans = all(&text);
         check_spans(&text, &spans);
@@ -1031,10 +1231,27 @@ mod tests {
     }
 
     #[test]
+    fn a_block_over_the_limit_is_left_plain() {
+        let mut text = "# 标题\n\n".to_owned();
+        text.push_str(&"长".repeat(MAX_PARSED / 3 + 10));
+        text.push_str(" **尾巴**\n\n**后面**");
+        assert_eq!(marks_at(&text, "标题", 0), Marks::HEADING);
+        assert_eq!(marks_at(&text, "尾巴", 0), Marks::NONE);
+        assert_eq!(marks_at(&text, "后面", 0), Marks::STRONG);
+        // Typing into it parses nothing.
+        let mut highlighter = Highlighter::new(&rope(&text));
+        let at = text.find("尾巴").unwrap();
+        let mut edited = text.clone();
+        edited.insert(at, 'x');
+        highlighter.edit(&rope(&edited), at..at, 1);
+        assert_eq!(highlighter.last_parsed(), 0);
+    }
+
+    #[test]
     fn blank_lines_inside_constructs_are_not_cuts() {
         let text =
             "- 项\n\n  续\n\n```\na\n\nb\n```\n\n<!--\n\n-->\n\n    code\n\n    more\n\n段落\n";
-        let ranges = Highlighter::new(text).block_ranges();
+        let ranges = Highlighter::new(&rope(text)).block_ranges();
         let starts: Vec<&str> = ranges
             .iter()
             .map(|r| text[r.clone()].lines().next().unwrap_or(""))
@@ -1093,7 +1310,7 @@ mod tests {
         let mut text = String::from(
             "# 标题\n\n段落 *强调*\n\n- 列表\n- [x] 任务\n\n```\n代码\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
         );
-        let mut highlighter = Highlighter::new(&text);
+        let mut highlighter = Highlighter::new(&rope(&text));
         for step in 0..3000 {
             let start = boundary(&text, rng.next(text.len() + 1));
             let end = boundary(&text, start + rng.next(6)).max(start);
@@ -1103,8 +1320,8 @@ mod tests {
                 PIECES[rng.next(PIECES.len())]
             };
             text.replace_range(start..end, insert);
-            highlighter.edit(&text, start..end, insert.len());
-            let fresh = Highlighter::new(&text);
+            highlighter.edit(&rope(&text), start..end, insert.len());
+            let fresh = Highlighter::new(&rope(&text));
             assert_eq!(
                 highlighter.block_ranges(),
                 fresh.block_ranges(),
@@ -1124,12 +1341,12 @@ mod tests {
     fn an_edit_parses_only_nearby_blocks() {
         let paragraph = "这是一段比较长的中文段落，带有 **粗体** 和 `代码`。\n\n";
         let text = paragraph.repeat(2000);
-        let mut highlighter = Highlighter::new(&text);
+        let mut highlighter = Highlighter::new(&rope(&text));
         assert_eq!(highlighter.last_parsed(), text.len());
         let at = paragraph.len() * 1000 + 3;
         let mut edited = text.clone();
         edited.insert(at, '字');
-        highlighter.edit(&edited, at..at, "字".len());
+        highlighter.edit(&rope(&edited), at..at, "字".len());
         assert!(
             highlighter.last_parsed() < paragraph.len() * 3,
             "parsed {} bytes",
@@ -1137,14 +1354,14 @@ mod tests {
         );
         assert_eq!(
             highlighter.spans(0..edited.len()),
-            Highlighter::new(&edited).spans(0..edited.len())
+            Highlighter::new(&rope(&edited)).spans(0..edited.len())
         );
     }
 
     #[test]
     fn spans_are_found_by_range() {
         let text = "**a**\n\n**b**\n";
-        let highlighter = Highlighter::new(text);
+        let highlighter = Highlighter::new(&rope(text));
         let spans = highlighter.spans(7..9);
         assert!(
             spans

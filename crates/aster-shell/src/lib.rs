@@ -7,6 +7,7 @@
 //! binds it to the Slint UI under `ui/`.
 
 pub mod cli;
+pub mod content;
 pub mod files;
 pub mod i18n;
 pub mod icons;

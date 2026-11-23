@@ -26,10 +26,10 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use aster_markdown::{DecodeError, SavePoint, TextFormat};
+use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
 use aster_shell::cli::{self, Options};
-use aster_shell::files::{self, LoadError, Loaded};
+use aster_shell::files::{self, LoadError};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
 use aster_shell::recovery::{self, Age, Candidate, RecordInfo};
@@ -38,20 +38,23 @@ use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
 use aster_shell::toolbar::{self, Command, Control, ViewMode, ViewState, zoom_step};
-use aster_storage::{Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot};
+use aster_storage::{
+    Contents, Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot,
+};
 use aster_surface::host::{self, to_px};
 use aster_surface::preview::{PreviewLayout, PreviewWorker};
-use aster_surface::{Action, ImeEvent, TextSurface};
+use aster_surface::{Action, ImeEvent, Surface};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{
     CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
 
-use content::{DiskWarning, JournalStep, MarkdownEditor, WriterView};
+use aster_shell::content::{
+    self, DiskWarning, JournalStep, MarkdownEditor, Opened, Prepared, WriterView, rope_bytes,
+};
 
 slint::include_modules!();
 
-mod content;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -71,7 +74,7 @@ enum Content {
 }
 
 impl Content {
-    fn surface(&mut self) -> &mut TextSurface {
+    fn surface(&mut self) -> &mut dyn Surface {
         match self {
             Content::Writer(view) => &mut view.surface,
             Content::Markdown(editor) => &mut editor.surface,
@@ -116,7 +119,7 @@ enum Closing {
 struct SaveJob {
     id: TabId,
     path: PathBuf,
-    text: String,
+    text: Rope,
     format: TextFormat,
     point: SavePoint,
 }
@@ -138,6 +141,8 @@ struct Shell {
     candidates: Vec<Candidate>,
     /// Lays out Markdown previews. `None` in tests.
     previews: Option<PreviewWorker>,
+    /// Files being read and prepared on a worker thread.
+    opening: Vec<PathBuf>,
     /// Runs once typing has paused, to bring the preview up to date.
     preview_timer: Timer,
 }
@@ -157,6 +162,7 @@ impl Shell {
             next_key: 0,
             candidates: Vec::new(),
             previews: None,
+            opening: Vec::new(),
             preview_timer: Timer::default(),
         }
     }
@@ -167,7 +173,7 @@ impl Shell {
     }
 
     /// The surface of the tab in front, if it has one.
-    fn active_surface(&mut self) -> Option<&mut TextSurface> {
+    fn active_surface(&mut self) -> Option<&mut dyn Surface> {
         self.active_content().map(Content::surface)
     }
 
@@ -274,7 +280,7 @@ impl Shell {
 
     /// Show a file that has been read from disk. A file that is already open is
     /// brought to the front instead; its tab keeps whatever was typed into it.
-    fn open_file(&mut self, path: PathBuf, loaded: Loaded) -> TabId {
+    fn open_file(&mut self, path: PathBuf, opened: Opened) -> TabId {
         self.leave_active_document();
         if let Some(id) = self.tab_of_file(&path) {
             self.tabs.activate(id);
@@ -283,13 +289,14 @@ impl Shell {
         let id = self
             .tabs
             .open(DocKind::Markdown, files::display_name(&path));
-        let Loaded {
-            decoded,
+        let Opened {
+            prepared,
+            format,
             fingerprint,
-        } = loaded;
-        let editor = MarkdownEditor::new(
-            &decoded.text,
-            decoded.format,
+        } = opened;
+        let editor = MarkdownEditor::from_prepared(
+            prepared,
+            format,
             Some(path),
             Some(fingerprint),
             &self.tokens,
@@ -307,12 +314,16 @@ impl Shell {
             record,
             info: Some(info),
             text: Ok(text),
+            prepared,
             disk,
             ..
         } = candidate
         else {
             return None;
         };
+        let prepared = prepared
+            .and_then(|prepared| prepared.downcast::<Prepared>().ok())
+            .map_or_else(|| content::prepare(text.clone()), |prepared| *prepared);
         self.leave_active_document();
         let warning = match disk {
             Some(FileState::Changed | FileState::Unreadable(_)) => Some(DiskWarning::Changed),
@@ -328,7 +339,7 @@ impl Shell {
         };
         let id = self.tabs.open(DocKind::Markdown, title);
         let mut editor = MarkdownEditor::recovered(
-            &text,
+            prepared,
             info.format,
             info.path.clone(),
             info.disk,
@@ -339,7 +350,12 @@ impl Shell {
             let key = self.next_key;
             self.next_key += 1;
             // The restored text becomes the record's new checkpoint.
-            writer.adopt(key, record, info.to_meta(), text.into_bytes());
+            writer.adopt(
+                key,
+                record,
+                info.to_meta(),
+                Contents::later(move || rope_bytes(&text)),
+            );
             editor.record = Some(key);
         }
         self.contents
@@ -387,14 +403,18 @@ impl Shell {
             match (step, editor.record.or(previous)) {
                 (JournalStep::Nothing, _) | (_, None) => {}
                 (JournalStep::Open(text), Some(key)) => {
-                    writer.open(key, info.to_meta(), text.into_bytes());
+                    writer.open(
+                        key,
+                        info.to_meta(),
+                        Contents::later(move || rope_bytes(&text)),
+                    );
                 }
                 (JournalStep::Append(entries, checkpoint), Some(key)) => {
                     for entry in entries {
                         writer.append(key, entry);
                     }
                     if let Some(text) = checkpoint {
-                        writer.checkpoint(key, text.into_bytes());
+                        writer.checkpoint(key, Contents::later(move || rope_bytes(&text)));
                     }
                 }
                 (JournalStep::Discard, Some(key)) => writer.discard(key),
@@ -981,6 +1001,48 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_composing(false);
         }
     }
+
+    // A file being opened says so above anything else.
+    if let Some(path) = shell.opening.last() {
+        let name = files::display_name(path);
+        ui.set_status_notice(i18n::fill(strings.notice_opening, "name", &name).into());
+    }
+}
+
+/// Count the words of the tab in front again on another thread, if an edit
+/// could not be counted locally and its text is too large to count here.
+fn schedule_count(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    if !editor.stats_stale || editor.counting {
+        return;
+    }
+    editor.counting = true;
+    let text = editor.document.text().clone();
+    let version = editor.text_version();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let stats = TextStats::of_rope(&text);
+        drop(text);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    if let Some(editor) = shell.markdown(id) {
+                        editor.counting = false;
+                        editor.counted(version, stats);
+                    }
+                    // The text may have changed again meanwhile.
+                    schedule_count(ui, shell);
+                    refresh_status(ui, shell);
+                }),
+            );
+        });
+    });
 }
 
 /// Render the document in front, hand the frame to Slint, and move the
@@ -1041,9 +1103,19 @@ fn present_preview(ui: &AppWindow, shell: &mut Shell) {
         return;
     }
     request_preview(shell, !shell.preview_timer.running());
+    let strings = shell.language.strings();
     let Some(editor) = shell.active_markdown() else {
         return;
     };
+    let note = if editor.preview_too_large() {
+        let limit = format!("{} MB", content::PREVIEW_LIMIT / (1024 * 1024));
+        i18n::fill(strings.preview_too_large, "size", &limit)
+    } else {
+        String::new()
+    };
+    if ui.get_preview_note().as_str() != note {
+        ui.set_preview_note(note.into());
+    }
     editor.preview.resize(width, height, scale);
     editor.follow_editor();
     // A caret blink in the source does not change the preview: keep the
@@ -1162,6 +1234,7 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
             refresh_toolbar(ui, shell);
         }
         schedule_preview(ui, shell);
+        schedule_count(ui, shell);
     }
     refresh_status(ui, shell);
     present(ui, shell);
@@ -1239,9 +1312,19 @@ fn deliver(ui: AppWindow, job: Delivery) {
 
 /// Read a file on a worker thread and open it in a tab when it arrives.
 fn spawn_load(ui: &AppWindow, path: PathBuf) {
+    // Say so in the status bar while it takes: a large file takes seconds.
+    let opening = path.clone();
+    deliver(
+        ui.clone_strong(),
+        Box::new(move |ui, shell| {
+            shell.opening.push(opening);
+            refresh_status(ui, shell);
+        }),
+    );
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let result = files::load(&path);
+        // Reading, decoding and preparing a large file all happen here.
+        let result = files::load(&path).map(content::open);
         // The window may be gone by the time the file is read.
         let _ = weak.upgrade_in_event_loop(move |ui| {
             deliver(
@@ -1257,7 +1340,18 @@ fn spawn_load(ui: &AppWindow, path: PathBuf) {
 fn spawn_recovery_scan(ui: &AppWindow, root: RecoveryRoot) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let found = recovery::find(&root);
+        let found = recovery::find(&root).map(|mut candidates| {
+            // Prepare restorable documents here, so restoring one does not
+            // stall the window however large it is.
+            for candidate in &mut candidates {
+                if let Ok(text) = &candidate.text {
+                    let prepared: Box<dyn std::any::Any + Send> =
+                        Box::new(content::prepare(text.clone()));
+                    candidate.prepared = Some(prepared);
+                }
+            }
+            candidates
+        });
         let _ = weak.upgrade_in_event_loop(move |ui| {
             deliver(
                 ui,
@@ -1362,11 +1456,15 @@ fn finish_load(
     ui: &AppWindow,
     shell: &mut Shell,
     path: PathBuf,
-    result: Result<Loaded, LoadError>,
+    result: Result<Opened, LoadError>,
 ) {
+    if let Some(at) = shell.opening.iter().position(|opening| opening == &path) {
+        shell.opening.remove(at);
+    }
+    refresh_status(ui, shell);
     match result {
-        Ok(loaded) => {
-            shell.open_file(path, loaded);
+        Ok(opened) => {
+            shell.open_file(path, opened);
             after_tab_change(ui, shell);
         }
         Err(err) => {
@@ -2187,15 +2285,15 @@ mod tests {
         Shell::new(ThemeMode::Light, Language::ZhHans)
     }
 
-    fn decoded(text: &str) -> Loaded {
-        Loaded {
+    fn decoded(text: &str) -> Opened {
+        content::open(files::Loaded {
             decoded: aster_markdown::decode(text.as_bytes()).expect("valid UTF-8"),
             fingerprint: aster_storage::Fingerprint {
                 len: text.len() as u64,
                 checksum: aster_storage::checksum(text.as_bytes()),
                 modified_nanos: None,
             },
-        }
+        })
     }
 
     fn written() -> Option<Fingerprint> {
@@ -2299,7 +2397,7 @@ mod tests {
         assert_eq!(
             shell
                 .active_markdown()
-                .map(|editor| editor.document.text().to_owned()),
+                .map(|editor| editor.document.text().to_string()),
             Some("x# 笔记\n".to_owned())
         );
     }
@@ -2383,7 +2481,7 @@ mod tests {
                 }
                 Content::Markdown(editor) => {
                     editor.ime(preedit);
-                    editor.document.text().to_owned()
+                    editor.document.text().to_string()
                 }
             };
             shell.open_untitled(DocKind::Writer);
@@ -2440,14 +2538,14 @@ mod tests {
         assert_eq!(
             shell
                 .active_markdown()
-                .map(|e| e.document.text().to_owned()),
+                .map(|e| e.document.text().to_string()),
             Some(String::new())
         );
         assert!(shell.run(Command::Redo));
         assert_eq!(
             shell
                 .active_markdown()
-                .map(|e| e.document.text().to_owned()),
+                .map(|e| e.document.text().to_string()),
             Some("abc".to_owned())
         );
         assert!(!shell.run(Command::Redo));
@@ -2485,10 +2583,7 @@ mod tests {
         assert!(surface.text().starts_with("Aster Office shell"));
         // A new Markdown document is empty.
         shell.open_untitled(DocKind::Markdown);
-        assert_eq!(
-            shell.active_markdown().map(|e| e.document.text().len()),
-            Some(0)
-        );
+        assert_eq!(shell.active_markdown().map(|e| e.document.len()), Some(0));
     }
 
     #[test]

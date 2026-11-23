@@ -2,7 +2,7 @@
 name = "aster-platform"
 version.workspace = true
 license.workspace = true
-description = "What Aster Office asks of the operating system: file dialogs for now"
+description = "What Aster Office asks of the operating system: file dialogs, opening links, data folders"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true

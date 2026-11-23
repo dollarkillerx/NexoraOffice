@@ -1311,7 +1311,10 @@ impl MarkdownEditor {
         let text = self.document.text();
         let selection = self.document.selection();
         let edit = match command {
-            Format::Inline(kind) => format::toggle_inline(text, selection, kind),
+            Format::Inline(kind) => match self.fresh_highlighter() {
+                Some(highlighter) => format::toggle_inline_in(text, highlighter, selection, kind),
+                None => format::toggle_inline(text, selection, kind),
+            },
             Format::Heading(level) => format::set_heading(text, selection, level),
             Format::Block(kind) => format::toggle_block(text, selection, kind),
             Format::Link => format::insert_link(text, selection, false),
@@ -1324,6 +1327,21 @@ impl MarkdownEditor {
         self.document.set_selection(edit.selection);
         change.selection = edit.selection;
         self.show(Some(change))
+    }
+
+    /// The highlighting, while it matches the text.
+    fn fresh_highlighter(&self) -> Option<&Highlighter> {
+        (!self.highlight_stale).then_some(&self.highlighter)
+    }
+
+    /// The styles a format button would take away from the selection, for
+    /// showing those buttons pressed.
+    pub fn styles(&self) -> format::Styles {
+        format::styles(
+            self.document.text(),
+            self.fresh_highlighter(),
+            self.document.selection(),
+        )
     }
 
     /// The heading level of the line with the caret, 0 for body text.
@@ -2089,6 +2107,24 @@ mod tests {
         e.undo();
         e.undo();
         assert_eq!(text_of(&e), "会议纪要\n第一项\n第二项");
+    }
+
+    #[test]
+    fn the_caret_in_bold_text_shows_bold_and_takes_it_off() {
+        use aster_markdown::format::{Block, Inline};
+        let mut e = editor("- 会议**纪要**");
+        // The caret between 纪 and 要.
+        e.document.set_selection(Selection::caret(13));
+        let styles = e.styles();
+        assert!(styles.bold && !styles.italic);
+        assert_eq!(styles.block, Some(Block::Bullet));
+        assert!(e.format(Format::Inline(Inline::Bold)));
+        assert_eq!(text_of(&e), "- 会议纪要");
+        assert_eq!(e.document.selection(), Selection::caret(11));
+        assert!(!e.styles().bold);
+        assert_in_step(&e);
+        e.undo();
+        assert_eq!(text_of(&e), "- 会议**纪要**");
     }
 
     #[test]

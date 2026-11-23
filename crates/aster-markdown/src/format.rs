@@ -13,6 +13,7 @@ use std::ops::Range;
 use ropey::Rope;
 
 use crate::document::{Selection, slice};
+use crate::highlight::{Highlighter, Marks};
 
 /// A replacement to make, and where the selection goes afterwards (offsets
 /// in the text after the replacement).
@@ -39,6 +40,16 @@ impl Inline {
             Inline::Italic => "*",
             Inline::Strike => "~~",
             Inline::Code => "`",
+        }
+    }
+
+    /// How the highlighter marks text with this style.
+    fn marks(self) -> Marks {
+        match self {
+            Inline::Bold => Marks::STRONG,
+            Inline::Italic => Marks::EMPHASIS,
+            Inline::Strike => Marks::STRIKE,
+            Inline::Code => Marks::CODE,
         }
     }
 
@@ -126,25 +137,34 @@ fn run_at_start(text: &str, unit: char) -> usize {
 /// its own, since emphasis cannot cross a paragraph.
 pub fn toggle_inline(text: &Rope, selection: Selection, kind: Inline) -> Edit {
     let range = selection.range();
+    if let Some(edit) = unwrap(text, &range, kind) {
+        return edit;
+    }
+    wrap(text, range, kind)
+}
+
+/// The edit that takes the style away from a selection that is exactly a
+/// styled text, with or without its marks; `None` for any other selection.
+fn unwrap(text: &Rope, range: &Range<usize>, kind: Inline) -> Option<Edit> {
     let unit = kind.unit();
     let width = kind.mark().len();
 
     // Marks just outside the selection: `**|text|**`.
-    let (before, after) = around(text, &range, 3);
+    let (before, after) = around(text, range, 3);
     let left = run_at_end(&before, unit);
     let right = run_at_start(&after, unit);
     if !range.is_empty() && kind.surrounds(left, right) {
         let take = if kind == Inline::Code { left } else { width };
         let inner = slice(text, range.clone());
         let start = range.start - take;
-        return Edit {
+        return Some(Edit {
             range: start..range.end + take,
             text: inner.clone(),
             selection: Selection {
                 anchor: start,
                 focus: start + inner.len(),
             },
-        };
+        });
     }
 
     let selected = slice(text, range.clone());
@@ -155,16 +175,23 @@ pub fn toggle_inline(text: &Rope, selection: Selection, kind: Inline) -> Edit {
         if kind.surrounds(lead, trail) && !selected.contains('\n') {
             let take = if kind == Inline::Code { lead } else { width };
             let inner = selected[take..selected.len() - take].to_owned();
-            return Edit {
+            return Some(Edit {
                 range: range.clone(),
                 text: inner.clone(),
                 selection: Selection {
                     anchor: range.start,
                     focus: range.start + inner.len(),
                 },
-            };
+            });
         }
     }
+    None
+}
+
+/// Put the marks around a selection, or between a caret's sides.
+fn wrap(text: &Rope, range: Range<usize>, kind: Inline) -> Edit {
+    let unit = kind.unit();
+    let selected = slice(text, range.clone());
 
     if range.is_empty() {
         let mark = kind.mark();
@@ -245,6 +272,212 @@ pub fn toggle_inline(text: &Rope, selection: Selection, kind: Inline) -> Edit {
         text: out,
         selection,
     }
+}
+
+/// How far a styled stretch is followed from the selection, each way. A
+/// longer one is treated as not styled: looking costs nothing then.
+const RUN_REACH: usize = 64 * 1024;
+
+/// The stretch with style `kind` that contains `range`, from the start of its
+/// opening mark to the end of its closing one, as the highlighter sees it. A
+/// caret counts only inside: just before the opening mark or just after the
+/// closing one is outside.
+fn styled_run(
+    highlighter: &Highlighter,
+    range: &Range<usize>,
+    kind: Inline,
+) -> Option<Range<usize>> {
+    let mark = kind.marks();
+    let span_at = |at: usize| {
+        highlighter
+            .spans(at..at + 1)
+            .into_iter()
+            .find(|span| span.range.contains(&at) && span.marks.contains(mark))
+    };
+    // The bytes that must have the style: either side of a caret, or the
+    // first and last of a selection.
+    let (first, last) = if range.is_empty() {
+        (range.start.checked_sub(1)?, range.start)
+    } else {
+        (range.start, range.end - 1)
+    };
+    let mut start = span_at(first)?.range.start;
+    let mut end = span_at(first)?.range.end;
+    // Every byte up to `last` must have it too.
+    while end <= last {
+        if end - range.start > RUN_REACH {
+            return None;
+        }
+        end = span_at(end)?.range.end;
+    }
+    while let Some(span) = start.checked_sub(1).and_then(span_at) {
+        if range.start - span.range.start > RUN_REACH {
+            return None;
+        }
+        start = span.range.start;
+    }
+    while let Some(span) = span_at(end) {
+        if span.range.end - range.end > RUN_REACH {
+            return None;
+        }
+        end = span.range.end;
+    }
+    Some(start..end)
+}
+
+/// How many bytes the opening mark of a styled stretch takes; the closing
+/// mark takes as many.
+fn mark_width(text: &Rope, run: &Range<usize>, kind: Inline) -> usize {
+    let width = match kind {
+        Inline::Bold => 2,
+        Inline::Italic => 1,
+        // `~x~` and `~~x~~`; any number of backticks.
+        Inline::Strike | Inline::Code => {
+            let end = ceil(text, (run.start + 16).min(run.end));
+            run_at_start(&slice(text, run.start..end), kind.unit())
+        }
+    };
+    width.min(run.len() / 2)
+}
+
+/// [`toggle_inline`], knowing where the text already has the style. With
+/// the caret inside styled text, the style comes off the whole of it; a
+/// selection inside styled text comes out of it, and what is left on either
+/// side keeps the style. Pass the highlighting only while it is up to date.
+pub fn toggle_inline_in(
+    text: &Rope,
+    highlighter: &Highlighter,
+    selection: Selection,
+    kind: Inline,
+) -> Edit {
+    let range = selection.range();
+    let Some(run) = styled_run(highlighter, &range, kind) else {
+        return toggle_inline(text, selection, kind);
+    };
+    let width = mark_width(text, &run, kind);
+    let inner = run.start + width..run.end - width;
+    if range.is_empty() {
+        let caret = range.start.clamp(inner.start, inner.end) - width;
+        return Edit {
+            range: run.clone(),
+            text: slice(text, inner),
+            selection: Selection::caret(caret),
+        };
+    }
+    if range == inner || range.start < inner.start || range.end > inner.end {
+        return toggle_inline(text, selection, kind);
+    }
+    let mut open = slice(text, run.start..inner.start);
+    let mut close = slice(text, inner.end..run.end);
+    // `_` emphasis does not work inside a word, which is where the pieces
+    // now meet: `__一__二__三__` is plain text. Stars do.
+    if open.starts_with('_') {
+        open = kind.mark().to_owned();
+        close = open.clone();
+    }
+    // A side keeps the style; white space at its ends goes outside the
+    // marks, where emphasis needs it.
+    let side = |part: String| {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return part;
+        }
+        let lead = &part[..part.len() - part.trim_start().len()];
+        let trail = &part[part.trim_end().len()..];
+        format!("{lead}{open}{trimmed}{close}{trail}")
+    };
+    let left = side(slice(text, inner.start..range.start));
+    let middle = slice(text, range.clone());
+    let right = side(slice(text, range.end..inner.end));
+    let start = run.start + left.len();
+    Edit {
+        range: run,
+        selection: Selection {
+            anchor: start,
+            focus: start + middle.len(),
+        },
+        text: left + &middle + &right,
+    }
+}
+
+/// The styles the toolbar shows pressed for a selection: those a click
+/// would take away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Styles {
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub code: bool,
+    /// Every line of the selection is this kind of list item, or quoted.
+    pub block: Option<Block>,
+}
+
+impl Styles {
+    pub fn has(&self, kind: Inline) -> bool {
+        match kind {
+            Inline::Bold => self.bold,
+            Inline::Italic => self.italic,
+            Inline::Strike => self.strike,
+            Inline::Code => self.code,
+        }
+    }
+}
+
+/// The styles of a selection. Selections longer than this show none: the
+/// answer would cost a read of all of it on every caret move.
+const STYLES_REACH: usize = 64 * 1024;
+
+/// What the selection's text already is: the styles [`toggle_inline_in`]
+/// and [`toggle_block`] would take away. Pass the highlighting only while it
+/// is up to date; without it only a selection that is exactly a styled
+/// text, or that includes its marks, counts.
+pub fn styles(text: &Rope, highlighter: Option<&Highlighter>, selection: Selection) -> Styles {
+    let range = selection.range();
+    if range.len() > STYLES_REACH {
+        return Styles::default();
+    }
+    let has = |kind: Inline| {
+        highlighter.is_some_and(|h| styled_run(h, &range, kind).is_some())
+            || unwrap(text, &range, kind).is_some()
+    };
+    Styles {
+        bold: has(Inline::Bold),
+        italic: has(Inline::Italic),
+        strike: has(Inline::Strike),
+        code: has(Inline::Code),
+        block: block_of(text, &range),
+    }
+}
+
+/// The block every line of `range` is, as [`toggle_block`] decides it;
+/// blank lines among several do not count.
+fn block_of(text: &Rope, range: &Range<usize>) -> Option<Block> {
+    let span = line_span(text, range);
+    // A marker is near the start of its line, and a line can be a whole
+    // 100 MB file.
+    let lines = if text.byte_to_line(span.start) == text.byte_to_line(span.end) {
+        slice(
+            text,
+            span.start..ceil(text, (span.start + 64).min(span.end)),
+        )
+    } else if span.len() <= STYLES_REACH {
+        slice(text, span)
+    } else {
+        return None;
+    };
+    let several = lines.contains('\n');
+    let mut found = None;
+    for line in lines.split('\n') {
+        if several && line.trim().is_empty() {
+            continue;
+        }
+        let kind = parse_block(line).1?;
+        if found.is_some_and(|seen| seen != kind) {
+            return None;
+        }
+        found = Some(kind);
+    }
+    found
 }
 
 /// The parts of a line: indentation, the block prefix, and the rest.
@@ -798,5 +1031,132 @@ mod tests {
         let edit = set_heading(&rope, Selection::caret(start + 3), 1);
         assert_eq!(edit.range, start..start + "目标行".len());
         assert_eq!(edit.text, "# 目标行");
+    }
+
+    /// Text with a caret written `|` or a selection written `«…»`, as the
+    /// text and the range.
+    fn marked(input: &str) -> (String, Range<usize>) {
+        if let Some(at) = input.find('|') {
+            return (input.replacen('|', "", 1), at..at);
+        }
+        let start = input.find('«').expect("a caret or a selection");
+        let text = input.replacen('«', "", 1);
+        let end = text.find('»').expect("the end of the selection");
+        (text.replacen('»', "", 1), start..end)
+    }
+
+    fn styled(input: &str, kind: Inline) -> String {
+        let (text, range) = marked(input);
+        run(&text, range, |rope, sel| {
+            toggle_inline_in(rope, &Highlighter::new(rope), sel, kind)
+        })
+    }
+
+    fn styles_of(input: &str) -> Styles {
+        let (text, range) = marked(input);
+        let rope = Rope::from_str(&text);
+        let selection = Selection {
+            anchor: range.start,
+            focus: range.end,
+        };
+        styles(&rope, Some(&Highlighter::new(&rope)), selection)
+    }
+
+    #[test]
+    fn caret_inside_styled_text_takes_the_style_off() {
+        assert_eq!(
+            styled("一段**中|文**文字。", Inline::Bold),
+            "一段中|文文字。"
+        );
+        assert_eq!(styled("一段**|中文**。", Inline::Bold), "一段|中文。");
+        assert_eq!(styled("a __bo|ld__ b", Inline::Bold), "a bo|ld b");
+        assert_eq!(styled("x *斜|体* y", Inline::Italic), "x 斜|体 y");
+        assert_eq!(styled("x ~~删|除~~ y", Inline::Strike), "x 删|除 y");
+        assert_eq!(styled("run `co|de` now", Inline::Code), "run co|de now");
+        // Bold and italic at once: each takes its own marks.
+        assert_eq!(styled("***b|i***", Inline::Bold), "*b|i*");
+        assert_eq!(styled("***b|i***", Inline::Italic), "**b|i**");
+        // Just outside the marks is not inside: the marks go in as before.
+        assert_eq!(styled("**粗体**|后", Inline::Bold), "**粗体****|**后");
+        assert_eq!(styled("前|**粗体**", Inline::Bold), "前**|****粗体**");
+        // Plain text is wrapped as before.
+        assert_eq!(styled("一段«中文»。", Inline::Bold), "一段**[中文]**。");
+    }
+
+    #[test]
+    fn a_selection_inside_styled_text_comes_out_of_it() {
+        assert_eq!(
+            styled("**一二«三»四五**", Inline::Bold),
+            "**一二**[三]**四五**"
+        );
+        assert_eq!(styled("**«一二»三四五**", Inline::Bold), "[一二]**三四五**");
+        assert_eq!(styled("**一二三«四五»**", Inline::Bold), "**一二三**[四五]");
+        // Underscores would not work between the pieces; stars do.
+        assert_eq!(styled("__一«二»三__", Inline::Bold), "**一**[二]**三**");
+        assert_eq!(styled("_一«二»三_", Inline::Italic), "*一*[二]*三*");
+        // White space stays outside the marks on both sides.
+        assert_eq!(
+            styled("**one «two» three**", Inline::Bold),
+            "**one** [two] **three**"
+        );
+        // The whole text, with or without its marks: the style comes off.
+        assert_eq!(styled("**«一二三»**", Inline::Bold), "[一二三]");
+        assert_eq!(styled("«**一二三**»", Inline::Bold), "[一二三]");
+    }
+
+    #[test]
+    fn styles_report_what_a_click_would_take_away() {
+        let bold = styles_of("一段**中|文**文字。");
+        assert!(bold.bold && !bold.italic && !bold.code);
+        assert!(!styles_of("一段**中文**|文字。").bold);
+        assert!(!styles_of("一段|**中文**文字。").bold);
+        assert!(styles_of("**一«二»三**").bold);
+        // Part of the selection is plain.
+        assert!(!styles_of("**一«二**三»").bold);
+        let both = styles_of("***b|i***");
+        assert!(both.bold && both.italic);
+        assert!(styles_of("a `c|ode` b").code);
+        assert!(styles_of("a ~~s|trike~~ b").strike);
+        assert_eq!(styles_of("plain |text"), Styles::default());
+        // Without the highlighting, an exact selection still counts.
+        let rope = Rope::from_str("x **bold** y");
+        let exact = Selection {
+            anchor: 4,
+            focus: 8,
+        };
+        assert!(styles(&rope, None, exact).bold);
+        assert!(!styles(&rope, None, Selection::caret(6)).bold);
+    }
+
+    #[test]
+    fn styles_report_the_block_of_the_lines() {
+        assert_eq!(styles_of("- it|em").block, Some(Block::Bullet));
+        assert_eq!(styles_of("  1. 第|一").block, Some(Block::Numbered));
+        assert_eq!(styles_of("> 引|用").block, Some(Block::Quote));
+        let task = "- [ ] 待办";
+        let rope = Rope::from_str(task);
+        let caret = Selection::caret(task.len());
+        assert_eq!(styles(&rope, None, caret).block, Some(Block::Task));
+        assert_eq!(
+            styles_of("1. «a\n\n2. b»").block,
+            Some(Block::Numbered),
+            "blank lines among several do not count"
+        );
+        assert_eq!(styles_of("- «a\nb»").block, None);
+        assert_eq!(styles_of("- «a\n1. b»").block, None);
+        assert_eq!(styles_of("pla|in").block, None);
+    }
+
+    #[test]
+    fn styles_of_a_huge_line_read_only_its_start() {
+        let long = format!("- {}", "字".repeat(1 << 20));
+        let rope = Rope::from_str(&long);
+        let caret = Selection::caret(long.len());
+        assert_eq!(styles(&rope, None, caret).block, Some(Block::Bullet));
+        let all = Selection {
+            anchor: 0,
+            focus: long.len(),
+        };
+        assert_eq!(styles(&rope, None, all), Styles::default());
     }
 }

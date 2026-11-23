@@ -5,6 +5,8 @@
 //! laid out where it will live but drawn disabled, so the toolbar shows the
 //! intended design without pretending to work.
 
+use aster_markdown::format::{Block, Styles};
+
 use crate::i18n::Strings;
 use crate::icons::Icon;
 use crate::tabs::DocKind;
@@ -293,6 +295,9 @@ pub struct ViewState {
     /// Markdown tabs: the heading level of the line with the caret, 0 for
     /// body text.
     pub heading: u8,
+    /// Markdown tabs: the styles the selection has, whose buttons show
+    /// pressed.
+    pub styles: Styles,
 }
 
 impl Default for ViewState {
@@ -303,11 +308,28 @@ impl Default for ViewState {
             can_redo: false,
             view_mode: ViewMode::Edit,
             heading: 0,
+            styles: Styles::default(),
         }
     }
 }
 
 impl ViewState {
+    /// Whether the selection already has what a formatting command writes.
+    fn has(&self, command: Command) -> bool {
+        let styles = &self.styles;
+        match command {
+            Command::Bold => styles.bold,
+            Command::Italic => styles.italic,
+            Command::Strikethrough => styles.strike,
+            Command::InlineCode => styles.code,
+            Command::BulletList => styles.block == Some(Block::Bullet),
+            Command::NumberedList => styles.block == Some(Block::Numbered),
+            Command::Checklist => styles.block == Some(Block::Task),
+            Command::Quote => styles.block == Some(Block::Quote),
+            _ => false,
+        }
+    }
+
     /// Whether a command the view supports has something to act on right now.
     fn allows(&self, command: Command) -> bool {
         match command {
@@ -337,7 +359,9 @@ impl Builder {
             control,
             command: Some(command),
             enabled,
-            active: enabled && ViewMode::of(command) == Some(self.view.view_mode),
+            active: enabled
+                && (ViewMode::of(command) == Some(self.view.view_mode)
+                    || (self.kind == DocKind::Markdown && self.view.has(command))),
             options: Vec::new(),
         });
         self
@@ -800,6 +824,43 @@ mod tests {
                 width: 92.0
             }
         );
+    }
+
+    #[test]
+    fn format_buttons_show_the_styles_of_the_selection() {
+        let pressed = |kind: DocKind, view: ViewState| {
+            toolbar(kind, view, &ZH_HANS)
+                .into_iter()
+                .filter(|item| item.active)
+                .filter_map(|item| item.command)
+                .collect::<Vec<_>>()
+        };
+        let view = ViewState {
+            styles: Styles {
+                bold: true,
+                code: true,
+                block: Some(Block::Task),
+                ..Styles::default()
+            },
+            ..ViewState::default()
+        };
+        assert_eq!(
+            pressed(DocKind::Markdown, view),
+            [
+                Command::Bold,
+                Command::InlineCode,
+                Command::Checklist,
+                Command::ViewSource
+            ]
+        );
+        // Nothing is pressed while the buttons cannot be used.
+        let preview = ViewState {
+            view_mode: ViewMode::Preview,
+            ..view
+        };
+        assert_eq!(pressed(DocKind::Markdown, preview), [Command::ViewPreview]);
+        // Other kinds of tab do not read Markdown styles.
+        assert!(!pressed(DocKind::Writer, view).contains(&Command::Bold));
     }
 
     #[test]

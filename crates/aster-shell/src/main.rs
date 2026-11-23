@@ -27,6 +27,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use aster_markdown::format::Styles;
 use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
 use aster_sheets::Cancel;
@@ -178,6 +179,8 @@ struct Shell {
     previews: Option<PreviewWorker>,
     /// The heading level the toolbar's paragraph style field shows.
     shown_heading: u8,
+    /// The styles the toolbar shows pressed.
+    shown_styles: Styles,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -228,6 +231,7 @@ impl Shell {
             previews: None,
             preview_builder: None,
             shown_heading: 0,
+            shown_styles: Styles::default(),
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1069,8 +1073,12 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         heading: shell
             .active_markdown()
             .map_or(0, |editor| editor.heading_level()),
+        styles: shell
+            .active_markdown()
+            .map_or_else(Styles::default, |editor| editor.styles()),
     };
     shell.shown_heading = view.heading;
+    shell.shown_styles = view.styles;
     ui.set_toolbar_items(model(
         toolbar::toolbar(kind, view, shell.language.strings())
             .iter()
@@ -1491,16 +1499,22 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         schedule_search(ui, shell);
         schedule_highlight(ui, shell);
     }
-    // The paragraph style field follows the caret from line to line.
-    if shell
-        .active_markdown()
-        .map_or(0, |editor| editor.heading_level())
-        != shell.shown_heading
-    {
-        refresh_toolbar(ui, shell);
-    }
+    follow_selection(ui, shell);
     refresh_status(ui, shell);
     present(ui, shell);
+}
+
+/// Rebuild the toolbar if the paragraph style field or the pressed format
+/// buttons no longer match the selection.
+fn follow_selection(ui: &AppWindow, shell: &mut Shell) {
+    let shown = shell
+        .active_markdown()
+        .map_or((0, Styles::default()), |editor| {
+            (editor.heading_level(), editor.styles())
+        });
+    if shown != (shell.shown_heading, shell.shown_styles) {
+        refresh_toolbar(ui, shell);
+    }
 }
 
 /// The formatting a toolbar command stands for in a Markdown tab.
@@ -2954,6 +2968,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(Content::Markdown(editor)) => editor.pointer_drag(x, y),
             _ => return,
         }
+        follow_selection(&ui, shell);
         present(&ui, shell);
     }));
 

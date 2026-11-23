@@ -6,6 +6,7 @@ members = [
     "crates/aster-shell",
     "crates/aster-storage",
     "crates/aster-surface",
+    "crates/aster-text",
     "crates/aster-workspace",
     "spikes/g1-ime",
     "spikes/g2-frame",
@@ -33,6 +34,7 @@ aster-markdown = { path = "crates/aster-markdown" }
 aster-platform = { path = "crates/aster-platform" }
 aster-storage = { path = "crates/aster-storage" }
 aster-surface = { path = "crates/aster-surface" }
+aster-text = { path = "crates/aster-text" }
 aster-workspace = { path = "crates/aster-workspace" }
 slint = { version = "~1.19.0", default-features = false, features = [
     "std",

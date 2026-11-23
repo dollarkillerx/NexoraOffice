@@ -2,7 +2,7 @@
 //! need: a colour per stretch, and bold and italic made up from the regular
 //! face where the font has no real one.
 
-use parley::Run;
+use parley::{FontData, Run};
 use vello_cpu::kurbo::{Affine, Rect, Stroke};
 use vello_cpu::peniko::Color;
 use vello_cpu::{Glyph, RenderContext, Resources};
@@ -32,34 +32,64 @@ pub fn draw(
     glyphs: &[Glyph],
     paint: GlyphPaint,
 ) {
+    let synthesis = run.synthesis();
+    let face = Face {
+        font: run.font(),
+        size: run.font_size(),
+        coords: bytemuck::cast_slice::<_, i16>(run.normalized_coords()),
+        embolden: paint.embolden || synthesis.embolden(),
+        skew: paint.skew.or(synthesis.skew()),
+    };
+    draw_face(ctx, resources, &face, paint.color, glyphs);
+}
+
+/// A font at a size, with the made-up styles to apply.
+#[derive(Clone, Copy, Debug)]
+pub struct Face<'a> {
+    pub font: &'a FontData,
+    pub size: f32,
+    pub coords: &'a [i16],
+    /// Thicken the outlines.
+    pub embolden: bool,
+    /// Slant, in degrees.
+    pub skew: Option<f32>,
+}
+
+/// Draw glyphs in one face, already positioned in the current transform.
+pub fn draw_face(
+    ctx: &mut RenderContext,
+    resources: &mut Resources,
+    face: &Face<'_>,
+    color: Color,
+    glyphs: &[Glyph],
+) {
     if glyphs.is_empty() {
         return;
     }
-    let synthesis = run.synthesis();
-    let embolden = paint.embolden || synthesis.embolden();
-    let skew = paint.skew.or(synthesis.skew());
-    let font_size = run.font_size();
-    let coords = bytemuck::cast_slice::<_, i16>(run.normalized_coords());
-    let transform = skew.map(|degrees| Affine::skew(f64::from(degrees.to_radians().tan()), 0.0));
+    // The glyph transform works in layout space, where y grows downwards: a
+    // positive slant needs a negative skew to lean the tops to the right.
+    let transform = face
+        .skew
+        .map(|degrees| Affine::skew(-f64::from(degrees.to_radians().tan()), 0.0));
 
-    ctx.set_paint(paint.color);
+    ctx.set_paint(color);
     let mut builder = ctx
-        .glyph_run(resources, run.font())
-        .font_size(font_size)
+        .glyph_run(resources, face.font)
+        .font_size(face.size)
         .hint(transform.is_none())
-        .normalized_coords(coords);
+        .normalized_coords(face.coords);
     if let Some(transform) = transform {
         builder = builder.glyph_transform(transform);
     }
     builder.fill_glyphs(glyphs.iter().copied());
 
-    if embolden {
-        ctx.set_stroke(Stroke::new(f64::from(font_size * SYNTHETIC_BOLD)));
+    if face.embolden {
+        ctx.set_stroke(Stroke::new(f64::from(face.size * SYNTHETIC_BOLD)));
         let mut builder = ctx
-            .glyph_run(resources, run.font())
-            .font_size(font_size)
+            .glyph_run(resources, face.font)
+            .font_size(face.size)
             .hint(false)
-            .normalized_coords(coords);
+            .normalized_coords(face.coords);
         if let Some(transform) = transform {
             builder = builder.glyph_transform(transform);
         }

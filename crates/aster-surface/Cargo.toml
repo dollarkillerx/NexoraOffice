@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 aster-markdown = { workspace = true }
+aster-text = { workspace = true }
 ropey = { workspace = true }
 slint = { workspace = true }
 parley = { workspace = true }

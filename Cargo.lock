@@ -173,6 +173,7 @@ dependencies = [
  "aster-platform",
  "aster-storage",
  "aster-surface",
+ "aster-text",
  "aster-workspace",
  "chrono",
  "ropey",
@@ -194,11 +195,22 @@ name = "aster-surface"
 version = "0.0.1"
 dependencies = [
  "aster-markdown",
+ "aster-text",
  "bytemuck",
  "parley 0.13.0",
  "ropey",
  "slint",
  "vello_cpu",
+]
+
+[[package]]
+name = "aster-text"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "icu_locale_core",
+ "icu_segmenter",
+ "parley 0.13.0",
 ]
 
 [[package]]

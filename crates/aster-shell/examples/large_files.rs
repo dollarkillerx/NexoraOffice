@@ -315,7 +315,7 @@ fn run_case(path: &Path, preview: bool) {
             &fresh.document.text().to_string(),
             VIEW.0 / 2,
             VIEW.2,
-            &preview_style(&tokens),
+            &preview_style(&tokens, &aster_shell::i18n::ZH_HANS),
         );
         report("预览：排版全文（工作线程）", ms(started.elapsed()));
         report("预览：文档高度", format!("{:.0} px", layout.height()));

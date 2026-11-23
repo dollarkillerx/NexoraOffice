@@ -2,9 +2,15 @@
 //! layout. Every block remembers which part of the source it came from, so
 //! the preview and the editor can be scrolled to the same place.
 //!
-//! Some things are shown as they are written instead of rendered: HTML,
-//! `$math$` and footnotes appear as code, and an image as a box with its
-//! description, since the preview loads nothing from disk or the network.
+//! Some things are shown as they are written instead of rendered: HTML and
+//! `$math$` appear as code, and an image as a box with its description,
+//! since the preview loads nothing from disk or the network.
+//!
+//! Footnotes are numbered in the order they are first referred to and
+//! gathered at the end, the way GitHub shows them. A reference links to
+//! `#fn:<label>` and the note links back to `#fnref:<label>` with an arrow
+//! ([`FOOTNOTE_BACK`]), with the label
+//! as [`syntax::normalize_label`] writes it; the preview resolves both.
 
 use std::ops::Range;
 
@@ -40,6 +46,11 @@ pub enum BlockKind {
         text: String,
     },
     Quote(Vec<Block>),
+    /// GitHub's `> [!NOTE]` and its kin.
+    Callout {
+        kind: CalloutKind,
+        blocks: Vec<Block>,
+    },
     List {
         /// Number of the first item of an ordered list.
         start: Option<u64>,
@@ -58,10 +69,57 @@ pub enum BlockKind {
     Image {
         description: String,
     },
-    Footnote {
-        label: String,
-        blocks: Vec<Block>,
-    },
+    /// Every footnote of the document, in number order; always the last
+    /// block.
+    Footnotes(Vec<Footnote>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalloutKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl CalloutKind {
+    pub const ALL: [CalloutKind; 5] = [
+        CalloutKind::Note,
+        CalloutKind::Tip,
+        CalloutKind::Important,
+        CalloutKind::Warning,
+        CalloutKind::Caution,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Footnote {
+    /// As written in the definition.
+    pub label: String,
+    /// 1 for the first one referred to. Notes nobody refers to come last.
+    pub number: usize,
+    pub blocks: Vec<Block>,
+    pub source: Range<usize>,
+}
+
+/// What the link back from a footnote shows. Not ↩, which none of the fonts
+/// the fallback looks at has on macOS: it came out as the system font's
+/// missing-glyph box. ↑ is in GB 2312 and JIS X 0208, so in every Chinese
+/// and Japanese font, and in the system font as well.
+pub const FOOTNOTE_BACK: &str = "↑";
+
+/// The link of a reference to the footnote `label`, and of the way back.
+pub fn footnote_link(label: &str) -> String {
+    format!("#fn:{}", syntax::normalize_label(label))
+}
+
+pub fn footnote_back_link(label: &str) -> String {
+    format!("#fnref:{}", syntax::normalize_label(label))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,9 +161,10 @@ pub struct Style {
     pub strong: bool,
     pub emphasis: bool,
     pub strike: bool,
-    /// Inline code, and what is shown like it: inline HTML, math, footnote
-    /// references.
+    /// Inline code, and what is shown like it: inline HTML, math.
     pub code: bool,
+    /// A footnote reference, shown as a small raised number.
+    pub footnote: bool,
     /// The description of an image that sits inside text.
     pub image: bool,
 }
@@ -244,7 +303,7 @@ impl InlineBuilder {
 }
 
 enum Frame {
-    Quote(Range<usize>, Vec<Block>),
+    Quote(Range<usize>, Option<CalloutKind>, Vec<Block>),
     List {
         source: Range<usize>,
         start: Option<u64>,
@@ -292,6 +351,9 @@ struct Builder {
     frames: Vec<Frame>,
     leaf: Leaf,
     top: Vec<Block>,
+    /// Footnote numbers by normalised label, in order of first reference.
+    numbers: Vec<String>,
+    footnotes: Vec<Footnote>,
 }
 
 impl Builder {
@@ -300,6 +362,20 @@ impl Builder {
             frames: Vec::new(),
             leaf: Leaf::None,
             top: Vec::new(),
+            numbers: Vec::new(),
+            footnotes: Vec::new(),
+        }
+    }
+
+    /// The number of footnote `label`, given at its first reference.
+    fn number(&mut self, label: &str) -> usize {
+        let key = syntax::normalize_label(label);
+        match self.numbers.iter().position(|known| *known == key) {
+            Some(index) => index + 1,
+            None => {
+                self.numbers.push(key);
+                self.numbers.len()
+            }
         }
     }
 
@@ -307,16 +383,76 @@ impl Builder {
         self.close_implicit();
         // A well-formed event stream closes everything; this is for safety.
         while let Some(frame) = self.frames.pop() {
-            let block = frame_block(frame);
-            self.add(block);
+            self.close_frame(frame);
+        }
+        let mut footnotes = std::mem::take(&mut self.footnotes);
+        if !footnotes.is_empty() {
+            // Unreferenced notes are numbered after the referenced ones.
+            for note in &mut footnotes {
+                note.number = self.number(&note.label);
+            }
+            footnotes.sort_by_key(|note| note.number);
+            let start = footnotes
+                .iter()
+                .map(|note| note.source.start)
+                .min()
+                .unwrap_or(0);
+            let end = footnotes
+                .iter()
+                .map(|note| note.source.end)
+                .max()
+                .unwrap_or(0);
+            self.top.push(Block {
+                kind: BlockKind::Footnotes(footnotes),
+                source: start..end,
+            });
         }
         Outline { blocks: self.top }
+    }
+
+    /// A container ended: a footnote goes to the end, anything else into
+    /// whatever holds it.
+    fn close_frame(&mut self, frame: Frame) {
+        match frame {
+            Frame::Footnote {
+                source,
+                label,
+                mut blocks,
+            } => {
+                // The way back to the reference, at the end of the note.
+                let back = footnote_back_link(&label);
+                match blocks.last_mut() {
+                    Some(Block {
+                        kind: BlockKind::Paragraph(inline),
+                        ..
+                    }) => push_back_link(inline, back),
+                    _ => {
+                        let mut inline = Inline::default();
+                        push_back_link(&mut inline, back);
+                        blocks.push(Block {
+                            kind: BlockKind::Paragraph(inline),
+                            source: source.end..source.end,
+                        });
+                    }
+                }
+                self.footnotes.push(Footnote {
+                    label,
+                    number: 0,
+                    blocks,
+                    source,
+                });
+            }
+            frame => {
+                let block = frame_block(frame);
+                self.add(block);
+            }
+        }
     }
 
     /// Where a finished block goes: into the innermost container.
     fn add(&mut self, block: Block) {
         match self.frames.last_mut() {
-            Some(Frame::Quote(_, blocks))
+            Some(Frame::Quote(_, _, blocks))
             | Some(Frame::Item { blocks, .. })
             | Some(Frame::Footnote { blocks, .. }) => blocks.push(block),
             // Only items go into lists; anything else is a parser surprise.
@@ -404,8 +540,14 @@ impl Builder {
                 }
             }
             Event::FootnoteReference(label) => {
+                let number = self.number(&label);
                 if let Some(inline) = self.inline(range.start) {
-                    inline.code(&format!("[{label}]"));
+                    inline.source.end = inline.source.end.max(range.end);
+                    let style = Style {
+                        footnote: true,
+                        ..inline.style()
+                    };
+                    inline.push(&number.to_string(), style, Some(footnote_link(&label)));
                 }
             }
             Event::SoftBreak => {
@@ -476,7 +618,16 @@ impl Builder {
                     implicit: false,
                 }
             }
-            Tag::BlockQuote(_) => self.frames.push(Frame::Quote(range, Vec::new())),
+            Tag::BlockQuote(kind) => {
+                let kind = kind.map(|kind| match kind {
+                    pulldown_cmark::BlockQuoteKind::Note => CalloutKind::Note,
+                    pulldown_cmark::BlockQuoteKind::Tip => CalloutKind::Tip,
+                    pulldown_cmark::BlockQuoteKind::Important => CalloutKind::Important,
+                    pulldown_cmark::BlockQuoteKind::Warning => CalloutKind::Warning,
+                    pulldown_cmark::BlockQuoteKind::Caution => CalloutKind::Caution,
+                });
+                self.frames.push(Frame::Quote(range, kind, Vec::new()))
+            }
             Tag::CodeBlock(kind) => {
                 let language = match kind {
                     CodeBlockKind::Fenced(info) => {
@@ -631,10 +782,7 @@ impl Builder {
                             }
                         }
                     }
-                    Some(frame) => {
-                        let block = frame_block(frame);
-                        self.add(block);
-                    }
+                    Some(frame) => self.close_frame(frame),
                     None => {}
                 }
             }
@@ -730,8 +878,11 @@ impl Builder {
 
 fn frame_block(frame: Frame) -> Block {
     match frame {
-        Frame::Quote(source, blocks) => Block {
-            kind: BlockKind::Quote(blocks),
+        Frame::Quote(source, kind, blocks) => Block {
+            kind: match kind {
+                Some(kind) => BlockKind::Callout { kind, blocks },
+                None => BlockKind::Quote(blocks),
+            },
             source,
         },
         Frame::List {
@@ -761,15 +912,27 @@ fn frame_block(frame: Frame) -> Block {
             },
             source,
         },
-        Frame::Footnote {
-            source,
-            label,
-            blocks,
-        } => Block {
-            kind: BlockKind::Footnote { label, blocks },
+        // Footnotes are taken out by `Builder::close_frame`; this keeps
+        // the content of one that gets here anyway.
+        Frame::Footnote { source, blocks, .. } => Block {
+            kind: BlockKind::Quote(blocks),
             source,
         },
     }
+}
+
+/// Add the link back to a footnote's reference at the end of `inline`.
+fn push_back_link(inline: &mut Inline, link: String) {
+    if !inline.text.is_empty() {
+        inline.text.push(' ');
+    }
+    let start = inline.text.len();
+    inline.text.push_str(FOOTNOTE_BACK);
+    inline.runs.push(Run {
+        range: start..inline.text.len(),
+        style: Style::default(),
+        link: Some(link),
+    });
 }
 
 /// A paragraph that is nothing but one image becomes an image block.
@@ -1027,8 +1190,59 @@ mod tests {
         let BlockKind::Paragraph(inline) = &blocks[2] else {
             panic!();
         };
-        assert_eq!(inline.text, "注[a]");
-        assert!(matches!(&blocks[3], BlockKind::Footnote { label, .. } if label == "a"));
+        assert_eq!(inline.text, "注1");
+        assert_eq!(inline.runs[0].link.as_deref(), Some("#fn:a"));
+        assert!(inline.runs[0].style.footnote);
+        let BlockKind::Footnotes(notes) = &blocks[3] else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(notes[0].label, "a");
+    }
+
+    #[test]
+    fn footnotes_are_numbered_by_first_reference_and_gathered_at_the_end() {
+        let source = "后[^b]先[^A]再[^b]，没有[^nope]。\n\n[^a]: 甲\n\n[^b]: 乙\n\n    第二段\n\n[^c]: 没人引用\n\n结尾。\n";
+        let blocks = kinds(source);
+        let BlockKind::Paragraph(inline) = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
+        // b is 1, a (written A) is 2; an undefined reference stays text.
+        assert_eq!(inline.text, "后1先2再1，没有[^nope]。");
+        let links: Vec<_> = inline
+            .runs
+            .iter()
+            .filter_map(|run| run.link.as_deref())
+            .collect();
+        assert_eq!(links, ["#fn:b", "#fn:a", "#fn:b"]);
+        // The note text is not where it was written.
+        assert!(matches!(&blocks[1], BlockKind::Paragraph(p) if p.text == "结尾。"));
+        let BlockKind::Footnotes(notes) = blocks.last().unwrap() else {
+            panic!("{blocks:?}");
+        };
+        let order: Vec<_> = notes.iter().map(|n| (n.number, n.label.as_str())).collect();
+        assert_eq!(order, [(1, "b"), (2, "a"), (3, "c")]);
+        // Each ends with the way back.
+        let BlockKind::Paragraph(last) = &notes[0].blocks.last().unwrap().kind else {
+            panic!();
+        };
+        assert_eq!(last.text, format!("第二段 {FOOTNOTE_BACK}"));
+        assert_eq!(last.runs.last().unwrap().link.as_deref(), Some("#fnref:b"));
+    }
+
+    #[test]
+    fn callouts_keep_their_kind() {
+        let blocks = kinds("> [!NOTE]\n> 说明\n\n> [!caution]\n> 小心\n\n> 普通引用\n");
+        assert!(
+            matches!(&blocks[0], BlockKind::Callout { kind: CalloutKind::Note, blocks } if blocks.len() == 1)
+        );
+        assert!(matches!(
+            &blocks[1],
+            BlockKind::Callout {
+                kind: CalloutKind::Caution,
+                ..
+            }
+        ));
+        assert!(matches!(&blocks[2], BlockKind::Quote(_)));
     }
 
     #[test]

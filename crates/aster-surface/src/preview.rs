@@ -1,6 +1,10 @@
 //! The Markdown preview: the outline from `aster-markdown`, laid out with
-//! Parley and drawn with vello_cpu, the same text stack and fonts as the
-//! editor. No browser engine is involved.
+//! `aster-text` (Parley's shaping, our own Chinese and Japanese line
+//! breaking) and drawn with vello_cpu, with the same fonts as the editor. No
+//! browser engine is involved.
+//!
+//! Text can be selected with the mouse and copied as plain text; links that
+//! start with `#` (footnotes and the way back from them) scroll the preview.
 //!
 //! Laying out a document is the slow part, so it happens on a worker thread
 //! ([`PreviewWorker`]) and produces a [`PreviewLayout`]: a display list with
@@ -13,26 +17,28 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use aster_markdown::preview::{Alignment, Block, BlockKind, Inline, Item as ListItem, Outline};
-use parley::layout::PositionedLayoutItem;
-use parley::{
-    Affinity, AlignmentOptions, Cursor, FontContext, FontFamily, FontStyle, FontWeight,
-    GenericFamily, Layout, LayoutContext, Selection, StyleProperty,
+use aster_markdown::preview::{
+    Alignment, Block, BlockKind, Footnote, Inline, Item as ListItem, Outline,
+};
+use aster_markdown::syntax::normalize_label;
+use aster_text::selection::Piece as SelectionPiece;
+use aster_text::{
+    Align, Family, Paragraph, Rules, Selection, Shaper, Span, Spec, Style as TextStyle, TextPoint,
 };
 use vello_cpu::kurbo::{Affine, BezPath, Rect, RoundedRect, Shape, Stroke};
 use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
-use crate::glyphs::{self, GlyphPaint};
-use crate::text_surface::{Brush, DEFAULT_LANGUAGE, PageLayout, Rgba8, configure_han_fallback};
+use crate::glyphs;
+use crate::text_surface::{DEFAULT_LANGUAGE, HAN_FALLBACK_FAMILIES, PageLayout, Rgba8};
 
 /// Code fonts, best first. The generic `monospace` comes out as Courier on
 /// macOS, which is hard to read on screen.
 const CODE_FONTS: &str = "\"SF Mono\", Menlo, Monaco, Consolas, \"Cascadia Mono\", \"DejaVu Sans Mono\", \"Liberation Mono\", monospace";
-
-fn code_family() -> StyleProperty<'static, Brush> {
-    StyleProperty::FontFamily(FontFamily::Source(CODE_FONTS.into()))
-}
+/// The marker of an unordered list item.
+pub const BULLET: &str = "•";
+/// Line height of preview text, as a multiple of the font size.
+const LINE_HEIGHT: f32 = 1.6;
 
 fn color(rgba: Rgba8) -> Color {
     Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
@@ -53,19 +59,21 @@ pub struct PreviewStyle {
     pub fill: Rgba8,
     /// Rules, table lines, the bar of a quote.
     pub line: Rgba8,
+    /// Behind selected text.
+    pub selection: Rgba8,
+    /// Bars and titles of GitHub's callouts, in the order of
+    /// [`aster_markdown::preview::CalloutKind::ALL`].
+    pub callouts: [Rgba8; 5],
+    /// Their titles, in the interface language.
+    pub callout_labels: [&'static str; 5],
     /// Body text size in logical pixels.
     pub font_size: f32,
     pub page: PageLayout,
 }
 
 /// Something to draw, at a position in the whole document, in physical pixels.
+/// Text is drawn after everything else, over the selection.
 enum Piece {
-    Text {
-        x: f64,
-        y: f64,
-        // Boxed: a layout is large and most pieces are rectangles.
-        layout: Box<Layout<Brush>>,
-    },
     Rect {
         rect: Rect,
         color: Rgba8,
@@ -90,6 +98,24 @@ struct Painted {
     bottom: f64,
 }
 
+/// A laid-out text at its place in the document. The index of one in
+/// [`PreviewLayout::texts`] is what a selection calls a block.
+struct TextBox {
+    x: f64,
+    y: f64,
+    paragraph: Paragraph,
+    /// Takes part in selections; list markers and the like do not.
+    selectable: bool,
+    /// What separates it from the text before it when copied.
+    before: &'static str,
+}
+
+impl TextBox {
+    fn bottom(&self) -> f64 {
+        self.y + f64::from(self.paragraph.height())
+    }
+}
+
 /// Where a block of the source ended up, for scrolling the editor and the
 /// preview to the same place.
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +134,10 @@ pub struct PreviewLayout {
     /// In document order, with tops and sources only going up.
     anchors: Vec<Anchor>,
     links: Vec<(Rect, String)>,
+    /// In reading order.
+    texts: Vec<TextBox>,
+    /// Where `#name` links go: footnotes and the references to them.
+    targets: HashMap<String, f64>,
 }
 
 impl PreviewLayout {
@@ -119,6 +149,77 @@ impl PreviewLayout {
     /// Total height in physical pixels.
     pub fn height(&self) -> f64 {
         self.height
+    }
+
+    /// The text position nearest to a point in document coordinates: in the
+    /// text the point is level with, or the nearest one above or below.
+    pub fn point_at(&self, x: f64, y: f64) -> Option<TextPoint> {
+        let mut best: Option<(f64, f64, usize)> = None;
+        for (index, text) in self.texts.iter().enumerate() {
+            if !text.selectable {
+                continue;
+            }
+            let dy = if y < text.y {
+                text.y - y
+            } else {
+                (y - text.bottom()).max(0.0)
+            };
+            let right = text.x + f64::from(text.paragraph.width()).max(1.0);
+            let dx = if x < text.x {
+                text.x - x
+            } else {
+                (x - right).max(0.0)
+            };
+            if best.is_none_or(|(by, bx, _)| (dy, dx) < (by, bx)) {
+                best = Some((dy, dx, index));
+            }
+        }
+        let (_, _, block) = best?;
+        let text = &self.texts[block];
+        let offset = text
+            .paragraph
+            .offset_at((x - text.x) as f32, (y - text.y) as f32);
+        Some(TextPoint { block, offset })
+    }
+
+    fn pieces(&self) -> Vec<SelectionPiece<'_>> {
+        self.texts
+            .iter()
+            .map(|text| SelectionPiece {
+                text: if text.selectable {
+                    text.paragraph.text()
+                } else {
+                    ""
+                },
+                before: if text.selectable { text.before } else { "" },
+            })
+            .collect()
+    }
+
+    /// The plain text of a selection.
+    pub fn selected_text(&self, selection: &Selection) -> String {
+        selection.text(&self.pieces())
+    }
+
+    /// A selection of everything, if there is any text.
+    pub fn select_all(&self) -> Option<Selection> {
+        let first = self.texts.iter().position(|text| text.selectable)?;
+        let last = self.texts.iter().rposition(|text| text.selectable)?;
+        Some(Selection {
+            anchor: TextPoint {
+                block: first,
+                offset: 0,
+            },
+            focus: TextPoint {
+                block: last,
+                offset: self.texts[last].paragraph.text().len(),
+            },
+        })
+    }
+
+    /// Where a `#name` link goes, in document coordinates.
+    pub fn target(&self, name: &str) -> Option<f64> {
+        self.targets.get(name).copied()
     }
 
     /// The link under a point in document coordinates, if any.
@@ -186,8 +287,7 @@ impl PreviewLayout {
 
 /// Lays out documents. Owns its own fonts, so it can live on another thread.
 pub struct PreviewBuilder {
-    font_cx: FontContext,
-    layout_cx: LayoutContext<Brush>,
+    shaper: Shaper,
 }
 
 impl Default for PreviewBuilder {
@@ -212,7 +312,22 @@ struct TextOptions {
     color: Rgba8,
     bold: bool,
     mono: bool,
-    alignment: parley::Alignment,
+    alignment: Align,
+    /// Ordinary text; list markers and labels are not.
+    selectable: bool,
+}
+
+impl TextOptions {
+    fn body(size: f32, color: Rgba8) -> Self {
+        Self {
+            size,
+            color,
+            bold: false,
+            mono: false,
+            alignment: Align::Start,
+            selectable: true,
+        }
+    }
 }
 
 struct Pass<'a> {
@@ -224,16 +339,17 @@ struct Pass<'a> {
     items: Vec<Painted>,
     anchors: Vec<Anchor>,
     links: Vec<(Rect, String)>,
+    texts: Vec<TextBox>,
+    targets: HashMap<String, f64>,
+    /// Separator before the next selectable text, in copied text.
+    before: &'static str,
 }
 
 impl PreviewBuilder {
     pub fn new() -> Self {
-        let mut font_cx = FontContext::default();
-        configure_han_fallback(&mut font_cx);
-        Self {
-            font_cx,
-            layout_cx: LayoutContext::default(),
-        }
+        let mut shaper = Shaper::new();
+        shaper.set_han_fallbacks(&HAN_FALLBACK_FAMILIES);
+        Self { shaper }
     }
 
     /// Lay out `source` for a surface `width` physical pixels wide.
@@ -275,6 +391,9 @@ impl PreviewBuilder {
             items: Vec::new(),
             anchors: Vec::new(),
             links: Vec::new(),
+            texts: Vec::new(),
+            targets: HashMap::new(),
+            before: "",
         };
         let context = Context {
             color: style.text,
@@ -290,6 +409,8 @@ impl PreviewBuilder {
             items: pass.items,
             anchors: pass.anchors,
             links: pass.links,
+            texts: pass.texts,
+            targets: pass.targets,
         }
     }
 }
@@ -348,13 +469,7 @@ impl Pass<'_> {
         let base = f64::from(style.font_size * context.size);
         match &block.kind {
             BlockKind::Paragraph(inline) => {
-                let options = TextOptions {
-                    size: base as f32,
-                    color: context.color,
-                    bold: false,
-                    mono: false,
-                    alignment: parley::Alignment::Start,
-                };
+                let options = TextOptions::body(base as f32, context.color);
                 let bottom = self.text(inline, x, y, width, &options);
                 self.anchor(y, bottom, block.source.clone());
                 bottom
@@ -368,11 +483,8 @@ impl Pass<'_> {
                     context.color
                 };
                 let options = TextOptions {
-                    size: (base * factor) as f32,
-                    color,
                     bold: true,
-                    mono: false,
-                    alignment: parley::Alignment::Start,
+                    ..TextOptions::body((base * factor) as f32, color)
                 };
                 let mut bottom = self.text(text, x, y, width, &options);
                 if *level <= 2 {
@@ -400,11 +512,8 @@ impl Pass<'_> {
                     runs: Vec::new(),
                 };
                 let options = TextOptions {
-                    size: (base * 0.9) as f32,
-                    color: context.color,
-                    bold: false,
                     mono: true,
-                    alignment: parley::Alignment::Start,
+                    ..TextOptions::body((base * 0.9) as f32, context.color)
                 };
                 let index = self.items.len();
                 let text_bottom = self.text(&inline, x + pad, y + pad, width - 2.0 * pad, &options);
@@ -503,49 +612,51 @@ impl Pass<'_> {
                     runs: Vec::new(),
                 };
                 let options = TextOptions {
-                    size: (base * 0.9) as f32,
-                    color: style.secondary,
-                    bold: false,
-                    mono: false,
-                    alignment: parley::Alignment::Center,
+                    alignment: Align::Center,
+                    ..TextOptions::body((base * 0.9) as f32, style.secondary)
                 };
-                let layout = self.layout(&inline, width - 2.0 * em, &options);
-                let text_height = f64::from(layout.height());
+                let paragraph = self.layout(&inline, width - 2.0 * em, &options);
+                let text_height = f64::from(paragraph.height());
                 let text_y = y + (height - text_height) / 2.0;
-                self.push(
-                    Piece::Text {
-                        x: x + em,
-                        y: text_y,
-                        layout: Box::new(layout),
-                    },
-                    text_y,
-                    text_y + text_height,
-                );
+                self.add_text(x + em, text_y, paragraph, true);
                 let bottom = y + height;
                 self.anchor(y, bottom, block.source.clone());
                 bottom
             }
-            BlockKind::Footnote { label, blocks } => {
-                let inner = Context {
-                    color: style.secondary,
-                    size: context.size * 0.88,
-                    ..context
-                };
-                let gutter = self.em(inner) * 2.2;
-                let marker = Inline {
-                    text: format!("{label}."),
+            BlockKind::Callout { kind, blocks } => {
+                let tint = style.callouts[kind.index()];
+                let indent = em * 1.1;
+                let title = Inline {
+                    text: style.callout_labels[kind.index()].to_owned(),
                     runs: Vec::new(),
                 };
                 let options = TextOptions {
-                    size: (base * 0.88) as f32,
-                    color: style.secondary,
-                    bold: false,
-                    mono: false,
-                    alignment: parley::Alignment::Start,
+                    bold: true,
+                    selectable: false,
+                    ..TextOptions::body(base as f32, tint)
                 };
-                self.text(&marker, x, y, gutter, &options);
-                self.blocks(blocks, x + gutter, y, width - gutter, inner)
+                let title_bottom = self.text(&title, x + indent, y, width - indent, &options);
+                let bottom = self.blocks(
+                    blocks,
+                    x + indent,
+                    title_bottom + em * 0.2,
+                    width - indent,
+                    context,
+                );
+                let bar = (3.0 * s).round();
+                self.push(
+                    Piece::Rect {
+                        rect: Rect::new(x, y, x + bar, bottom),
+                        color: tint,
+                        radius: bar / 2.0,
+                    },
+                    y,
+                    bottom,
+                );
+                self.anchor(y, bottom, block.source.clone());
+                bottom
             }
+            BlockKind::Footnotes(notes) => self.footnotes(notes, x, y, width, context),
         }
     }
 
@@ -609,18 +720,16 @@ impl Pass<'_> {
                 None => {
                     let marker = match start {
                         Some(first) => format!("{}.", first + index as u64),
-                        None => "•".to_owned(),
+                        None => BULLET.to_owned(),
                     };
                     let inline = Inline {
                         text: marker,
                         runs: Vec::new(),
                     };
                     let options = TextOptions {
-                        size: base,
-                        color: self.style.tertiary,
-                        bold: false,
-                        mono: false,
-                        alignment: parley::Alignment::End,
+                        alignment: Align::End,
+                        selectable: false,
+                        ..TextOptions::body(base, self.style.tertiary)
                     };
                     self.text(&inline, x, y, gutter - em * 0.45, &options);
                 }
@@ -632,6 +741,61 @@ impl Pass<'_> {
             y = bottom.max(y + line_height);
         }
         y
+    }
+
+    /// The footnotes at the end: a short rule, then each note with its
+    /// number. Each note is where `#fn:` links go.
+    fn footnotes(
+        &mut self,
+        notes: &[Footnote],
+        x: f64,
+        y: f64,
+        width: f64,
+        context: Context,
+    ) -> f64 {
+        let style = *self.style;
+        let em = self.em(context);
+        let line = (y + em * 0.3).round();
+        let thickness = self.s.round().max(1.0);
+        let rule = Rect::new(x, line, x + (width / 3.0).min(em * 12.0), line + thickness);
+        self.push(
+            Piece::Rect {
+                rect: rule,
+                color: style.line,
+                radius: 0.0,
+            },
+            line,
+            line + thickness,
+        );
+        let inner = Context {
+            color: style.secondary,
+            size: context.size * 0.88,
+            tight: false,
+        };
+        let small = self.em(inner);
+        let gutter = small * 2.2;
+        let mut top = line + thickness + em * 0.8;
+        for note in notes {
+            if top > line + thickness + em * 0.8 {
+                top += small * 0.5;
+            }
+            self.targets
+                .insert(format!("fn:{}", normalize_label(&note.label)), top);
+            let marker = Inline {
+                text: format!("{}.", note.number),
+                runs: Vec::new(),
+            };
+            let options = TextOptions {
+                alignment: Align::End,
+                selectable: false,
+                ..TextOptions::body(style.font_size * inner.size, style.secondary)
+            };
+            self.text(&marker, x, top, gutter - small * 0.4, &options);
+            let bottom = self.blocks(&note.blocks, x + gutter, top, width - gutter, inner);
+            self.anchor(top, bottom, note.source.clone());
+            top = bottom.max(top + small * LINE_HEIGHT as f64);
+        }
+        top
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -665,14 +829,11 @@ impl Pass<'_> {
         for (is_head, row) in &all_rows {
             for (column, want) in wanted.iter_mut().enumerate() {
                 let options = TextOptions {
-                    size: base,
-                    color: self.style.text,
                     bold: *is_head,
-                    mono: false,
-                    alignment: parley::Alignment::Start,
+                    ..TextOptions::body(base, self.style.text)
                 };
-                let layout = self.layout(&cell(row, column), f64::INFINITY, &options);
-                *want = want.max(f64::from(layout.full_width()) + 2.0 * pad_x + 1.0);
+                let paragraph = self.layout(&cell(row, column), f64::INFINITY, &options);
+                *want = want.max(f64::from(paragraph.width()) + 2.0 * pad_x + 1.0);
             }
         }
         let total: f64 = wanted.iter().sum();
@@ -700,20 +861,19 @@ impl Pass<'_> {
             let mut laid = Vec::with_capacity(columns);
             for (column, column_width) in wanted.iter().enumerate() {
                 let alignment = match alignments.get(column) {
-                    Some(Alignment::Center) => parley::Alignment::Center,
-                    Some(Alignment::Right) => parley::Alignment::End,
-                    _ => parley::Alignment::Start,
+                    Some(Alignment::Center) => Align::Center,
+                    Some(Alignment::Right) => Align::End,
+                    _ => Align::Start,
                 };
                 let options = TextOptions {
-                    size: base,
-                    color: context.color,
                     bold: *is_head,
-                    mono: false,
                     alignment,
+                    ..TextOptions::body(base, context.color)
                 };
-                let layout = self.layout(&cell(row, column), column_width - 2.0 * pad_x, &options);
-                height = height.max(f64::from(layout.height()));
-                laid.push(layout);
+                let paragraph =
+                    self.layout(&cell(row, column), column_width - 2.0 * pad_x, &options);
+                height = height.max(f64::from(paragraph.height()));
+                laid.push(paragraph);
             }
             let bottom = top + height + 2.0 * pad_y;
             if *is_head {
@@ -729,20 +889,15 @@ impl Pass<'_> {
                 );
             }
             let mut left = x;
-            for ((column_width, layout), column) in wanted.iter().zip(laid).zip(0..) {
+            for ((column_width, paragraph), column) in wanted.iter().zip(laid).zip(0..) {
                 let row_cell = cell(row, column);
-                self.collect_links(&row_cell, &layout, left + pad_x, top + pad_y);
-                self.code_backgrounds(&row_cell, &layout, left + pad_x, top + pad_y);
-                let text_bottom = top + pad_y + f64::from(layout.height());
-                self.push(
-                    Piece::Text {
-                        x: left + pad_x,
-                        y: top + pad_y,
-                        layout: Box::new(layout),
-                    },
-                    top,
-                    text_bottom,
-                );
+                self.collect_links(&row_cell, &paragraph, left + pad_x, top + pad_y);
+                self.code_backgrounds(&row_cell, &paragraph, left + pad_x, top + pad_y);
+                // Cells of a row copy as tab-separated values.
+                if column > 0 {
+                    self.before = "\t";
+                }
+                self.add_text(left + pad_x, top + pad_y, paragraph, true);
                 left += column_width;
             }
             top = bottom;
@@ -782,113 +937,130 @@ impl Pass<'_> {
 
     /// Lay out `inline` at `(x, y)` within `width`; returns its bottom.
     fn text(&mut self, inline: &Inline, x: f64, y: f64, width: f64, options: &TextOptions) -> f64 {
-        let layout = self.layout(inline, width, options);
-        let height = f64::from(layout.height());
-        self.collect_links(inline, &layout, x, y);
-        self.code_backgrounds(inline, &layout, x, y);
-        self.push(
-            Piece::Text {
-                x,
-                y,
-                layout: Box::new(layout),
-            },
-            y,
-            y + height,
-        );
-        y + height
+        let paragraph = self.layout(inline, width, options);
+        let bottom = y + f64::from(paragraph.height());
+        self.collect_links(inline, &paragraph, x, y);
+        self.code_backgrounds(inline, &paragraph, x, y);
+        self.add_text(x, y, paragraph, options.selectable);
+        bottom
     }
 
-    fn layout(&mut self, inline: &Inline, width: f64, options: &TextOptions) -> Layout<Brush> {
-        let style = self.style;
-        let builder = &mut *self.builder;
-        let text = inline.text.as_str();
-        let mut b = builder
-            .layout_cx
-            .ranged_builder(&mut builder.font_cx, text, self.scale, true);
-        if options.mono {
-            b.push_default(code_family());
+    fn add_text(&mut self, x: f64, y: f64, paragraph: Paragraph, selectable: bool) {
+        let before = if selectable {
+            std::mem::replace(&mut self.before, "\n")
         } else {
-            b.push_default(StyleProperty::from(GenericFamily::SystemUi));
-        }
-        b.push_default(StyleProperty::FontSize(options.size));
-        b.push_default(StyleProperty::LineHeight(
-            parley::LineHeight::FontSizeRelative(1.6),
-        ));
-        b.push_default(StyleProperty::Brush(Brush(color(options.color))));
-        b.push_default(StyleProperty::Locale(DEFAULT_LANGUAGE.parse().ok()));
-        if options.bold {
-            b.push_default(StyleProperty::FontWeight(FontWeight::BOLD));
-        }
-        for run in &inline.runs {
-            let range = run.range.clone();
-            if run.style.strong {
-                b.push(StyleProperty::FontWeight(FontWeight::BOLD), range.clone());
-            }
-            if run.style.emphasis {
-                b.push(StyleProperty::FontStyle(FontStyle::Italic), range.clone());
-            }
-            if run.style.strike {
-                b.push(StyleProperty::Strikethrough(true), range.clone());
-            }
-            if run.style.code {
-                b.push(code_family(), range.clone());
-                b.push(StyleProperty::FontSize(options.size * 0.9), range.clone());
-            }
-            if run.style.image {
-                b.push(
-                    StyleProperty::Brush(Brush(color(style.secondary))),
-                    range.clone(),
-                );
-            }
-            if run.link.is_some() {
-                b.push(
-                    StyleProperty::Brush(Brush(color(style.accent))),
-                    range.clone(),
-                );
-                b.push(StyleProperty::Underline(true), range.clone());
-            }
-        }
-        let mut layout = b.build(text);
-        layout.set_alignment(options.alignment, AlignmentOptions::default());
-        let max = (width.is_finite()).then_some(width.max(1.0) as f32);
-        layout.break_all_lines(max);
-        layout
+            ""
+        };
+        self.texts.push(TextBox {
+            x,
+            y,
+            paragraph,
+            selectable,
+            before,
+        });
+    }
+
+    fn layout(&mut self, inline: &Inline, width: f64, options: &TextOptions) -> Paragraph {
+        let style = self.style;
+        let base = TextStyle {
+            family: if options.mono {
+                Family::List(CODE_FONTS.into())
+            } else {
+                Family::SystemUi
+            },
+            size: options.size,
+            color: options.color,
+            bold: options.bold,
+            italic: false,
+            underline: false,
+            strike: false,
+            rise: 0.0,
+        };
+        let spans: Vec<Span> = inline
+            .runs
+            .iter()
+            .map(|run| {
+                let mut look = base.clone();
+                look.bold |= run.style.strong;
+                look.italic |= run.style.emphasis;
+                look.strike |= run.style.strike;
+                if run.style.code {
+                    look.family = Family::List(CODE_FONTS.into());
+                    look.size = options.size * 0.9;
+                }
+                if run.style.image {
+                    look.color = style.secondary;
+                }
+                if run.link.is_some() {
+                    look.color = style.accent;
+                    look.underline = true;
+                }
+                if run.style.footnote {
+                    // A raised number, like a superscript.
+                    look.size = options.size * 0.72;
+                    look.rise = options.size * 0.38;
+                    look.underline = false;
+                }
+                Span {
+                    range: run.range.clone(),
+                    style: look,
+                }
+            })
+            .collect();
+        let language = aster_text::segment::guess_language(&inline.text, DEFAULT_LANGUAGE);
+        let spec = Spec {
+            text: &inline.text,
+            base,
+            spans: &spans,
+            language,
+            width: width.is_finite().then_some(width.max(1.0) as f32),
+            scale: self.scale,
+            line_height: LINE_HEIGHT,
+            align: options.alignment,
+            rules: Rules::for_language(language),
+        };
+        self.builder.shaper.lay_out(&spec)
     }
 
     /// Rectangles of a text range of a laid-out text, in document coordinates.
-    fn rects(layout: &Layout<Brush>, range: Range<usize>, x: f64, y: f64) -> Vec<Rect> {
-        let selection = Selection::new(
-            Cursor::from_byte_index(layout, range.start, Affinity::Downstream),
-            Cursor::from_byte_index(layout, range.end, Affinity::Upstream),
-        );
-        let mut rects = Vec::new();
-        selection.geometry_with(layout, |rect, _| {
-            rects.push(Rect::new(
-                x + rect.x0,
-                y + rect.y0,
-                x + rect.x1,
-                y + rect.y1,
-            ));
-        });
-        rects
+    fn rects(paragraph: &Paragraph, range: Range<usize>, x: f64, y: f64) -> Vec<Rect> {
+        paragraph
+            .rects(range)
+            .into_iter()
+            .map(|[x0, y0, x1, y1]| {
+                Rect::new(
+                    x + f64::from(x0),
+                    y + f64::from(y0),
+                    x + f64::from(x1),
+                    y + f64::from(y1),
+                )
+            })
+            .collect()
     }
 
-    fn collect_links(&mut self, inline: &Inline, layout: &Layout<Brush>, x: f64, y: f64) {
+    fn collect_links(&mut self, inline: &Inline, paragraph: &Paragraph, x: f64, y: f64) {
         for run in &inline.runs {
             if let Some(url) = &run.link {
-                for rect in Self::rects(layout, run.range.clone(), x, y) {
+                let rects = Self::rects(paragraph, run.range.clone(), x, y);
+                // The first reference to a footnote is where its note links back to.
+                if let (Some(label), Some(first)) = (url.strip_prefix("#fn:"), rects.first()) {
+                    self.targets
+                        .entry(format!("fnref:{label}"))
+                        .or_insert(first.y0);
+                }
+                for rect in rects {
                     self.links.push((rect, url.clone()));
                 }
             }
         }
     }
 
-    fn code_backgrounds(&mut self, inline: &Inline, layout: &Layout<Brush>, x: f64, y: f64) {
+    fn code_backgrounds(&mut self, inline: &Inline, paragraph: &Paragraph, x: f64, y: f64) {
         let fill = self.style.fill;
         let radius = 3.0 * self.s;
         for run in &inline.runs {
             if run.style.code || run.style.image {
-                for rect in Self::rects(layout, run.range.clone(), x, y) {
+                for rect in Self::rects(paragraph, run.range.clone(), x, y) {
                     let pad = rect.height() * 0.1;
                     let rect = Rect::new(
                         rect.x0 - 2.0 * self.s,
@@ -924,9 +1096,20 @@ pub struct PreviewView {
     height: u16,
     scale: f32,
     glyphs: Vec<Glyph>,
-    /// What the pixels show: scroll offset, layout and background. `None`
-    /// until the first render.
-    drawn: Option<(f64, usize, Rgba8)>,
+    selection: Option<Selection>,
+    /// Behind selected text.
+    selection_color: Rgba8,
+    /// What the pixels show. `None` until the first render.
+    drawn: Option<Drawn>,
+}
+
+/// What a render depends on, to tell whether the pixels are still right.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Drawn {
+    scroll: f64,
+    layout: usize,
+    background: Rgba8,
+    selection: Option<Selection>,
 }
 
 impl Default for PreviewView {
@@ -948,17 +1131,24 @@ impl PreviewView {
             height: 0,
             scale: 1.0,
             glyphs: Vec::new(),
+            selection: None,
+            selection_color: [0xe4, 0xdc, 0xfa, 0xff],
             drawn: None,
         }
     }
 
     /// What a render would draw now, to compare with what was drawn.
-    fn state(&self) -> (f64, usize, Rgba8) {
+    fn state(&self) -> Drawn {
         let layout = self
             .layout
             .as_ref()
             .map_or(0, |layout| Arc::as_ptr(layout) as usize);
-        (self.scroll, layout, self.background)
+        Drawn {
+            scroll: self.scroll,
+            layout,
+            background: self.background,
+            selection: self.selection,
+        }
     }
 
     /// Forget what was drawn, so the next [`Self::needs_render`] says yes:
@@ -994,12 +1184,105 @@ impl PreviewView {
         self.background = background;
     }
 
+    pub fn set_selection_color(&mut self, color: Rgba8) {
+        self.selection_color = color;
+    }
+
     /// Show a new layout. The scroll position is kept in pixels; the caller
     /// moves it with [`Self::scroll_to_position`] if it should follow the
-    /// source instead.
+    /// source instead. A selection is dropped: its text may have moved.
     pub fn set_layout(&mut self, layout: Arc<PreviewLayout>) {
         self.layout = Some(layout);
+        self.selection = None;
         self.clamp();
+    }
+
+    // --- Selection ---
+
+    /// Start a selection at a point in physical pixels relative to the view,
+    /// or with `extend` move the end of the current one there.
+    pub fn press(&mut self, x: f64, y: f64, extend: bool) {
+        let Some(point) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.point_at(x, y + self.scroll))
+        else {
+            self.selection = None;
+            return;
+        };
+        self.selection = match self.selection {
+            Some(selection) if extend => Some(Selection {
+                anchor: selection.anchor,
+                focus: point,
+            }),
+            _ => Some(Selection::caret(point)),
+        };
+    }
+
+    /// Move the end of the selection being dragged.
+    pub fn drag(&mut self, x: f64, y: f64) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if let Some(point) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.point_at(x, y + self.scroll))
+        {
+            self.selection = Some(Selection {
+                anchor: selection.anchor,
+                focus: point,
+            });
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection = self.layout.as_ref().and_then(|layout| layout.select_all());
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// The selected text, if anything is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.filter(|selection| !selection.is_empty())?;
+        let text = self.layout.as_ref()?.selected_text(&selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    // --- Scrolling by keyboard and by link ---
+
+    /// Height of the view in physical pixels.
+    pub fn view_height(&self) -> f64 {
+        f64::from(self.height)
+    }
+
+    /// Scroll to an offset in physical pixels; returns whether the view moved.
+    pub fn scroll_to(&mut self, offset: f64) -> bool {
+        let before = self.scroll;
+        self.scroll = offset;
+        self.clamp();
+        self.scroll != before
+    }
+
+    /// Follow a link inside the document (`#fn:…`, `#fnref:…`): scroll so its
+    /// target is a little below the top. Returns false if there is no such
+    /// target.
+    pub fn follow(&mut self, link: &str) -> bool {
+        let Some(name) = link.strip_prefix('#') else {
+            return false;
+        };
+        let Some(target) = self.layout.as_ref().and_then(|layout| layout.target(name)) else {
+            return false;
+        };
+        let margin = 24.0 * f64::from(self.scale);
+        self.scroll_to(target - margin);
+        true
     }
 
     pub fn layout(&self) -> Option<&Arc<PreviewLayout>> {
@@ -1073,6 +1356,8 @@ impl PreviewView {
             height,
             scale,
             glyphs: buffer,
+            selection,
+            selection_color,
             ..
         } = self;
         let (w, h) = (f64::from(*width), f64::from(*height));
@@ -1083,17 +1368,48 @@ impl PreviewView {
         ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
         if let Some(layout) = layout {
             let (top, bottom) = (*scroll, *scroll + h);
+            let view = Affine::translate((0.0, -*scroll));
             for item in &layout.items {
                 if item.bottom < top || item.top > bottom {
                     continue;
                 }
-                ctx.set_transform(Affine::translate((0.0, -*scroll)));
-                draw_shape(
+                ctx.set_transform(view);
+                draw_shape(ctx, &item.shape, *scale);
+            }
+            let visible = layout
+                .texts
+                .iter()
+                .enumerate()
+                .filter(|(_, text)| text.bottom() >= top && text.y <= bottom);
+            // The selection goes under the text.
+            if let Some(selection) = selection.filter(|s| !s.is_empty()) {
+                ctx.set_transform(view);
+                ctx.set_paint(color(*selection_color));
+                for (index, text) in visible.clone() {
+                    if !text.selectable {
+                        continue;
+                    }
+                    let Some(range) = selection.range_in(index, text.paragraph.text().len()) else {
+                        continue;
+                    };
+                    for [x0, y0, x1, y1] in text.paragraph.rects(range) {
+                        ctx.fill_rect(&Rect::new(
+                            text.x + f64::from(x0),
+                            text.y + f64::from(y0),
+                            text.x + f64::from(x1),
+                            text.y + f64::from(y1),
+                        ));
+                    }
+                }
+            }
+            for (_, text) in visible {
+                ctx.set_transform(view * Affine::translate((text.x, text.y)));
+                draw_text(
                     ctx,
                     resources,
-                    &item.shape,
-                    top - item.top_of_text(),
-                    h,
+                    &text.paragraph,
+                    (top - text.y) as f32,
+                    (bottom - text.y) as f32,
                     *scale,
                     buffer,
                 );
@@ -1114,26 +1430,8 @@ impl PreviewView {
     }
 }
 
-impl Painted {
-    fn top_of_text(&self) -> f64 {
-        match &self.shape {
-            Piece::Text { y, .. } => *y,
-            _ => self.top,
-        }
-    }
-}
-
-/// Draw one item. `visible_from` is the top of the view relative to the
-/// item's own top, so long texts skip lines above the view.
-fn draw_shape(
-    ctx: &mut RenderContext,
-    resources: &mut Resources,
-    shape: &Piece,
-    visible_from: f64,
-    view_height: f64,
-    scale: f32,
-    buffer: &mut Vec<Glyph>,
-) {
+/// Draw one shape in the current transform.
+fn draw_shape(ctx: &mut RenderContext, shape: &Piece, scale: f32) {
     match shape {
         Piece::Rect {
             rect,
@@ -1171,68 +1469,44 @@ fn draw_shape(
             ctx.set_stroke(Stroke::new(*width));
             ctx.stroke_path(&path);
         }
-        Piece::Text { x, y, layout } => {
-            let transform = *ctx.transform();
-            ctx.set_transform(transform * Affine::translate((*x, *y)));
-            for line in layout.lines() {
-                let metrics = line.metrics();
-                if f64::from(metrics.block_max_coord) < visible_from {
-                    continue;
-                }
-                if f64::from(metrics.block_min_coord) > visible_from + view_height {
-                    break;
-                }
-                for item in line.items() {
-                    let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                        continue;
-                    };
-                    let style = glyph_run.style();
-                    let run = glyph_run.run();
-                    buffer.clear();
-                    buffer.extend(glyph_run.positioned_glyphs().map(|glyph| Glyph {
-                        id: glyph.id,
-                        x: glyph.x,
-                        y: glyph.y,
-                    }));
-                    let paint = GlyphPaint {
-                        color: style.brush.0,
-                        embolden: false,
-                        skew: None,
-                    };
-                    glyphs::draw(ctx, resources, run, buffer, paint);
-                    let x0 = f64::from(glyph_run.offset());
-                    let x1 = x0 + f64::from(glyph_run.advance());
-                    let font = run.font_metrics();
-                    if let Some(underline) = &style.underline {
-                        let offset = underline.offset.unwrap_or(font.underline_offset);
-                        let size = underline.size.unwrap_or(font.underline_size);
-                        glyphs::line(
-                            ctx,
-                            underline.brush.0,
-                            (x0, x1),
-                            glyph_run.baseline(),
-                            offset,
-                            size,
-                            scale,
-                        );
-                    }
-                    if let Some(strike) = &style.strikethrough {
-                        let offset = strike.offset.unwrap_or(font.strikethrough_offset);
-                        let size = strike.size.unwrap_or(font.strikethrough_size);
-                        glyphs::line(
-                            ctx,
-                            strike.brush.0,
-                            (x0, x1),
-                            glyph_run.baseline(),
-                            offset,
-                            size,
-                            scale,
-                        );
-                    }
-                }
-            }
-            ctx.set_transform(transform);
-        }
+    }
+}
+
+/// Draw the lines of a paragraph between `top` and `bottom` (relative to the
+/// paragraph), in the current transform.
+fn draw_text(
+    ctx: &mut RenderContext,
+    resources: &mut Resources,
+    paragraph: &Paragraph,
+    top: f32,
+    bottom: f32,
+    scale: f32,
+    buffer: &mut Vec<Glyph>,
+) {
+    for run in paragraph.draw_runs(top, bottom) {
+        buffer.clear();
+        buffer.extend(run.glyphs.iter().map(|glyph| Glyph {
+            id: glyph.id,
+            x: glyph.x,
+            y: glyph.y,
+        }));
+        let face = glyphs::Face {
+            font: &run.face.font,
+            size: run.face.size,
+            coords: &run.face.coords,
+            embolden: run.face.embolden,
+            skew: run.skew,
+        };
+        glyphs::draw_face(ctx, resources, &face, color(run.color), buffer);
+    }
+    for line in paragraph.decorations(top, bottom, scale) {
+        ctx.set_paint(color(line.color));
+        ctx.fill_rect(&Rect::new(
+            f64::from(line.x0),
+            f64::from(line.y),
+            f64::from(line.x1),
+            f64::from(line.y + line.thickness),
+        ));
     }
 }
 
@@ -1306,6 +1580,15 @@ mod tests {
             accent: [0x7c, 0x5c, 0xe0, 0xff],
             fill: [0xf1, 0xf1, 0xf0, 0xff],
             line: [0xde, 0xde, 0xdd, 0xff],
+            selection: [0xe4, 0xdc, 0xfa, 0xff],
+            callouts: [
+                [0x09, 0x69, 0xda, 0xff],
+                [0x1a, 0x7f, 0x37, 0xff],
+                [0x82, 0x50, 0xdf, 0xff],
+                [0x9a, 0x67, 0x00, 0xff],
+                [0xd1, 0x24, 0x2f, 0xff],
+            ],
+            callout_labels: ["注意", "提示", "重要", "警告", "当心"],
             font_size: 15.0,
             page: PageLayout {
                 margin: 0.0,
@@ -1434,6 +1717,99 @@ mod tests {
         narrow.render();
     }
 
+    const MIXED: &str = "# 标题\n\n排版引擎需要处理“禁则”：句号、逗号和后引号（」』）》等）不能出现在行首，前引号（「『（《等）不能出现在行尾。日本語の組版では、行頭に句読点や閉じ括弧（」）、小書きの仮名（ゃ・ゅ・ょ・っ）などを置くことはできません。\n\n- 第一项\n- 第二项\n\n| 甲 | 乙 |\n|---|---|\n| 一 | 二 |\n";
+
+    #[test]
+    fn preview_paragraphs_follow_the_line_breaking_rules() {
+        for width in [300u16, 420, 560, 700] {
+            let layout = PreviewBuilder::new().build(MIXED, width, 1.0, &style());
+            let text = &layout.texts[1].paragraph;
+            let ranges = text.line_ranges();
+            assert!(ranges.len() > 1, "width {width}");
+            for (n, range) in ranges.iter().enumerate().skip(1) {
+                let first = text.text()[range.clone()].chars().next().unwrap();
+                let after_emergency = text.lines()[n - 1].kind == aster_text::BreakKind::Emergency;
+                assert!(
+                    after_emergency || !"。，、」』）》：；ゃゅょっ”".contains(first),
+                    "width {width}: line {n} starts with {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selecting_and_copying() {
+        let mut view = view(MIXED, 900, 2000);
+        let layout = view.layout().unwrap().clone();
+        // Drag from the start of the heading to the middle of the paragraph.
+        let heading = &layout.texts[0];
+        let paragraph = &layout.texts[1];
+        view.press(heading.x + 1.0, heading.y + 4.0, false);
+        let line = &paragraph.paragraph.lines()[0];
+        view.drag(
+            paragraph.x + f64::from(line.width) / 2.0,
+            paragraph.y + f64::from(line.top + line.height / 2.0),
+        );
+        let copied = view.selected_text().unwrap();
+        assert!(copied.starts_with("标题\n排版引擎"), "{copied}");
+        assert!(copied.len() < paragraph.paragraph.text().len());
+        // Select all: list markers are left out, table cells are tab separated.
+        view.select_all();
+        let all = view.selected_text().unwrap();
+        assert!(all.starts_with("标题\n"), "{all}");
+        assert!(all.contains("第一项\n第二项"), "{all}");
+        assert!(!all.contains('•'), "{all}");
+        assert!(all.ends_with("甲\t乙\n一\t二"), "{all}");
+        // Drawn: the selection colour appears.
+        view.select_all();
+        let data = view.render().data_as_u8_slice().to_vec();
+        let (pixels, _) = data.as_chunks::<4>();
+        assert!(pixels.iter().any(|px| *px == style().selection));
+        view.clear_selection();
+        assert!(view.selected_text().is_none());
+        // A new layout drops the selection.
+        view.select_all();
+        view.set_layout(Arc::new(PreviewBuilder::new().build(
+            "新",
+            900,
+            2.0,
+            &style(),
+        )));
+        assert!(view.selection().is_none());
+    }
+
+    #[test]
+    fn footnotes_link_both_ways() {
+        let filler: String = (0..60).map(|i| format!("第 {i} 段。\n\n")).collect();
+        let source = format!("正文[^注]。\n\n{filler}[^注]: 脚注的内容。\n");
+        let mut view = view(&source, 900, 600);
+        let layout = view.layout().unwrap().clone();
+        let note = layout.target("fn:注").expect("note target");
+        let back = layout.target("fnref:注").expect("reference target");
+        assert!(note > back + 1000.0);
+        // The target ends up just below the top: 24 logical pixels.
+        assert!(view.follow("#fn:注"));
+        let (scroll, max) = view.scroll_range();
+        assert_eq!(scroll, (note - 48.0).min(max));
+        assert!(view.follow("#fnref:注"));
+        assert_eq!(view.scroll_range().0, (back - 48.0).max(0.0));
+        assert!(!view.follow("#nowhere"));
+        assert!(!view.follow("https://example.com"));
+        let urls: Vec<&str> = layout.links.iter().map(|(_, url)| url.as_str()).collect();
+        assert!(urls.contains(&"#fn:注") && urls.contains(&"#fnref:注"));
+    }
+
+    #[test]
+    fn callouts_have_a_title_in_their_colour() {
+        let mut view = view("> [!WARNING]\n> 小心。\n", 900, 400);
+        let layout = view.layout().unwrap().clone();
+        assert_eq!(layout.texts[0].paragraph.text(), "警告");
+        assert!(!layout.texts[0].selectable);
+        let data = view.render().data_as_u8_slice().to_vec();
+        let (pixels, _) = data.as_chunks::<4>();
+        assert!(pixels.iter().any(|px| *px == style().callouts[3]));
+    }
+
     #[test]
     fn the_worker_lays_out_the_newest_job() {
         let (sender, results) = mpsc::channel();
@@ -1463,5 +1839,57 @@ mod tests {
             }
         }
         assert_eq!(last, 4);
+    }
+
+    /// Made-up italics lean forward: the ink of the top of a glyph sits
+    /// further right than the ink of its bottom.
+    #[test]
+    fn made_up_italics_lean_forward() {
+        let layout = PreviewBuilder::new().build("这", 300, 2.0, &style());
+        let runs = layout.texts[0].paragraph.draw_runs(0.0, 1000.0);
+        let run = &runs[0];
+        let lean = |skew: Option<f32>| {
+            let mut ctx = RenderContext::new(200, 200);
+            let mut resources = Resources::new();
+            let mut pixmap = Pixmap::new(200, 200);
+            ctx.set_paint(Color::from_rgba8(255, 255, 255, 255));
+            ctx.fill_rect(&Rect::new(0.0, 0.0, 200.0, 200.0));
+            ctx.set_transform(Affine::translate((60.0, 140.0)));
+            let face = glyphs::Face {
+                font: &run.face.font,
+                size: 100.0,
+                coords: &run.face.coords,
+                embolden: false,
+                skew,
+            };
+            let glyph = Glyph {
+                id: run.glyphs[0].id,
+                x: 0.0,
+                y: 0.0,
+            };
+            glyphs::draw_face(&mut ctx, &mut resources, &face, Color::BLACK, &[glyph]);
+            ctx.flush();
+            ctx.render(&mut pixmap, &mut resources);
+            let data = pixmap.data_as_u8_slice();
+            let centre = |rows: std::ops::Range<usize>| {
+                let (mut sum, mut count) = (0.0, 0.0);
+                for y in rows {
+                    for x in 0..200 {
+                        let ink = 255.0 - f64::from(data[(y * 200 + x) * 4]);
+                        sum += ink * x as f64;
+                        count += ink;
+                    }
+                }
+                sum / count.max(1.0)
+            };
+            // Top third of the glyph minus bottom third.
+            centre(50..80) - centre(110..140)
+        };
+        let upright = lean(Some(0.0));
+        let slanted = lean(Some(14.0));
+        assert!(
+            slanted > upright + 5.0,
+            "upright {upright}, slanted {slanted}"
+        );
     }
 }

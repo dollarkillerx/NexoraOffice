@@ -42,7 +42,7 @@ use aster_storage::{
     Contents, Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot,
 };
 use aster_surface::host::{self, to_px};
-use aster_surface::preview::{PreviewLayout, PreviewWorker};
+use aster_surface::preview::{PreviewBuilder, PreviewLayout, PreviewWorker};
 use aster_surface::{Action, ImeEvent, Surface};
 use aster_workspace::{
     FileTree, Filter, RecentFiles, Row, RowKind, Store, WorkspaceState, read_folder,
@@ -64,6 +64,9 @@ slint::include_modules!();
 mod macos;
 
 const CARET_BLINK: Duration = Duration::from_millis(530);
+/// Documents up to this size get their first preview laid out at once, on
+/// this thread, instead of an empty pane while the worker does it.
+const PREVIEW_AT_ONCE: usize = 256 * 1024;
 /// How long typing has to pause before the preview is laid out again.
 const PREVIEW_DELAY: Duration = Duration::from_millis(250);
 /// Width kept free for the window buttons when the tab strip is the title bar.
@@ -151,6 +154,10 @@ struct Shell {
     candidates: Vec<Candidate>,
     /// Lays out Markdown previews. `None` in tests.
     previews: Option<PreviewWorker>,
+    /// Lays out a small document's first preview on this thread, so the
+    /// pane is never shown empty. Made and warmed up on a worker thread at
+    /// start-up; `None` until then.
+    preview_builder: Option<PreviewBuilder>,
     /// Files being read and prepared on a worker thread.
     opening: Vec<PathBuf>,
     /// Runs once typing has paused, to bring the preview up to date.
@@ -195,6 +202,7 @@ impl Shell {
             next_key: 0,
             candidates: Vec::new(),
             previews: None,
+            preview_builder: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1171,6 +1179,7 @@ fn present_preview(ui: &AppWindow, shell: &mut Shell) {
     if width == 0 || height == 0 {
         return;
     }
+    first_preview_at_once(shell, width, height, scale);
     request_preview(shell, !shell.preview_timer.running());
     let strings = shell.language.strings();
     let Some(editor) = shell.active_markdown() else {
@@ -1207,13 +1216,36 @@ fn present_preview(ui: &AppWindow, shell: &mut Shell) {
     ui.set_preview_scroll_max(max as f32 / scale);
 }
 
+/// The first time the preview of a small document is shown, lay it out here
+/// and now: the worker would leave the pane empty for a moment.
+fn first_preview_at_once(shell: &mut Shell, width: u16, height: u16, scale: f32) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let style = content::preview_style(&shell.tokens, shell.language.strings());
+    let Some(mut builder) = shell.preview_builder.take() else {
+        return;
+    };
+    if let Some(editor) = shell.markdown(id)
+        && editor.preview.layout().is_none()
+        && editor.document.len() <= PREVIEW_AT_ONCE
+    {
+        editor.preview.resize(width, height, scale);
+        if let Some(job) = editor.preview_job(u64::from(id.0), true, style) {
+            let layout = builder.build(&job.source, job.width, job.scale, &job.style);
+            editor.show_preview(layout);
+        }
+    }
+    shell.preview_builder = Some(builder);
+}
+
 /// Hand the preview of the tab in front to the worker if it is out of date.
 /// Changes to the text count only when `text_changes` is set.
 fn request_preview(shell: &mut Shell, text_changes: bool) {
     let Some(id) = shell.tabs.active_id() else {
         return;
     };
-    let style = content::preview_style(&shell.tokens);
+    let style = content::preview_style(&shell.tokens, shell.language.strings());
     let Some(editor) = shell.markdown(id) else {
         return;
     };
@@ -1279,10 +1311,10 @@ fn after_tab_change(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
     refresh_chrome(ui, shell);
     refresh_sidebar(ui, shell);
+    present(ui, shell);
     if shell.active_surface().is_some() && shell.pending.is_none() {
         ui.invoke_focus_document();
     }
-    present(ui, shell);
 }
 
 /// After the text or the view of the document in front changed.
@@ -1313,6 +1345,52 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
 }
 
 /// Shortcuts the shell handles before the document sees the key.
+/// A key while the preview has the keyboard: arrows, Page Up and Down,
+/// space and Home and End scroll it, Cmd+A selects all of it, Cmd+C copies
+/// (also through the menu), Esc drops the selection. Returns whether the key
+/// was used. Typing does nothing: the preview is not editable.
+fn preview_key(editor: &mut MarkdownEditor, text: &str, shift: bool, primary: bool) -> bool {
+    use slint::platform::Key;
+
+    let mut chars = text.chars();
+    let (Some(key), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let is = |k: Key| char::from(k) == key;
+    let view = editor.preview.view_height();
+    let scale = f64::from(editor.preview.size().2);
+    let line = 40.0 * scale.max(1.0);
+    let page = (view - line).max(line);
+    if primary {
+        return match key.to_ascii_lowercase() {
+            'a' => {
+                editor.preview.select_all();
+                true
+            }
+            _ => false,
+        };
+    }
+    if is(Key::UpArrow) {
+        editor.scroll_preview(-line);
+    } else if is(Key::DownArrow) {
+        editor.scroll_preview(line);
+    } else if is(Key::PageUp) || (key == ' ' && shift) {
+        editor.scroll_preview(-page);
+    } else if is(Key::PageDown) || key == ' ' {
+        editor.scroll_preview(page);
+    } else if is(Key::Home) {
+        editor.scroll_preview_to(0.0);
+    } else if is(Key::End) {
+        editor.scroll_preview_to(f64::MAX);
+    } else if is(Key::Escape) {
+        editor.preview.clear_selection();
+    } else {
+        // Typing into a preview does nothing; let it fall through quietly.
+        return true;
+    }
+    true
+}
+
 fn shell_shortcut(text: &str, primary: bool) -> Option<Command> {
     if !primary {
         return None;
@@ -2296,6 +2374,25 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         });
         shell.borrow_mut().previews = Some(worker);
     }
+    // And one for first previews on this thread, made where it does not
+    // hold up the window: loading the system's font list takes a while.
+    {
+        let weak = ui.as_weak();
+        let style = {
+            let shell = shell.borrow();
+            content::preview_style(&shell.tokens, shell.language.strings())
+        };
+        std::thread::spawn(move || {
+            let mut builder = PreviewBuilder::new();
+            builder.build("# 预热\n\n中文、日本語、English。", 600, 2.0, &style);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |_, shell| shell.preview_builder = Some(builder)),
+                );
+            });
+        });
+    }
 
     // Most handlers below follow the same shape: get the window and the shell,
     // change the shell, then push what changed back into the window.
@@ -2379,6 +2476,15 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             after_find(&ui, shell, None);
             return true;
         }
+        if let Some(editor) = shell.active_markdown()
+            && editor.preview_has_focus()
+        {
+            let handled = preview_key(editor, text.as_str(), shift, primary);
+            if handled {
+                present(&ui, shell);
+            }
+            return handled;
+        }
         let Some(action) = host::decode_key(text.as_str(), shift, primary, alt) else {
             return false;
         };
@@ -2454,17 +2560,49 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
+    ui.on_preview_pressed(handler!(|ui, shell, x, y, shift| {
+        let scale = f64::from(ui.window().scale_factor());
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        editor.preview_press(f64::from(x) * scale, f64::from(y) * scale, shift);
+        present(&ui, shell);
+    }));
+
+    ui.on_preview_dragged(handler!(|ui, shell, x, y| {
+        let scale = f64::from(ui.window().scale_factor());
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        editor.preview_drag(f64::from(x) * scale, f64::from(y) * scale);
+        present(&ui, shell);
+    }));
+
     ui.on_preview_clicked(handler!(|ui, shell, x, y| {
         let scale = f64::from(ui.window().scale_factor());
         let Some(editor) = shell.active_markdown() else {
             return;
         };
+        // A drag that selected text is not a click on a link.
+        if editor
+            .preview
+            .selection()
+            .is_some_and(|selection| !selection.is_empty())
+        {
+            return;
+        }
         let Some(url) = editor
             .preview
             .link_at(f64::from(x) * scale, f64::from(y) * scale)
         else {
             return;
         };
+        if url.starts_with('#') {
+            if editor.follow_preview_link(&url) {
+                present(&ui, shell);
+            }
+            return;
+        }
         let refused = match aster_platform::links::open(&url) {
             Ok(()) => false,
             Err(aster_platform::links::OpenError::Refused) => true,
@@ -2601,8 +2739,10 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 refresh_toolbar(&ui, shell);
                 refresh_status(&ui, shell);
-                ui.invoke_focus_document();
+                // After `present`, which tells the window the new view: the
+                // keyboard goes to the preview when it is alone on screen.
                 present(&ui, shell);
+                ui.invoke_focus_document();
                 return;
             }
             refresh_toolbar(&ui, shell);
@@ -2716,6 +2856,15 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     // --- Clipboard and selection ---
 
     ui.on_edit_cut(handler!(|ui, shell| {
+        // The preview cannot be edited: cutting from it copies.
+        if let Some(editor) = shell.active_markdown()
+            && editor.preview_has_focus()
+        {
+            if let Some(text) = editor.preview.selected_text() {
+                ui.invoke_copy_to_clipboard(text.into());
+            }
+            return;
+        }
         if let Some(text) = shell.active_markdown().and_then(MarkdownEditor::cut) {
             ui.invoke_copy_to_clipboard(text.into());
             after_edit(&ui, shell, true);
@@ -2723,13 +2872,23 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_copy(handler!(|ui, shell| {
-        if let Some(text) = shell.active_markdown().and_then(|editor| editor.copy()) {
+        let text = shell.active_markdown().and_then(|editor| {
+            if editor.preview_has_focus() {
+                editor.preview.selected_text()
+            } else {
+                editor.copy()
+            }
+        });
+        if let Some(text) = text {
             ui.invoke_copy_to_clipboard(text.into());
         }
     }));
 
     ui.on_edit_paste(handler!(|ui, shell| {
-        if shell.active_markdown().is_none() {
+        if shell
+            .active_markdown()
+            .is_none_or(|editor| editor.preview_has_focus())
+        {
             return;
         }
         let text = ui.invoke_clipboard_text();
@@ -2741,6 +2900,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_select_all(handler!(|ui, shell| {
+        if let Some(editor) = shell.active_markdown()
+            && editor.preview_has_focus()
+        {
+            editor.preview.select_all();
+            present(&ui, shell);
+            return;
+        }
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.apply(Action::SelectAll),
             Some(Content::Markdown(editor)) => editor.select_all(),

@@ -220,6 +220,29 @@ impl Colors {
     }
 }
 
+/// Bars and titles of GitHub's five callouts in documents: note, tip,
+/// important, warning and caution. GitHub's own colours, which readers of
+/// Markdown know, except that "important" takes the accent. All of them are
+/// text and keep at least 4.5:1 against the page.
+pub const fn callout_colors(mode: ThemeMode) -> [Rgba; 5] {
+    match mode {
+        ThemeMode::Light => [
+            Rgba::rgb(0x0969da),
+            Rgba::rgb(0x1a7f37),
+            ACCENT,
+            Rgba::rgb(0x9a6700),
+            Rgba::rgb(0xd1242f),
+        ],
+        ThemeMode::Dark => [
+            Rgba::rgb(0x4493f8),
+            Rgba::rgb(0x3fb950),
+            Rgba::rgb(0x9a80ee),
+            Rgba::rgb(0xd29922),
+            Rgba::rgb(0xf85149),
+        ],
+    }
+}
+
 /// Lengths in logical pixels. The same in both themes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
@@ -331,6 +354,17 @@ mod tests {
             Rgba(0, 0, 0, 128).over(Rgba::rgb(0xffffff)),
             Rgba(127, 127, 127, 255)
         );
+    }
+
+    #[test]
+    fn callouts_are_readable_on_the_page() {
+        for mode in MODES {
+            let page = Colors::of(mode).page;
+            for color in callout_colors(mode) {
+                let ratio = contrast(color, page);
+                assert!(ratio >= 4.5, "{mode:?} {color:?}: {ratio}");
+            }
+        }
     }
 
     #[test]

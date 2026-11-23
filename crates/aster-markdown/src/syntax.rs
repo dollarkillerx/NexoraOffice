@@ -73,13 +73,69 @@ pub struct BareUrl {
     pub url: String,
 }
 
-/// Find `http://`, `https://` and `www.` addresses in plain text.
+/// Find `http://`, `https://` and `www.` addresses, and e-mail addresses, in
+/// plain text. An e-mail address links to `mailto:` it.
 ///
 /// This follows GitHub's extended autolinks, with one difference: an address
 /// stops at the first character outside ASCII. In Chinese or Japanese text an
 /// address is usually followed directly by more text, with no space, and
 /// GitHub's rule would pull that text into the link.
 pub fn find_bare_urls(text: &str) -> Vec<BareUrl> {
+    let mut found = find_web_addresses(text);
+    for email in find_emails(text) {
+        let overlaps = found
+            .iter()
+            .any(|url| url.range.start < email.range.end && email.range.start < url.range.end);
+        if !overlaps {
+            found.push(email);
+        }
+    }
+    found.sort_by_key(|found| found.range.start);
+    found
+}
+
+/// E-mail addresses as GitHub finds them: letters, digits and `.+-_` before
+/// the `@`, a domain with at least one dot after it, ending in a letter or
+/// digit.
+fn find_emails(text: &str) -> Vec<BareUrl> {
+    let bytes = text.as_bytes();
+    let local = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_');
+    let domain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_');
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(at) = text[search..].find('@').map(|at| at + search) {
+        search = at + 1;
+        let mut start = at;
+        while start > 0 && local(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < bytes.len() && domain(bytes[end]) {
+            end += 1;
+        }
+        // A full stop or other mark after the address ends the sentence.
+        while end > at + 1 && !bytes[end - 1].is_ascii_alphanumeric() {
+            end -= 1;
+        }
+        let host = &text[at + 1..end];
+        let valid = start < at
+            && host.contains('.')
+            && !host.starts_with('.')
+            && !host.contains("..")
+            && bytes[at - 1] != b'.';
+        if valid {
+            let written = &text[start..end];
+            found.push(BareUrl {
+                range: start..end,
+                url: format!("mailto:{written}"),
+            });
+            search = end;
+        }
+    }
+    found
+}
+
+fn find_web_addresses(text: &str) -> Vec<BareUrl> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
     let mut at = 0;
@@ -215,6 +271,26 @@ mod tests {
     fn an_address_stops_before_cjk_text() {
         let text = "请访问https://example.com/路径获取，或者 www.example.org。";
         assert_eq!(urls(text), ["https://example.com/", "www.example.org"]);
+    }
+
+    #[test]
+    fn e_mail_addresses_link_to_mailto() {
+        let text = "写信给 someone.name+tag@example.co.jp，或者a_b@mail.example.org。";
+        let found = find_bare_urls(text);
+        assert_eq!(
+            urls(text),
+            ["someone.name+tag@example.co.jp", "a_b@mail.example.org"]
+        );
+        assert_eq!(found[0].url, "mailto:someone.name+tag@example.co.jp");
+        // Not addresses: no dot after the @, nothing before it, a doubled
+        // dot, and an @ inside a web address.
+        assert!(urls("@example.com").is_empty());
+        assert!(urls("a@localhost").is_empty());
+        assert!(urls("a@b..com").is_empty());
+        assert_eq!(
+            urls("https://example.com/@who/a@b.cn/x and a@b.cn"),
+            ["https://example.com/@who/a@b.cn/x", "a@b.cn"]
+        );
     }
 
     #[test]

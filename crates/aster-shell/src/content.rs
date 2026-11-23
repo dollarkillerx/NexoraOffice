@@ -334,8 +334,12 @@ impl ReplaceJob {
     }
 }
 
-/// The preview's colours and column, matching the editor's.
-pub fn preview_style(tokens: &theme::Tokens) -> PreviewStyle {
+/// The preview's colours and column, matching the editor's; callout titles
+/// in the interface language.
+pub fn preview_style(
+    tokens: &theme::Tokens,
+    strings: &'static crate::i18n::Strings,
+) -> PreviewStyle {
     let c = &tokens.colors;
     PreviewStyle {
         background: c.surface.to_array(),
@@ -345,6 +349,15 @@ pub fn preview_style(tokens: &theme::Tokens) -> PreviewStyle {
         accent: c.link.to_array(),
         fill: c.fill.to_array(),
         line: c.page_edge.to_array(),
+        selection: c.selection.to_array(),
+        callouts: theme::callout_colors(tokens.mode).map(|color| color.to_array()),
+        callout_labels: [
+            strings.callout_note,
+            strings.callout_tip,
+            strings.callout_important,
+            strings.callout_warning,
+            strings.callout_caution,
+        ],
         font_size: MARKDOWN_FONT_SIZE,
         page: editor_layout(tokens),
     }
@@ -437,6 +450,10 @@ pub struct MarkdownEditor {
     /// The last link clicked in the preview was not opened: it was not a web
     /// or e-mail link.
     pub link_refused: bool,
+    /// The preview was clicked last, not the source: the keyboard scrolls
+    /// it, and copying and "select all" act on it. Always so when the
+    /// preview is on screen alone.
+    preview_focused: bool,
     pub find: FindState,
     /// The highlighting is out of date after a large change and is being
     /// rebuilt elsewhere; the text shows plain until then.
@@ -575,6 +592,7 @@ impl MarkdownEditor {
         surface.set_selection(0, 0);
         let mut preview = PreviewView::new();
         preview.set_background(tokens.colors.surface.to_array());
+        preview.set_selection_color(tokens.colors.selection.to_array());
         Self {
             highlighter,
             syntax: SyntaxColors::of(tokens),
@@ -585,6 +603,7 @@ impl MarkdownEditor {
             synced_scroll: None,
             preview_target: None,
             link_refused: false,
+            preview_focused: false,
             find: FindState::default(),
             highlight_stale: false,
             highlighting: false,
@@ -672,6 +691,8 @@ impl MarkdownEditor {
         self.syntax = SyntaxColors::of(tokens);
         self.preview
             .set_background(tokens.colors.surface.to_array());
+        self.preview
+            .set_selection_color(tokens.colors.selection.to_array());
     }
 
     /// Highlight what the editor shows. Called before every frame: only the
@@ -794,6 +815,46 @@ impl MarkdownEditor {
         }
         self.preview.scroll_to_position(self.surface.top_position());
         self.synced_scroll = Some(scroll);
+    }
+
+    /// Whether the keyboard and the Edit menu act on the preview.
+    pub fn preview_has_focus(&self) -> bool {
+        match self.view_mode {
+            ViewMode::Edit => false,
+            ViewMode::Preview => true,
+            ViewMode::Split => self.preview_focused,
+        }
+    }
+
+    /// A press in the preview, in physical pixels relative to it: starts a
+    /// selection there, or with `extend` moves the end of the current one.
+    pub fn preview_press(&mut self, x: f64, y: f64, extend: bool) {
+        self.link_refused = false;
+        self.preview_focused = true;
+        self.preview.press(x, y, extend);
+    }
+
+    pub fn preview_drag(&mut self, x: f64, y: f64) {
+        self.preview.drag(x, y);
+    }
+
+    /// Scroll the preview to an offset in physical pixels; in split view the
+    /// editor follows.
+    pub fn scroll_preview_to(&mut self, offset: f64) -> bool {
+        let (current, _) = self.preview.scroll_range();
+        self.scroll_preview(offset - current)
+    }
+
+    /// Follow a `#` link in the preview, such as a footnote.
+    pub fn follow_preview_link(&mut self, link: &str) -> bool {
+        if !self.preview.follow(link) {
+            return false;
+        }
+        if self.view_mode == ViewMode::Split {
+            self.surface.scroll_to_position(self.preview.top_position());
+            self.synced_scroll = Some(self.surface.scroll_range().0);
+        }
+        true
     }
 
     /// Scroll the preview by physical pixels; in split view the editor
@@ -1244,6 +1305,7 @@ impl MarkdownEditor {
 
     pub fn pointer_down(&mut self, x: f64, y: f64, extend: bool) {
         self.link_refused = false;
+        self.preview_focused = false;
         self.surface.pointer_down(x, y, extend);
         if !self.surface.is_composing() {
             self.adopt_selection();
@@ -1742,7 +1804,7 @@ mod tests {
     }
 
     fn style() -> PreviewStyle {
-        preview_style(&theme::Tokens::of(ThemeMode::Light))
+        preview_style(&theme::Tokens::of(ThemeMode::Light), &crate::i18n::ZH_HANS)
     }
 
     /// Lay out the preview here instead of on the worker thread.
@@ -1844,7 +1906,7 @@ mod tests {
         // A new size or theme asks again even while typing.
         e.preview.resize(900, 600, 2.0);
         assert!(e.preview_job(1, false, style()).is_some());
-        let dark = preview_style(&theme::Tokens::of(ThemeMode::Dark));
+        let dark = preview_style(&theme::Tokens::of(ThemeMode::Dark), &crate::i18n::ZH_HANS);
         assert!(e.preview_job(1, false, dark).is_some());
     }
 

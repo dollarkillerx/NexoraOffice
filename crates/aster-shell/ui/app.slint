@@ -182,10 +182,19 @@ export component AppWindow inherits Window {
     callback menu-find-selection();
     callback preview-clicked(length, length);
     callback preview-moved(length, length);
+    // A press in the preview starts a selection (with Shift, extends it);
+    // moving with the button down drags it.
+    callback preview-pressed(length, length, bool);
+    callback preview-dragged(length, length);
 
     // Give the keyboard to the document surface.
     public function focus-document() {
-        scope.focus();
+        // With the preview alone on screen, the keyboard scrolls it.
+        if (root.view-mode == 2) {
+            preview-scope.focus();
+        } else {
+            scope.focus();
+        }
     }
 
     public function focus-find-query() {
@@ -666,14 +675,33 @@ export component AppWindow inherits Window {
                                 image-fit: fill;
                             }
 
+                            // Keys while the preview was clicked last, or is on
+                            // screen alone: scrolling, select all, copy.
+                            preview-scope := FocusScope {
+                                enabled: root.surface-active && root.view-mode != 0;
+                                key-pressed(event) => {
+                                    return root.key-pressed(event.text, event.modifiers.shift, event.modifiers.control, event.modifiers.alt) ? accept : reject;
+                                }
+                            }
+
                             TouchArea {
                                 enabled: root.surface-active && root.view-mode != 0;
-                                mouse-cursor: root.preview-link-hover ? pointer : default;
+                                mouse-cursor: root.preview-link-hover ? pointer : text;
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                        preview-scope.focus();
+                                        root.preview-pressed(self.mouse-x, self.mouse-y, event.modifiers.shift);
+                                    }
+                                }
                                 clicked => {
                                     root.preview-clicked(self.mouse-x, self.mouse-y);
                                 }
                                 moved => {
-                                    root.preview-moved(self.mouse-x, self.mouse-y);
+                                    if (self.pressed) {
+                                        root.preview-dragged(self.mouse-x, self.mouse-y);
+                                    } else {
+                                        root.preview-moved(self.mouse-x, self.mouse-y);
+                                    }
                                 }
                                 scroll-event(event) => {
                                     root.preview-scrolled(event.delta-y);

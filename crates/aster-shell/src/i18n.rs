@@ -360,6 +360,12 @@ strings! {
     opened_yesterday,
     opened_this_year,
     opened_other_year,
+    /// Titles of GitHub's callouts (`> [!NOTE]`) in the preview.
+    callout_note,
+    callout_tip,
+    callout_important,
+    callout_warning,
+    callout_caution,
 }
 
 impl Strings {
@@ -586,6 +592,11 @@ Aster Office 外壳原型
     opened_yesterday: "昨天 {time}",
     opened_this_year: "{month} 月 {day} 日",
     opened_other_year: "{year} 年 {month} 月 {day} 日",
+    callout_note: "说明",
+    callout_tip: "提示",
+    callout_important: "重要",
+    callout_warning: "警告",
+    callout_caution: "当心",
 };
 
 pub const JA: Strings = Strings {
@@ -756,6 +767,11 @@ Aster Office シェルの試作
     opened_yesterday: "昨日 {time}",
     opened_this_year: "{month}月{day}日",
     opened_other_year: "{year}年{month}月{day}日",
+    callout_note: "注記",
+    callout_tip: "ヒント",
+    callout_important: "重要",
+    callout_warning: "警告",
+    callout_caution: "注意",
 };
 
 pub const EN: Strings = Strings {
@@ -926,6 +942,11 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     opened_yesterday: "Yesterday {time}",
     opened_this_year: "{month}/{day}",
     opened_other_year: "{month}/{day}/{year}",
+    callout_note: "Note",
+    callout_tip: "Tip",
+    callout_important: "Important",
+    callout_warning: "Warning",
+    callout_caution: "Caution",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -1078,6 +1099,11 @@ pub const ZH_HANT: Strings = Strings {
     opened_yesterday: "昨天 {time}",
     opened_this_year: "{month} 月 {day} 日",
     opened_other_year: "{year} 年 {month} 月 {day} 日",
+    callout_note: "說明",
+    callout_tip: "提示",
+    callout_important: "重要",
+    callout_warning: "警告",
+    callout_caution: "當心",
 };
 
 pub const FR: Strings = Strings {
@@ -1230,6 +1256,11 @@ pub const FR: Strings = Strings {
     opened_yesterday: "Hier {time}",
     opened_this_year: "{day}/{month}",
     opened_other_year: "{day}/{month}/{year}",
+    callout_note: "Remarque",
+    callout_tip: "Astuce",
+    callout_important: "Important",
+    callout_warning: "Avertissement",
+    callout_caution: "Attention",
 };
 
 pub const DE: Strings = Strings {
@@ -1382,6 +1413,11 @@ pub const DE: Strings = Strings {
     opened_yesterday: "Gestern {time}",
     opened_this_year: "{day}.{month}.",
     opened_other_year: "{day}.{month}.{year}",
+    callout_note: "Hinweis",
+    callout_tip: "Tipp",
+    callout_important: "Wichtig",
+    callout_warning: "Warnung",
+    callout_caution: "Vorsicht",
 };
 
 pub const ES: Strings = Strings {
@@ -1534,6 +1570,11 @@ pub const ES: Strings = Strings {
     opened_yesterday: "Ayer {time}",
     opened_this_year: "{day}/{month}",
     opened_other_year: "{day}/{month}/{year}",
+    callout_note: "Nota",
+    callout_tip: "Consejo",
+    callout_important: "Importante",
+    callout_warning: "Advertencia",
+    callout_caution: "Precaución",
 };
 
 pub const KO: Strings = Strings {
@@ -1686,6 +1727,11 @@ pub const KO: Strings = Strings {
     opened_yesterday: "어제 {time}",
     opened_this_year: "{month}월 {day}일",
     opened_other_year: "{year}. {month}. {day}.",
+    callout_note: "참고",
+    callout_tip: "팁",
+    callout_important: "중요",
+    callout_warning: "경고",
+    callout_caution: "주의",
 };
 
 #[cfg(test)]
@@ -1729,7 +1775,13 @@ mod tests {
     #[test]
     fn translations_are_not_copies_of_english() {
         // Product names and format names are the same everywhere; the rest is not.
-        let shared = ["markdown_label", "pdf_label", "button_ok"];
+        // "Important" is the same word in French.
+        let shared = [
+            "markdown_label",
+            "pdf_label",
+            "button_ok",
+            "callout_important",
+        ];
         let english = EN.fields();
         for language in Language::ALL {
             if language == Language::En {

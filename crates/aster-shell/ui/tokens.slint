@@ -119,6 +119,18 @@ export global Strings {
     in property <string> refresh;
     in property <string> unsupported;
     in property <string> no-matches;
+    in property <string> menu-format;
+    in property <string> format-bold;
+    in property <string> format-italic;
+    in property <string> format-strike;
+    in property <string> format-code;
+    in property <string> format-bullet;
+    in property <string> format-numbered;
+    in property <string> format-task;
+    in property <string> format-quote;
+    in property <string> format-link;
+    in property <string> format-image;
+    in property <string> format-table;
 }
 
 // Path data for the icons the chrome itself uses. Toolbar icons arrive with the
@@ -165,6 +177,8 @@ export struct ToolItem {
     // Shown pressed: the choice in effect.
     active: bool,
     command: int,
+    // A select field: what its list offers, in order.
+    options: [string],
 }
 
 export struct KindItem {

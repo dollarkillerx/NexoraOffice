@@ -13,6 +13,7 @@ use crate::stats::TextStats;
 use crate::theme;
 use crate::toolbar::ViewMode;
 use aster_markdown::document::{floor_char_boundary, slice};
+use aster_markdown::format;
 use aster_markdown::highlight::{Highlighter, Marks, Span};
 use aster_markdown::search::{Finder, Found, Query};
 use aster_markdown::{Change, Document, EditCommand, Rope, SavePoint, Selection, TextFormat};
@@ -218,6 +219,18 @@ pub const SEARCH_INLINE: usize = 2 * 1024 * 1024;
 /// on another thread. Nor is it written to the recovery record as an entry:
 /// the record is checkpointed instead.
 pub const LARGE_CHANGE: usize = 4 * 1024 * 1024;
+
+/// A formatting command for [`MarkdownEditor::format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Inline(format::Inline),
+    /// 0 for body text, else 1 to 6.
+    Heading(u8),
+    Block(format::Block),
+    Link,
+    Image,
+    Table,
+}
 
 /// The find bar of a tab and what it found.
 #[derive(Default)]
@@ -1287,6 +1300,37 @@ impl MarkdownEditor {
         self.show(change)
     }
 
+    /// Format the selection: emphasis, a heading level, a list or quote, or
+    /// insert a link, image or table. One undo step. Returns whether the
+    /// text changed. Not while composing, while a replacement throughout the
+    /// document runs, or with only the preview on screen.
+    pub fn format(&mut self, command: Format) -> bool {
+        if self.surface.is_composing() || self.locked() || !self.view_mode.shows_source() {
+            return false;
+        }
+        let text = self.document.text();
+        let selection = self.document.selection();
+        let edit = match command {
+            Format::Inline(kind) => format::toggle_inline(text, selection, kind),
+            Format::Heading(level) => format::set_heading(text, selection, level),
+            Format::Block(kind) => format::toggle_block(text, selection, kind),
+            Format::Link => format::insert_link(text, selection, false),
+            Format::Image => format::insert_link(text, selection, true),
+            Format::Table => format::insert_table(text, selection),
+        };
+        let Some(mut change) = self.document.replace_range(edit.range, &edit.text) else {
+            return false;
+        };
+        self.document.set_selection(edit.selection);
+        change.selection = edit.selection;
+        self.show(Some(change))
+    }
+
+    /// The heading level of the line with the caret, 0 for body text.
+    pub fn heading_level(&self) -> u8 {
+        format::heading_level(self.document.text(), self.document.selection().focus)
+    }
+
     /// Carry out what a key press decoded to. Returns whether the text changed.
     pub fn key(&mut self, action: Action) -> bool {
         match action {
@@ -2010,6 +2054,51 @@ mod tests {
         e.undo();
         assert_eq!(text_of(&e), "狗 cat cat");
         assert_in_step(&e);
+    }
+
+    #[test]
+    fn formatting_is_one_undo_step_and_keeps_the_text_selected() {
+        use aster_markdown::format::{Block, Inline};
+        let mut e = editor("会议纪要\n第一项\n第二项");
+        // Select 纪要 and make it bold.
+        e.document.set_selection(Selection {
+            anchor: 6,
+            focus: 12,
+        });
+        e.surface.set_selection(6, 12);
+        assert!(e.format(Format::Inline(Inline::Bold)));
+        assert_eq!(text_of(&e), "会议**纪要**\n第一项\n第二项");
+        assert_eq!(e.document.selection().range(), 8..14);
+        assert_in_step(&e);
+        // The first line becomes a heading; the level is what the toolbar shows.
+        assert!(e.format(Format::Heading(1)));
+        assert_eq!(e.heading_level(), 1);
+        // The two items become a numbered list.
+        let start = text_of(&e).find("第一项").unwrap();
+        let end = text_of(&e).len();
+        e.document.set_selection(Selection {
+            anchor: start,
+            focus: end,
+        });
+        assert!(e.format(Format::Block(Block::Numbered)));
+        assert_eq!(text_of(&e), "# 会议**纪要**\n1. 第一项\n2. 第二项");
+        assert_in_step(&e);
+        // Each command is one step back.
+        e.undo();
+        assert_eq!(text_of(&e), "# 会议**纪要**\n第一项\n第二项");
+        e.undo();
+        e.undo();
+        assert_eq!(text_of(&e), "会议纪要\n第一项\n第二项");
+    }
+
+    #[test]
+    fn formatting_waits_for_the_source() {
+        let mut e = editor("文字");
+        e.set_view_mode(ViewMode::Preview);
+        assert!(!e.format(Format::Table));
+        assert_eq!(text_of(&e), "文字");
+        e.set_view_mode(ViewMode::Split);
+        assert!(e.format(Format::Table));
     }
 
     #[test]

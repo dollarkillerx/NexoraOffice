@@ -14,6 +14,7 @@
 
 pub mod document;
 pub mod file;
+pub mod format;
 pub mod highlight;
 mod history;
 pub mod journal;

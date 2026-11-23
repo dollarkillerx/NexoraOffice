@@ -61,6 +61,8 @@ export component AppWindow inherits Window {
 
     // The tab in front is a document that can be edited, saved and undone.
     in property <bool> editing;
+    // Its source is on screen, so the Format menu can write into it.
+    property <bool> formatting: root.editing && root.view-mode != 2;
     in property <bool> can-undo;
     in property <bool> can-redo;
     // 0 while no question is open; see dialog.slint for the kinds.
@@ -150,6 +152,14 @@ export component AppWindow inherits Window {
     callback toggle-theme();
     callback set-language(int);
     callback toolbar-command(int);
+    // An entry of a toolbar field's list: the field's command, the index.
+    callback toolbar-option(int, int);
+    // The Format menu. 0 bold, 1 italic, 2 strikethrough, 3 inline code,
+    // 4 bulleted list, 5 numbered list, 6 task list, 7 quote, 8 link,
+    // 9 image, 10 table, 20 body text, 21 to 26 heading levels.
+    callback format(int);
+    // Body text and heading levels 1 to 6, for the Format menu.
+    in property <[string]> heading-names: ["", "", "", "", "", "", ""];
     callback file-new();
     callback file-open();
     callback file-save();
@@ -452,6 +462,178 @@ export component AppWindow inherits Window {
                 }
             }
         }
+
+        // Markdown syntax written for the user; only with the source on
+        // screen. Shortcuts as in Typora.
+        Menu {
+            title: Strings.menu-format;
+
+            MenuItem {
+                title: Strings.format-bold;
+                shortcut: @keys(Control + B);
+                enabled: root.formatting;
+                activated => {
+                    root.format(0);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-italic;
+                shortcut: @keys(Control + I);
+                enabled: root.formatting;
+                activated => {
+                    root.format(1);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-strike;
+                shortcut: @keys(Control + Shift + X);
+                enabled: root.formatting;
+                activated => {
+                    root.format(2);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-code;
+                enabled: root.formatting;
+                activated => {
+                    root.format(3);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.format-bullet;
+                shortcut: @keys(Control + Alt + U);
+                enabled: root.formatting;
+                activated => {
+                    root.format(4);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-numbered;
+                shortcut: @keys(Control + Alt + O);
+                enabled: root.formatting;
+                activated => {
+                    root.format(5);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-task;
+                shortcut: @keys(Control + Alt + X);
+                enabled: root.formatting;
+                activated => {
+                    root.format(6);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-quote;
+                shortcut: @keys(Control + Alt + Q);
+                enabled: root.formatting;
+                activated => {
+                    root.format(7);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.format-link;
+                shortcut: @keys(Control + K);
+                enabled: root.formatting;
+                activated => {
+                    root.format(8);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-image;
+                enabled: root.formatting;
+                activated => {
+                    root.format(9);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-table;
+                shortcut: @keys(Control + Alt + T);
+                enabled: root.formatting;
+                activated => {
+                    root.format(10);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                // No Cmd+0: Writer tabs reset the zoom with it.
+                title: root.heading-names[0];
+                enabled: root.formatting;
+                activated => {
+                    root.format(20);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[1];
+                shortcut: @keys(Control + "1");
+                enabled: root.formatting;
+                activated => {
+                    root.format(21);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[2];
+                shortcut: @keys(Control + "2");
+                enabled: root.formatting;
+                activated => {
+                    root.format(22);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[3];
+                shortcut: @keys(Control + "3");
+                enabled: root.formatting;
+                activated => {
+                    root.format(23);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[4];
+                shortcut: @keys(Control + "4");
+                enabled: root.formatting;
+                activated => {
+                    root.format(24);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[5];
+                shortcut: @keys(Control + "5");
+                enabled: root.formatting;
+                activated => {
+                    root.format(25);
+                }
+            }
+
+            MenuItem {
+                title: root.heading-names[6];
+                shortcut: @keys(Control + "6");
+                enabled: root.formatting;
+                activated => {
+                    root.format(26);
+                }
+            }
+        }
     }
 
     VerticalLayout {
@@ -550,6 +732,9 @@ export component AppWindow inherits Window {
                     items: root.toolbar-items;
                     command(id) => {
                         root.toolbar-command(id);
+                    }
+                    option(id, index) => {
+                        root.toolbar-option(id, index);
                     }
                 }
 

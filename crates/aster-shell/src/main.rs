@@ -57,8 +57,8 @@ use slint::{
 };
 
 use aster_shell::content::{
-    self, DiskWarning, JournalStep, MarkdownEditor, Opened, Prepared, ReplaceJob, SearchJob,
-    WriterView, rope_bytes,
+    self, DiskWarning, Format, JournalStep, MarkdownEditor, Opened, Prepared, ReplaceJob,
+    SearchJob, WriterView, rope_bytes,
 };
 
 slint::include_modules!();
@@ -176,6 +176,8 @@ struct Shell {
     candidates: Vec<Candidate>,
     /// Lays out Markdown previews. `None` in tests.
     previews: Option<PreviewWorker>,
+    /// The heading level the toolbar's paragraph style field shows.
+    shown_heading: u8,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -225,6 +227,7 @@ impl Shell {
             candidates: Vec::new(),
             previews: None,
             preview_builder: None,
+            shown_heading: 0,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -621,6 +624,9 @@ impl Shell {
             return false;
         }
         match (self.active_content(), command) {
+            (Some(Content::Markdown(editor)), command) if format_of(command).is_some() => {
+                format_of(command).is_some_and(|format| editor.format(format))
+            }
             (Some(Content::Markdown(editor)), Command::Undo) => editor.undo(),
             (Some(Content::Markdown(editor)), Command::Redo) => editor.redo(),
             (
@@ -910,6 +916,24 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_refresh(strings.refresh.into());
     s.set_unsupported(strings.unsupported.into());
     s.set_no_matches(strings.no_matches.into());
+    s.set_menu_format(strings.menu_format.into());
+    s.set_format_bold(strings.format_bold.into());
+    s.set_format_italic(strings.format_italic.into());
+    s.set_format_strike(strings.format_strike.into());
+    s.set_format_code(strings.format_code.into());
+    s.set_format_bullet(strings.format_bullet.into());
+    s.set_format_numbered(strings.format_numbered.into());
+    s.set_format_task(strings.format_task.into());
+    s.set_format_quote(strings.format_quote.into());
+    s.set_format_link(strings.format_link.into());
+    s.set_format_image(strings.format_image.into());
+    s.set_format_table(strings.format_table.into());
+    ui.set_heading_names(model(
+        toolbar::heading_names(strings)
+            .into_iter()
+            .map(SharedString::from)
+            .collect(),
+    ));
 
     ui.set_language_index(language.index() as i32);
     ui.set_kinds(model(
@@ -943,6 +967,12 @@ fn tool_item(item: &toolbar::Item) -> ToolItem {
         enabled: item.enabled,
         active: item.active,
         command: item.command.map_or(-1, Command::id),
+        options: model(
+            item.options
+                .iter()
+                .map(|option| SharedString::from(option.as_str()))
+                .collect(),
+        ),
         ..ToolItem::default()
     };
     match &item.control {
@@ -1036,7 +1066,11 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         view_mode: shell
             .active_markdown()
             .map_or(ViewMode::Edit, |editor| editor.view_mode),
+        heading: shell
+            .active_markdown()
+            .map_or(0, |editor| editor.heading_level()),
     };
+    shell.shown_heading = view.heading;
     ui.set_toolbar_items(model(
         toolbar::toolbar(kind, view, shell.language.strings())
             .iter()
@@ -1457,8 +1491,67 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         schedule_search(ui, shell);
         schedule_highlight(ui, shell);
     }
+    // The paragraph style field follows the caret from line to line.
+    if shell
+        .active_markdown()
+        .map_or(0, |editor| editor.heading_level())
+        != shell.shown_heading
+    {
+        refresh_toolbar(ui, shell);
+    }
     refresh_status(ui, shell);
     present(ui, shell);
+}
+
+/// The formatting a toolbar command stands for in a Markdown tab.
+fn format_of(command: Command) -> Option<Format> {
+    use aster_markdown::format::{Block, Inline};
+    Some(match command {
+        Command::Bold => Format::Inline(Inline::Bold),
+        Command::Italic => Format::Inline(Inline::Italic),
+        Command::Strikethrough => Format::Inline(Inline::Strike),
+        Command::InlineCode => Format::Inline(Inline::Code),
+        Command::BulletList => Format::Block(Block::Bullet),
+        Command::NumberedList => Format::Block(Block::Numbered),
+        Command::Checklist => Format::Block(Block::Task),
+        Command::Quote => Format::Block(Block::Quote),
+        Command::InsertLink => Format::Link,
+        Command::InsertImage => Format::Image,
+        Command::InsertTable => Format::Table,
+        _ => return None,
+    })
+}
+
+/// The formatting a Format menu code stands for; see `format` in
+/// `ui/app.slint`.
+fn format_of_menu(code: i32) -> Option<Format> {
+    let command = match code {
+        0 => Command::Bold,
+        1 => Command::Italic,
+        2 => Command::Strikethrough,
+        3 => Command::InlineCode,
+        4 => Command::BulletList,
+        5 => Command::NumberedList,
+        6 => Command::Checklist,
+        7 => Command::Quote,
+        8 => Command::InsertLink,
+        9 => Command::InsertImage,
+        10 => Command::InsertTable,
+        20..=26 => return Some(Format::Heading((code - 20) as u8)),
+        _ => return None,
+    };
+    format_of(command)
+}
+
+/// Carry out a formatting command on the Markdown tab in front.
+fn apply_format(ui: &AppWindow, shell: &mut Shell, format: Format) {
+    let changed = shell
+        .active_markdown()
+        .is_some_and(|editor| editor.format(format));
+    if changed {
+        after_edit(ui, shell, true);
+        refresh_toolbar(ui, shell);
+    }
 }
 
 /// Shortcuts the shell handles before the document sees the key.
@@ -3112,6 +3205,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
             refresh_toolbar(&ui, shell);
             after_edit(&ui, shell, true);
+        }
+    }));
+
+    ui.on_toolbar_option(handler!(|ui, shell, id, index| {
+        if Command::from_id(id) == Some(Command::Heading)
+            && let Ok(level) = u8::try_from(index)
+        {
+            apply_format(&ui, shell, Format::Heading(level));
+        }
+    }));
+
+    ui.on_format(handler!(|ui, shell, code| {
+        if let Some(format) = format_of_menu(code) {
+            apply_format(&ui, shell, format);
         }
     }));
 

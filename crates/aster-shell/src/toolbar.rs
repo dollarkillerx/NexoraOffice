@@ -154,25 +154,50 @@ impl Command {
     }
 
     /// Whether this build can carry the command out on a view of this kind:
-    /// zoom on the plain-text surface behind Writer tabs, undo, redo and the
-    /// three views in Markdown tabs, and nothing else. Whether there is anything to undo right
-    /// now is a separate question, answered by [`ViewState`].
+    /// zoom on the plain-text surface behind Writer tabs; undo, redo, the
+    /// three views and the formatting commands in Markdown tabs; nothing
+    /// else. Whether there is anything to undo right now is a separate
+    /// question, answered by [`ViewState`].
     pub fn is_available(self, kind: DocKind) -> bool {
         match kind {
             DocKind::Writer => matches!(
                 self,
                 Command::ZoomOut | Command::ZoomReset | Command::ZoomIn
             ),
-            DocKind::Markdown => matches!(
-                self,
-                Command::Undo
-                    | Command::Redo
-                    | Command::ViewSource
-                    | Command::ViewSplit
-                    | Command::ViewPreview
-            ),
+            DocKind::Markdown => {
+                matches!(
+                    self,
+                    Command::Undo
+                        | Command::Redo
+                        | Command::ViewSource
+                        | Command::ViewSplit
+                        | Command::ViewPreview
+                ) || self.formats_markdown()
+            }
             DocKind::Sheets | DocKind::Slides | DocKind::Pdf => false,
         }
+    }
+}
+
+impl Command {
+    /// The commands that write Markdown syntax into the source. Underline
+    /// is not one: Markdown has no underline.
+    pub fn formats_markdown(self) -> bool {
+        matches!(
+            self,
+            Command::Heading
+                | Command::Bold
+                | Command::Italic
+                | Command::Strikethrough
+                | Command::InlineCode
+                | Command::BulletList
+                | Command::NumberedList
+                | Command::Checklist
+                | Command::Quote
+                | Command::InsertLink
+                | Command::InsertImage
+                | Command::InsertTable
+        )
     }
 }
 
@@ -211,6 +236,8 @@ pub struct Item {
     pub enabled: bool,
     /// Shown pressed: the choice in effect, such as the current view.
     pub active: bool,
+    /// For a field that opens a list: what the list offers, in order.
+    pub options: Vec<String>,
 }
 
 /// How a Markdown tab shows its document.
@@ -263,6 +290,9 @@ pub struct ViewState {
     /// There is an undone step to do again.
     pub can_redo: bool,
     pub view_mode: ViewMode,
+    /// Markdown tabs: the heading level of the line with the caret, 0 for
+    /// body text.
+    pub heading: u8,
 }
 
 impl Default for ViewState {
@@ -272,6 +302,7 @@ impl Default for ViewState {
             can_undo: false,
             can_redo: false,
             view_mode: ViewMode::Edit,
+            heading: 0,
         }
     }
 }
@@ -282,6 +313,8 @@ impl ViewState {
         match command {
             Command::Undo => self.can_undo,
             Command::Redo => self.can_redo,
+            // Formatting writes into the source, which must be on screen.
+            command if command.formats_markdown() => self.view_mode.shows_source(),
             _ => true,
         }
     }
@@ -305,6 +338,7 @@ impl Builder {
             command: Some(command),
             enabled,
             active: enabled && ViewMode::of(command) == Some(self.view.view_mode),
+            options: Vec::new(),
         });
         self
     }
@@ -332,6 +366,7 @@ impl Builder {
             command: None,
             enabled: false,
             active: false,
+            options: Vec::new(),
         });
         self
     }
@@ -394,6 +429,17 @@ impl Builder {
     }
 }
 
+/// Body text, then heading levels 1 to 6, as the paragraph style field of
+/// a Markdown tab lists them.
+pub fn heading_names(strings: &Strings) -> Vec<String> {
+    std::iter::once(strings.style_body.to_owned())
+        .chain(
+            (1..=6)
+                .map(|level| crate::i18n::fill(strings.heading_level, "level", &level.to_string())),
+        )
+        .collect()
+}
+
 /// The toolbar for a document of this kind. `strings` supplies the values
 /// shown in its fields.
 pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
@@ -440,10 +486,16 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
                 .icon(Icon::More, Command::More);
         }
         DocKind::Markdown => {
-            b.history()
-                .sep()
-                .select(strings.style_body, 92.0, Command::Heading)
-                .sep()
+            let levels = heading_names(strings);
+            b.history().sep().select(
+                &levels[usize::from(view.heading.min(6))],
+                92.0,
+                Command::Heading,
+            );
+            if let Some(item) = b.items.last_mut() {
+                item.options = levels;
+            }
+            b.sep()
                 .emphasis()
                 .icon(Icon::Code, Command::InlineCode)
                 .sep()
@@ -654,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn what_works_today_is_writer_zoom_and_markdown_history_and_views() {
+    fn what_works_today_is_writer_zoom_and_markdown_editing() {
         let busy = ViewState {
             can_undo: true,
             can_redo: true,
@@ -676,6 +728,18 @@ mod tests {
                     [
                         Command::Undo,
                         Command::Redo,
+                        Command::Heading,
+                        Command::Bold,
+                        Command::Italic,
+                        Command::Strikethrough,
+                        Command::InlineCode,
+                        Command::BulletList,
+                        Command::NumberedList,
+                        Command::Checklist,
+                        Command::Quote,
+                        Command::InsertLink,
+                        Command::InsertImage,
+                        Command::InsertTable,
                         Command::ViewSource,
                         Command::ViewSplit,
                         Command::ViewPreview
@@ -684,6 +748,58 @@ mod tests {
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }
+    }
+
+    #[test]
+    fn markdown_formatting_needs_the_source_and_has_no_underline() {
+        let items = |view: ViewState| toolbar(DocKind::Markdown, view, &ZH_HANS);
+        let enabled = |view: ViewState, command: Command| {
+            items(view)
+                .into_iter()
+                .find(|item| item.command == Some(command))
+                .is_some_and(|item| item.enabled)
+        };
+        let source = ViewState::default();
+        let preview = ViewState {
+            view_mode: ViewMode::Preview,
+            ..ViewState::default()
+        };
+        let split = ViewState {
+            view_mode: ViewMode::Split,
+            ..ViewState::default()
+        };
+        assert!(enabled(source, Command::Bold) && enabled(split, Command::Bold));
+        assert!(!enabled(preview, Command::Bold));
+        assert!(!enabled(preview, Command::Heading));
+        assert!(enabled(preview, Command::ViewSource));
+        assert!(!enabled(source, Command::Underline));
+        // The style field shows the level of the caret's line and offers all.
+        let heading = |view: ViewState| {
+            items(view)
+                .into_iter()
+                .find(|item| item.command == Some(Command::Heading))
+                .expect("a style field")
+        };
+        let body = heading(source);
+        assert_eq!(
+            body.control,
+            Control::Select {
+                value: "正文".into(),
+                width: 92.0
+            }
+        );
+        assert_eq!(body.options.len(), 7);
+        let two = heading(ViewState {
+            heading: 2,
+            ..ViewState::default()
+        });
+        assert_eq!(
+            two.control,
+            Control::Select {
+                value: "标题 2".into(),
+                width: 92.0
+            }
+        );
     }
 
     #[test]

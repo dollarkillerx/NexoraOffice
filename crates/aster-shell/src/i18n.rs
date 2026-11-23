@@ -398,6 +398,21 @@ strings! {
     office_too_large,
     /// `{reason}` names the damaged part.
     office_broken,
+    /// The paragraph style field of a Markdown tab. `{level}` is 1 to 6.
+    heading_level,
+    /// The Format menu: Markdown syntax the editor writes for the user.
+    menu_format,
+    format_bold,
+    format_italic,
+    format_strike,
+    format_code,
+    format_bullet,
+    format_numbered,
+    format_task,
+    format_quote,
+    format_link,
+    format_image,
+    format_table,
 }
 
 impl Strings {
@@ -650,6 +665,19 @@ Aster Office 外壳原型
     office_wrong_kind: "文件的内容和扩展名不符：比如一个演示文稿被命名成了 .xlsx。",
     office_too_large: "这个文件超出了安全限制（部件太多、太大，或压缩得异常），没有打开。",
     office_broken: "文件已损坏，读不出来：{reason}",
+    heading_level: "标题 {level}",
+    menu_format: "格式",
+    format_bold: "粗体",
+    format_italic: "斜体",
+    format_strike: "删除线",
+    format_code: "行内代码",
+    format_bullet: "无序列表",
+    format_numbered: "有序列表",
+    format_task: "任务列表",
+    format_quote: "引用",
+    format_link: "链接",
+    format_image: "图片",
+    format_table: "表格",
 };
 
 pub const JA: Strings = Strings {
@@ -846,6 +874,19 @@ Aster Office シェルの試作
     office_wrong_kind: "ファイルの内容が拡張子と合いません（たとえば .xlsx という名前のプレゼンテーション）。",
     office_too_large: "このファイルは安全上の制限（部品の数、大きさ、異常な圧縮率）を超えているため、開きませんでした。",
     office_broken: "ファイルが壊れていて読み取れません：{reason}",
+    heading_level: "見出し {level}",
+    menu_format: "書式",
+    format_bold: "太字",
+    format_italic: "斜体",
+    format_strike: "取り消し線",
+    format_code: "インラインコード",
+    format_bullet: "箇条書き",
+    format_numbered: "番号付きリスト",
+    format_task: "タスクリスト",
+    format_quote: "引用",
+    format_link: "リンク",
+    format_image: "画像",
+    format_table: "表",
 };
 
 pub const EN: Strings = Strings {
@@ -1042,6 +1083,19 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     office_wrong_kind: "The file’s contents don’t match its extension, such as a presentation named .xlsx.",
     office_too_large: "This file is over a safety limit (too many parts, parts too large, or unusually compressed) and was not opened.",
     office_broken: "The file is damaged and can’t be read: {reason}",
+    heading_level: "Heading {level}",
+    menu_format: "Format",
+    format_bold: "Bold",
+    format_italic: "Italic",
+    format_strike: "Strikethrough",
+    format_code: "Inline Code",
+    format_bullet: "Bulleted List",
+    format_numbered: "Numbered List",
+    format_task: "Task List",
+    format_quote: "Quote",
+    format_link: "Link",
+    format_image: "Image",
+    format_table: "Table",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -1220,6 +1274,19 @@ pub const ZH_HANT: Strings = Strings {
     office_wrong_kind: "檔案的內容和副檔名不符：例如一份簡報被命名成了 .xlsx。",
     office_too_large: "這個檔案超出了安全限制（部件太多、太大，或壓縮得異常），沒有開啟。",
     office_broken: "檔案已損壞，讀不出來：{reason}",
+    heading_level: "標題 {level}",
+    menu_format: "格式",
+    format_bold: "粗體",
+    format_italic: "斜體",
+    format_strike: "刪除線",
+    format_code: "行內程式碼",
+    format_bullet: "項目符號清單",
+    format_numbered: "編號清單",
+    format_task: "待辦清單",
+    format_quote: "引用",
+    format_link: "連結",
+    format_image: "圖片",
+    format_table: "表格",
 };
 
 pub const FR: Strings = Strings {
@@ -1398,6 +1465,19 @@ pub const FR: Strings = Strings {
     office_wrong_kind: "Le contenu du fichier ne correspond pas à son extension, par exemple une présentation nommée .xlsx.",
     office_too_large: "Ce fichier dépasse une limite de sécurité (trop de parties, parties trop grandes ou compression anormale) et n’a pas été ouvert.",
     office_broken: "Le fichier est endommagé et illisible : {reason}",
+    heading_level: "Titre {level}",
+    menu_format: "Format",
+    format_bold: "Gras",
+    format_italic: "Italique",
+    format_strike: "Barré",
+    format_code: "Code en ligne",
+    format_bullet: "Liste à puces",
+    format_numbered: "Liste numérotée",
+    format_task: "Liste de tâches",
+    format_quote: "Citation",
+    format_link: "Lien",
+    format_image: "Image",
+    format_table: "Tableau",
 };
 
 pub const DE: Strings = Strings {
@@ -1576,6 +1656,19 @@ pub const DE: Strings = Strings {
     office_wrong_kind: "Der Inhalt der Datei passt nicht zu ihrer Endung, etwa eine Präsentation mit der Endung .xlsx.",
     office_too_large: "Diese Datei überschreitet eine Sicherheitsgrenze (zu viele oder zu große Teile oder ungewöhnlich stark komprimiert) und wurde nicht geöffnet.",
     office_broken: "Die Datei ist beschädigt und kann nicht gelesen werden: {reason}",
+    heading_level: "Überschrift {level}",
+    menu_format: "Format",
+    format_bold: "Fett",
+    format_italic: "Kursiv",
+    format_strike: "Durchgestrichen",
+    format_code: "Inline-Code",
+    format_bullet: "Aufzählung",
+    format_numbered: "Nummerierte Liste",
+    format_task: "Aufgabenliste",
+    format_quote: "Zitat",
+    format_link: "Link",
+    format_image: "Bild",
+    format_table: "Tabelle",
 };
 
 pub const ES: Strings = Strings {
@@ -1754,6 +1847,19 @@ pub const ES: Strings = Strings {
     office_wrong_kind: "El contenido del archivo no coincide con su extensión, por ejemplo una presentación llamada .xlsx.",
     office_too_large: "Este archivo supera un límite de seguridad (demasiadas partes, partes demasiado grandes o una compresión inusual) y no se abrió.",
     office_broken: "El archivo está dañado y no se puede leer: {reason}",
+    heading_level: "Título {level}",
+    menu_format: "Formato",
+    format_bold: "Negrita",
+    format_italic: "Cursiva",
+    format_strike: "Tachado",
+    format_code: "Código en línea",
+    format_bullet: "Lista con viñetas",
+    format_numbered: "Lista numerada",
+    format_task: "Lista de tareas",
+    format_quote: "Cita",
+    format_link: "Enlace",
+    format_image: "Imagen",
+    format_table: "Tabla",
 };
 
 pub const KO: Strings = Strings {
@@ -1932,6 +2038,19 @@ pub const KO: Strings = Strings {
     office_wrong_kind: "파일 내용이 확장자와 맞지 않습니다. 예를 들어 .xlsx라는 이름의 프레젠테이션입니다.",
     office_too_large: "이 파일은 안전 한도(부분이 너무 많거나 크거나 비정상적으로 압축됨)를 넘어서 열지 않았습니다.",
     office_broken: "파일이 손상되어 읽을 수 없습니다: {reason}",
+    heading_level: "제목 {level}",
+    menu_format: "서식",
+    format_bold: "굵게",
+    format_italic: "기울임꼴",
+    format_strike: "취소선",
+    format_code: "인라인 코드",
+    format_bullet: "글머리 기호 목록",
+    format_numbered: "번호 매기기 목록",
+    format_task: "작업 목록",
+    format_quote: "인용",
+    format_link: "링크",
+    format_image: "이미지",
+    format_table: "표",
 };
 
 #[cfg(test)]
@@ -1975,12 +2094,16 @@ mod tests {
     #[test]
     fn translations_are_not_copies_of_english() {
         // Product names and format names are the same everywhere; the rest is not.
-        // "Important" is the same word in French.
+        // "Important" and "Image" are the same words in French, "Format"
+        // in French and German, "Link" in German.
         let shared = [
             "markdown_label",
             "pdf_label",
             "button_ok",
             "callout_important",
+            "menu_format",
+            "format_image",
+            "format_link",
         ];
         let english = EN.fields();
         for language in Language::ALL {

@@ -1,9 +1,11 @@
 import { Tokens, Icons, ToolItem } from "tokens.slint";
-import { Icon } from "widgets.slint";
+import { Icon, MenuRow, MenuFrame } from "widgets.slint";
 
 component ToolControl inherits Rectangle {
     in property <ToolItem> item;
     callback activated;
+    // An entry of a select field's list was chosen.
+    callback chosen(int);
     property <bool> is-button: item.control == 0 || item.control == 1;
     property <bool> is-gap: item.control == 4 || item.control == 5;
     property <length> fixed-width: is-button ? Tokens.control-height : item.control == 4 ? 9px : item.control == 5 ? 0px : item.width;
@@ -94,7 +96,34 @@ component ToolControl inherits Rectangle {
     touch := TouchArea {
         enabled: root.item.enabled && !root.is-gap;
         clicked => {
-            root.activated();
+            if (root.item.options.length > 0) {
+                options.show();
+            } else {
+                root.activated();
+            }
+        }
+    }
+
+    // A select field with a list opens it under itself. Drawn by Slint
+    // rather than as a native menu: a native menu opened from a click runs
+    // its own event loop inside winit's handler, and winit panics on the
+    // next event.
+    options := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: max(root.width, 132px);
+        MenuFrame { }
+
+        VerticalLayout {
+            padding: Tokens.space-xs + 2px;
+            spacing: 1px;
+            for option[index] in root.item.options: MenuRow {
+                text: option;
+                checked: option == root.item.text;
+                clicked => {
+                    root.chosen(index);
+                }
+            }
         }
     }
 }
@@ -103,6 +132,8 @@ component ToolControl inherits Rectangle {
 export component Toolbar inherits Rectangle {
     in property <[ToolItem]> items;
     callback command(int);
+    // An entry of a select field's list: the field's command, the index.
+    callback option(int, int);
     height: Tokens.toolbar-height + 2 * Tokens.space-xs + 2px;
     background: Tokens.surface;
 
@@ -129,6 +160,9 @@ export component Toolbar inherits Rectangle {
                     item: item;
                     activated => {
                         root.command(item.command);
+                    }
+                    chosen(index) => {
+                        root.option(item.command, index);
                     }
                 }
             }

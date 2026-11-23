@@ -1,5 +1,7 @@
-//! Times reading a workbook and calculating it:
+//! Times reading a workbook and calculating it, and lists the formulas
+//! whose result differs from the one saved in the file:
 //! `cargo run --release -p aster-calc --example time_xlsx -- file.xlsx`
+//! Addresses after the file (`Orders!E2`) print those cells' results.
 
 use std::time::Instant;
 
@@ -22,4 +24,28 @@ fn main() {
         loaded - read,
         done - loaded
     );
+    for wanted in std::env::args().skip(2) {
+        let Some((sheet, cell)) = wanted.split_once('!') else {
+            continue;
+        };
+        let index = workbook.sheets.iter().position(|s| s.name == sheet);
+        let at = aster_sheets::CellRef::parse(cell);
+        let value = results
+            .iter()
+            .find(|r| Some(r.sheet) == index && Some(r.at) == at)
+            .map(|r| format!("{:?}", r.value));
+        println!(
+            "{wanted} = {}",
+            value.unwrap_or_else(|| "(not a formula)".into())
+        );
+    }
+    let mismatches = workbook.mismatches(&results);
+    println!("{} differ from the saved results", mismatches.len());
+    for m in mismatches.iter().take(20) {
+        let sheet = &workbook.sheets[m.sheet].name;
+        println!(
+            "  {sheet}!{}: saved {:?}, calculated {:?}",
+            m.at, m.saved, m.computed
+        );
+    }
 }

@@ -63,6 +63,24 @@ pub struct Computed {
     pub value: Value,
 }
 
+/// A formula whose calculated result is not the one saved in the file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mismatch {
+    pub sheet: usize,
+    pub at: CellRef,
+    pub saved: Value,
+    pub computed: Value,
+}
+
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            x == y || (x - y).abs() <= 1e-12 * x.abs().max(y.abs())
+        }
+        _ => a == b,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CalcError {
     Cancelled,
@@ -106,6 +124,29 @@ impl Workbook {
             }
         }
         (out, changed)
+    }
+
+    /// The formula cells whose calculated result differs from the one saved
+    /// in the file: where the engine and the program that saved the file
+    /// disagree, or the file was saved without recalculating. Numbers are
+    /// equal to within one part in 10^12, as Excel keeps 15 digits.
+    pub fn mismatches(&self, results: &[Computed]) -> Vec<Mismatch> {
+        results
+            .iter()
+            .filter_map(|result| {
+                let cell = self.sheets.get(result.sheet)?.cell(result.at)?;
+                cell.formula.as_ref()?;
+                if cell.value == Value::Empty || same(&cell.value, &result.value) {
+                    return None;
+                }
+                Some(Mismatch {
+                    sheet: result.sheet,
+                    at: result.at,
+                    saved: cell.value.clone(),
+                    computed: result.value.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Every formula cell: sheet index, address and formula text.
@@ -168,6 +209,42 @@ mod tests {
             sheet.cell(CellRef::new(0, 0)).unwrap().value,
             Value::Number(1.0)
         );
+    }
+
+    #[test]
+    fn mismatches_with_the_saved_results_are_found() {
+        let mut builder = SheetBuilder::new("Sheet1", SheetKind::Worksheet);
+        for (col, saved) in [
+            (0, Value::Number(0.3)),
+            (1, Value::Number(2.0)),
+            (2, Value::Text(Arc::from("東京"))),
+            (3, Value::Empty),
+        ] {
+            let mut cell = Cell::new(col, saved);
+            cell.formula = Some(Arc::from("1"));
+            builder.push(0, cell);
+        }
+        let workbook = Workbook {
+            sheets: vec![builder.finish()],
+            ..Workbook::default()
+        };
+        let computed = |col: u32, value: Value| Computed {
+            sheet: 0,
+            at: CellRef::new(0, col),
+            value,
+        };
+        let results = [
+            // 0.1 + 0.2 in binary: the same to 15 digits.
+            computed(0, Value::Number(0.1 + 0.2)),
+            computed(1, Value::Number(3.0)),
+            computed(2, Value::Text(Arc::from("东京"))),
+            // Nothing was saved: nothing to disagree with.
+            computed(3, Value::Number(1.0)),
+        ];
+        let found = workbook.mismatches(&results);
+        let cols: Vec<u32> = found.iter().map(|m| m.at.col).collect();
+        assert_eq!(cols, [1, 2]);
+        assert_eq!(found[0].saved, Value::Number(2.0));
     }
 
     #[test]

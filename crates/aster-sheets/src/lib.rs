@@ -24,7 +24,7 @@ pub mod model;
 
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};
 pub use axis::Axis;
-pub use calc::{CalcEngine, CalcError, Cancel, Computed, Edit};
+pub use calc::{CalcEngine, CalcError, Cancel, Computed, Edit, Mismatch};
 pub use format::{Format, date_parts};
 pub use model::{
     Cell, CellStyle, Display, DisplayKind, HAlign, Row, Sheet, SheetBuilder, SheetKind, Value,

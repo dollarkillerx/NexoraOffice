@@ -8,6 +8,12 @@
 //!
 //! Files are read and written on worker threads. Their results come back to
 //! this thread through the event loop.
+//!
+//! Every Markdown document with unsaved changes has a recovery record. Its
+//! edits go to the record writer's thread as they are made; this thread never
+//! waits for the disk. A record is deleted when its document is saved or
+//! closed, so the records found at start-up are what a crash left behind, and
+//! the user is asked what to do with them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,17 +22,19 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use aster_markdown::{DecodeError, Decoded, SavePoint, TextFormat};
+use aster_markdown::{DecodeError, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
 use aster_shell::cli::{self, Options};
-use aster_shell::files::{self, LoadError};
+use aster_shell::files::{self, LoadError, Loaded};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
+use aster_shell::recovery::{self, Age, Candidate, RecordInfo};
 use aster_shell::sample::{RECENT_FILES, WORKSPACE_TREE};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
 use aster_shell::toolbar::{self, Command, Control, ViewState, zoom_step};
+use aster_storage::{Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot};
 use aster_surface::host::{self, to_px};
 use aster_surface::{Action, ImeEvent, TextSurface};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
@@ -34,7 +42,7 @@ use slint::{
     CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
 
-use content::{MarkdownEditor, WriterView};
+use content::{DiskWarning, JournalStep, MarkdownEditor, WriterView};
 
 slint::include_modules!();
 
@@ -50,8 +58,9 @@ const TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
 
 /// What a tab holds. Tabs of the other kinds hold nothing yet.
 enum Content {
-    Writer(WriterView),
-    Markdown(MarkdownEditor),
+    // Boxed: both are several kilobytes, and tabs are moved around.
+    Writer(Box<WriterView>),
+    Markdown(Box<MarkdownEditor>),
 }
 
 impl Content {
@@ -114,6 +123,12 @@ struct Shell {
     caret_on: bool,
     last_blink: Instant,
     pending: Option<Pending>,
+    /// Writes recovery records. `None` when the system gives no folder for
+    /// them; documents are then not protected against a crash.
+    writer: Option<RecordWriter>,
+    next_key: RecordKey,
+    /// Records found at start-up that the user has not decided about yet.
+    candidates: Vec<Candidate>,
 }
 
 impl Shell {
@@ -127,6 +142,9 @@ impl Shell {
             caret_on: true,
             last_blink: Instant::now(),
             pending: None,
+            writer: None,
+            next_key: 0,
+            candidates: Vec::new(),
         }
     }
 
@@ -142,21 +160,21 @@ impl Shell {
 
     fn active_writer(&mut self) -> Option<&mut WriterView> {
         match self.active_content()? {
-            Content::Writer(view) => Some(view),
+            Content::Writer(view) => Some(&mut **view),
             Content::Markdown(_) => None,
         }
     }
 
     fn active_markdown(&mut self) -> Option<&mut MarkdownEditor> {
         match self.active_content()? {
-            Content::Markdown(editor) => Some(editor),
+            Content::Markdown(editor) => Some(&mut **editor),
             Content::Writer(_) => None,
         }
     }
 
     fn markdown(&mut self, id: TabId) -> Option<&mut MarkdownEditor> {
         match self.contents.get_mut(&id)? {
-            Content::Markdown(editor) => Some(editor),
+            Content::Markdown(editor) => Some(&mut **editor),
             Content::Writer(_) => None,
         }
     }
@@ -187,11 +205,13 @@ impl Shell {
         match kind {
             DocKind::Writer => {
                 let view = WriterView::new(strings.writer_sample, &self.tokens);
-                self.contents.insert(id, Content::Writer(view));
+                self.contents.insert(id, Content::Writer(Box::new(view)));
             }
             DocKind::Markdown => {
-                let editor = MarkdownEditor::new("", TextFormat::default(), None, &self.tokens);
-                self.contents.insert(id, Content::Markdown(editor));
+                let editor =
+                    MarkdownEditor::new("", TextFormat::default(), None, None, &self.tokens);
+                self.contents
+                    .insert(id, Content::Markdown(Box::new(editor)));
             }
             DocKind::Sheets | DocKind::Slides | DocKind::Pdf => {}
         }
@@ -213,11 +233,13 @@ impl Shell {
         match file.kind {
             DocKind::Writer => {
                 let view = WriterView::new(&text, &self.tokens);
-                self.contents.insert(id, Content::Writer(view));
+                self.contents.insert(id, Content::Writer(Box::new(view)));
             }
             DocKind::Markdown => {
-                let editor = MarkdownEditor::new(&text, TextFormat::default(), None, &self.tokens);
-                self.contents.insert(id, Content::Markdown(editor));
+                let editor =
+                    MarkdownEditor::new(&text, TextFormat::default(), None, None, &self.tokens);
+                self.contents
+                    .insert(id, Content::Markdown(Box::new(editor)));
             }
             DocKind::Sheets | DocKind::Slides | DocKind::Pdf => {}
         }
@@ -239,7 +261,7 @@ impl Shell {
 
     /// Show a file that has been read from disk. A file that is already open is
     /// brought to the front instead; its tab keeps whatever was typed into it.
-    fn open_file(&mut self, path: PathBuf, decoded: Decoded) -> TabId {
+    fn open_file(&mut self, path: PathBuf, loaded: Loaded) -> TabId {
         self.leave_active_document();
         if let Some(id) = self.tab_of_file(&path) {
             self.tabs.activate(id);
@@ -248,9 +270,123 @@ impl Shell {
         let id = self
             .tabs
             .open(DocKind::Markdown, files::display_name(&path));
-        let editor = MarkdownEditor::new(&decoded.text, decoded.format, Some(path), &self.tokens);
-        self.contents.insert(id, Content::Markdown(editor));
+        let Loaded {
+            decoded,
+            fingerprint,
+        } = loaded;
+        let editor = MarkdownEditor::new(
+            &decoded.text,
+            decoded.format,
+            Some(path),
+            Some(fingerprint),
+            &self.tokens,
+        );
+        self.contents
+            .insert(id, Content::Markdown(Box::new(editor)));
         id
+    }
+
+    /// Bring back a document from a record left by an earlier run, in a tab of
+    /// its own, and keep writing to that record. Unreadable records stay where
+    /// they are. Returns the new tab.
+    fn restore(&mut self, candidate: Candidate) -> Option<TabId> {
+        let Candidate {
+            record,
+            info: Some(info),
+            text: Ok(text),
+            disk,
+            ..
+        } = candidate
+        else {
+            return None;
+        };
+        self.leave_active_document();
+        let warning = match disk {
+            Some(FileState::Changed | FileState::Unreadable(_)) => Some(DiskWarning::Changed),
+            Some(FileState::Missing) => Some(DiskWarning::Missing),
+            Some(FileState::Unchanged) | None => None,
+        };
+        let title = if info.title.is_empty() {
+            info.path
+                .as_deref()
+                .map_or_else(String::new, files::display_name)
+        } else {
+            info.title.clone()
+        };
+        let id = self.tabs.open(DocKind::Markdown, title);
+        let mut editor = MarkdownEditor::recovered(
+            &text,
+            info.format,
+            info.path.clone(),
+            info.disk,
+            warning,
+            &self.tokens,
+        );
+        if let Some(writer) = &self.writer {
+            let key = self.next_key;
+            self.next_key += 1;
+            // The restored text becomes the record's new checkpoint.
+            writer.adopt(key, record, info.to_meta(), text.into_bytes());
+            editor.record = Some(key);
+        }
+        self.contents
+            .insert(id, Content::Markdown(Box::new(editor)));
+        self.sync_modified();
+        Some(id)
+    }
+
+    /// What the recovery record of a tab's document says about it.
+    fn record_info(&self, id: TabId, editor: &MarkdownEditor) -> RecordInfo {
+        RecordInfo {
+            title: self
+                .tabs
+                .get(id)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default(),
+            path: editor.path.clone(),
+            format: editor.format,
+            disk: editor.disk,
+        }
+    }
+
+    /// Hand every Markdown document's new edits to the record writer, and
+    /// start or delete records as documents gain or lose unsaved changes.
+    /// Cheap: it encodes a few bytes per edit and queues them.
+    fn sync_records(&mut self) {
+        let ids: Vec<TabId> = self.contents.keys().copied().collect();
+        for id in ids {
+            let Some(Content::Markdown(editor)) = self.contents.get(&id) else {
+                continue;
+            };
+            let info = self.record_info(id, editor);
+            let next_key = &mut self.next_key;
+            let Some(Content::Markdown(editor)) = self.contents.get_mut(&id) else {
+                continue;
+            };
+            let previous = editor.record;
+            let step = editor.journal_step(|| {
+                *next_key += 1;
+                *next_key - 1
+            });
+            let Some(writer) = &self.writer else {
+                continue;
+            };
+            match (step, editor.record.or(previous)) {
+                (JournalStep::Nothing, _) | (_, None) => {}
+                (JournalStep::Open(text), Some(key)) => {
+                    writer.open(key, info.to_meta(), text.into_bytes());
+                }
+                (JournalStep::Append(entries, checkpoint), Some(key)) => {
+                    for entry in entries {
+                        writer.append(key, entry);
+                    }
+                    if let Some(text) = checkpoint {
+                        writer.checkpoint(key, text.into_bytes());
+                    }
+                }
+                (JournalStep::Discard, Some(key)) => writer.discard(key),
+            }
+        }
     }
 
     fn activate(&mut self, index: usize) {
@@ -275,10 +411,27 @@ impl Shell {
         Closing::Closed
     }
 
-    /// Close a tab whatever state its document is in.
+    /// Close a tab whatever state its document is in. Its recovery record goes
+    /// with it: closing is the user's decision, not a crash.
     fn force_close(&mut self, id: TabId) {
         self.tabs.close(id);
-        self.contents.remove(&id);
+        if let Some(Content::Markdown(editor)) = self.contents.remove(&id)
+            && let (Some(writer), Some(key)) = (&self.writer, editor.record)
+        {
+            writer.discard(key);
+        }
+    }
+
+    /// Delete every recovery record: the user chose to quit without saving.
+    fn discard_all_records(&mut self) {
+        for content in self.contents.values_mut() {
+            if let Content::Markdown(editor) = content
+                && let Some(key) = editor.record.take()
+                && let Some(writer) = &self.writer
+            {
+                writer.discard(key);
+            }
+        }
     }
 
     fn show_start_page(&mut self) {
@@ -344,7 +497,13 @@ impl Shell {
             .path
             .clone()
             .unwrap_or_else(|| files::suggested_file_name(&title));
-        Some((editor.path.clone(), suggested))
+        // A restored document whose file changed or vanished is never written
+        // over silently: saving asks where to, starting at the old place.
+        let existing = editor
+            .path
+            .clone()
+            .filter(|_| editor.disk_warning.is_none());
+        Some((existing, suggested))
     }
 
     /// Take a snapshot of a document for writing to `path`. `None` if there is
@@ -367,20 +526,43 @@ impl Shell {
 
     /// A save has finished. On success the document is tied to the file it was
     /// written to and the state that was written counts as saved.
-    fn finish_save(&mut self, id: TabId, path: &Path, point: SavePoint, succeeded: bool) {
+    fn finish_save(
+        &mut self,
+        id: TabId,
+        path: &Path,
+        point: SavePoint,
+        written: Option<Fingerprint>,
+    ) {
         let Some(editor) = self.markdown(id) else {
             return;
         };
         editor.saving = false;
-        if !succeeded {
+        let Some(written) = written else {
             return;
-        }
+        };
         editor.path = Some(path.to_owned());
+        editor.disk = Some(written);
+        editor.disk_warning = None;
         // What is on disk now has one line-ending style.
         editor.format.mixed_line_endings = false;
         editor.document.mark_saved(point);
         self.tabs.rename(id, files::display_name(path));
         self.sync_modified();
+
+        // Typed on while the save ran: the record stays, and now describes the
+        // file as it is.
+        if let Some(Content::Markdown(editor)) = self.contents.get(&id)
+            && let (Some(writer), Some(key)) = (&self.writer, editor.record)
+        {
+            let meta = self.record_info(id, editor).to_meta();
+            let remove = RecordInfo::optional_keys()
+                .into_iter()
+                .filter(|optional| !meta.iter().any(|(key, _)| key == optional))
+                .collect();
+            writer.set_meta(key, meta, remove);
+        }
+        // Saved with nothing typed since: the record goes.
+        self.sync_records();
     }
 }
 
@@ -521,6 +703,12 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_button_cancel(strings.button_cancel.into());
     s.set_button_ok(strings.button_ok.into());
     s.set_button_quit_anyway(strings.button_quit_anyway.into());
+    s.set_recovery_title(strings.recovery_title.into());
+    s.set_recovery_body(strings.recovery_body.into());
+    s.set_recovery_restore(strings.recovery_restore.into());
+    s.set_recovery_discard(strings.recovery_discard.into());
+    s.set_recovery_restore_all(strings.recovery_restore_all.into());
+    s.set_recovery_later(strings.recovery_later.into());
 
     ui.set_language_index(language.index() as i32);
     ui.set_kinds(model(
@@ -713,7 +901,14 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_zoom(SharedString::new());
             ui.set_zoom_enabled(false);
             ui.set_status_format(format_label(&editor.format).into());
-            let notice = if editor.format.mixed_line_endings {
+            let notice = if let Some(reason) = &editor.record_failed {
+                i18n::fill(strings.notice_record_failed, "reason", reason)
+            } else if let Some(warning) = editor.disk_warning {
+                match warning {
+                    DiskWarning::Changed => strings.notice_disk_changed.to_owned(),
+                    DiskWarning::Missing => strings.notice_disk_missing.to_owned(),
+                }
+            } else if editor.format.mixed_line_endings {
                 i18n::fill(
                     strings.mixed_line_endings,
                     "style",
@@ -816,6 +1011,7 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         if shell.sync_modified() {
             refresh_tabs(ui, shell);
         }
+        shell.sync_records();
         // Rebuild the toolbar only when what it shows has changed.
         let (can_undo, can_redo) = shell.active_markdown().map_or((false, false), |editor| {
             (editor.document.can_undo(), editor.document.can_redo())
@@ -913,15 +1109,121 @@ fn spawn_load(ui: &AppWindow, path: PathBuf) {
     });
 }
 
+/// Look for records a crash left behind, on a worker thread, and ask the user
+/// about them once they are loaded.
+fn spawn_recovery_scan(ui: &AppWindow, root: RecoveryRoot) {
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let found = recovery::find(&root);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| match found {
+                    Ok(candidates) if candidates.is_empty() => {}
+                    Ok(candidates) => {
+                        shell.candidates = candidates;
+                        refresh_recovery(ui, shell);
+                    }
+                    // Nothing to offer; editing still works and still writes
+                    // records.
+                    Err(err) => eprintln!("aster-shell: cannot look for recovery records: {err}"),
+                }),
+            );
+        });
+    });
+}
+
+/// The words for how long ago a record was written.
+fn age_label(strings: &i18n::Strings, written: Option<std::time::SystemTime>) -> String {
+    let Some(elapsed) = written.and_then(|written| written.elapsed().ok()) else {
+        return String::new();
+    };
+    match recovery::age(elapsed) {
+        Age::JustNow => strings.recovery_just_now.to_owned(),
+        Age::Minutes(n) => i18n::fill(strings.recovery_minutes, "count", &n.to_string()),
+        Age::Hours(n) => i18n::fill(strings.recovery_hours, "count", &n.to_string()),
+        Age::Days(n) => i18n::fill(strings.recovery_days, "count", &n.to_string()),
+    }
+}
+
+/// One row of the recovery question.
+fn recovery_item(strings: &i18n::Strings, candidate: &Candidate) -> RecoveryItem {
+    let info = candidate.info.as_ref();
+    let title = info
+        .map(|info| {
+            if info.title.is_empty() {
+                info.path
+                    .as_deref()
+                    .map_or_else(String::new, files::display_name)
+            } else {
+                info.title.clone()
+            }
+        })
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "?".to_owned());
+    let detail = match info.and_then(|info| info.path.as_deref()) {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None if info.is_some() => strings.recovery_new_document.to_owned(),
+        None => String::new(),
+    };
+    let note = match (&candidate.text, &candidate.disk) {
+        (Err(reason), _) => i18n::fill(strings.recovery_unreadable, "reason", reason),
+        (Ok(_), Some(FileState::Changed)) => strings.recovery_disk_changed.to_owned(),
+        (Ok(_), Some(FileState::Missing)) => strings.recovery_disk_missing.to_owned(),
+        (Ok(_), Some(FileState::Unreadable(reason))) => {
+            i18n::fill(strings.recovery_disk_unreadable, "reason", reason)
+        }
+        (Ok(_), Some(FileState::Unchanged) | None) => String::new(),
+    };
+    RecoveryItem {
+        title: title.into(),
+        detail: detail.into(),
+        age: age_label(strings, candidate.last_written).into(),
+        note: note.into(),
+        readable: candidate.is_readable(),
+    }
+}
+
+/// Show the recovery question, or take it away once every record is decided.
+fn refresh_recovery(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    let items: Vec<RecoveryItem> = shell
+        .candidates
+        .iter()
+        .map(|candidate| recovery_item(strings, candidate))
+        .collect();
+    let open = !items.is_empty();
+    if open {
+        shell.leave_active_document();
+        stop_platform_composition(ui);
+    }
+    ui.set_recovery_items(model(items));
+    if !open && shell.active_surface().is_some() && shell.pending.is_none() {
+        ui.invoke_focus_document();
+    }
+}
+
+/// The record writer could not write a document's record.
+fn record_failed(ui: &AppWindow, shell: &mut Shell, key: RecordKey, reason: String) {
+    for content in shell.contents.values_mut() {
+        if let Content::Markdown(editor) = content
+            && editor.record == Some(key)
+        {
+            editor.record_failed = Some(reason.clone());
+        }
+    }
+    refresh_status(ui, shell);
+}
+
 fn finish_load(
     ui: &AppWindow,
     shell: &mut Shell,
     path: PathBuf,
-    result: Result<Decoded, LoadError>,
+    result: Result<Loaded, LoadError>,
 ) {
     match result {
-        Ok(decoded) => {
-            shell.open_file(path, decoded);
+        Ok(loaded) => {
+            shell.open_file(path, loaded);
             after_tab_change(ui, shell);
         }
         Err(err) => {
@@ -958,16 +1260,16 @@ fn finish_save(
     id: TabId,
     path: PathBuf,
     point: SavePoint,
-    result: std::io::Result<()>,
+    result: std::io::Result<Fingerprint>,
     after: AfterSave,
 ) {
-    shell.finish_save(id, &path, point, result.is_ok());
+    shell.finish_save(id, &path, point, result.as_ref().ok().copied());
     match result {
-        Ok(()) if after == AfterSave::CloseTab => {
+        Ok(_) if after == AfterSave::CloseTab => {
             shell.force_close(id);
             after_tab_change(ui, shell);
         }
-        Ok(()) => {
+        Ok(_) => {
             refresh_chrome(ui, shell);
             present(ui, shell);
         }
@@ -1115,6 +1417,29 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     ui.set_assistant_open(options.assistant);
 
+    // Recovery records: start the writer, then look for what a crash left.
+    match aster_platform::paths::recovery_dir() {
+        Some(dir) => {
+            let root = RecoveryRoot::new(dir);
+            let weak = ui.as_weak();
+            let writer = RecordWriter::spawn(root.clone(), move |event| {
+                if let Event::Failed { key, reason } = event {
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        deliver(
+                            ui,
+                            Box::new(move |ui, shell| record_failed(ui, shell, key, reason)),
+                        );
+                    });
+                }
+            });
+            shell.borrow_mut().writer = Some(writer);
+            spawn_recovery_scan(&ui, root);
+        }
+        None => {
+            eprintln!("aster-shell: no folder for recovery records; unsaved work is not protected")
+        }
+    }
+
     // Most handlers below follow the same shape: get the window and the shell,
     // change the shell, then push what changed back into the window.
     macro_rules! handler {
@@ -1259,6 +1584,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             shell.language = language;
             apply_language(&ui, language);
             refresh_chrome(&ui, shell);
+            if !shell.candidates.is_empty() {
+                refresh_recovery(&ui, shell);
+            }
         }
     }));
 
@@ -1442,6 +1770,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 after_tab_change(&ui, shell);
             }
             Some(Pending::Quit) => {
+                // Quitting without saving is a decision, not a crash: nothing
+                // is left to recover.
+                shell.discard_all_records();
                 let _ = slint::quit_event_loop();
             }
             None => {}
@@ -1450,6 +1781,59 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_dialog_cancel(handler!(|ui, shell| {
         hide_dialog(&ui, shell);
+    }));
+
+    // --- The recovery question ---
+
+    ui.on_recovery_restore(handler!(|ui, shell, index| {
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        if index >= shell.candidates.len() || !shell.candidates[index].is_readable() {
+            return;
+        }
+        let candidate = shell.candidates.remove(index);
+        shell.restore(candidate);
+        refresh_recovery(&ui, shell);
+        after_tab_change(&ui, shell);
+    }));
+
+    ui.on_recovery_discard(handler!(|ui, shell, index| {
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        if index >= shell.candidates.len() {
+            return;
+        }
+        let candidate = shell.candidates.remove(index);
+        match &shell.writer {
+            Some(writer) => writer.discard_found(candidate.record),
+            None => {
+                let _ = candidate.record.discard();
+            }
+        }
+        refresh_recovery(&ui, shell);
+    }));
+
+    ui.on_recovery_restore_all(handler!(|ui, shell| {
+        let (readable, unreadable): (Vec<Candidate>, Vec<Candidate>) =
+            std::mem::take(&mut shell.candidates)
+                .into_iter()
+                .partition(Candidate::is_readable);
+        // Unreadable records stay on the list: only the user may delete them.
+        shell.candidates = unreadable;
+        for candidate in readable {
+            shell.restore(candidate);
+        }
+        refresh_recovery(&ui, shell);
+        after_tab_change(&ui, shell);
+    }));
+
+    ui.on_recovery_later(handler!(|ui, shell| {
+        // The records stay on disk, unlocked, and are offered again at the
+        // next start.
+        shell.candidates.clear();
+        refresh_recovery(&ui, shell);
     }));
 
     ui.on_drag_window({
@@ -1528,6 +1912,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ui.run()?;
+    // Carry out what the record writer still has queued (deleting the records
+    // of documents that were saved or discarded) before the process ends.
+    if let Ok(mut shell) = shell.try_borrow_mut() {
+        drop(shell.writer.take());
+        shell.candidates.clear();
+    }
     SHELL.with(|cell| cell.borrow_mut().take());
     Ok(())
 }
@@ -1558,8 +1948,23 @@ mod tests {
         Shell::new(ThemeMode::Light, Language::ZhHans)
     }
 
-    fn decoded(text: &str) -> Decoded {
-        aster_markdown::decode(text.as_bytes()).expect("valid UTF-8")
+    fn decoded(text: &str) -> Loaded {
+        Loaded {
+            decoded: aster_markdown::decode(text.as_bytes()).expect("valid UTF-8"),
+            fingerprint: aster_storage::Fingerprint {
+                len: text.len() as u64,
+                checksum: aster_storage::checksum(text.as_bytes()),
+                modified_nanos: None,
+            },
+        }
+    }
+
+    fn written() -> Option<Fingerprint> {
+        Some(Fingerprint {
+            len: 0,
+            checksum: 0,
+            modified_nanos: None,
+        })
     }
 
     fn type_into_active(shell: &mut Shell, text: &str) {
@@ -1679,7 +2084,7 @@ mod tests {
         // A second save cannot start while the first is running.
         assert!(shell.begin_save(id, path.clone()).is_none());
 
-        shell.finish_save(id, &path, job.point, true);
+        shell.finish_save(id, &path, job.point, written());
         assert_eq!(
             shell.tabs.get(id).map(|tab| tab.title.as_str()),
             Some("会议.md")
@@ -1701,7 +2106,7 @@ mod tests {
         let job = shell
             .begin_save(id, path.clone())
             .expect("nothing is saving");
-        shell.finish_save(id, &path, job.point, false);
+        shell.finish_save(id, &path, job.point, None);
         let editor = shell.markdown(id).expect("still open");
         assert!(editor.document.is_modified());
         assert_eq!(editor.path, None);
@@ -1719,7 +2124,7 @@ mod tests {
             .begin_save(id, path.clone())
             .expect("nothing is saving");
         type_into_active(&mut shell, "b");
-        shell.finish_save(id, &path, job.point, true);
+        shell.finish_save(id, &path, job.point, written());
         assert_eq!(shell.tabs.modified_count(), 1);
     }
 

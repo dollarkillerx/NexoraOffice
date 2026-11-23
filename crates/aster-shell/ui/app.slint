@@ -2,7 +2,7 @@
 // status bar. Everything here is chrome; the document area of a Writer tab is
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem } from "tokens.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -11,6 +11,7 @@ import { Placeholder } from "placeholder.slint";
 import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
+import { RecoveryDialog } from "recovery.slint";
 import { Hairline } from "widgets.slint";
 
 export { Tokens, Icons, Strings }
@@ -54,6 +55,8 @@ export component AppWindow inherits Window {
     in property <int> dialog-kind;
     in property <string> dialog-title;
     in property <string> dialog-body;
+    // Documents a crash left unsaved; the question is shown while any remain.
+    in property <[RecoveryItem]> recovery-items;
 
     in property <string> status-kind;
     in property <string> status-note;
@@ -104,6 +107,10 @@ export component AppWindow inherits Window {
     callback dialog-save();
     callback dialog-discard();
     callback dialog-cancel();
+    callback recovery-restore(int);
+    callback recovery-discard(int);
+    callback recovery-restore-all();
+    callback recovery-later();
     callback zoom-out();
     callback zoom-reset();
     callback zoom-in();
@@ -442,6 +449,24 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.recovery-items.length > 0: RecoveryDialog {
+        items: root.recovery-items;
+        restore(index) => {
+            root.recovery-restore(index);
+        }
+        discard(index) => {
+            root.recovery-discard(index);
+        }
+        restore-all => {
+            root.recovery-restore-all();
+        }
+        later => {
+            root.recovery-later();
+        }
+    }
+
+    // After the recovery question, so a message raised while it is open
+    // appears on top of it.
     if root.dialog-kind != 0: Dialog {
         kind: root.dialog-kind;
         title: root.dialog-title;

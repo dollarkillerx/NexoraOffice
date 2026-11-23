@@ -10,6 +10,7 @@ pub mod cli;
 pub mod files;
 pub mod i18n;
 pub mod icons;
+pub mod recovery;
 pub mod sample;
 pub mod stats;
 pub mod tabs;
@@ -27,6 +28,7 @@ mod tests {
             ("files.rs", include_str!("files.rs")),
             ("i18n.rs", include_str!("i18n.rs")),
             ("icons.rs", include_str!("icons.rs")),
+            ("recovery.rs", include_str!("recovery.rs")),
             ("sample.rs", include_str!("sample.rs")),
             ("stats.rs", include_str!("stats.rs")),
             ("tabs.rs", include_str!("tabs.rs")),

@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use aster_markdown::{DecodeError, Decoded, TextFormat};
+use aster_storage::Fingerprint;
 
 /// Why a file could not be opened.
 #[derive(Debug)]
@@ -29,16 +30,31 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// A file as read from disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub decoded: Decoded,
+    /// What the file held, to tell later whether another program changed it.
+    pub fingerprint: Fingerprint,
+}
+
 /// Read a text file. Nothing is written, whatever the outcome.
-pub fn load(path: &Path) -> Result<Decoded, LoadError> {
+pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     let bytes = aster_storage::read(path).map_err(LoadError::Io)?;
-    aster_markdown::decode(&bytes).map_err(LoadError::Decode)
+    let decoded = aster_markdown::decode(&bytes).map_err(LoadError::Decode)?;
+    Ok(Loaded {
+        decoded,
+        fingerprint: Fingerprint::of(path, &bytes),
+    })
 }
 
 /// Write a document's text to its file, in the format the file had. The file
 /// is replaced atomically: a failure leaves the previous contents in place.
-pub fn save(path: &Path, text: &str, format: &TextFormat) -> io::Result<()> {
-    aster_storage::write_atomically(path, &aster_markdown::encode(text, format))
+/// Returns the fingerprint of what was written.
+pub fn save(path: &Path, text: &str, format: &TextFormat) -> io::Result<Fingerprint> {
+    let bytes = aster_markdown::encode(text, format);
+    aster_storage::write_atomically(path, &bytes)?;
+    Ok(Fingerprint::of(path, &bytes))
 }
 
 /// The name a tab shows for a file.
@@ -96,7 +112,7 @@ mod tests {
     fn an_edited_crlf_file_is_saved_as_crlf() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, "notes.md", "# 标题\r\n\r\n第一行\r\n".as_bytes());
-        let loaded = load(&path).unwrap();
+        let loaded = load(&path).unwrap().decoded;
         assert_eq!(loaded.text, "# 标题\n\n第一行\n");
         assert_eq!(loaded.format.line_ending, LineEnding::CrLf);
 
@@ -120,8 +136,10 @@ mod tests {
         for (index, sample) in samples.into_iter().enumerate() {
             let path = write(&dir, &format!("{index}.txt"), sample);
             let loaded = load(&path).unwrap();
-            save(&path, &loaded.text, &loaded.format).unwrap();
+            let written = save(&path, &loaded.decoded.text, &loaded.decoded.format).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), sample);
+            // Same bytes, same fingerprint.
+            assert!(written.same_content(&loaded.fingerprint));
         }
     }
 

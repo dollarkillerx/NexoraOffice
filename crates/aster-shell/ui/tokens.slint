@@ -91,6 +91,12 @@ export global Strings {
     in property <string> button-cancel;
     in property <string> button-ok;
     in property <string> button-quit-anyway;
+    in property <string> recovery-title;
+    in property <string> recovery-body;
+    in property <string> recovery-restore;
+    in property <string> recovery-discard;
+    in property <string> recovery-restore-all;
+    in property <string> recovery-later;
 }
 
 // Path data for the icons the chrome itself uses. Toolbar icons arrive with the
@@ -156,4 +162,17 @@ export struct TreeItem {
     // -1 for a folder.
     kind: int,
     expanded: bool,
+}
+
+// One document the recovery question offers.
+export struct RecoveryItem {
+    title: string,
+    // The file it belongs to, or that it was never saved.
+    detail: string,
+    // How long ago it was last edited.
+    age: string,
+    // What became of its file, or why the record cannot be read.
+    note: string,
+    // False when the record cannot be read: it can only be discarded.
+    readable: bool,
 }

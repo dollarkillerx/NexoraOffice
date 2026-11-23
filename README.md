@@ -9,7 +9,7 @@
 | `crates/aster-shell` | 应用外壳原型：窗口、标签、工具栏、侧边栏、设计令牌、界面语言。说明里写明了哪些是占位 |
 | `crates/aster-surface` | 文档表面：自绘的纯文本表面和它接入窗口的胶水，G1 关卡也用它 |
 | `crates/aster-markdown` | Markdown 编辑器的文档模型：文本、选区、编辑命令、撤销历史、文件编码与换行符 |
-| `crates/aster-storage` | 原子写入，来自 G6 关卡；以后的命令日志和崩溃恢复也在这里 |
+| `crates/aster-storage` | 原子写入和崩溃恢复（命令日志、检查点、恢复记录），来自 G6 关卡 |
 | `crates/aster-platform` | 系统的打开、保存对话框 |
 | `spikes/` | Phase 0 的验证工程，每道关卡一个，各自带说明和结果 |
 | `assets/brand/` | Logo、图标和品牌说明 |

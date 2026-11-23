@@ -1,0 +1,190 @@
+import { Tokens, Strings, RecoveryItem } from "tokens.slint";
+import { TextButton, Hairline, KindGlyph } from "widgets.slint";
+
+component Row inherits Rectangle {
+    in property <RecoveryItem> item;
+    callback restore();
+    callback discard();
+    min-height: column.preferred-height + 2 * Tokens.space-sm;
+    HorizontalLayout {
+        padding-top: Tokens.space-sm;
+        padding-bottom: Tokens.space-sm;
+        spacing: Tokens.space-md;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 2px;
+            KindGlyph {
+                kind: 3;
+                ink: Tokens.text-secondary;
+            }
+        }
+
+        column := VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: Tokens.space-sm;
+                Text {
+                    text: root.item.title;
+                    font-size: Tokens.font-md;
+                    font-weight: 600;
+                    color: Tokens.text;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+
+                Text {
+                    text: root.item.age;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-tertiary;
+                    horizontal-stretch: 0;
+                }
+            }
+
+            Text {
+                text: root.item.detail;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-secondary;
+                overflow: elide;
+            }
+
+            if root.item.note != "": Text {
+                text: root.item.note;
+                font-size: Tokens.font-sm;
+                color: Tokens.text;
+                wrap: word-wrap;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            HorizontalLayout {
+                spacing: Tokens.space-xs;
+                TextButton {
+                    text: Strings.recovery-discard;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+
+                if root.item.readable: TextButton {
+                    text: Strings.recovery-restore;
+                    primary: true;
+                    clicked => {
+                        root.restore();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Asked at start-up when the last run left documents with unsaved changes.
+// Drawn by the shell, not by the system, and modal: nothing behind it reacts
+// until every document has been decided or the question is put off.
+export component RecoveryDialog inherits Rectangle {
+    in property <[RecoveryItem]> items;
+    callback restore(int);
+    callback discard(int);
+    callback restore-all();
+    callback later();
+    background: #00000040;
+
+    TouchArea {
+        scroll-event => {
+            return accept;
+        }
+    }
+
+    FocusScope {
+        init => {
+            self.focus();
+        }
+        key-pressed(event) => {
+            // Keys must not reach the document behind the question.
+            return accept;
+        }
+    }
+
+    Rectangle {
+        width: min(560px, parent.width - 2 * Tokens.space-xl);
+        height: min(card.preferred-height, parent.height - 2 * Tokens.space-xl);
+        border-radius: Tokens.radius-lg;
+        border-width: 1px;
+        border-color: Tokens.hairline;
+        background: Tokens.surface;
+        drop-shadow-blur: 32px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000040;
+        clip: true;
+
+        TouchArea { }
+
+        card := VerticalLayout {
+            padding: Tokens.space-xl;
+            spacing: Tokens.space-sm;
+            Text {
+                text: Strings.recovery-title;
+                font-size: Tokens.font-lg;
+                font-weight: 600;
+                color: Tokens.text;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: Strings.recovery-body;
+                font-size: Tokens.font-md;
+                color: Tokens.text-secondary;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                height: Tokens.space-xs;
+            }
+
+            Hairline { }
+
+            for item[index] in root.items: VerticalLayout {
+                Row {
+                    item: item;
+                    restore => {
+                        root.restore(index);
+                    }
+                    discard => {
+                        root.discard(index);
+                    }
+                }
+
+                Hairline { }
+            }
+
+            Rectangle {
+                height: Tokens.space-sm;
+            }
+
+            HorizontalLayout {
+                spacing: Tokens.space-sm;
+                TextButton {
+                    text: Strings.recovery-later;
+                    clicked => {
+                        root.later();
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                TextButton {
+                    text: Strings.recovery-restore-all;
+                    primary: true;
+                    clicked => {
+                        root.restore-all();
+                    }
+                }
+            }
+        }
+    }
+}

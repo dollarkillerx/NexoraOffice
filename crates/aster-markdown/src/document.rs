@@ -136,6 +136,16 @@ impl Document {
         }
     }
 
+    /// A document holding `text` that has never been saved in this state, such
+    /// as one brought back from a recovery journal. It counts as modified until
+    /// it is saved, and undoing cannot reach a saved state.
+    pub fn unsaved(text: &str) -> Self {
+        Self {
+            saved: None,
+            ..Self::new(text)
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -672,6 +682,20 @@ mod tests {
         // Same text, but not known to be what is on disk.
         assert_eq!(document.text(), "ab");
         assert!(document.is_modified());
+    }
+
+    #[test]
+    fn a_recovered_document_stays_modified_until_it_is_saved() {
+        let mut document = Document::unsaved("restored");
+        assert!(document.is_modified());
+        document.set_selection(Selection::caret(8));
+        typed(&mut document, "!");
+        document.undo();
+        // Back to the restored text, which was never saved.
+        assert!(document.is_modified());
+        let point = document.save_point();
+        document.mark_saved(point);
+        assert!(!document.is_modified());
     }
 
     #[test]

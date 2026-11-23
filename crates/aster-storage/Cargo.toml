@@ -2,10 +2,11 @@
 name = "aster-storage"
 version.workspace = true
 license.workspace = true
-description = "Durable file access for Aster Office: atomic writes now, journal and recovery later"
+description = "Durable storage for Aster Office: atomic saves, and recovery records that survive a crash"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+rusqlite = { workspace = true }
 tempfile = { workspace = true }

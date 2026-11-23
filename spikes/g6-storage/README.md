@@ -80,4 +80,4 @@ macOS 27.0.1，Apple M6，2026-11-22，SQLite 3.54（随 rusqlite 编译进来�
 - 命令的编码从第一天起就带版本号，恢复时遇到不认识的版本要明确报错。
 - 恢复失败时保留现场，不要覆盖或删除任何文件。
 
-原子写入 `write_atomically` 已经搬到 `crates/aster-storage`，产品和这个工程用的是同一份。
+原子写入 `write_atomically` 已经搬到 `crates/aster-storage`，产品和这个工程用的是同一份。命令日志、检查点和强杀测试也在 `crates/aster-storage` 里有了正式版本（`journal.rs`、`tests/kill.rs`），这个工程本身保持原样，作为关卡的记录。

@@ -178,6 +178,7 @@ dependencies = [
 name = "aster-storage"
 version = "0.0.1"
 dependencies = [
+ "rusqlite",
  "tempfile",
 ]
 

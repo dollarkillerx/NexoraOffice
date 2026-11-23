@@ -1,17 +1,21 @@
 # Aster Office
 
-用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。`crates/aster-shell` 是应用外壳的原型，可以打开看界面；Markdown 标签能打开、编辑、保存真实的文本文件（100 MB 也可以），源码有语法高亮，可以分屏预览（预览按中日文禁则断行，能选中复制），可以查找替换；侧边栏列出最近打开的文件和一个打开的文件夹。其余编辑器还是占位。
+用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。`crates/aster-shell` 是应用外壳的原型，可以打开看界面；Markdown 标签能打开、编辑、保存真实的文本文件（100 MB 也可以），源码有语法高亮，可以分屏预览（预览按中日文禁则断行，能选中复制），可以查找替换；侧边栏列出最近打开的文件和一个打开的文件夹。Excel（.xlsx）和 PowerPoint（.pptx）文件可以打开查看：工作簿显示网格、数字格式、合并单元格，公式由 formualizer 重新计算；演示文稿显示幻灯片里的文字和形状轮廓。这两种都只读，Writer 和 PDF 还是占位。
 
 ## 仓库结构
 
 | 路径 | 内容 |
 | --- | --- |
 | `crates/aster-shell` | 应用外壳原型：窗口、标签、工具栏、侧边栏、设计令牌、界面语言。说明里写明了哪些是占位 |
-| `crates/aster-surface` | 文档表面：自绘的纯文本表面、只排可见部分的大文件文本视图、Markdown 预览的排版和绘制，以及接入窗口的胶水，G1 关卡也用它 |
+| `crates/aster-surface` | 文档表面：自绘的纯文本表面、只排可见部分的大文件文本视图、Markdown 预览的排版和绘制、工作表网格视图和幻灯片视图，以及接入窗口的胶水，G1 关卡也用它 |
 | `crates/aster-text` | 文字排版：G3 的中日文断行器（禁则、行尾标点、挤压、中西文间距），在 Parley 整形之上排段落，命中测试和选区；预览用它 |
 | `crates/aster-markdown` | Markdown 编辑器的文档模型：文本、选区、编辑命令、撤销历史、文件编码与换行符；增量语法高亮和预览的块结构（用 `pulldown-cmark` 解析） |
 | `crates/aster-storage` | 原子写入和崩溃恢复（命令日志、检查点、恢复记录），来自 G6 关卡 |
 | `crates/aster-platform` | 系统的打开、保存和选择文件夹对话框，打开网页和邮件链接，在访达或文件管理器里显示文件，应用数据目录 |
+| `crates/aster-ooxml` | Office Open XML：我们自己的包层（按需解压、安全限额、内容类型、关系，ADR 0001），XLSX 和 PPTX 的读取器。还不写回 |
+| `crates/aster-sheets` | Sheets 的模型：工作簿、稀疏单元格、行高列宽、合并单元格、数字格式、共享公式展开，以及 `CalcEngine` 接口 |
+| `crates/aster-calc` | 计算引擎的适配器：formualizer 接在 `CalcEngine` 后面（ADR 0002），只从我们的模型取输入 |
+| `crates/aster-slides` | Slides 的模型：幻灯片、形状、文字框；母版和版式的继承由读取器解析好 |
 | `crates/aster-workspace` | 文档周围的文件：最近文件列表、侧边栏的文件夹树（一次读一个文件夹）、重启后记住的文件夹 |
 | `spikes/` | Phase 0 的验证工程，每道关卡一个，各自带说明和结果 |
 | `assets/brand/` | Logo、图标和品牌说明 |
@@ -88,6 +92,6 @@ Aster Office 以 [GNU Affero 通用公共许可证第 3 版](LICENSE)（AGPL-3.0
 
 这是一个著作权传染性的许可证：你可以自由使用、研究、修改和分发本软件，但分发修改后的版本，或者把修改后的版本作为网络服务提供给他人使用时，必须以同样的许可证公开对应的完整源代码。
 
-界面框架 Slint 以它的 GPL-3.0 选项使用。其余依赖都是宽松许可证，清单由 `python3 packaging/licenses.py --report <文件>` 生成。
+界面框架 Slint 以它的 GPL-3.0 选项使用。公式引擎 formualizer 经 Apache Arrow 带进 `tiny-keccak`，它只有 CC0-1.0 许可证（公有领域贡献声明），项目负责人于 2026-11-23 决定接受，已写进 `deny.toml` 的允许列表。其余依赖都是宽松许可证，清单由 `python3 packaging/licenses.py --report <文件>` 生成。
 
 Copyright (C) 2026 Aster Office contributors

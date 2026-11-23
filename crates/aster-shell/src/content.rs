@@ -1321,12 +1321,34 @@ impl MarkdownEditor {
             Format::Image => format::insert_link(text, selection, true),
             Format::Table => format::insert_table(text, selection),
         };
+        self.apply(edit)
+    }
+
+    /// Make an edit worked out from the text, as one undo step.
+    fn apply(&mut self, edit: format::Edit) -> bool {
         let Some(mut change) = self.document.replace_range(edit.range, &edit.text) else {
             return false;
         };
         self.document.set_selection(edit.selection);
         change.selection = edit.selection;
         self.show(Some(change))
+    }
+
+    /// Enter: on a list item or in a quote the next line gets the same
+    /// markers, or an empty item ends the list; elsewhere a line break.
+    fn newline(&mut self) -> bool {
+        if self.surface.is_composing() || self.locked() {
+            return false;
+        }
+        let edit = format::line_break(
+            self.document.text(),
+            self.fresh_highlighter(),
+            self.document.selection(),
+        );
+        match edit {
+            Some(edit) => self.apply(edit),
+            None => self.edit(EditCommand::LineBreak),
+        }
     }
 
     /// The highlighting, while it matches the text.
@@ -1353,7 +1375,7 @@ impl MarkdownEditor {
     pub fn key(&mut self, action: Action) -> bool {
         match action {
             Action::Insert(text) => self.edit(EditCommand::Type(text)),
-            Action::Newline => self.edit(EditCommand::LineBreak),
+            Action::Newline => self.newline(),
             Action::Backspace => self.edit(EditCommand::Backspace),
             Action::Delete => self.edit(EditCommand::Delete),
             movement => {
@@ -2125,6 +2147,28 @@ mod tests {
         assert_in_step(&e);
         e.undo();
         assert_eq!(text_of(&e), "- 会议**纪要**");
+    }
+
+    #[test]
+    fn enter_continues_a_list_in_one_undo_step() {
+        let mut e = editor("1. 买菜\n2. 做饭");
+        let end = "1. 买菜".len();
+        e.document.set_selection(Selection::caret(end));
+        assert!(e.key(Action::Newline));
+        assert_eq!(text_of(&e), "1. 买菜\n2. \n3. 做饭");
+        assert_eq!(e.document.selection(), Selection::caret(end + 4));
+        assert_in_step(&e);
+        // Enter again on the empty item ends the list there.
+        assert!(e.key(Action::Newline));
+        assert_eq!(text_of(&e), "1. 买菜\n\n3. 做饭");
+        e.undo();
+        e.undo();
+        assert_eq!(text_of(&e), "1. 买菜\n2. 做饭");
+        // Plain text gets a plain line break.
+        let mut plain = editor("正文");
+        plain.document.set_selection(Selection::caret(6));
+        assert!(plain.key(Action::Newline));
+        assert_eq!(text_of(&plain), "正文\n");
     }
 
     #[test]

@@ -480,6 +480,172 @@ fn block_of(text: &Rope, range: &Range<usize>) -> Option<Block> {
     found
 }
 
+/// How much of a line is read for its list and quote markers.
+const PREFIX_REACH: usize = 256;
+/// How far after a new list item the numbers of the items below are put
+/// right. Further down they stay as they are.
+const RENUMBER_REACH: usize = 64 * 1024;
+
+/// The markers at the start of a line that Enter carries on to the next:
+/// quotes, then at most one list marker. Returns how many bytes they take
+/// and what the next line starts with: the same quotes, the same bullet, the
+/// next number, an unticked box.
+fn continuation(line: &str) -> Option<(usize, String)> {
+    let mut at = 0;
+    let mut next = String::new();
+    loop {
+        let (parsed, kind) = parse_block(&line[at..]);
+        let kind = kind?;
+        next.push_str(parsed.indent);
+        at += parsed.indent.len() + parsed.prefix.len();
+        match kind {
+            Block::Quote => {
+                next.push_str(parsed.prefix.trim_end());
+                next.push(' ');
+                // A quote alone is enough; a list inside it is carried too.
+                if parse_block(&line[at..]).1.is_none() {
+                    return Some((at, next));
+                }
+            }
+            Block::Bullet => {
+                next.push_str(parsed.prefix);
+                return Some((at, next));
+            }
+            Block::Task => {
+                next.push_str(&parsed.prefix[..2]);
+                next.push_str("[ ] ");
+                return Some((at, next));
+            }
+            Block::Numbered => {
+                let digits = parsed.prefix.len() - 2;
+                let number: u64 = parsed.prefix[..digits].parse().ok()?;
+                let delimiter = &parsed.prefix[digits..digits + 1];
+                next.push_str(&format!("{}{delimiter} ", number + 1));
+                return Some((at, next));
+            }
+        }
+    }
+}
+
+/// What Enter does on a list item or in a quote: the new line starts with
+/// the same markers (the next number, an unticked box), and the numbers of
+/// the items below go up by one. Enter on an item with nothing in it ends
+/// the list instead, taking the marker away. `None` where Enter is a plain
+/// line break: elsewhere, inside the markers, or in a code block (pass the
+/// highlighting while it is up to date, to tell).
+pub fn line_break(
+    text: &Rope,
+    highlighter: Option<&Highlighter>,
+    selection: Selection,
+) -> Option<Edit> {
+    let range = selection.range();
+    let line = text.byte_to_line(range.start);
+    let start = text.line_to_byte(line);
+    let end = line_span(text, &(start..start)).end;
+    let head = slice(text, start..ceil(text, (start + PREFIX_REACH).min(end)));
+    let (marker, next) = continuation(&head)?;
+    if range.start < start + marker {
+        return None;
+    }
+    if let Some(highlighter) = highlighter
+        && highlighter
+            .spans(start..start + marker)
+            .iter()
+            .any(|span| span.marks.contains(Marks::CODE_BLOCK))
+    {
+        return None;
+    }
+
+    // An empty item: the list ends here.
+    let rest = start + marker..end;
+    if range.is_empty() && rest.len() <= PREFIX_REACH && slice(text, rest).trim().is_empty() {
+        return Some(Edit {
+            range: start..end,
+            text: String::new(),
+            selection: Selection::caret(start),
+        });
+    }
+
+    let mut out = format!("\n{next}");
+    let caret = range.start + out.len();
+    let mut edit_end = range.end;
+    if let Some(number) = numbered(&next) {
+        let indent = next.len() - next.trim_start().len();
+        if let Some((renumbered, until)) = renumber(text, range.end, indent, number + 1) {
+            out.push_str(&renumbered);
+            edit_end = until;
+        }
+    }
+    Some(Edit {
+        range: range.start..edit_end,
+        text: out,
+        selection: Selection::caret(caret),
+    })
+}
+
+/// The number of a numbered item's marker with nothing before it but
+/// indentation.
+fn numbered(prefix: &str) -> Option<u64> {
+    let body = prefix.trim_start_matches([' ', '\t']);
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    body[..digits].parse().ok()
+}
+
+/// The text from `from` (inside the line of the new item, after the caret)
+/// down to the last numbered item that needed a new number, with the
+/// numbers of the items at `indent` counting on from `first`, and where
+/// that text ends. `None` if no number changes. Lines indented further
+/// belong to an item and are passed over; anything else ends the list.
+fn renumber(text: &Rope, from: usize, indent: usize, first: u64) -> Option<(String, usize)> {
+    let mut line = text.byte_to_line(from) + 1;
+    let mut expected = first;
+    let mut changes: Vec<(Range<usize>, String)> = Vec::new();
+    let mut blank_before = false;
+    while line < text.len_lines() {
+        let start = text.line_to_byte(line);
+        if start - from > RENUMBER_REACH {
+            break;
+        }
+        let end = line_span(text, &(start..start)).end;
+        let head = slice(text, start..ceil(text, (start + PREFIX_REACH).min(end)));
+        line += 1;
+        if head.trim().is_empty() {
+            // Two blank lines in a row end a list.
+            if blank_before {
+                break;
+            }
+            blank_before = true;
+            continue;
+        }
+        blank_before = false;
+        let own = head.len() - head.trim_start_matches([' ', '\t']).len();
+        if own > indent {
+            continue;
+        }
+        let (parsed, kind) = parse_block(&head);
+        if own < indent || kind != Some(Block::Numbered) {
+            break;
+        }
+        let digits = parsed.prefix.len() - 2;
+        let number = &parsed.prefix[..digits];
+        if number == expected.to_string() {
+            break;
+        }
+        let at = start + parsed.indent.len();
+        changes.push((at..at + digits, expected.to_string()));
+        expected += 1;
+    }
+    let until = changes.last()?.0.end;
+    let mut out = String::new();
+    let mut copied = from;
+    for (range, number) in changes {
+        out.push_str(&slice(text, copied..range.start));
+        out.push_str(&number);
+        copied = range.end;
+    }
+    Some((out, until))
+}
+
 /// The parts of a line: indentation, the block prefix, and the rest.
 struct Parsed<'a> {
     indent: &'a str,
@@ -1158,5 +1324,94 @@ mod tests {
             focus: long.len(),
         };
         assert_eq!(styles(&rope, None, all), Styles::default());
+    }
+
+    /// Enter at the caret or selection; `None` where it is a plain break.
+    fn enter(input: &str) -> Option<String> {
+        let (text, range) = marked(input);
+        let rope = Rope::from_str(&text);
+        let selection = Selection {
+            anchor: range.start,
+            focus: range.end,
+        };
+        line_break(&rope, Some(&Highlighter::new(&rope)), selection)?;
+        Some(run(&text, range, |rope, sel| {
+            line_break(rope, Some(&Highlighter::new(rope)), sel).expect("an edit")
+        }))
+    }
+
+    #[test]
+    fn enter_carries_list_and_quote_markers_on() {
+        assert_eq!(enter("- 苹果|").as_deref(), Some("- 苹果\n- |"));
+        assert_eq!(enter("* a|").as_deref(), Some("* a\n* |"));
+        assert_eq!(enter("  + 缩进|").as_deref(), Some("  + 缩进\n  + |"));
+        assert_eq!(enter("1. 第一|").as_deref(), Some("1. 第一\n2. |"));
+        assert_eq!(enter("9) nine|").as_deref(), Some("9) nine\n10) |"));
+        // A ticked box starts an unticked one.
+        assert_eq!(enter("- [x] 完成|").as_deref(), Some("- [x] 完成\n- [ ] |"));
+        assert_eq!(enter("> 引用|").as_deref(), Some("> 引用\n> |"));
+        assert_eq!(enter(">紧挨|").as_deref(), Some(">紧挨\n> |"));
+        assert_eq!(
+            enter("> - 引用里的列表|").as_deref(),
+            Some("> - 引用里的列表\n> - |")
+        );
+        // In the middle of an item, the rest moves to the new one.
+        assert_eq!(enter("- 前|后").as_deref(), Some("- 前\n- |后"));
+        // A selection is replaced.
+        assert_eq!(enter("- 留«删掉»").as_deref(), Some("- 留\n- |"));
+    }
+
+    #[test]
+    fn enter_on_an_empty_item_ends_the_list() {
+        assert_eq!(enter("- a\n- |").as_deref(), Some("- a\n|"));
+        assert_eq!(enter("1. a\n2.  |").as_deref(), Some("1. a\n|"));
+        assert_eq!(enter("- [ ] |").as_deref(), Some("|"));
+        assert_eq!(enter("> |").as_deref(), Some("|"));
+    }
+
+    #[test]
+    fn enter_is_a_plain_break_elsewhere() {
+        assert_eq!(enter("正文|"), None);
+        assert_eq!(enter("# 标题|"), None);
+        // Inside the marker.
+        assert_eq!(enter("-| a"), None);
+        assert_eq!(enter("12|. a"), None);
+        // In a code block, a line that looks like an item is code.
+        assert_eq!(enter("```\n- 代码|\n```"), None);
+        assert_eq!(enter("    - 缩进代码|"), None);
+        // Indented as far inside a list, it is an item.
+        assert_eq!(
+            enter("- a\n    - 子项|").as_deref(),
+            Some("- a\n    - 子项\n    - |")
+        );
+    }
+
+    #[test]
+    fn enter_renumbers_the_items_below() {
+        assert_eq!(
+            enter("1. a|\n2. b\n3. c").as_deref(),
+            Some("1. a\n2. |\n3. b\n4. c")
+        );
+        // Nested lines and one blank line stay in the list; numbers that
+        // are already right stop the work.
+        assert_eq!(
+            enter("1. a|\n2. b\n   - 子项\n\n3. c\n\n\n4. 另一个列表").as_deref(),
+            Some("1. a\n2. |\n3. b\n   - 子项\n\n4. c\n\n\n4. 另一个列表")
+        );
+        assert_eq!(
+            enter("1. a|\n3. b\n4. c").as_deref(),
+            Some("1. a\n2. |\n3. b\n4. c"),
+            "already counting on"
+        );
+        // A less indented line ends the nested list.
+        assert_eq!(
+            enter("1. x\n   1. a|\n   2. b\n2. y").as_deref(),
+            Some("1. x\n   1. a\n   2. |\n   3. b\n2. y")
+        );
+        // Text after the caret moves along.
+        assert_eq!(
+            enter("1. 一|二\n2. 三").as_deref(),
+            Some("1. 一\n2. |二\n3. 三")
+        );
     }
 }

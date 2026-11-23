@@ -1,5 +1,5 @@
 import { Tokens, Icons, Strings, KindItem, RecentItem } from "tokens.slint";
-import { Icon, KindGlyph, AsterMark, Badge, Hairline, TextButton } from "widgets.slint";
+import { Icon, KindGlyph, AsterMark, Badge, Hairline, TextButton, MenuFrame, RecentMenuItems } from "widgets.slint";
 
 component KindTile inherits Rectangle {
     in property <KindItem> item;
@@ -114,36 +114,33 @@ component RecentRow inherits Rectangle {
         }
     }
 
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: Strings.reveal;
-                enabled: !root.item.missing;
-                activated => {
-                    root.reveal();
-                }
-            }
-
-            MenuItem {
-                title: Strings.recent-remove;
-                activated => {
-                    root.remove();
-                }
-            }
-
-            MenuSeparator { }
-
-            MenuItem {
-                title: Strings.menu-clear-recent;
-                activated => {
-                    root.clear();
-                }
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                menu.show();
             }
         }
+    }
 
-        touch := TouchArea {
-            clicked => {
-                root.clicked();
+    menu := PopupWindow {
+        x: touch.mouse-x + 2px;
+        y: touch.mouse-y + 2px;
+        width: max(200px, items.preferred-width);
+        MenuFrame { }
+
+        items := RecentMenuItems {
+            missing: root.item.missing;
+            reveal => {
+                root.reveal();
+            }
+            remove => {
+                root.remove();
+            }
+            clear => {
+                root.clear();
             }
         }
     }

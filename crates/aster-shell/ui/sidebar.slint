@@ -1,6 +1,6 @@
 import { ListView } from "std-widgets.slint";
 import { Tokens, Icons, Strings, RecentItem, TreeItem } from "tokens.slint";
-import { Icon, KindGlyph, IconButton, TextButton, VHairline } from "widgets.slint";
+import { Icon, KindGlyph, IconButton, TextButton, VHairline, MenuFrame, MenuRow, RecentMenuItems } from "widgets.slint";
 
 component SectionHeader inherits Rectangle {
     in property <string> title;
@@ -83,36 +83,33 @@ component RecentRow inherits Rectangle {
         }
     }
 
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: Strings.reveal;
-                enabled: !root.item.missing;
-                activated => {
-                    root.reveal();
-                }
-            }
-
-            MenuItem {
-                title: Strings.recent-remove;
-                activated => {
-                    root.remove();
-                }
-            }
-
-            MenuSeparator { }
-
-            MenuItem {
-                title: Strings.menu-clear-recent;
-                activated => {
-                    root.clear();
-                }
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                menu.show();
             }
         }
+    }
 
-        touch := TouchArea {
-            clicked => {
-                root.clicked();
+    menu := PopupWindow {
+        x: touch.mouse-x + 2px;
+        y: touch.mouse-y + 2px;
+        width: max(200px, items.preferred-width);
+        MenuFrame { }
+
+        items := RecentMenuItems {
+            missing: root.item.missing;
+            reveal => {
+                root.reveal();
+            }
+            remove => {
+                root.remove();
+            }
+            clear => {
+                root.clear();
             }
         }
     }
@@ -182,21 +179,32 @@ component TreeRow inherits Rectangle {
         }
     }
 
-    ContextMenuArea {
-        enabled: !root.note;
-        Menu {
-            MenuItem {
-                title: Strings.reveal;
-                activated => {
-                    root.reveal();
-                }
+    touch := TouchArea {
+        clicked => {
+            if !root.note {
+                root.clicked();
             }
         }
+        pointer-event(event) => {
+            if (!root.note && event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                menu.show();
+            }
+        }
+    }
 
-        touch := TouchArea {
-            clicked => {
-                if !root.note {
-                    root.clicked();
+    // Drawn by Slint for the reason given at RecentMenuItems.
+    menu := PopupWindow {
+        x: touch.mouse-x + 2px;
+        y: touch.mouse-y + 2px;
+        width: max(200px, rows.preferred-width);
+        MenuFrame { }
+
+        rows := VerticalLayout {
+            padding: Tokens.space-xs + 2px;
+            MenuRow {
+                text: Strings.reveal;
+                clicked => {
+                    root.reveal();
                 }
             }
         }

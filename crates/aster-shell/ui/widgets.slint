@@ -133,10 +133,11 @@ export component MenuRow inherits Rectangle {
     in property <string> text;
     in property <string> detail;
     in property <bool> checked;
+    in property <bool> enabled: true;
     callback clicked;
     height: Tokens.control-height + 4px;
     border-radius: Tokens.radius-sm;
-    background: touch.has-hover ? Tokens.hover : transparent;
+    background: touch.has-hover && root.enabled ? Tokens.hover : transparent;
     HorizontalLayout {
         padding-left: Tokens.space-sm;
         padding-right: Tokens.space-sm;
@@ -151,7 +152,7 @@ export component MenuRow inherits Rectangle {
         Text {
             text: root.text;
             font-size: Tokens.font-md;
-            color: Tokens.text;
+            color: root.enabled ? Tokens.text : Tokens.text-disabled;
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
@@ -175,8 +176,54 @@ export component MenuRow inherits Rectangle {
     }
 
     touch := TouchArea {
+        enabled: root.enabled;
         clicked => {
             root.clicked();
+        }
+    }
+}
+
+// A thin rule between groups of rows in a popup menu.
+export component MenuRule inherits VerticalLayout {
+    padding-top: 3px;
+    padding-bottom: 3px;
+    padding-left: Tokens.space-sm;
+    padding-right: Tokens.space-sm;
+    Hairline { }
+}
+
+// The rows of the right-click menu of a recent file, shared by the sidebar
+// and the start page. Each sits in a PopupWindow rather than a native
+// ContextMenuArea: a native menu runs its own event loop inside winit's
+// handler, and on macOS winit panics on the next event.
+export component RecentMenuItems inherits VerticalLayout {
+    in property <bool> missing;
+    callback reveal;
+    callback remove;
+    callback clear;
+    padding: Tokens.space-xs + 2px;
+    spacing: 1px;
+    MenuRow {
+        text: Strings.reveal;
+        enabled: !root.missing;
+        clicked => {
+            root.reveal();
+        }
+    }
+
+    MenuRow {
+        text: Strings.recent-remove;
+        clicked => {
+            root.remove();
+        }
+    }
+
+    MenuRule { }
+
+    MenuRow {
+        text: Strings.menu-clear-recent;
+        clicked => {
+            root.clear();
         }
     }
 }

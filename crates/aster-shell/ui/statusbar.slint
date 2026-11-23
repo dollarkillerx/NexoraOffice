@@ -20,6 +20,11 @@ export component StatusBar inherits Rectangle {
     // Already worded, e.g. "125 字". Empty when the view has no text to count.
     in property <string> words;
     in property <string> chars;
+    // Encoding and line endings of the file, e.g. "UTF-8 · CRLF". Empty when
+    // the view is not a file.
+    in property <string> file-format;
+    // Something the user should know before saving. Empty most of the time.
+    in property <string> notice;
     in property <string> ime-label;
     in property <bool> ime-composing;
     in property <string> zoom-label;
@@ -57,8 +62,18 @@ export component StatusBar inherits Rectangle {
             text: root.chars;
         }
 
+        if root.notice != "": Dot { }
+        if root.notice != "": StatusText {
+            text: root.notice;
+            color: Tokens.text;
+        }
+
         Rectangle {
             horizontal-stretch: 1;
+        }
+
+        if root.file-format != "": StatusText {
+            text: root.file-format;
         }
 
         if root.ime-label != "": HorizontalLayout {

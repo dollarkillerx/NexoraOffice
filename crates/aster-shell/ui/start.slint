@@ -1,5 +1,5 @@
 import { Tokens, Icons, Strings, KindItem, RecentItem } from "tokens.slint";
-import { Icon, KindGlyph, AsterMark, Badge, Hairline } from "widgets.slint";
+import { Icon, KindGlyph, AsterMark, Badge, Hairline, TextButton } from "widgets.slint";
 
 component KindTile inherits Rectangle {
     in property <KindItem> item;
@@ -123,6 +123,7 @@ export component StartPage inherits Rectangle {
     in property <[RecentItem]> recent;
     callback new-document(int);
     callback open-recent(int);
+    callback open-file();
     background: Tokens.surface;
 
     Flickable {
@@ -184,7 +185,23 @@ export component StartPage inherits Rectangle {
             }
 
             Rectangle {
-                height: 36px;
+                height: Tokens.space-lg;
+            }
+
+            // Opens a real file from disk, in a Markdown tab.
+            HorizontalLayout {
+                alignment: start;
+                TextButton {
+                    text: Strings.open-file;
+                    icon: Icons.folder-open;
+                    clicked => {
+                        root.open-file();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 28px;
             }
 
             HorizontalLayout {

@@ -205,3 +205,45 @@ component MenuHeading inherits HorizontalLayout {
 }
 
 export { MenuHeading }
+
+// A button with a label. `primary` marks the answer the dialog expects.
+export component TextButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <string> icon;
+    callback clicked;
+    height: Tokens.control-height;
+    width: label.preferred-width + 2 * Tokens.space-md + (root.icon != "" ? Tokens.icon-size + Tokens.space-xs : 0px);
+    border-radius: Tokens.radius-md;
+    border-width: root.primary ? 0px : 1px;
+    border-color: Tokens.hairline;
+    background: root.primary ? Tokens.accent : touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+    opacity: root.primary && touch.pressed ? 0.85 : 1;
+    animate background { duration: Tokens.quick; }
+    HorizontalLayout {
+        padding-left: Tokens.space-md;
+        padding-right: Tokens.space-md;
+        spacing: Tokens.space-xs;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                data: root.icon;
+                tint: root.primary ? Tokens.on-accent : Tokens.text-secondary;
+            }
+        }
+
+        label := Text {
+            text: root.text;
+            font-size: Tokens.font-md;
+            font-weight: root.primary ? 600 : 400;
+            color: root.primary ? Tokens.on-accent : Tokens.text;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}

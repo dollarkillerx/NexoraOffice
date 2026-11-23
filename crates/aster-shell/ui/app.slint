@@ -10,6 +10,7 @@ import { StartPage } from "start.slint";
 import { Placeholder } from "placeholder.slint";
 import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
+import { Dialog } from "dialog.slint";
 import { Hairline } from "widgets.slint";
 
 export { Tokens, Icons, Strings }
@@ -45,10 +46,21 @@ export component AppWindow inherits Window {
     // Room for the window buttons where the tab strip doubles as the title bar.
     in property <length> leading-inset;
 
+    // The tab in front is a document that can be edited, saved and undone.
+    in property <bool> editing;
+    in property <bool> can-undo;
+    in property <bool> can-redo;
+    // 0 while no question is open; see dialog.slint for the kinds.
+    in property <int> dialog-kind;
+    in property <string> dialog-title;
+    in property <string> dialog-body;
+
     in property <string> status-kind;
     in property <string> status-note;
     in property <string> status-words;
     in property <string> status-chars;
+    in property <string> status-format;
+    in property <string> status-notice;
     in property <string> status-ime;
     in property <bool> status-composing;
     in property <string> status-zoom;
@@ -66,7 +78,8 @@ export component AppWindow inherits Window {
     out property <length> surface-x: surface.absolute-position.x;
     out property <length> surface-y: surface.absolute-position.y;
     out property <bool> surface-focused: scope.has-focus;
-    property <bool> surface-active: root.active-kind == 0;
+    // Writer and Markdown tabs both show the custom-drawn surface.
+    property <bool> surface-active: root.active-kind == 0 || root.active-kind == 3;
 
     callback tab-activate(int);
     callback tab-close(int);
@@ -76,6 +89,21 @@ export component AppWindow inherits Window {
     callback toggle-theme();
     callback set-language(int);
     callback toolbar-command(int);
+    callback file-new();
+    callback file-open();
+    callback file-save();
+    callback file-save-as();
+    callback file-close();
+    callback quit-requested();
+    callback edit-undo();
+    callback edit-redo();
+    callback edit-cut();
+    callback edit-copy();
+    callback edit-paste();
+    callback edit-select-all();
+    callback dialog-save();
+    callback dialog-discard();
+    callback dialog-cancel();
     callback zoom-out();
     callback zoom-reset();
     callback zoom-in();
@@ -90,6 +118,151 @@ export component AppWindow inherits Window {
     // Give the keyboard to the document surface.
     public function focus-document() {
         scope.focus();
+    }
+
+    // Slint has no clipboard API for application code, but its text input can
+    // copy and paste. This one is never shown; it only carries text to and from
+    // the system clipboard. It belongs in aster-platform once that has a
+    // clipboard of its own.
+    public function copy-to-clipboard(text: string) {
+        clipboard.text = text;
+        clipboard.select-all();
+        clipboard.copy();
+        clipboard.text = "";
+    }
+
+    public function clipboard-text() -> string {
+        clipboard.text = "";
+        clipboard.paste();
+        return clipboard.text;
+    }
+
+    clipboard := TextInput {
+        visible: false;
+        width: 0px;
+        height: 0px;
+        single-line: false;
+    }
+
+    MenuBar {
+        Menu {
+            title: Strings.menu-file;
+            MenuItem {
+                title: Strings.menu-new-markdown;
+                shortcut: @keys(Control + N);
+                activated => {
+                    root.file-new();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-open;
+                shortcut: @keys(Control + O);
+                activated => {
+                    root.file-open();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-save;
+                shortcut: @keys(Control + S);
+                enabled: root.editing;
+                activated => {
+                    root.file-save();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-save-as;
+                shortcut: @keys(Control + Shift + S);
+                enabled: root.editing;
+                activated => {
+                    root.file-save-as();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-close-tab;
+                shortcut: @keys(Control + W);
+                enabled: root.active-index >= 0;
+                activated => {
+                    root.file-close();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-quit;
+                role: quit;
+                activated => {
+                    root.quit-requested();
+                }
+            }
+        }
+
+        Menu {
+            title: Strings.menu-edit;
+            MenuItem {
+                title: Strings.menu-undo;
+                shortcut: @keys(Control + Z);
+                enabled: root.editing && root.can-undo;
+                activated => {
+                    root.edit-undo();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-redo;
+                shortcut: @keys(Control + Shift + Z);
+                enabled: root.editing && root.can-redo;
+                activated => {
+                    root.edit-redo();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-cut;
+                shortcut: @keys(Control + X);
+                enabled: root.editing;
+                activated => {
+                    root.edit-cut();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-copy;
+                shortcut: @keys(Control + C);
+                enabled: root.editing;
+                activated => {
+                    root.edit-copy();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-paste;
+                shortcut: @keys(Control + V);
+                enabled: root.editing;
+                activated => {
+                    root.edit-paste();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-select-all;
+                shortcut: @keys(Control + A);
+                enabled: root.surface-active;
+                activated => {
+                    root.edit-select-all();
+                }
+            }
+        }
     }
 
     VerticalLayout {
@@ -216,7 +389,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.active-kind > 0: Placeholder {
+                if root.active-kind > 0 && root.active-kind != 3: Placeholder {
                     kind: root.active-kind;
                     title: root.placeholder-title;
                     plan: root.placeholder-plan;
@@ -230,6 +403,9 @@ export component AppWindow inherits Window {
                     }
                     open-recent(index) => {
                         root.open-recent(index);
+                    }
+                    open-file => {
+                        root.file-open();
                     }
                 }
             }
@@ -248,6 +424,8 @@ export component AppWindow inherits Window {
             note: root.status-note;
             words: root.status-words;
             chars: root.status-chars;
+            file-format: root.status-format;
+            notice: root.status-notice;
             ime-label: root.status-ime;
             ime-composing: root.status-composing;
             zoom-label: root.status-zoom;
@@ -261,6 +439,21 @@ export component AppWindow inherits Window {
             zoom-in => {
                 root.zoom-in();
             }
+        }
+    }
+
+    if root.dialog-kind != 0: Dialog {
+        kind: root.dialog-kind;
+        title: root.dialog-title;
+        body: root.dialog-body;
+        save => {
+            root.dialog-save();
+        }
+        discard => {
+            root.dialog-discard();
+        }
+        cancel => {
+            root.dialog-cancel();
         }
     }
 }

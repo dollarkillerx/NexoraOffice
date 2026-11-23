@@ -70,6 +70,27 @@ export global Strings {
     in property <string> ai-point-approval;
     in property <string> ai-point-keys;
     in property <string> ai-input;
+
+    in property <string> menu-file;
+    in property <string> menu-edit;
+    in property <string> menu-new-markdown;
+    in property <string> menu-open;
+    in property <string> menu-save;
+    in property <string> menu-save-as;
+    in property <string> menu-close-tab;
+    in property <string> menu-quit;
+    in property <string> menu-undo;
+    in property <string> menu-redo;
+    in property <string> menu-cut;
+    in property <string> menu-copy;
+    in property <string> menu-paste;
+    in property <string> menu-select-all;
+    in property <string> open-file;
+    in property <string> button-save;
+    in property <string> button-discard;
+    in property <string> button-cancel;
+    in property <string> button-ok;
+    in property <string> button-quit-anyway;
 }
 
 // Path data for the icons the chrome itself uses. Toolbar icons arrive with the
@@ -89,10 +110,13 @@ export global Icons {
     in property <string> globe;
     in property <string> assistant;
     in property <string> check;
+    in property <string> folder-open;
 }
 
 export struct TabItem {
     title: string,
+    // The document has unsaved changes.
+    modified: bool,
     // Index into the document kinds: 0 Writer, 1 Sheets, 2 Slides, 3 Markdown, 4 PDF.
     kind: int,
 }

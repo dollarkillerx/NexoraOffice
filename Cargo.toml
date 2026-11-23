@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/aster-markdown",
+    "crates/aster-platform",
     "crates/aster-shell",
     "crates/aster-storage",
     "crates/aster-surface",
@@ -26,6 +28,8 @@ publish = false
 # API both change between minor releases; upgrading means re-running the Phase 0
 # gate tests (G1 input method, G2 frame path).
 [workspace.dependencies]
+aster-markdown = { path = "crates/aster-markdown" }
+aster-platform = { path = "crates/aster-platform" }
 aster-storage = { path = "crates/aster-storage" }
 aster-surface = { path = "crates/aster-surface" }
 slint = { version = "~1.19.0", default-features = false, features = [
@@ -54,6 +58,8 @@ icu_locale_core = "2.3"
 # SQLite is compiled in, so every platform runs the same version.
 rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3.27"
+# Native open and save dialogs on all three systems.
+rfd = "~0.18.0"
 
 [profile.dev]
 opt-level = 1

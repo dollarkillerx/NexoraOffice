@@ -7,6 +7,7 @@
 //! binds it to the Slint UI under `ui/`.
 
 pub mod cli;
+pub mod files;
 pub mod i18n;
 pub mod icons;
 pub mod sample;
@@ -23,6 +24,7 @@ mod tests {
     fn shell_logic_does_not_mention_the_toolkit() {
         let sources = [
             ("cli.rs", include_str!("cli.rs")),
+            ("files.rs", include_str!("files.rs")),
             ("i18n.rs", include_str!("i18n.rs")),
             ("icons.rs", include_str!("icons.rs")),
             ("sample.rs", include_str!("sample.rs")),

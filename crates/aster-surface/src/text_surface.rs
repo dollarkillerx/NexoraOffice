@@ -353,7 +353,7 @@ impl TextSurface {
 
     /// Scroll just far enough to bring the caret, or the composition text, into
     /// the view.
-    fn reveal_caret(&mut self) {
+    pub fn reveal_caret(&mut self) {
         if self.height == 0 {
             return;
         }
@@ -372,6 +372,73 @@ impl TextSurface {
             self.scroll += bottom - (height - keep);
         }
         self.scroll = self.scroll.clamp(0.0, geometry.max_scroll);
+    }
+
+    /// Change the body text size, in logical pixels at 100 % zoom.
+    pub fn set_font_size(&mut self, size: f32) {
+        self.editor
+            .edit_styles()
+            .insert(StyleProperty::FontSize(size));
+    }
+
+    // The next five methods are for a host that keeps the text in a document
+    // model of its own and uses this surface as the view: the model decides
+    // what an edit does, and the surface is told to show the result. Such a
+    // host does not call `ime` or the text-changing variants of `apply`.
+
+    /// The selection as byte offsets into the committed text: where it was
+    /// started and where its moving end, the caret, is. Meaningless while a
+    /// composition is in progress.
+    pub fn selection(&self) -> (usize, usize) {
+        let selection = self.editor.raw_selection();
+        (selection.anchor().index(), selection.focus().index())
+    }
+
+    /// Put the selection at byte offsets into the committed text. Offsets that
+    /// are not on a character boundary are ignored.
+    pub fn set_selection(&mut self, anchor: usize, focus: usize) {
+        if self.editor.is_composing() {
+            return;
+        }
+        let mut drv = self.driver();
+        drv.move_to_byte(anchor);
+        if focus != anchor {
+            drv.extend_selection_to_byte(focus);
+        }
+        self.caret_on = true;
+    }
+
+    /// Replace a byte range of the committed text, as an edit made in the
+    /// host's model. Ends any composition first. The caret is left after the
+    /// new text; the host normally follows up with `set_selection`.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let mut drv = self.driver();
+        drv.clear_compose();
+        drv.select_byte_range(range.start, range.end);
+        if text.is_empty() {
+            drv.delete_selection();
+        } else {
+            drv.insert_or_replace_selection(text);
+        }
+        self.caret_on = true;
+    }
+
+    /// Show input-method composition text at the caret. `cursor` is a byte range
+    /// inside `text`; `None` hides the caret. Empty text ends the composition.
+    pub fn compose(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        if text.is_empty() {
+            self.driver().clear_compose();
+        } else {
+            self.driver().set_compose(text, cursor);
+        }
+        self.caret_on = true;
+        self.reveal_caret();
+    }
+
+    /// Drop the composition text, if any. The committed text is untouched.
+    pub fn end_composition(&mut self) {
+        self.driver().clear_compose();
+        self.caret_on = true;
     }
 
     /// The committed text. Composition text is not part of it.
@@ -753,6 +820,64 @@ mod tests {
         let inked = s.render().data().to_vec();
         let changed = blank.iter().zip(&inked).filter(|(a, b)| a != b).count();
         assert!(changed > 100, "only {changed} pixels changed");
+    }
+
+    #[test]
+    fn a_host_can_read_and_place_the_selection() {
+        let mut s = surface("中文 text");
+        // The caret starts at the end.
+        assert_eq!(s.selection(), (11, 11));
+        s.set_selection(0, 6);
+        assert_eq!(s.selection(), (0, 6));
+        // A backwards selection keeps its direction.
+        s.set_selection(6, 3);
+        assert_eq!(s.selection(), (6, 3));
+        s.apply(Action::Left {
+            select: false,
+            word: false,
+        });
+        let (anchor, focus) = s.selection();
+        assert_eq!(anchor, focus);
+    }
+
+    #[test]
+    fn a_host_can_replace_ranges_of_the_text() {
+        let mut s = surface("hello world");
+        s.replace_range(6..11, "世界");
+        assert_eq!(s.text(), "hello 世界");
+        assert_eq!(s.selection(), (12, 12));
+        s.replace_range(0..5, "");
+        assert_eq!(s.text(), " 世界");
+        s.replace_range(0..0, "你好");
+        assert_eq!(s.text(), "你好 世界");
+    }
+
+    #[test]
+    fn host_driven_composition_never_touches_the_committed_text() {
+        let mut s = surface("ab");
+        s.compose("ni", Some((2, 2)));
+        assert!(s.is_composing());
+        assert_eq!(s.text(), "ab");
+        s.compose("", None);
+        assert!(!s.is_composing());
+        s.compose("nihao", Some((5, 5)));
+        s.end_composition();
+        assert!(!s.is_composing());
+        assert_eq!(s.text(), "ab");
+        // Replacing a range ends a composition rather than mixing with it.
+        s.compose("x", None);
+        s.replace_range(2..2, "你好");
+        assert!(!s.is_composing());
+        assert_eq!(s.text(), "ab你好");
+    }
+
+    #[test]
+    fn the_text_size_can_be_changed() {
+        let mut s = surface("hello");
+        let (_, _, _, before) = s.ime_cursor_area();
+        s.set_font_size(FONT_SIZE / 2.0);
+        let (_, _, _, after) = s.ime_cursor_area();
+        assert!(after < before * 0.7, "caret height {before} -> {after}");
     }
 
     #[test]

@@ -44,9 +44,10 @@ impl DocKind {
     }
 
     /// Whether this build has a working view for the kind. Everything else
-    /// opens a labelled placeholder.
+    /// opens a labelled placeholder. "Working" is modest: Writer tabs are plain
+    /// text, and Markdown tabs edit and save text without understanding Markdown.
     pub fn is_implemented(self) -> bool {
-        matches!(self, DocKind::Writer)
+        matches!(self, DocKind::Writer | DocKind::Markdown)
     }
 
     /// The phase of the roadmap that delivers the editor.
@@ -70,6 +71,8 @@ pub struct Tab {
     pub id: TabId,
     pub kind: DocKind,
     pub title: String,
+    /// The document has changes that are not saved yet.
+    pub modified: bool,
 }
 
 /// The tab strip's state. `active` is `None` while the start page is showing,
@@ -133,6 +136,7 @@ impl Tabs {
             id,
             kind,
             title: title.into(),
+            modified: false,
         });
         self.active = Some(id);
         id
@@ -157,6 +161,30 @@ impl Tabs {
             .id;
         self.active = Some(id);
         Some(id)
+    }
+
+    /// Give a tab a new title, for a document that was saved under a new name.
+    pub fn rename(&mut self, id: TabId, title: impl Into<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.title = title.into();
+        }
+    }
+
+    /// Set whether a tab's document has unsaved changes. Returns whether that
+    /// was news, so the caller knows to redraw the strip.
+    pub fn set_modified(&mut self, id: TabId, modified: bool) -> bool {
+        match self.tabs.iter_mut().find(|tab| tab.id == id) {
+            Some(tab) if tab.modified != modified => {
+                tab.modified = modified;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many open documents have unsaved changes.
+    pub fn modified_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.modified).count()
     }
 
     /// Bring a tab to the front. Returns false if there is no such tab.
@@ -314,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn tabs_can_be_renamed_and_marked_modified() {
+        let mut tabs = Tabs::new();
+        let a = tabs.open(DocKind::Markdown, "未命名笔记 1");
+        let b = tabs.open(DocKind::Markdown, "b.md");
+        assert_eq!(tabs.modified_count(), 0);
+        assert!(tabs.set_modified(a, true));
+        // Saying it again is not news.
+        assert!(!tabs.set_modified(a, true));
+        assert_eq!(tabs.modified_count(), 1);
+        tabs.rename(a, "notes.md");
+        assert_eq!(titles(&tabs), ["notes.md", "b.md"]);
+        assert!(tabs.get(a).is_some_and(|tab| tab.modified));
+        assert!(tabs.set_modified(a, false));
+        assert!(!tabs.set_modified(b, false));
+        // A tab that is gone is ignored.
+        tabs.close(a);
+        tabs.rename(a, "x");
+        assert!(!tabs.set_modified(a, true));
+        assert_eq!(titles(&tabs), ["b.md"]);
+    }
+
+    #[test]
     fn cycling_wraps_around() {
         let mut tabs = Tabs::new();
         tabs.cycle(true);
@@ -337,11 +387,11 @@ mod tests {
             assert!(!kind.name().is_empty());
         }
         assert_eq!(DocKind::from_index(DocKind::ALL.len()), None);
-        // Only the text surface exists so far.
+        // Only the two text views exist so far.
         let real: Vec<_> = DocKind::ALL
             .into_iter()
             .filter(|kind| kind.is_implemented())
             .collect();
-        assert_eq!(real, [DocKind::Writer]);
+        assert_eq!(real, [DocKind::Writer, DocKind::Markdown]);
     }
 }

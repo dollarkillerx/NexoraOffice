@@ -1,13 +1,16 @@
 //! Command-line options of the shell binary.
 //!
-//! They exist so a given state of the window can be reached without clicking:
-//! for screenshots, and for checking a theme or a language.
+//! Files named on the command line are opened in Markdown tabs. The flags exist
+//! so a given state of the window can be reached without clicking: for
+//! screenshots, and for checking a theme or a language.
+
+use std::path::PathBuf;
 
 use crate::i18n::Language;
 use crate::tabs::DocKind;
 use crate::theme::ThemeMode;
 
-pub const USAGE: &str = "usage: aster-shell [--theme light|dark] [--assistant] [--open writer|sheets|slides|markdown|pdf]...";
+pub const USAGE: &str = "usage: aster-shell [--theme light|dark] [--assistant] [--open writer|sheets|slides|markdown|pdf]... [file]...";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -16,8 +19,10 @@ pub struct Options {
     pub language: Option<Language>,
     /// Start with the assistant panel open.
     pub assistant: bool,
-    /// Documents to open at start-up, in order.
+    /// New documents to open at start-up, in order.
     pub open: Vec<DocKind>,
+    /// Text files to open at start-up, after the new documents.
+    pub files: Vec<PathBuf>,
 }
 
 impl Default for Options {
@@ -27,6 +32,7 @@ impl Default for Options {
             language: None,
             assistant: false,
             open: Vec::new(),
+            files: Vec::new(),
         }
     }
 }
@@ -73,7 +79,8 @@ where
                     parse_kind(&name).ok_or_else(|| format!("unknown document kind {name:?}"))?;
                 options.open.push(kind);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            flag if flag.starts_with("--") => return Err(format!("unknown argument {flag:?}")),
+            file => options.files.push(PathBuf::from(file)),
         }
     }
     Ok(options)
@@ -108,6 +115,7 @@ mod tests {
                 language: Some(Language::Ja),
                 assistant: true,
                 open: vec![DocKind::Writer, DocKind::Pdf],
+                files: Vec::new(),
             })
         );
     }
@@ -118,6 +126,19 @@ mod tests {
             let options = parse(["--open", &kind.name().to_lowercase()]).expect("valid");
             assert_eq!(options.open, [kind]);
         }
+    }
+
+    #[test]
+    fn other_arguments_are_files_to_open() {
+        let options = parse(["notes.md", "--theme", "dark", "/tmp/会议 纪要.txt"]).expect("valid");
+        assert_eq!(
+            options.files,
+            [
+                PathBuf::from("notes.md"),
+                PathBuf::from("/tmp/会议 纪要.txt")
+            ]
+        );
+        assert_eq!(options.theme, ThemeMode::Dark);
     }
 
     #[test]

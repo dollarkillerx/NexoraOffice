@@ -1,0 +1,125 @@
+import { Tokens, Strings } from "tokens.slint";
+import { TextButton } from "widgets.slint";
+
+// A question or a message over the whole window. Nothing behind it reacts
+// until it is answered.
+export component Dialog inherits Rectangle {
+    // 1 unsaved changes: save, don't save, cancel.
+    // 2 message: OK.
+    // 3 quitting with unsaved changes: quit anyway, cancel.
+    in property <int> kind;
+    in property <string> title;
+    in property <string> body;
+    callback save();
+    callback discard();
+    callback cancel();
+    background: #00000040;
+
+    // Takes every click and scroll that misses the card.
+    TouchArea {
+        scroll-event => {
+            return accept;
+        }
+    }
+
+    scope := FocusScope {
+        init => {
+            self.focus();
+        }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.cancel();
+                return accept;
+            }
+            if (event.text == Key.Return) {
+                if (root.kind == 1) {
+                    root.save();
+                } else if (root.kind == 2) {
+                    root.cancel();
+                }
+                return accept;
+            }
+            // Keys must not reach the document while a question is open.
+            return accept;
+        }
+    }
+
+    Rectangle {
+        width: 420px;
+        height: card.preferred-height;
+        border-radius: Tokens.radius-lg;
+        border-width: 1px;
+        border-color: Tokens.hairline;
+        background: Tokens.surface;
+        drop-shadow-blur: 32px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000040;
+
+        // Clicks on the card are not clicks on the scrim.
+        TouchArea { }
+
+        card := VerticalLayout {
+            padding: Tokens.space-xl;
+            spacing: Tokens.space-sm;
+            Text {
+                text: root.title;
+                font-size: Tokens.font-lg;
+                font-weight: 600;
+                color: Tokens.text;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.body;
+                font-size: Tokens.font-md;
+                color: Tokens.text-secondary;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                height: Tokens.space-md;
+            }
+
+            HorizontalLayout {
+                spacing: Tokens.space-sm;
+                if root.kind == 1: TextButton {
+                    text: Strings.button-discard;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+                if root.kind == 3: TextButton {
+                    text: Strings.button-quit-anyway;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                if root.kind != 2: TextButton {
+                    text: Strings.button-cancel;
+                    primary: root.kind == 3;
+                    clicked => {
+                        root.cancel();
+                    }
+                }
+                if root.kind == 1: TextButton {
+                    text: Strings.button-save;
+                    primary: true;
+                    clicked => {
+                        root.save();
+                    }
+                }
+                if root.kind == 2: TextButton {
+                    text: Strings.button-ok;
+                    primary: true;
+                    clicked => {
+                        root.cancel();
+                    }
+                }
+            }
+        }
+    }
+}

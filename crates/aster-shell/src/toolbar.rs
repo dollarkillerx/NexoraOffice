@@ -153,15 +153,19 @@ impl Command {
             .copied()
     }
 
-    /// Whether this build can carry the command out on a view of this kind.
-    /// Today that is zooming the plain-text surface behind Writer tabs, and
-    /// nothing else.
+    /// Whether this build can carry the command out on a view of this kind:
+    /// zoom on the plain-text surface behind Writer tabs, undo and redo in
+    /// Markdown tabs, and nothing else. Whether there is anything to undo right
+    /// now is a separate question, answered by [`ViewState`].
     pub fn is_available(self, kind: DocKind) -> bool {
-        kind == DocKind::Writer
-            && matches!(
+        match kind {
+            DocKind::Writer => matches!(
                 self,
                 Command::ZoomOut | Command::ZoomReset | Command::ZoomIn
-            )
+            ),
+            DocKind::Markdown => matches!(self, Command::Undo | Command::Redo),
+            DocKind::Sheets | DocKind::Slides | DocKind::Pdf => false,
+        }
     }
 }
 
@@ -204,11 +208,30 @@ pub struct Item {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub zoom_percent: u32,
+    /// There is a step to take back.
+    pub can_undo: bool,
+    /// There is an undone step to do again.
+    pub can_redo: bool,
 }
 
 impl Default for ViewState {
     fn default() -> Self {
-        Self { zoom_percent: 100 }
+        Self {
+            zoom_percent: 100,
+            can_undo: false,
+            can_redo: false,
+        }
+    }
+}
+
+impl ViewState {
+    /// Whether a command the view supports has something to act on right now.
+    fn allows(&self, command: Command) -> bool {
+        match command {
+            Command::Undo => self.can_undo,
+            Command::Redo => self.can_redo,
+            _ => true,
+        }
     }
 }
 
@@ -218,6 +241,7 @@ const DEFAULT_FONT: &str = "Noto Sans CJK";
 
 struct Builder {
     kind: DocKind,
+    view: ViewState,
     items: Vec<Item>,
 }
 
@@ -226,7 +250,7 @@ impl Builder {
         self.items.push(Item {
             control,
             command: Some(command),
-            enabled: command.is_available(self.kind),
+            enabled: command.is_available(self.kind) && self.view.allows(command),
         });
         self
     }
@@ -320,6 +344,7 @@ impl Builder {
 pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
     let mut b = Builder {
         kind,
+        view,
         items: Vec::new(),
     };
     let plain = LetterStyle::default();
@@ -521,9 +546,15 @@ mod tests {
     }
 
     #[test]
-    fn a_control_is_enabled_exactly_when_its_command_is_available() {
-        for (kind, items) in all_toolbars() {
-            for item in &items {
+    fn a_control_is_enabled_only_if_its_command_is_available() {
+        // With something to undo and redo, "available" is the whole story.
+        let busy = ViewState {
+            can_undo: true,
+            can_redo: true,
+            ..ViewState::default()
+        };
+        for kind in DocKind::ALL {
+            for item in toolbar(kind, busy, &ZH_HANS) {
                 match item.command {
                     Some(command) => {
                         assert_eq!(
@@ -539,22 +570,52 @@ mod tests {
     }
 
     #[test]
-    fn only_writer_zoom_works_today() {
-        for (kind, items) in all_toolbars() {
-            let enabled: Vec<_> = items
-                .iter()
+    fn what_works_today_is_writer_zoom_and_markdown_history() {
+        let busy = ViewState {
+            can_undo: true,
+            can_redo: true,
+            ..ViewState::default()
+        };
+        for kind in DocKind::ALL {
+            let enabled: Vec<_> = toolbar(kind, busy, &ZH_HANS)
+                .into_iter()
                 .filter(|item| item.enabled)
                 .filter_map(|item| item.command)
                 .collect();
-            if kind == DocKind::Writer {
-                assert_eq!(
+            match kind {
+                DocKind::Writer => assert_eq!(
                     enabled,
                     [Command::ZoomOut, Command::ZoomReset, Command::ZoomIn]
-                );
-            } else {
-                assert_eq!(enabled, [], "{kind:?} is a placeholder");
+                ),
+                DocKind::Markdown => assert_eq!(enabled, [Command::Undo, Command::Redo]),
+                _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }
+    }
+
+    #[test]
+    fn undo_and_redo_follow_the_document() {
+        let enabled = |view: ViewState, command: Command| {
+            toolbar(DocKind::Markdown, view, &ZH_HANS)
+                .into_iter()
+                .find(|item| item.command == Some(command))
+                .is_some_and(|item| item.enabled)
+        };
+        let fresh = ViewState::default();
+        assert!(!enabled(fresh, Command::Undo));
+        assert!(!enabled(fresh, Command::Redo));
+        let edited = ViewState {
+            can_undo: true,
+            ..fresh
+        };
+        assert!(enabled(edited, Command::Undo));
+        assert!(!enabled(edited, Command::Redo));
+        // A Writer tab has no history, whatever the view state says.
+        let writer_undo = toolbar(DocKind::Writer, edited, &ZH_HANS)
+            .into_iter()
+            .find(|item| item.command == Some(Command::Undo))
+            .expect("Writer shows an undo button");
+        assert!(!writer_undo.enabled);
     }
 
     #[test]
@@ -569,7 +630,11 @@ mod tests {
 
     #[test]
     fn the_zoom_readout_follows_the_view() {
-        let items = toolbar(DocKind::Writer, ViewState { zoom_percent: 125 }, &ZH_HANS);
+        let view = ViewState {
+            zoom_percent: 125,
+            ..ViewState::default()
+        };
+        let items = toolbar(DocKind::Writer, view, &ZH_HANS);
         let readout = items
             .iter()
             .find(|item| item.command == Some(Command::ZoomReset))

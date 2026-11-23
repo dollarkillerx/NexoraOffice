@@ -1,0 +1,11 @@
+[package]
+name = "aster-markdown"
+version.workspace = true
+license.workspace = true
+description = "The Markdown editor's document: text, selection, edit commands, undo history and the file format"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+icu_segmenter = { workspace = true }

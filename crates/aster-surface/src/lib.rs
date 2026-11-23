@@ -11,6 +11,8 @@
 mod glyphs;
 pub mod host;
 pub mod preview;
+pub mod sheet_view;
+pub mod slide_view;
 pub mod text_surface;
 pub mod text_view;
 
@@ -79,3 +81,49 @@ macro_rules! surface {
 
 surface!(TextSurface);
 surface!(TextView);
+
+/// Read-only views take no text input; scrolling is vertical.
+macro_rules! viewer {
+    ($type:ty, $scroll:expr) => {
+        impl Surface for $type {
+            fn resize(&mut self, width: u16, height: u16, scale: f32) {
+                <$type>::resize(self, width, height, scale)
+            }
+            fn size(&self) -> (u16, u16, f32) {
+                <$type>::size(self)
+            }
+            fn set_caret_on(&mut self, _on: bool) {}
+            fn render(&mut self) -> &Pixmap {
+                <$type>::render(self)
+            }
+            fn scroll_by(&mut self, delta: f64) -> bool {
+                #[allow(clippy::redundant_closure_call)]
+                ($scroll)(self, delta)
+            }
+            fn scroll_range(&mut self) -> (f64, f64) {
+                <$type>::scroll_range(self)
+            }
+            fn is_composing(&self) -> bool {
+                false
+            }
+            fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+                (0.0, 0.0, 0.0, 0.0)
+            }
+            fn text(&self) -> String {
+                <$type>::text(self)
+            }
+        }
+    };
+}
+
+viewer!(
+    sheet_view::SheetView,
+    |view: &mut sheet_view::SheetView, delta| view.scroll_by(0.0, delta)
+);
+viewer!(
+    slide_view::SlideView,
+    |view: &mut slide_view::SlideView, delta| {
+        let x = f64::from(view.size().0);
+        view.wheel(x, delta)
+    }
+);

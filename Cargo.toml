@@ -1,9 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/aster-calc",
     "crates/aster-markdown",
     "crates/aster-platform",
+    "crates/aster-ooxml",
+    "crates/aster-sheets",
     "crates/aster-shell",
+    "crates/aster-slides",
     "crates/aster-storage",
     "crates/aster-surface",
     "crates/aster-text",
@@ -30,8 +34,12 @@ publish = false
 # API both change between minor releases; upgrading means re-running the Phase 0
 # gate tests (G1 input method, G2 frame path).
 [workspace.dependencies]
+aster-calc = { path = "crates/aster-calc" }
 aster-markdown = { path = "crates/aster-markdown" }
+aster-ooxml = { path = "crates/aster-ooxml" }
 aster-platform = { path = "crates/aster-platform" }
+aster-sheets = { path = "crates/aster-sheets" }
+aster-slides = { path = "crates/aster-slides" }
 aster-storage = { path = "crates/aster-storage" }
 aster-surface = { path = "crates/aster-surface" }
 aster-text = { path = "crates/aster-text" }
@@ -77,6 +85,13 @@ ropey = { version = "~1.6.1", default-features = false, features = ["simd"] }
 # search can be confined to a window of the text and cancelled between them.
 regex-automata = "~0.4.19"
 regex-syntax = "~0.8.12"
+# XLSX and PPTX (ADR 0001): our own package layer on these two, the same pair
+# the G4 gate measured. Only reading and inflating; nothing is written yet.
+zip = { version = "~8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "~0.42.0"
+# The formula engine (ADR 0002), only through `aster-calc`. Exact version: an
+# upgrade means re-running G5's measurements and its 69-formula comparison.
+formualizer = { version = "=0.15.0", default-features = false, features = ["workbook", "eval", "common", "system-clock"] }
 
 [profile.dev]
 opt-level = 1

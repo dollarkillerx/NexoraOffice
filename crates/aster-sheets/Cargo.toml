@@ -1,0 +1,10 @@
+[package]
+name = "aster-sheets"
+version.workspace = true
+license.workspace = true
+description = "The Sheets document model: workbooks, sparse cells, row and column sizes, number formats"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

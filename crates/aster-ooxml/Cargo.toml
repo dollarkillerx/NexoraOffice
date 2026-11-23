@@ -1,0 +1,14 @@
+[package]
+name = "aster-ooxml"
+version.workspace = true
+license.workspace = true
+description = "Office Open XML: the OPC package with safety limits, and the XLSX and PPTX readers"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aster-sheets = { workspace = true }
+aster-slides = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }

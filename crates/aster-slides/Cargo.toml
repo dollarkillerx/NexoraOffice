@@ -1,0 +1,10 @@
+[package]
+name = "aster-slides"
+version.workspace = true
+license.workspace = true
+description = "The Slides document model: presentations, slides, shapes and their text"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1474,7 +1474,7 @@ fn draw_shape(ctx: &mut RenderContext, shape: &Piece, scale: f32) {
 
 /// Draw the lines of a paragraph between `top` and `bottom` (relative to the
 /// paragraph), in the current transform.
-fn draw_text(
+pub(crate) fn draw_text(
     ctx: &mut RenderContext,
     resources: &mut Resources,
     paragraph: &Paragraph,

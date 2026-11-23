@@ -36,6 +36,10 @@ allow = [
     "BSL-1.0",
     # Unicode data tables used by ICU4X.
     "Unicode-3.0",
+    # A public-domain dedication. Accepted by the project owner on 2026-11-23
+    # for the formula engine (ADR 0002): formualizer's Apache Arrow pulls in
+    # `tiny-keccak`, licensed CC0-1.0 only, used at compile time.
+    "CC0-1.0",
     # Slint is offered under GPL-3.0-only, a royalty-free licence with usage
     # restrictions, or a commercial one. An AGPL project has to take the GPL
     # option: the royalty-free licence restricts fields of use, which the AGPL

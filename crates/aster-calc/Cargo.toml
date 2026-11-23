@@ -1,0 +1,12 @@
+[package]
+name = "aster-calc"
+version.workspace = true
+license.workspace = true
+description = "The formula engine adapter: formualizer behind aster-sheets' CalcEngine (ADR 0002)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aster-sheets = { workspace = true }
+formualizer = { workspace = true }

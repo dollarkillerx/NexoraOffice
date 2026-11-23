@@ -514,19 +514,25 @@ impl SlideView {
                 self.ctx.set_paint(color(PAGE_LINE));
                 self.ctx.set_stroke(Stroke::new(line_width));
                 self.ctx.stroke_rect(&frame);
-                let x = (frame.x0 + frame.x1 - f64::from(label.width())) / 2.0;
-                let y = (frame.y0 + frame.y1 - f64::from(label.height())) / 2.0;
-                self.ctx
-                    .set_transform(transform * Affine::translate((x, y)));
-                draw_text(
-                    &mut self.ctx,
-                    &mut self.resources,
-                    label,
-                    0.0,
-                    label.height(),
-                    self.scale,
-                    &mut self.glyphs,
-                );
+                // A small picture, such as an icon in front of a line of
+                // text, is only a box: its name would spill over the text.
+                let fits = f64::from(label.width()) <= frame.width() * 0.9
+                    && f64::from(label.height()) <= frame.height() * 0.9;
+                if fits {
+                    let x = (frame.x0 + frame.x1 - f64::from(label.width())) / 2.0;
+                    let y = (frame.y0 + frame.y1 - f64::from(label.height())) / 2.0;
+                    self.ctx
+                        .set_transform(transform * Affine::translate((x, y)));
+                    draw_text(
+                        &mut self.ctx,
+                        &mut self.resources,
+                        label,
+                        0.0,
+                        label.height(),
+                        self.scale,
+                        &mut self.glyphs,
+                    );
+                }
             }
             if shape.outlined {
                 self.ctx.set_transform(transform);

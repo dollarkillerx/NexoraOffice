@@ -405,6 +405,7 @@ name = "aster-surface"
 version = "0.0.1"
 dependencies = [
  "aster-markdown",
+ "aster-ooxml",
  "aster-sheets",
  "aster-slides",
  "aster-text",

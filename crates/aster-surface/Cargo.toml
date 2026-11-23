@@ -17,3 +17,6 @@ slint = { workspace = true }
 parley = { workspace = true }
 vello_cpu = { workspace = true }
 bytemuck = { workspace = true }
+
+[dev-dependencies]
+aster-ooxml = { workspace = true }

@@ -24,14 +24,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
+use aster_sheets::Cancel;
 use aster_shell::cli::{self, Options};
 use aster_shell::files::{self, LoadError};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
+use aster_shell::office::{self, SheetTab, SlidesTab};
 use aster_shell::recovery::{self, Age, Candidate, RecordInfo};
 use aster_shell::sidebar::{self, Look, SIDEBAR_RECENT};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
@@ -76,12 +79,18 @@ const WINDOW_BUTTONS_INSET: f32 = 76.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 /// Extensions offered in the open and save dialogs.
 const TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
+/// Everything the open dialog offers at once.
+const SUPPORTED_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "xlsx", "xlsm", "pptx", "pptm"];
 
-/// What a tab holds. Tabs of the other kinds hold nothing yet.
+/// What a tab holds. Untitled Sheets, Slides and PDF tabs hold nothing yet.
 enum Content {
-    // Boxed: both are several kilobytes, and tabs are moved around.
+    // Boxed: each is several kilobytes, and tabs are moved around.
     Writer(Box<WriterView>),
     Markdown(Box<MarkdownEditor>),
+    /// A workbook from a file, read-only.
+    Sheet(Box<SheetTab>),
+    /// A presentation from a file, read-only.
+    Slides(Box<SlidesTab>),
 }
 
 impl Content {
@@ -89,6 +98,8 @@ impl Content {
         match self {
             Content::Writer(view) => &mut view.surface,
             Content::Markdown(editor) => &mut editor.surface,
+            Content::Sheet(tab) => &mut tab.view,
+            Content::Slides(tab) => &mut tab.view,
         }
     }
 
@@ -96,6 +107,17 @@ impl Content {
         match self {
             Content::Writer(view) => view.stats,
             Content::Markdown(editor) => editor.stats,
+            Content::Sheet(_) | Content::Slides(_) => TextStats::default(),
+        }
+    }
+
+    /// The file a tab shows, if it came from one.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Content::Markdown(editor) => editor.path.as_deref(),
+            Content::Sheet(tab) => Some(&tab.path),
+            Content::Slides(tab) => Some(&tab.path),
+            Content::Writer(_) => None,
         }
     }
 }
@@ -232,21 +254,35 @@ impl Shell {
     fn active_writer(&mut self) -> Option<&mut WriterView> {
         match self.active_content()? {
             Content::Writer(view) => Some(&mut **view),
-            Content::Markdown(_) => None,
+            _ => None,
         }
     }
 
     fn active_markdown(&mut self) -> Option<&mut MarkdownEditor> {
         match self.active_content()? {
             Content::Markdown(editor) => Some(&mut **editor),
-            Content::Writer(_) => None,
+            _ => None,
+        }
+    }
+
+    fn active_sheet(&mut self) -> Option<&mut SheetTab> {
+        match self.active_content()? {
+            Content::Sheet(tab) => Some(&mut **tab),
+            _ => None,
+        }
+    }
+
+    fn active_slides(&mut self) -> Option<&mut SlidesTab> {
+        match self.active_content()? {
+            Content::Slides(tab) => Some(&mut **tab),
+            _ => None,
         }
     }
 
     fn markdown(&mut self, id: TabId) -> Option<&mut MarkdownEditor> {
         match self.contents.get_mut(&id)? {
             Content::Markdown(editor) => Some(&mut **editor),
-            Content::Writer(_) => None,
+            _ => None,
         }
     }
 
@@ -337,16 +373,12 @@ impl Shell {
 
     /// The tab that already shows this file, if any.
     fn tab_of_file(&self, path: &Path) -> Option<TabId> {
-        self.contents
-            .iter()
-            .find_map(|(id, content)| match content {
-                Content::Markdown(editor) => editor
-                    .path
-                    .as_deref()
-                    .is_some_and(|open| files::same_file(open, path))
-                    .then_some(*id),
-                Content::Writer(_) => None,
-            })
+        self.contents.iter().find_map(|(id, content)| {
+            content
+                .path()
+                .is_some_and(|open| files::same_file(open, path))
+                .then_some(*id)
+        })
     }
 
     /// Show a file that has been read from disk. A file that is already open is
@@ -374,6 +406,30 @@ impl Shell {
         );
         self.contents
             .insert(id, Content::Markdown(Box::new(editor)));
+        id
+    }
+
+    /// Show a workbook or presentation that has been read from disk.
+    fn open_office(&mut self, path: PathBuf, loaded: office::Loaded) -> TabId {
+        self.leave_active_document();
+        if let Some(id) = self.tab_of_file(&path) {
+            self.tabs.activate(id);
+            return id;
+        }
+        let title = files::display_name(&path);
+        let content = match loaded {
+            office::Loaded::Workbook(workbook) => {
+                let id = self.tabs.open(DocKind::Sheets, title);
+                let tab = SheetTab::new(workbook, path, &self.tokens);
+                self.contents.insert(id, Content::Sheet(Box::new(tab)));
+                return id;
+            }
+            office::Loaded::Presentation(presentation) => {
+                SlidesTab::new(presentation, path, &self.tokens, self.language.strings())
+            }
+        };
+        let id = self.tabs.open(DocKind::Slides, title);
+        self.contents.insert(id, Content::Slides(Box::new(content)));
         id
     }
 
@@ -545,10 +601,13 @@ impl Shell {
 
     fn set_theme(&mut self, mode: ThemeMode) {
         self.tokens = theme::Tokens::of(mode);
+        let strings = self.language.strings();
         for content in self.contents.values_mut() {
             match content {
                 Content::Writer(view) => view.restyle(&self.tokens),
                 Content::Markdown(editor) => editor.restyle(&self.tokens),
+                Content::Sheet(tab) => tab.restyle(&self.tokens),
+                Content::Slides(tab) => tab.restyle(&self.tokens, strings),
             }
         }
     }
@@ -954,6 +1013,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
         }
     }
     ui.set_editing(shell.active_markdown().is_some());
+    refresh_viewer(ui, shell);
     refresh_toolbar(ui, shell);
     refresh_status(ui, shell);
     refresh_find(ui, shell);
@@ -1004,8 +1064,10 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
         kind.map_or(strings.start, |kind| strings.kind_label(kind))
             .into(),
     );
+    let viewing = shell.active_sheet().is_some() || shell.active_slides().is_some();
     ui.set_status_note(
         match kind {
+            _ if viewing => strings.read_only_note,
             Some(DocKind::Writer) => strings.plain_text_note,
             Some(DocKind::Markdown) => strings.markdown_note,
             Some(_) => strings.placeholder_view,
@@ -1050,6 +1112,26 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             };
             ui.set_status_notice(notice.into());
         }
+        Some(Content::Sheet(tab)) => {
+            ui.set_status_zoom(SharedString::new());
+            ui.set_zoom_enabled(false);
+            ui.set_status_format("XLSX".into());
+            let notice = match &tab.calc {
+                office::Calc::Running(_) => strings.calc_running.to_owned(),
+                office::Calc::Done(0) => String::new(),
+                office::Calc::Done(count) => {
+                    i18n::fill(strings.calc_done, "count", &group_digits(*count))
+                }
+                office::Calc::Failed(reason) => i18n::fill(strings.calc_failed, "reason", reason),
+            };
+            ui.set_status_notice(notice.into());
+        }
+        Some(Content::Slides(_)) => {
+            ui.set_status_zoom(SharedString::new());
+            ui.set_zoom_enabled(false);
+            ui.set_status_format("PPTX".into());
+            ui.set_status_notice(SharedString::new());
+        }
         None => {
             ui.set_status_zoom(SharedString::new());
             ui.set_zoom_enabled(false);
@@ -1058,24 +1140,50 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
         }
     }
 
-    match shell.active_content() {
-        Some(content) => {
-            let stats = content.stats();
-            let count = |template: &str, value: usize| {
-                SharedString::from(i18n::fill(template, "count", &group_digits(value)))
-            };
-            ui.set_status_words(count(strings.word_count, stats.words));
-            ui.set_status_chars(count(strings.char_count, stats.chars));
-            let composing = content.surface().is_composing();
-            let state = if composing { ImeState::Composing } else { ime };
-            ui.set_status_ime(strings.ime(state).into());
-            ui.set_status_composing(composing);
-        }
-        None => {
-            ui.set_status_words(SharedString::new());
-            ui.set_status_chars(SharedString::new());
-            ui.set_status_ime(SharedString::new());
-            ui.set_status_composing(false);
+    if let Some(tab) = shell.active_sheet() {
+        let cells = tab.view.sheet().map_or(0, |sheet| sheet.cell_count());
+        ui.set_status_words(i18n::fill(strings.cell_count, "count", &group_digits(cells)).into());
+        ui.set_status_chars(SharedString::new());
+        ui.set_status_ime(SharedString::new());
+        ui.set_status_composing(false);
+    } else if let Some(tab) = shell.active_slides() {
+        let position = if tab.view.count() == 0 {
+            String::new()
+        } else {
+            i18n::fill(
+                &i18n::fill(
+                    strings.slide_position,
+                    "index",
+                    &(tab.view.current() + 1).to_string(),
+                ),
+                "count",
+                &tab.view.count().to_string(),
+            )
+        };
+        ui.set_status_words(position.into());
+        ui.set_status_chars(SharedString::new());
+        ui.set_status_ime(SharedString::new());
+        ui.set_status_composing(false);
+    } else {
+        match shell.active_content() {
+            Some(content) => {
+                let stats = content.stats();
+                let count = |template: &str, value: usize| {
+                    SharedString::from(i18n::fill(template, "count", &group_digits(value)))
+                };
+                ui.set_status_words(count(strings.word_count, stats.words));
+                ui.set_status_chars(count(strings.char_count, stats.chars));
+                let composing = content.surface().is_composing();
+                let state = if composing { ImeState::Composing } else { ime };
+                ui.set_status_ime(strings.ime(state).into());
+                ui.set_status_composing(composing);
+            }
+            None => {
+                ui.set_status_words(SharedString::new());
+                ui.set_status_chars(SharedString::new());
+                ui.set_status_ime(SharedString::new());
+                ui.set_status_composing(false);
+            }
         }
     }
 
@@ -1433,6 +1541,28 @@ fn text_file_types(strings: &'static i18n::Strings) -> [FileType; 1] {
         name: strings.file_type_text,
         extensions: TEXT_EXTENSIONS,
     }]
+}
+
+/// What the open dialog offers: everything at once, then each kind.
+fn open_file_types(strings: &'static i18n::Strings) -> [FileType; 4] {
+    [
+        FileType {
+            name: strings.file_type_supported,
+            extensions: SUPPORTED_EXTENSIONS,
+        },
+        FileType {
+            name: strings.file_type_text,
+            extensions: TEXT_EXTENSIONS,
+        },
+        FileType {
+            name: strings.file_type_spreadsheet,
+            extensions: office::SHEET_EXTENSIONS,
+        },
+        FileType {
+            name: strings.file_type_presentation,
+            extensions: office::SLIDE_EXTENSIONS,
+        },
+    ]
 }
 
 // --- Work that leaves this thread and comes back ---------------------------
@@ -1990,6 +2120,18 @@ fn start_load(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
     shell.opening.push(path.clone());
     refresh_status(ui, shell);
     let weak = ui.as_weak();
+    if office::kind_of(&path).is_some() {
+        std::thread::spawn(move || {
+            let result = office::load(&path);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| finish_office_load(ui, shell, path, result)),
+                );
+            });
+        });
+        return;
+    }
     std::thread::spawn(move || {
         // Reading, decoding and preparing a large file all happen here.
         let result = files::load(&path).map(content::open);
@@ -2147,6 +2289,155 @@ fn finish_load(
             show_dialog(ui, shell, 2, title, reason);
         }
     }
+}
+
+fn finish_office_load(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    path: PathBuf,
+    result: Result<office::Loaded, office::LoadError>,
+) {
+    if let Some(at) = shell.opening.iter().position(|opening| opening == &path) {
+        shell.opening.remove(at);
+    }
+    match result {
+        Ok(loaded) => {
+            shell.remember_file(&path);
+            let id = shell.open_office(path, loaded);
+            start_calc(ui, shell, id);
+            after_tab_change(ui, shell);
+        }
+        Err(err) => {
+            refresh_status(ui, shell);
+            let strings = shell.language.strings();
+            let title = i18n::fill(strings.open_failed, "name", &files::display_name(&path));
+            show_dialog(ui, shell, 2, title, err.message(strings));
+        }
+    }
+}
+
+/// Calculate a workbook's formulas on a worker thread. Until the results
+/// arrive the grid shows the values saved in the file.
+fn start_calc(ui: &AppWindow, shell: &mut Shell, id: TabId) {
+    let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+        return;
+    };
+    let workbook = tab.view.workbook().clone();
+    if workbook.formulas().next().is_none() {
+        return;
+    }
+    let cancel = Cancel::new();
+    tab.calc = office::Calc::Running(cancel.clone());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = office::calculate(&workbook, &cancel);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| finish_calc(ui, shell, id, result)),
+            );
+        });
+    });
+}
+
+fn finish_calc(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    result: Result<(aster_sheets::Workbook, usize), aster_sheets::CalcError>,
+) {
+    // The tab may have been closed meanwhile.
+    let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+        return;
+    };
+    tab.calc = match result {
+        Ok((workbook, formulas)) => {
+            tab.view.set_workbook(Arc::new(workbook));
+            office::Calc::Done(formulas)
+        }
+        Err(aster_sheets::CalcError::Cancelled) => office::Calc::Done(0),
+        Err(err) => office::Calc::Failed(err.to_string()),
+    };
+    if shell.tabs.active_id() == Some(id) {
+        refresh_viewer(ui, shell);
+        refresh_status(ui, shell);
+        present(ui, shell);
+    }
+}
+
+/// What the chrome around a viewer shows: the formula bar and sheet tabs of
+/// a workbook, the note over an empty presentation.
+fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    if let Some(tab) = shell.active_sheet() {
+        let view = &tab.view;
+        let visible = view.visible_sheets();
+        let names: Vec<SharedString> = visible
+            .iter()
+            .map(|&i| view.workbook().sheets[i].name.as_str().into())
+            .collect();
+        let current = visible.iter().position(|&i| i == view.sheet_index());
+        let (address, content) = view.selection_text();
+        let note = match view.sheet().map(|sheet| sheet.kind) {
+            Some(aster_sheets::SheetKind::Chart) => strings.chart_sheet,
+            _ => "",
+        };
+        ui.set_viewer(1);
+        ui.set_sheet_names(model(names));
+        ui.set_sheet_index(current.map_or(-1, |i| i as i32));
+        ui.set_cell_address(address.into());
+        ui.set_cell_content(content.into());
+        ui.set_viewer_note(note.into());
+        return;
+    }
+    if let Some(tab) = shell.active_slides() {
+        let note = if tab.view.count() == 0 {
+            strings.no_slides
+        } else {
+            ""
+        };
+        ui.set_viewer(2);
+        ui.set_viewer_note(note.into());
+        return;
+    }
+    ui.set_viewer(0);
+    ui.set_viewer_note(SharedString::new());
+}
+
+/// A key on a viewer, decoded from what Slint reports.
+fn viewer_key(text: &str) -> Option<office::Key> {
+    use slint::platform::Key;
+
+    let mut chars = text.chars();
+    let (Some(key), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let is = |k: Key| char::from(k) == key;
+    Some(if is(Key::UpArrow) {
+        office::Key::Up
+    } else if is(Key::DownArrow) {
+        office::Key::Down
+    } else if is(Key::LeftArrow) {
+        office::Key::Left
+    } else if is(Key::RightArrow) {
+        office::Key::Right
+    } else if is(Key::PageUp) {
+        office::Key::PageUp
+    } else if is(Key::PageDown) {
+        office::Key::PageDown
+    } else if is(Key::Home) {
+        office::Key::Home
+    } else if is(Key::End) {
+        office::Key::End
+    } else if is(Key::Tab) || key == '\u{19}' {
+        office::Key::Tab
+    } else if is(Key::Return) {
+        office::Key::Enter
+    } else if key == ' ' {
+        office::Key::Space
+    } else {
+        return None;
+    })
 }
 
 /// Write a document on a worker thread.
@@ -2450,7 +2741,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     committed
                 }
                 Some(Content::Markdown(editor)) => editor.ime(event),
-                None => return EventResult::Propagate,
+                _ => return EventResult::Propagate,
             };
             after_edit(&ui, shell, text_changed);
             EventResult::PreventDefault
@@ -2485,6 +2776,27 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
             return handled;
         }
+        if shell.active_sheet().is_some() || shell.active_slides().is_some() {
+            let Some(key) = viewer_key(text.as_str()) else {
+                return false;
+            };
+            let moved = if let Some(tab) = shell.active_sheet() {
+                match office::sheet_key(key, shift, primary) {
+                    Some(key) => tab.view.key(key),
+                    None => false,
+                }
+            } else if let Some(tab) = shell.active_slides() {
+                office::slide_key(&mut tab.view, key, shift)
+            } else {
+                false
+            };
+            if moved {
+                refresh_viewer(&ui, shell);
+                refresh_status(&ui, shell);
+                present(&ui, shell);
+            }
+            return true;
+        }
         let Some(action) = host::decode_key(text.as_str(), shift, primary, alt) else {
             return false;
         };
@@ -2501,7 +2813,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 true
             }
             Some(Content::Markdown(editor)) => editor.key(action),
-            None => return false,
+            _ => return false,
         };
         after_edit(&ui, shell, text_changed);
         true
@@ -2513,6 +2825,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
             Some(Content::Markdown(editor)) => editor.pointer_down(x, y, shift),
+            Some(Content::Sheet(tab)) => {
+                if tab.view.press(x, y) {
+                    refresh_viewer(&ui, shell);
+                    present(&ui, shell);
+                }
+                return;
+            }
+            Some(Content::Slides(tab)) => {
+                if tab.view.press(x, y) {
+                    refresh_status(&ui, shell);
+                    present(&ui, shell);
+                }
+                return;
+            }
             None => return,
         }
         after_edit(&ui, shell, false);
@@ -2524,13 +2850,27 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_drag(x, y),
             Some(Content::Markdown(editor)) => editor.pointer_drag(x, y),
-            None => return,
+            _ => return,
         }
         present(&ui, shell);
     }));
 
-    ui.on_scrolled(handler!(|ui, shell, delta| {
+    ui.on_scrolled(handler!(|ui, shell, delta_x, delta, pointer_x| {
         let scale = f64::from(ui.window().scale_factor());
+        let (dx, dy) = (-f64::from(delta_x) * scale, -f64::from(delta) * scale);
+        if let Some(tab) = shell.active_sheet() {
+            if tab.view.scroll_by(dx, dy) {
+                present(&ui, shell);
+            }
+            return;
+        }
+        if let Some(tab) = shell.active_slides() {
+            if tab.view.wheel(f64::from(pointer_x) * scale, dy) {
+                refresh_status(&ui, shell);
+                present(&ui, shell);
+            }
+            return;
+        }
         if let Some(surface) = shell.active_surface()
             && surface.scroll_by(-f64::from(delta) * scale)
         {
@@ -2716,10 +3056,26 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         present(&ui, shell);
     }));
 
+    ui.on_sheet_selected(handler!(|ui, shell, index| {
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let visible = tab.view.visible_sheets();
+        if let Some(&sheet) = usize::try_from(index).ok().and_then(|i| visible.get(i))
+            && tab.view.set_sheet(sheet)
+        {
+            refresh_viewer(&ui, shell);
+            refresh_status(&ui, shell);
+            present(&ui, shell);
+        }
+    }));
+
     ui.on_set_language(handler!(|ui, shell, index| {
         if let Some(language) = usize::try_from(index).ok().and_then(Language::from_index) {
             // Titles and text of documents that are already open stay as they are.
             shell.language = language;
+            let mode = shell.tokens.mode;
+            shell.set_theme(mode);
             apply_language(&ui, language);
             refresh_chrome(&ui, shell);
             refresh_sidebar(&ui, shell);
@@ -2789,7 +3145,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             let weak = weak.clone();
             // Never block on a dialog inside an event handler: see `dialogs`.
             let _ = slint::spawn_local(async move {
-                let types = text_file_types(strings);
+                let types = open_file_types(strings);
                 if let Some(path) = dialogs::pick_file_to_open(strings.open_dialog, &types).await
                     && let Some(ui) = weak.upgrade()
                 {
@@ -2872,6 +3228,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_copy(handler!(|ui, shell| {
+        // A workbook copies what its formula bar shows.
+        if let Some(tab) = shell.active_sheet() {
+            let (_, content) = tab.view.selection_text();
+            ui.invoke_copy_to_clipboard(content.into());
+            return;
+        }
         let text = shell.active_markdown().and_then(|editor| {
             if editor.preview_has_focus() {
                 editor.preview.selected_text()
@@ -2910,7 +3272,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.apply(Action::SelectAll),
             Some(Content::Markdown(editor)) => editor.select_all(),
-            None => return,
+            _ => return,
         }
         after_edit(&ui, shell, false);
     }));
@@ -3488,6 +3850,7 @@ mod tests {
                     editor.ime(preedit);
                     editor.document.text().to_string()
                 }
+                Content::Sheet(_) | Content::Slides(_) => unreachable!("not a text tab"),
             };
             shell.open_untitled(DocKind::Writer);
             let surface = shell

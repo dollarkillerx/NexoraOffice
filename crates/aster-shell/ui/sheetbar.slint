@@ -1,0 +1,115 @@
+// The chrome of a Sheets tab around the grid the Rust side draws: the
+// formula bar above it (the selected cell's address and content) and the
+// sheet tabs below it. Read-only: the formula bar shows, it does not edit.
+
+import { Tokens } from "tokens.slint";
+
+export component FormulaBar inherits Rectangle {
+    in property <string> address;
+    in property <string> content;
+    height: Tokens.control-height + 2 * Tokens.space-xs;
+    background: Tokens.surface;
+
+    HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        padding-right: Tokens.space-sm;
+        padding-top: Tokens.space-xs;
+        padding-bottom: Tokens.space-xs;
+        spacing: Tokens.space-sm;
+
+        Rectangle {
+            width: 88px;
+            border-radius: Tokens.radius-sm;
+            background: Tokens.fill;
+            Text {
+                x: Tokens.space-sm;
+                width: parent.width - 2 * Tokens.space-sm;
+                text: root.address;
+                color: Tokens.text;
+                font-size: Tokens.font-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        Text {
+            text: "ƒx";
+            color: Tokens.text-tertiary;
+            font-size: Tokens.font-sm;
+            font-italic: true;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: Tokens.radius-sm;
+            background: Tokens.fill;
+            clip: true;
+            Text {
+                x: Tokens.space-sm;
+                width: parent.width - 2 * Tokens.space-sm;
+                text: root.content;
+                color: Tokens.text;
+                font-size: Tokens.font-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Tokens.hairline;
+    }
+}
+
+export component SheetBar inherits Rectangle {
+    in property <[string]> names;
+    in property <int> current;
+    callback selected(int);
+    height: Tokens.control-height + 2 * Tokens.space-xs;
+    background: Tokens.panel;
+
+    Rectangle {
+        height: 1px;
+        y: 0;
+        background: Tokens.hairline;
+    }
+
+    Flickable {
+        x: Tokens.space-sm;
+        width: parent.width - 2 * Tokens.space-sm;
+        content-width: max(self.width, tabs.preferred-width);
+        tabs := HorizontalLayout {
+            alignment: start;
+            spacing: Tokens.space-xs;
+            padding-top: Tokens.space-xs;
+            padding-bottom: Tokens.space-xs;
+            for name[index] in root.names: tab := Rectangle {
+                property <bool> active: index == root.current;
+                height: Tokens.control-height;
+                border-radius: Tokens.radius-sm;
+                background: self.active ? Tokens.surface : touch.has-hover ? Tokens.hover : transparent;
+                border-width: self.active ? 1px : 0px;
+                border-color: Tokens.hairline;
+                HorizontalLayout {
+                    padding-left: Tokens.space-md;
+                    padding-right: Tokens.space-md;
+                    label := Text {
+                        text: name;
+                        color: tab.active ? Tokens.accent : Tokens.text-secondary;
+                        font-size: Tokens.font-sm;
+                        font-weight: tab.active ? 600 : 400;
+                        vertical-alignment: center;
+                    }
+                }
+                touch := TouchArea {
+                    clicked => {
+                        root.selected(index);
+                    }
+                }
+            }
+        }
+    }
+}

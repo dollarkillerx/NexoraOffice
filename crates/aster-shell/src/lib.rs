@@ -11,6 +11,7 @@ pub mod content;
 pub mod files;
 pub mod i18n;
 pub mod icons;
+pub mod office;
 pub mod recovery;
 pub mod sidebar;
 pub mod stats;

@@ -372,7 +372,7 @@ mod tests {
             lines[1].look,
             Look::File {
                 kind: DocKind::Sheets,
-                opens: false
+                opens: true
             }
         );
         assert_eq!(

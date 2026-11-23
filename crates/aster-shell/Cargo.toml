@@ -8,8 +8,12 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+aster-calc = { workspace = true }
 aster-markdown = { workspace = true }
+aster-ooxml = { workspace = true }
 aster-platform = { workspace = true }
+aster-sheets = { workspace = true }
+aster-slides = { workspace = true }
 aster-storage = { workspace = true }
 aster-surface = { workspace = true }
 aster-workspace = { workspace = true }

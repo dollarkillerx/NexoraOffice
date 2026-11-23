@@ -15,6 +15,7 @@ import { Dialog } from "dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
 import { Hairline } from "widgets.slint";
 import { FindBar } from "findbar.slint";
+import { FormulaBar, SheetBar } from "sheetbar.slint";
 
 export { Tokens, Icons, Strings }
 
@@ -118,8 +119,19 @@ export component AppWindow inherits Window {
     out property <bool> surface-focused: scope.has-focus;
     out property <length> preview-width: preview-pane.width;
     out property <length> preview-height: preview-pane.height;
-    // Writer and Markdown tabs both show the custom-drawn surface.
-    property <bool> surface-active: root.active-kind == 0 || root.active-kind == 3;
+    // Read-only views of files: 0 none, 1 a workbook, 2 a presentation.
+    in property <int> viewer;
+    // The selected cell of a workbook, and the sheets one can switch to.
+    in property <string> cell-address;
+    in property <string> cell-content;
+    in property <[string]> sheet-names;
+    in property <int> sheet-index: -1;
+    // Shown over a viewer's surface: a chart sheet, a presentation without
+    // slides.
+    in property <string> viewer-note;
+
+    // Writer and Markdown tabs and the viewers show the custom-drawn surface.
+    property <bool> surface-active: root.active-kind == 0 || root.active-kind == 3 || root.viewer > 0;
 
     callback tab-activate(int);
     callback tab-close(int);
@@ -166,7 +178,9 @@ export component AppWindow inherits Window {
     callback key-pressed(string, bool, bool, bool) -> bool;
     callback pointer-down(length, length, bool);
     callback pointer-drag(length, length);
-    callback scrolled(length);
+    // Wheel movement across and down, and where the pointer is across.
+    callback scrolled(length, length, length);
+    callback sheet-selected(int);
     callback preview-scrolled(length);
     callback find-query-edited(string);
     callback find-replacement-edited(string);
@@ -586,9 +600,31 @@ export component AppWindow inherits Window {
 
                     // Always present so its size is known before the first Writer
                     // tab opens; other views are stacked on top of it.
+                    formula-bar := FormulaBar {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        visible: root.viewer == 1;
+                        address: root.cell-address;
+                        content: root.cell-content;
+                    }
+
+                    sheet-bar := SheetBar {
+                        x: 0;
+                        y: parent.height - self.height;
+                        width: parent.width;
+                        visible: root.viewer == 1;
+                        names: root.sheet-names;
+                        current: root.sheet-index;
+                        selected(index) => {
+                            root.sheet-selected(index);
+                            scope.focus();
+                        }
+                    }
+
                     surface := Rectangle {
-                        y: findbar.visible ? findbar.height : 0px;
-                        height: parent.height - self.y;
+                        y: findbar.visible ? findbar.height : formula-bar.visible ? formula-bar.height : 0px;
+                        height: parent.height - self.y - (sheet-bar.visible ? sheet-bar.height : 0px);
                         visible: root.surface-active;
                         // The source takes the whole width, the left half, or
                         // nothing; the preview the rest, after a hairline.
@@ -620,7 +656,7 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: text;
+                                    mouse-cursor: root.viewer > 0 ? default : text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();
@@ -633,10 +669,22 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     scroll-event(event) => {
-                                        root.scrolled(event.delta-y);
+                                        root.scrolled(event.delta-x, event.delta-y, self.mouse-x);
                                         return accept;
                                     }
                                 }
+                            }
+
+                            if root.viewer-note != "": Text {
+                                x: Tokens.space-xl;
+                                width: parent.width - 2 * Tokens.space-xl;
+                                height: parent.height;
+                                text: root.viewer-note;
+                                color: Tokens.text-secondary;
+                                font-size: Tokens.font-md;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
                             }
 
                             // Shows where the view is in the document. Not draggable yet.
@@ -734,7 +782,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.active-kind > 0 && root.active-kind != 3: Placeholder {
+                    if root.active-kind > 0 && root.active-kind != 3 && root.viewer == 0: Placeholder {
                         kind: root.active-kind;
                         title: root.placeholder-title;
                         plan: root.placeholder-plan;

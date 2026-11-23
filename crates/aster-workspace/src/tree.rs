@@ -40,17 +40,20 @@ impl FileKind {
             "md" | "markdown" => Self::Markdown,
             "txt" => Self::Text,
             "docx" => Self::Word,
-            "xlsx" => Self::Spreadsheet,
-            "pptx" => Self::Presentation,
+            "xlsx" | "xlsm" => Self::Spreadsheet,
+            "pptx" | "pptm" => Self::Presentation,
             "pdf" => Self::Pdf,
             _ => return None,
         })
     }
 
     /// Whether this version can open it. The others are shown, marked as not
-    /// supported yet.
+    /// supported yet. Workbooks and presentations open read-only.
     pub fn opens(self) -> bool {
-        matches!(self, Self::Markdown | Self::Text)
+        matches!(
+            self,
+            Self::Markdown | Self::Text | Self::Spreadsheet | Self::Presentation
+        )
     }
 }
 
@@ -593,7 +596,10 @@ mod tests {
         assert_eq!(kind("メモ.txt"), EntryKind::File(FileKind::Text));
         assert_eq!(kind("报告.docx"), EntryKind::File(FileKind::Word));
         assert_eq!(kind("合同.pdf"), EntryKind::File(FileKind::Pdf));
+        assert_eq!(kind("预算.xlsx"), EntryKind::File(FileKind::Spreadsheet));
+        assert_eq!(kind("発表.pptx"), EntryKind::File(FileKind::Presentation));
         assert!(FileKind::Markdown.opens() && FileKind::Text.opens());
+        assert!(FileKind::Spreadsheet.opens() && FileKind::Presentation.opens());
         assert!(!FileKind::Word.opens() && !FileKind::Pdf.opens());
         assert_eq!(listing.omitted, 0);
         assert!(!listing.incomplete);

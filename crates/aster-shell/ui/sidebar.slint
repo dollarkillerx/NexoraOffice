@@ -344,7 +344,7 @@ export component Sidebar inherits Rectangle {
 
             // More than five only while filtering; they scroll in place.
             Flickable {
-                viewport-height: recent-rows.preferred-height;
+                content-height: recent-rows.preferred-height;
                 recent-rows := VerticalLayout {
                     alignment: start;
                     for item[index] in root.recent: RecentRow {

@@ -60,6 +60,8 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3.27"
 # Native open and save dialogs on all three systems.
 rfd = "~0.18.0"
+# CommonMark and GitHub extensions. Without its HTML writer and command line.
+pulldown-cmark = { version = "~0.13.6", default-features = false }
 
 [profile.dev]
 opt-level = 1

@@ -9,3 +9,4 @@ publish.workspace = true
 
 [dependencies]
 icu_segmenter = { workspace = true }
+pulldown-cmark = { workspace = true }

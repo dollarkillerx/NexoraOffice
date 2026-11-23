@@ -1334,6 +1334,19 @@ impl MarkdownEditor {
         self.show(Some(change))
     }
 
+    /// Tab and Shift+Tab: list items move a level in or out; elsewhere Tab
+    /// types a tab and Shift+Tab does nothing.
+    fn indent(&mut self, outdent: bool) -> bool {
+        if self.surface.is_composing() || self.locked() {
+            return false;
+        }
+        match format::indent(self.document.text(), self.document.selection(), outdent) {
+            Some(edit) => self.apply(edit),
+            None if outdent => false,
+            None => self.edit(EditCommand::Type("\t".to_owned())),
+        }
+    }
+
     /// Enter: on a list item or in a quote the next line gets the same
     /// markers, or an empty item ends the list; elsewhere a line break.
     fn newline(&mut self) -> bool {
@@ -1376,6 +1389,9 @@ impl MarkdownEditor {
         match action {
             Action::Insert(text) => self.edit(EditCommand::Type(text)),
             Action::Newline => self.newline(),
+            Action::PlainNewline => self.edit(EditCommand::LineBreak),
+            Action::Indent => self.indent(false),
+            Action::Outdent => self.indent(true),
             Action::Backspace => self.edit(EditCommand::Backspace),
             Action::Delete => self.edit(EditCommand::Delete),
             movement => {
@@ -2169,6 +2185,26 @@ mod tests {
         plain.document.set_selection(Selection::caret(6));
         assert!(plain.key(Action::Newline));
         assert_eq!(text_of(&plain), "正文\n");
+    }
+
+    #[test]
+    fn tab_moves_list_items_and_types_a_tab_elsewhere() {
+        let mut e = editor("- 水果\n- 苹果");
+        e.document
+            .set_selection(Selection::caret(text_of(&e).len()));
+        assert!(e.key(Action::Indent));
+        assert_eq!(text_of(&e), "- 水果\n  - 苹果");
+        assert_in_step(&e);
+        assert!(e.key(Action::Outdent));
+        assert_eq!(text_of(&e), "- 水果\n- 苹果");
+        // Shift+Return breaks the line without carrying the list on.
+        assert!(e.key(Action::PlainNewline));
+        assert_eq!(text_of(&e), "- 水果\n- 苹果\n");
+        let mut plain = editor("正文");
+        plain.document.set_selection(Selection::caret(6));
+        assert!(plain.key(Action::Indent));
+        assert_eq!(text_of(&plain), "正文\t");
+        assert!(!plain.key(Action::Outdent));
     }
 
     #[test]

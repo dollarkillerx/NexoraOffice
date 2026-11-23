@@ -43,10 +43,21 @@ pub fn decode_key(text: &str, shift: bool, primary: bool, alt: bool) -> Option<A
             return Some(Action::Delete);
         }
         if is(Key::Return) {
-            return Some(Action::Newline);
+            return Some(if shift {
+                Action::PlainNewline
+            } else {
+                Action::Newline
+            });
         }
         if is(Key::Tab) {
-            return Some(Action::Insert("\t".to_owned()));
+            return Some(if shift {
+                Action::Outdent
+            } else {
+                Action::Indent
+            });
+        }
+        if is(Key::Backtab) {
+            return Some(Action::Outdent);
         }
         if is(Key::LeftArrow) {
             return Some(if primary {
@@ -204,6 +215,22 @@ mod tests {
         assert_eq!(
             decode_key(&key(Key::Return), false, false, false),
             Some(Action::Newline)
+        );
+        assert_eq!(
+            decode_key(&key(Key::Return), true, false, false),
+            Some(Action::PlainNewline)
+        );
+        assert_eq!(
+            decode_key(&key(Key::Tab), false, false, false),
+            Some(Action::Indent)
+        );
+        assert_eq!(
+            decode_key(&key(Key::Tab), true, false, false),
+            Some(Action::Outdent)
+        );
+        assert_eq!(
+            decode_key(&key(Key::Backtab), true, false, false),
+            Some(Action::Outdent)
         );
         assert_eq!(
             decode_key(&key(Key::LeftArrow), true, false, true),

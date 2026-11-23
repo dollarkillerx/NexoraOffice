@@ -148,14 +148,35 @@ pub enum ImeEvent {
 pub enum Action {
     Insert(String),
     Newline,
+    /// Shift+Return: a line break and nothing else, where Return would also
+    /// carry a list on.
+    PlainNewline,
+    /// Tab: a tab character here; editors with lists move items in a level.
+    Indent,
+    /// Shift+Tab: nothing here; editors with lists move items out a level.
+    Outdent,
     Backspace,
     Delete,
-    Left { select: bool, word: bool },
-    Right { select: bool, word: bool },
-    Up { select: bool },
-    Down { select: bool },
-    LineStart { select: bool },
-    LineEnd { select: bool },
+    Left {
+        select: bool,
+        word: bool,
+    },
+    Right {
+        select: bool,
+        word: bool,
+    },
+    Up {
+        select: bool,
+    },
+    Down {
+        select: bool,
+    },
+    LineStart {
+        select: bool,
+    },
+    LineEnd {
+        select: bool,
+    },
     SelectAll,
 }
 
@@ -569,7 +590,9 @@ impl TextSurface {
         let mut drv = self.driver();
         match action {
             Action::Insert(text) => drv.insert_or_replace_selection(&text),
-            Action::Newline => drv.insert_or_replace_selection("\n"),
+            Action::Newline | Action::PlainNewline => drv.insert_or_replace_selection("\n"),
+            Action::Indent => drv.insert_or_replace_selection("\t"),
+            Action::Outdent => {}
             Action::Backspace => drv.backdelete(),
             Action::Delete => drv.delete(),
             Action::Left {

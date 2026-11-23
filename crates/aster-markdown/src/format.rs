@@ -646,6 +646,125 @@ fn renumber(text: &Rope, from: usize, indent: usize, first: u64) -> Option<(Stri
     Some((out, until))
 }
 
+/// How far up Tab looks for the item above, to line the new level up with
+/// it.
+const INDENT_REACH: usize = 64 * 1024;
+
+/// A list item's line: how far it is indented, how long its marker is with
+/// the space after it, and its kind. Items in quotes are not counted. A task's
+/// box is the item's text, not its marker: `- [ ] ` is a `- ` marker.
+fn list_item(line: &str) -> Option<(usize, usize, Block)> {
+    let (parsed, kind) = parse_block(line);
+    let marker = match kind? {
+        Block::Quote => return None,
+        Block::Task => 2,
+        _ => parsed.prefix.len(),
+    };
+    Some((parsed.indent.len(), marker, kind?))
+}
+
+/// Tab and Shift+Tab on list items: move the items of the selection one
+/// level in or out. In, the first item lines up under the text of the item
+/// above it at its level (two spaces under `- `, three under `1. `), and a
+/// numbered item that starts a new list there is numbered 1; the first item
+/// of a list cannot go in. Out, it lines up with the item it belonged to.
+/// The other lines of the selection move as far. `None` where the first line
+/// of the selection is not a list item: Tab is then an ordinary key. An item
+/// that cannot move gives an edit that changes nothing.
+pub fn indent(text: &Rope, selection: Selection, outdent: bool) -> Option<Edit> {
+    let range = selection.range();
+    let first_line = text.byte_to_line(range.start);
+    let start = text.line_to_byte(first_line);
+    let end = line_span(text, &(start..start)).end;
+    let head = slice(text, start..ceil(text, (start + PREFIX_REACH).min(end)));
+    let (own, _, kind) = list_item(&head)?;
+    let unchanged = Edit {
+        range: range.start..range.start,
+        text: String::new(),
+        selection,
+    };
+
+    // The lines above, nearest first, as far as they are list content.
+    let mut above = Vec::new();
+    let mut line = first_line;
+    while line > 0 {
+        line -= 1;
+        let at = text.line_to_byte(line);
+        if start - at > INDENT_REACH {
+            break;
+        }
+        let end = line_span(text, &(at..at)).end;
+        let head = slice(text, at..ceil(text, (at + PREFIX_REACH).min(end)));
+        if head.trim().is_empty() {
+            continue;
+        }
+        let indent = head.len() - head.trim_start_matches([' ', '\t']).len();
+        let item = list_item(&head);
+        // Text that is not part of a list ends it.
+        if item.is_none() && indent == 0 {
+            break;
+        }
+        above.push((indent, item));
+    }
+
+    let (delta, restart) = if outdent {
+        if own == 0 {
+            return Some(unchanged);
+        }
+        let parent = above
+            .iter()
+            .find_map(|(indent, item)| item.filter(|_| *indent < own).map(|_| *indent));
+        (own - parent.unwrap_or(0), false)
+    } else {
+        // The item above at the same level; lines indented further belong to
+        // it. One less indented means this is the first item of its list.
+        let mut deeper_numbered = None;
+        let mut sibling = None;
+        for (indent, item) in &above {
+            if *indent < own {
+                break;
+            }
+            if *indent == own {
+                sibling = *item;
+                break;
+            }
+            if deeper_numbered.is_none() {
+                deeper_numbered = Some((*indent, matches!(item, Some((_, _, Block::Numbered)))));
+            }
+        }
+        let Some((_, sibling_marker, _)) = sibling else {
+            return Some(unchanged);
+        };
+        let new_indent = own + sibling_marker;
+        // A numbered item starts a list at its new level unless numbered
+        // items are already there.
+        let continues = deeper_numbered == Some((new_indent, true));
+        (sibling_marker, kind == Block::Numbered && !continues)
+    };
+
+    let mut first = true;
+    Some(rewrite_lines(text, selection, true, |line, _| {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let (old_prefix, new_line, new_prefix) = if outdent {
+            let take = indent.min(delta);
+            (take, line[take..].to_owned(), 0)
+        } else {
+            let pad = " ".repeat(delta);
+            let restart_here = first && restart;
+            let body = &line[indent..];
+            if restart_here {
+                let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+                let new = format!("{}{pad}1{}", &line[..indent], &body[digits..]);
+                (indent + digits, new, indent + delta + 1)
+            } else {
+                (0, format!("{pad}{line}"), delta)
+            }
+        };
+        first = false;
+        (new_line, old_prefix, new_prefix)
+    }))
+}
+
 /// The parts of a line: indentation, the block prefix, and the rest.
 struct Parsed<'a> {
     indent: &'a str,
@@ -1413,5 +1532,65 @@ mod tests {
             enter("1. 一|二\n2. 三").as_deref(),
             Some("1. 一\n2. |二\n3. 三")
         );
+    }
+
+    fn tab(input: &str, outdent: bool) -> Option<String> {
+        let (text, range) = marked(input);
+        let rope = Rope::from_str(&text);
+        let selection = Selection {
+            anchor: range.start,
+            focus: range.end,
+        };
+        indent(&rope, selection, outdent)?;
+        Some(run(&text, range, |rope, sel| {
+            indent(rope, sel, outdent).expect("an edit")
+        }))
+    }
+
+    #[test]
+    fn tab_moves_an_item_under_the_one_above() {
+        assert_eq!(tab("- a\n- b|", false).as_deref(), Some("- a\n  - b|"));
+        assert_eq!(tab("1. a\n2. b|", false).as_deref(), Some("1. a\n   1. b|"));
+        assert_eq!(
+            tab("- [ ] a\n- [ ] |b", false).as_deref(),
+            Some("- [ ] a\n  - [ ] |b")
+        );
+        // Further in, past the items already there.
+        assert_eq!(
+            tab("- a\n  - b\n  - c|", false).as_deref(),
+            Some("- a\n  - b\n    - c|")
+        );
+        // Numbered items already at the new level: the number stays.
+        assert_eq!(
+            tab("1. a\n   1. b\n2. c|", false).as_deref(),
+            Some("1. a\n   1. b\n   2. c|")
+        );
+        // The first item of a list has nothing to go under.
+        assert_eq!(tab("- a|", false).as_deref(), Some("- a|"));
+        assert_eq!(tab("- a\n  - b|", false).as_deref(), Some("- a\n  - b|"));
+        // Several items move together.
+        assert_eq!(
+            tab("- a\n- «b\n- c»", false).as_deref(),
+            Some("- a\n  - [b\n  - c]")
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_an_item_out() {
+        assert_eq!(tab("- a\n  - b|", true).as_deref(), Some("- a\n- b|"));
+        assert_eq!(tab("1. a\n   1. b|", true).as_deref(), Some("1. a\n1. b|"));
+        assert_eq!(
+            tab("- a\n  - b\n    - c|", true).as_deref(),
+            Some("- a\n  - b\n  - c|")
+        );
+        // Already at the left edge.
+        assert_eq!(tab("- a|", true).as_deref(), Some("- a|"));
+    }
+
+    #[test]
+    fn tab_outside_a_list_is_an_ordinary_key() {
+        assert_eq!(tab("正文|", false), None);
+        assert_eq!(tab("> - 引用里的项|", false), None);
+        assert_eq!(tab("# 标题|", true), None);
     }
 }

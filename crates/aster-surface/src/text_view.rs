@@ -1071,7 +1071,13 @@ impl TextView {
                 self.caret_on = true;
                 return;
             }
-            Action::Insert(_) | Action::Newline | Action::Backspace | Action::Delete => return,
+            Action::Insert(_)
+            | Action::Newline
+            | Action::PlainNewline
+            | Action::Indent
+            | Action::Outdent
+            | Action::Backspace
+            | Action::Delete => return,
         };
         let (focus, upstream, keep_x) = target;
         self.focus = focus;

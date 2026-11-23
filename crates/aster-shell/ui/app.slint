@@ -14,6 +14,7 @@ import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
 import { Hairline } from "widgets.slint";
+import { FindBar } from "findbar.slint";
 
 export { Tokens, Icons, Strings }
 
@@ -88,6 +89,18 @@ export component AppWindow inherits Window {
     // too large to preview.
     in property <string> preview-note;
 
+    // The find bar of the Markdown tab in front.
+    in property <bool> find-open;
+    in property <bool> find-replace;
+    in-out property <string> find-query;
+    in-out property <string> find-replacement;
+    in property <string> find-position;
+    in property <bool> find-error;
+    in property <bool> find-case;
+    in property <bool> find-whole;
+    in property <bool> find-regex;
+    in property <bool> find-busy;
+
     // Geometry the Rust side needs to size its buffer and place the candidate window.
     out property <length> surface-width: editor-pane.width;
     out property <length> surface-height: editor-pane.height;
@@ -137,12 +150,28 @@ export component AppWindow inherits Window {
     callback pointer-drag(length, length);
     callback scrolled(length);
     callback preview-scrolled(length);
+    callback find-query-edited(string);
+    callback find-replacement-edited(string);
+    callback find-next();
+    callback find-previous();
+    callback find-close();
+    // 0 case, 1 whole word, 2 regular expression.
+    callback find-toggle(int);
+    callback replace-one();
+    callback replace-all();
+    callback menu-find();
+    callback menu-replace();
+    callback menu-find-selection();
     callback preview-clicked(length, length);
     callback preview-moved(length, length);
 
     // Give the keyboard to the document surface.
     public function focus-document() {
         scope.focus();
+    }
+
+    public function focus-find-query() {
+        findbar.focus-query();
     }
 
     // Slint has no clipboard API for application code, but its text input can
@@ -233,18 +262,26 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-undo;
                 shortcut: @keys(Control + Z);
-                enabled: root.editing && root.can-undo;
+                enabled: findbar.editing-text || (root.editing && root.can-undo);
                 activated => {
-                    root.edit-undo();
+                    if (findbar.editing-text) {
+                        findbar.edit(4);
+                    } else {
+                        root.edit-undo();
+                    }
                 }
             }
 
             MenuItem {
                 title: Strings.menu-redo;
                 shortcut: @keys(Control + Shift + Z);
-                enabled: root.editing && root.can-redo;
+                enabled: findbar.editing-text || (root.editing && root.can-redo);
                 activated => {
-                    root.edit-redo();
+                    if (findbar.editing-text) {
+                        findbar.edit(5);
+                    } else {
+                        root.edit-redo();
+                    }
                 }
             }
 
@@ -255,7 +292,11 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + X);
                 enabled: root.editing;
                 activated => {
-                    root.edit-cut();
+                    if (findbar.editing-text) {
+                        findbar.edit(1);
+                    } else {
+                        root.edit-cut();
+                    }
                 }
             }
 
@@ -264,7 +305,11 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + C);
                 enabled: root.editing;
                 activated => {
-                    root.edit-copy();
+                    if (findbar.editing-text) {
+                        findbar.edit(2);
+                    } else {
+                        root.edit-copy();
+                    }
                 }
             }
 
@@ -273,7 +318,11 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + V);
                 enabled: root.editing;
                 activated => {
-                    root.edit-paste();
+                    if (findbar.editing-text) {
+                        findbar.edit(3);
+                    } else {
+                        root.edit-paste();
+                    }
                 }
             }
 
@@ -284,7 +333,58 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + A);
                 enabled: root.surface-active;
                 activated => {
-                    root.edit-select-all();
+                    if (findbar.editing-text) {
+                        findbar.edit(0);
+                    } else {
+                        root.edit-select-all();
+                    }
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-find;
+                shortcut: @keys(Control + F);
+                enabled: root.editing;
+                activated => {
+                    root.menu-find();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-find-next;
+                shortcut: @keys(Control + G);
+                enabled: root.editing;
+                activated => {
+                    root.find-next();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-find-previous;
+                shortcut: @keys(Control + Shift + G);
+                enabled: root.editing;
+                activated => {
+                    root.find-previous();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-find-selection;
+                shortcut: @keys(Control + E);
+                enabled: root.editing;
+                activated => {
+                    root.menu-find-selection();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-replace;
+                shortcut: @keys(Control + Alt + F);
+                enabled: root.editing;
+                activated => {
+                    root.menu-replace();
                 }
             }
         }
@@ -362,9 +462,51 @@ export component AppWindow inherits Window {
                 background: Tokens.desk;
                 clip: true;
 
+                findbar := FindBar {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    visible: root.find-open && root.active-kind == 3;
+                    replace-visible: root.find-replace;
+                    query <=> root.find-query;
+                    replacement <=> root.find-replacement;
+                    position: root.find-position;
+                    error: root.find-error;
+                    match-case: root.find-case;
+                    whole-word: root.find-whole;
+                    use-regex: root.find-regex;
+                    busy: root.find-busy;
+                    query-edited(text) => {
+                        root.find-query-edited(text);
+                    }
+                    replacement-edited(text) => {
+                        root.find-replacement-edited(text);
+                    }
+                    next => {
+                        root.find-next();
+                    }
+                    previous => {
+                        root.find-previous();
+                    }
+                    close => {
+                        root.find-close();
+                    }
+                    toggle(option) => {
+                        root.find-toggle(option);
+                    }
+                    replace-one => {
+                        root.replace-one();
+                    }
+                    replace-all => {
+                        root.replace-all();
+                    }
+                }
+
                 // Always present so its size is known before the first Writer
                 // tab opens; other views are stacked on top of it.
                 surface := Rectangle {
+                    y: findbar.visible ? findbar.height : 0px;
+                    height: parent.height - self.y;
                     visible: root.surface-active;
                     // The source takes the whole width, the left half, or
                     // nothing; the preview the rest, after a hairline.

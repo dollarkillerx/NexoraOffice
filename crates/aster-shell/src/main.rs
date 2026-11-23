@@ -50,7 +50,8 @@ use slint::{
 };
 
 use aster_shell::content::{
-    self, DiskWarning, JournalStep, MarkdownEditor, Opened, Prepared, WriterView, rope_bytes,
+    self, DiskWarning, JournalStep, MarkdownEditor, Opened, Prepared, ReplaceJob, SearchJob,
+    WriterView, rope_bytes,
 };
 
 slint::include_modules!();
@@ -145,6 +146,8 @@ struct Shell {
     opening: Vec<PathBuf>,
     /// Runs once typing has paused, to bring the preview up to date.
     preview_timer: Timer,
+    /// Runs once typing has paused, to search again with the find bar open.
+    find_timer: Timer,
 }
 
 impl Shell {
@@ -164,6 +167,7 @@ impl Shell {
             previews: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
+            find_timer: Timer::default(),
         }
     }
 
@@ -707,6 +711,7 @@ fn apply_icons(ui: &AppWindow) {
     icons.set_assistant(Icon::Assistant.path().into());
     icons.set_check(Icon::Check.path().into());
     icons.set_folder_open(Icon::FolderOpen.path().into());
+    icons.set_chevron_up(Icon::ChevronUp.path().into());
 }
 
 /// Copy the interface text of a language into the Slint globals, and rebuild
@@ -745,6 +750,19 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_copy(strings.menu_copy.into());
     s.set_menu_paste(strings.menu_paste.into());
     s.set_menu_select_all(strings.menu_select_all.into());
+    s.set_menu_find(strings.menu_find.into());
+    s.set_menu_find_next(strings.menu_find_next.into());
+    s.set_menu_find_previous(strings.menu_find_previous.into());
+    s.set_menu_find_selection(strings.menu_find_selection.into());
+    s.set_menu_replace(strings.menu_replace.into());
+    s.set_find_placeholder(strings.find_placeholder.into());
+    s.set_replace_placeholder(strings.replace_placeholder.into());
+    s.set_find_match_case(strings.find_match_case.into());
+    s.set_find_whole_word(strings.find_whole_word.into());
+    s.set_find_regex(strings.find_regex.into());
+    s.set_find_close(strings.find_close.into());
+    s.set_replace_one(strings.replace_one.into());
+    s.set_replace_all(strings.replace_all.into());
     s.set_open_file(strings.open_file.into());
     s.set_button_save(strings.button_save.into());
     s.set_button_discard(strings.button_discard.into());
@@ -884,6 +902,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
     ui.set_editing(shell.active_markdown().is_some());
     refresh_toolbar(ui, shell);
     refresh_status(ui, shell);
+    refresh_find(ui, shell);
 }
 
 fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
@@ -960,6 +979,10 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     DiskWarning::Changed => strings.notice_disk_changed.to_owned(),
                     DiskWarning::Missing => strings.notice_disk_missing.to_owned(),
                 }
+            } else if editor.find.replacing {
+                strings.notice_replacing.to_owned()
+            } else if let Some(count) = editor.find.replaced {
+                i18n::fill(strings.notice_replaced, "count", &group_digits(count))
             } else if editor.link_refused {
                 strings.notice_link_refused.to_owned()
             } else if editor.format.mixed_line_endings {
@@ -1235,6 +1258,8 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         }
         schedule_preview(ui, shell);
         schedule_count(ui, shell);
+        schedule_search(ui, shell);
+        schedule_highlight(ui, shell);
     }
     refresh_status(ui, shell);
     present(ui, shell);
@@ -1308,6 +1333,183 @@ fn deliver(ui: AppWindow, job: Delivery) {
         Ok(mut shell) => job(&ui, &mut shell),
         Err(_) => Timer::single_shot(Duration::from_millis(30), move || deliver(ui, job)),
     };
+}
+
+// --- Find and replace --------------------------------------------------------
+
+/// What the find bar says about the matches.
+fn find_position(strings: &i18n::Strings, editor: &MarkdownEditor) -> String {
+    let find = &editor.find;
+    if find.error.is_some() {
+        return strings.find_bad_pattern.to_owned();
+    }
+    if find.searching {
+        return strings.find_counting.to_owned();
+    }
+    if find.query.pattern.is_empty() {
+        return String::new();
+    }
+    if find.found.is_empty() {
+        return strings.find_none.to_owned();
+    }
+    let count = group_digits(find.found.len());
+    let count = if find.found.truncated {
+        i18n::fill(strings.find_too_many, "count", &count)
+    } else {
+        count
+    };
+    let index = find
+        .current
+        .map_or_else(|| "–".to_owned(), |index| group_digits(index + 1));
+    i18n::fill(
+        &i18n::fill(strings.find_position, "index", &index),
+        "count",
+        &count,
+    )
+}
+
+/// Push the find bar's state into the window.
+fn refresh_find(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    let Some(editor) = shell.active_markdown() else {
+        ui.set_find_open(false);
+        return;
+    };
+    let find = &editor.find;
+    ui.set_find_open(find.open);
+    ui.set_find_replace(find.replace_open);
+    ui.set_find_case(find.query.case_sensitive);
+    ui.set_find_whole(find.query.whole_word);
+    ui.set_find_regex(find.query.regex);
+    ui.set_find_error(find.error.is_some());
+    ui.set_find_busy(find.replacing);
+    ui.set_find_position(find_position(strings, editor).into());
+    if ui.get_find_query().as_str() != find.query.pattern {
+        ui.set_find_query(find.query.pattern.as_str().into());
+    }
+    if ui.get_find_replacement().as_str() != find.replacement {
+        ui.set_find_replacement(find.replacement.as_str().into());
+    }
+}
+
+/// After the find bar's state changed: redraw and say so.
+fn after_find(ui: &AppWindow, shell: &mut Shell, job: Option<SearchJob>) {
+    if let Some(job) = job {
+        spawn_search(ui, shell, job);
+    }
+    refresh_find(ui, shell);
+    refresh_status(ui, shell);
+    present(ui, shell);
+}
+
+/// Search a large document on a worker thread.
+fn spawn_search(ui: &AppWindow, shell: &mut Shell, job: SearchJob) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let (generation, found) = job.run();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    if let Some(editor) = shell.markdown(id) {
+                        editor.search_finished(generation, found);
+                    }
+                    if shell.tabs.active_id() == Some(id) {
+                        refresh_find(ui, shell);
+                        present(ui, shell);
+                    }
+                }),
+            );
+        });
+    });
+}
+
+/// Replace throughout a large document on a worker thread.
+fn spawn_replace(ui: &AppWindow, shell: &mut Shell, job: ReplaceJob) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let replaced = job.run();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    let changed = shell
+                        .markdown(id)
+                        .is_some_and(|editor| editor.replace_all_finished(replaced));
+                    if shell.tabs.active_id() == Some(id) {
+                        after_edit(ui, shell, changed);
+                        refresh_find(ui, shell);
+                    } else if changed {
+                        shell.sync_records();
+                    }
+                }),
+            );
+        });
+    });
+}
+
+/// The text changed with the find bar open: search again once typing pauses.
+fn schedule_search(ui: &AppWindow, shell: &mut Shell) {
+    if !shell
+        .active_markdown()
+        .is_some_and(|editor| editor.find.open && editor.find.stale && !editor.find.replacing)
+    {
+        return;
+    }
+    let weak = ui.as_weak();
+    shell.find_timer.start(
+        TimerMode::SingleShot,
+        Duration::from_millis(200),
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                deliver(
+                    ui,
+                    Box::new(|ui, shell| {
+                        let job = shell.active_markdown().and_then(|editor| {
+                            (editor.find.open && editor.find.stale)
+                                .then(|| editor.refresh_search())?
+                        });
+                        after_find(ui, shell, job);
+                    }),
+                );
+            }
+        },
+    );
+}
+
+/// Rebuild the highlighting of the tab in front on another thread after a
+/// change too large to highlight incrementally.
+fn schedule_highlight(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some((version, text)) = shell.markdown(id).and_then(MarkdownEditor::highlight_job) else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let highlighter = aster_markdown::highlight::Highlighter::new(&text);
+        drop(text);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    if let Some(editor) = shell.markdown(id) {
+                        editor.highlighted(version, highlighter);
+                    }
+                    // The text may have changed again meanwhile.
+                    schedule_highlight(ui, shell);
+                    present(ui, shell);
+                }),
+            );
+        });
+    });
 }
 
 /// Read a file on a worker thread and open it in a tab when it arrives.
@@ -1761,6 +1963,16 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
             return true;
         }
+        // Esc in the document closes the find bar, as it does in the bar.
+        if text.as_str() == "\u{1b}"
+            && let Some(editor) = shell.active_markdown()
+            && editor.find.open
+        {
+            editor.cancel_replace_all();
+            editor.close_find();
+            after_find(&ui, shell, None);
+            return true;
+        }
         let Some(action) = host::decode_key(text.as_str(), shift, primary, alt) else {
             return false;
         };
@@ -2059,6 +2271,123 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             None => return,
         }
         after_edit(&ui, shell, false);
+    }));
+
+    // --- Find and replace ---
+
+    ui.on_menu_find(handler!(|ui, shell| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        editor.open_find(false);
+        let job = (!editor.find.query.pattern.is_empty())
+            .then(|| editor.search())
+            .flatten();
+        after_find(&ui, shell, job);
+        ui.invoke_focus_find_query();
+    }));
+
+    ui.on_menu_replace(handler!(|ui, shell| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        editor.open_find(true);
+        let job = (!editor.find.query.pattern.is_empty())
+            .then(|| editor.search())
+            .flatten();
+        after_find(&ui, shell, job);
+        ui.invoke_focus_find_query();
+    }));
+
+    ui.on_menu_find_selection(handler!(|ui, shell| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        let job = editor.find_selection();
+        editor.open_find(editor.find.replace_open);
+        after_find(&ui, shell, job);
+    }));
+
+    ui.on_find_query_edited(handler!(|ui, shell, text| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        let mut query = editor.find.query.clone();
+        query.pattern = text.to_string();
+        let job = editor.set_query(query);
+        after_find(&ui, shell, job);
+    }));
+
+    ui.on_find_replacement_edited(handler!(|_ui, shell, text| {
+        if let Some(editor) = shell.active_markdown() {
+            editor.find.replacement = text.to_string();
+        }
+    }));
+
+    ui.on_find_toggle(handler!(|ui, shell, option| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        let mut query = editor.find.query.clone();
+        match option {
+            0 => query.case_sensitive = !query.case_sensitive,
+            1 => query.whole_word = !query.whole_word,
+            _ => query.regex = !query.regex,
+        }
+        let job = editor.set_query(query);
+        after_find(&ui, shell, job);
+    }));
+
+    ui.on_find_next(handler!(|ui, shell| {
+        let job = shell
+            .active_markdown()
+            .and_then(|editor| editor.find_step(true));
+        after_find(&ui, shell, job);
+    }));
+
+    ui.on_find_previous(handler!(|ui, shell| {
+        let job = shell
+            .active_markdown()
+            .and_then(|editor| editor.find_step(false));
+        after_find(&ui, shell, job);
+    }));
+
+    ui.on_find_close(handler!(|ui, shell| {
+        if let Some(editor) = shell.active_markdown() {
+            editor.cancel_replace_all();
+            editor.close_find();
+        }
+        after_find(&ui, shell, None);
+        ui.invoke_focus_document();
+    }));
+
+    ui.on_replace_one(handler!(|ui, shell| {
+        let changed = shell
+            .active_markdown()
+            .is_some_and(MarkdownEditor::replace_one);
+        after_edit(&ui, shell, changed);
+        refresh_find(&ui, shell);
+    }));
+
+    ui.on_replace_all(handler!(|ui, shell| {
+        let Some(editor) = shell.active_markdown() else {
+            return;
+        };
+        let before = editor.text_version();
+        match editor.replace_all() {
+            Some(job) => {
+                spawn_replace(&ui, shell, job);
+                refresh_find(&ui, shell);
+                refresh_status(&ui, shell);
+            }
+            None => {
+                let changed = shell
+                    .active_markdown()
+                    .is_some_and(|editor| editor.text_version() != before);
+                after_edit(&ui, shell, changed);
+                refresh_find(&ui, shell);
+            }
+        }
     }));
 
     // --- Answers to the question on screen ---

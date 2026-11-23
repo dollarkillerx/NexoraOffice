@@ -153,6 +153,8 @@ version = "0.0.1"
 dependencies = [
  "icu_segmenter",
  "pulldown-cmark",
+ "regex-automata",
+ "regex-syntax",
  "ropey",
 ]
 

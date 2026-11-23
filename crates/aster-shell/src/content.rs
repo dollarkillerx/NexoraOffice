@@ -4,12 +4,17 @@
 //! `aster-markdown` to the text surface from `aster-surface`. Neither of those
 //! knows about the other.
 
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::stats::TextStats;
 use crate::theme;
 use crate::toolbar::ViewMode;
+use aster_markdown::document::{floor_char_boundary, slice};
 use aster_markdown::highlight::{Highlighter, Marks, Span};
+use aster_markdown::search::{Finder, Found, Query};
 use aster_markdown::{Change, Document, EditCommand, Rope, SavePoint, Selection, TextFormat};
 use aster_storage::{Fingerprint, RecordKey};
 use aster_surface::preview::{PreviewJob, PreviewLayout, PreviewStyle, PreviewView};
@@ -76,6 +81,11 @@ struct SyntaxColors {
     link: Rgba8,
     /// Behind code.
     fill: Rgba8,
+    /// Behind every match of a search, and behind the current one.
+    found: Rgba8,
+    current: Rgba8,
+    /// Text of the current match.
+    on_current: Rgba8,
 }
 
 impl SyntaxColors {
@@ -86,6 +96,9 @@ impl SyntaxColors {
             secondary: c.text_secondary.to_array(),
             link: c.link.to_array(),
             fill: c.fill.to_array(),
+            found: c.accent_soft.to_array(),
+            current: c.accent.to_array(),
+            on_current: c.on_accent.to_array(),
         }
     }
 }
@@ -139,6 +152,186 @@ fn decorations(spans: Vec<Span>, colors: &SyntaxColors) -> Vec<Decoration> {
         }
     }
     out
+}
+
+/// The style at an offset of a list of decorations in order.
+fn decoration_at(decorations: &[Decoration], offset: usize) -> TextStyle {
+    let index = decorations.partition_point(|d| d.range.end <= offset);
+    match decorations.get(index) {
+        Some(d) if d.range.start <= offset => d.style,
+        _ => TextStyle::default(),
+    }
+}
+
+/// Lay search highlights over the syntax decorations: a background behind
+/// every match, and the accent with its own text colour behind the current
+/// one. `matches` are in order; `current` is the range of the current match.
+fn overlay(
+    base: Vec<Decoration>,
+    matches: &[Range<usize>],
+    current: Option<Range<usize>>,
+    colors: &SyntaxColors,
+) -> Vec<Decoration> {
+    if matches.is_empty() {
+        return base;
+    }
+    let mut points: Vec<usize> = Vec::with_capacity(2 * (base.len() + matches.len()));
+    for d in &base {
+        points.extend([d.range.start, d.range.end]);
+    }
+    for m in matches {
+        points.extend([m.start, m.end]);
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut out: Vec<Decoration> = Vec::with_capacity(points.len());
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let mut style = decoration_at(&base, a);
+        let index = matches.partition_point(|m| m.end <= a);
+        if let Some(m) = matches.get(index)
+            && m.start <= a
+        {
+            if current.as_ref() == Some(m) {
+                style.background = Some(colors.current);
+                style.color = Some(colors.on_current);
+            } else {
+                style.background = Some(colors.found);
+            }
+        }
+        if style == TextStyle::default() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.range.end == a && last.style == style => last.range.end = b,
+            _ => out.push(Decoration { range: a..b, style }),
+        }
+    }
+    out
+}
+
+/// Documents up to this size are searched right away on the interface
+/// thread; larger ones on another thread, which can be cancelled.
+pub const SEARCH_INLINE: usize = 2 * 1024 * 1024;
+/// An edit larger than this (a replacement throughout a large document, or
+/// its undo) is not highlighted incrementally: the highlighting is rebuilt
+/// on another thread. Nor is it written to the recovery record as an entry:
+/// the record is checkpointed instead.
+pub const LARGE_CHANGE: usize = 4 * 1024 * 1024;
+
+/// The find bar of a tab and what it found.
+#[derive(Default)]
+pub struct FindState {
+    pub open: bool,
+    /// The replace field is shown.
+    pub replace_open: bool,
+    pub query: Query,
+    pub replacement: String,
+    pub found: Found,
+    /// Index of the current match in `found`.
+    pub current: Option<usize>,
+    /// A search is running on another thread.
+    pub searching: bool,
+    /// The text changed since the search: the matches were moved along with
+    /// it, and a new search is due.
+    pub stale: bool,
+    /// Why the query is not a valid regular expression.
+    pub error: Option<String>,
+    /// Replacing every match is running on another thread. The document
+    /// takes no edits until it is done.
+    pub replacing: bool,
+    /// How many places the last "replace all" changed.
+    pub replaced: Option<usize>,
+    /// The running search should move the caret to its first match.
+    follow: bool,
+    finder: Option<Finder>,
+    generation: u64,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl FindState {
+    fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn current_range(&self) -> Option<Range<usize>> {
+        self.current
+            .and_then(|index| self.found.matches.get(index))
+            .cloned()
+    }
+}
+
+/// A search to run on another thread.
+pub struct SearchJob {
+    pub generation: u64,
+    finder: Finder,
+    text: Rope,
+    cancel: Arc<AtomicBool>,
+}
+
+impl SearchJob {
+    /// Search. `None` if cancelled.
+    pub fn run(self) -> (u64, Option<Found>) {
+        let text = self.text.to_string();
+        drop(self.text);
+        let found = self.finder.find_all(&text, &self.cancel, |_| {});
+        (self.generation, found)
+    }
+}
+
+/// Replacing every match, to run on another thread.
+pub struct ReplaceJob {
+    generation: u64,
+    finder: Finder,
+    text: Rope,
+    replacement: String,
+    cancel: Arc<AtomicBool>,
+}
+
+/// What [`ReplaceJob::run`] worked out: the edit, and the whole text after
+/// it, so that the interface thread only has to take it.
+pub struct Replaced {
+    pub generation: u64,
+    range: Range<usize>,
+    inserted: String,
+    removed: String,
+    text: Rope,
+    pub count: usize,
+}
+
+impl ReplaceJob {
+    /// `None` if cancelled; a count of 0 if nothing matched.
+    pub fn run(self) -> Option<Replaced> {
+        let string = self.text.to_string();
+        let found = self.finder.find_all(&string, &self.cancel, |_| {})?;
+        let Some((range, inserted)) =
+            self.finder
+                .replace_all(&string, &found.matches, &self.replacement, &self.cancel)
+        else {
+            return (!self.cancel.load(Ordering::Relaxed)).then(|| Replaced {
+                generation: self.generation,
+                range: 0..0,
+                inserted: String::new(),
+                removed: String::new(),
+                text: self.text.clone(),
+                count: 0,
+            });
+        };
+        let removed = string[range.clone()].to_owned();
+        drop(string);
+        let mut text = self.text;
+        aster_markdown::document::replace(&mut text, range.clone(), &inserted);
+        Some(Replaced {
+            generation: self.generation,
+            range,
+            inserted,
+            removed,
+            text,
+            count: found.matches.len(),
+        })
+    }
 }
 
 /// The preview's colours and column, matching the editor's.
@@ -244,6 +437,15 @@ pub struct MarkdownEditor {
     /// The last link clicked in the preview was not opened: it was not a web
     /// or e-mail link.
     pub link_refused: bool,
+    pub find: FindState,
+    /// The highlighting is out of date after a large change and is being
+    /// rebuilt elsewhere; the text shows plain until then.
+    pub highlight_stale: bool,
+    /// A rebuild of the highlighting is running on another thread.
+    pub highlighting: bool,
+    /// The next recovery step must checkpoint: a large change was not
+    /// written as an entry.
+    force_checkpoint: bool,
 }
 
 /// What became of a restored document's file.
@@ -383,6 +585,10 @@ impl MarkdownEditor {
             synced_scroll: None,
             preview_target: None,
             link_refused: false,
+            find: FindState::default(),
+            highlight_stale: false,
+            highlighting: false,
+            force_checkpoint: false,
             document: Document::from_rope(text),
             surface,
             path,
@@ -431,6 +637,7 @@ impl MarkdownEditor {
         match (self.record, self.document.is_modified()) {
             (None, false) => JournalStep::Nothing,
             (None, true) => {
+                self.force_checkpoint = false;
                 self.record = Some(new_key());
                 self.since_checkpoint = (0, 0);
                 JournalStep::Open(self.document.text().clone())
@@ -440,7 +647,7 @@ impl MarkdownEditor {
                 self.record_failed = None;
                 JournalStep::Discard
             }
-            (Some(_), true) if entries.is_empty() => JournalStep::Nothing,
+            (Some(_), true) if entries.is_empty() && !self.force_checkpoint => JournalStep::Nothing,
             (Some(_), true) => {
                 let (count, bytes) = &mut self.since_checkpoint;
                 *count += entries.len() as u64;
@@ -448,7 +655,8 @@ impl MarkdownEditor {
                 let len = self.document.len();
                 let entry_limit = CHECKPOINT_ENTRIES.max((len / CHECKPOINT_TEXT_PER_ENTRY) as u64);
                 let byte_limit = CHECKPOINT_BYTES.max(len / CHECKPOINT_BYTES_PER_TEXT);
-                let checkpoint = (*count >= entry_limit || *bytes >= byte_limit)
+                let due = *count >= entry_limit || *bytes >= byte_limit;
+                let checkpoint = (due || std::mem::take(&mut self.force_checkpoint))
                     .then(|| self.document.text().clone());
                 if checkpoint.is_some() {
                     self.since_checkpoint = (0, 0);
@@ -474,9 +682,17 @@ impl MarkdownEditor {
             return;
         }
         let range = self.surface.visible_range();
-        let spans = self.highlighter.spans(range);
-        self.surface
-            .set_decorations(decorations(spans, &self.syntax));
+        let spans = if self.highlight_stale {
+            Vec::new()
+        } else {
+            self.highlighter.spans(range.clone())
+        };
+        let mut decorated = decorations(spans, &self.syntax);
+        if self.find.open {
+            let (_, visible) = self.find.found.within(range);
+            decorated = overlay(decorated, visible, self.find.current_range(), &self.syntax);
+        }
+        self.surface.set_decorations(decorated);
     }
 
     /// Switch between source, split and preview. Both views keep showing the
@@ -598,17 +814,37 @@ impl MarkdownEditor {
         let Some(change) = change else {
             return false;
         };
-        self.highlighter.edit(
-            self.document.text(),
-            change.range.clone(),
-            change.inserted.len(),
-        );
+        let large = change.inserted.len() + change.removed.len() > LARGE_CHANGE;
+        if large {
+            self.highlight_stale = true;
+            self.force_checkpoint = true;
+        } else {
+            if !self.highlight_stale {
+                self.highlighter.edit(
+                    self.document.text(),
+                    change.range.clone(),
+                    change.inserted.len(),
+                );
+            }
+            self.unjournaled
+                .push(aster_markdown::journal::encode(&change));
+        }
         self.text_version += 1;
         self.link_refused = false;
-        self.unjournaled
-            .push(aster_markdown::journal::encode(&change));
-        self.surface
-            .replace_range(change.range.clone(), &change.inserted);
+        // "Replaced 12" describes the text before any later edit or undo.
+        self.find.replaced = None;
+        self.surface.apply_change(
+            change.range.clone(),
+            change.inserted.len(),
+            self.document.text().clone(),
+        );
+        if self.find.finder.is_some() {
+            self.find
+                .found
+                .edited(change.range.clone(), change.inserted.len());
+            self.find.current = None;
+            self.find.stale = true;
+        }
         self.surface
             .set_selection(change.selection.anchor, change.selection.focus);
         self.surface.reveal_caret();
@@ -627,6 +863,336 @@ impl MarkdownEditor {
             }
         }
         true
+    }
+
+    /// The document takes no edits: a replacement throughout it is running.
+    pub fn locked(&self) -> bool {
+        self.find.replacing
+    }
+
+    /// A rebuild of the highlighting to run elsewhere, if one is due and not
+    /// running: the text version and the text.
+    pub fn highlight_job(&mut self) -> Option<(u64, Rope)> {
+        if !self.highlight_stale || self.highlighting {
+            return None;
+        }
+        self.highlighting = true;
+        Some((self.text_version, self.document.text().clone()))
+    }
+
+    /// Highlighting rebuilt elsewhere for the text at `version`. Ignored if
+    /// the text has changed since; the caller then rebuilds again.
+    pub fn highlighted(&mut self, version: u64, highlighter: Highlighter) {
+        self.highlighting = false;
+        if version == self.text_version {
+            self.highlighter = highlighter;
+            self.highlight_stale = false;
+        }
+    }
+
+    // --- Find and replace -------------------------------------------------
+
+    /// Show the find bar, with the replace field if `replace`.
+    pub fn open_find(&mut self, replace: bool) {
+        self.find.open = true;
+        self.find.replace_open = replace;
+        self.find.replaced = None;
+    }
+
+    /// Hide the find bar. The current match, if any, becomes the selection.
+    pub fn close_find(&mut self) {
+        self.find.cancel();
+        self.find.open = false;
+        self.find.replace_open = false;
+        self.find.searching = false;
+        if let Some(m) = self.find.current_range()
+            && !self.find.stale
+            && !self.surface.is_composing()
+        {
+            self.document.set_selection(Selection {
+                anchor: m.start,
+                focus: m.end,
+            });
+            self.surface.set_selection(m.start, m.end);
+            self.surface.reveal_caret();
+        }
+    }
+
+    /// Look for `query`. A small document is searched at once; for a large
+    /// one this returns a job to run on another thread, and the result comes
+    /// back through [`Self::search_finished`].
+    pub fn set_query(&mut self, query: Query) -> Option<SearchJob> {
+        self.find.query = query;
+        self.search()
+    }
+
+    /// Search again for the current query, and go to the first match at
+    /// or after the selection.
+    pub fn search(&mut self) -> Option<SearchJob> {
+        self.find.follow = true;
+        self.run_search()
+    }
+
+    /// Search again after the text changed, without moving the caret: the
+    /// user may be typing in the document.
+    pub fn refresh_search(&mut self) -> Option<SearchJob> {
+        self.find.follow = false;
+        self.run_search()
+    }
+
+    fn run_search(&mut self) -> Option<SearchJob> {
+        let find = &mut self.find;
+        find.cancel();
+        find.generation += 1;
+        find.error = None;
+        find.stale = false;
+        find.searching = false;
+        let finder = match Finder::new(&find.query) {
+            Ok(Some(finder)) => finder,
+            Ok(None) => {
+                find.finder = None;
+                find.found = Found::default();
+                find.current = None;
+                return None;
+            }
+            Err(err) => {
+                find.finder = None;
+                find.error = Some(err);
+                find.found = Found::default();
+                find.current = None;
+                return None;
+            }
+        };
+        find.finder = Some(finder.clone());
+        if self.document.len() <= SEARCH_INLINE {
+            let text = self.document.text().to_string();
+            let found = finder
+                .find_all(&text, &AtomicBool::new(false), |_| {})
+                .unwrap_or_default();
+            self.found(found);
+            return None;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        find.cancel = Some(cancel.clone());
+        find.searching = true;
+        Some(SearchJob {
+            generation: find.generation,
+            finder,
+            text: self.document.text().clone(),
+            cancel,
+        })
+    }
+
+    /// A search from [`SearchJob::run`] finished. Ignored if another search
+    /// has started since.
+    pub fn search_finished(&mut self, generation: u64, found: Option<Found>) {
+        if generation != self.find.generation {
+            return;
+        }
+        self.find.searching = false;
+        self.find.cancel = None;
+        if let Some(found) = found {
+            self.found(found);
+        }
+    }
+
+    /// Take new matches; the current one is the first at or after the
+    /// selection, and the caret goes there unless the search only followed
+    /// an edit.
+    fn found(&mut self, found: Found) {
+        let from = self.document.selection().range().start;
+        self.find.current = found.next_from(from);
+        self.find.found = found;
+        self.find.stale = false;
+        if self.find.follow
+            && let Some(index) = self.find.current
+        {
+            self.go_to_match(index);
+        }
+    }
+
+    fn go_to_match(&mut self, index: usize) {
+        let Some(m) = self.find.found.matches.get(index).cloned() else {
+            return;
+        };
+        self.find.current = Some(index);
+        if self.surface.is_composing() {
+            return;
+        }
+        // The caret goes to the match, so it scrolls into view; the match
+        // becomes the selection when the bar closes.
+        self.document.set_selection(Selection::caret(m.start));
+        self.surface.set_selection(m.start, m.start);
+        self.surface.reveal_caret();
+    }
+
+    /// Go to the next match, or the previous one. If the matches are out
+    /// of date they are looked for again first; for a large document that
+    /// returns a job, and the step happens when it is done.
+    pub fn find_step(&mut self, forward: bool) -> Option<SearchJob> {
+        if self.find.finder.is_none() || self.find.stale {
+            if self.find.query.pattern.is_empty() {
+                return None;
+            }
+            let job = self.search();
+            if job.is_some() {
+                return job;
+            }
+        }
+        let found = &self.find.found;
+        let caret = self.document.selection().range().start;
+        let next = match (self.find.current, forward) {
+            (Some(index), true) => Some((index + 1) % found.len().max(1)),
+            (Some(index), false) => Some(
+                index
+                    .checked_sub(1)
+                    .unwrap_or(found.len().saturating_sub(1)),
+            ),
+            (None, true) => found.next_from(caret),
+            (None, false) => found.previous_before(caret),
+        };
+        if let Some(index) = next.filter(|_| !found.is_empty()) {
+            self.go_to_match(index);
+        }
+        None
+    }
+
+    /// Search for the selected text, as Cmd+E does.
+    pub fn find_selection(&mut self) -> Option<SearchJob> {
+        let selected = self.document.selected_text();
+        if selected.is_empty() {
+            return None;
+        }
+        self.find.query.pattern = selected;
+        self.find.query.regex = false;
+        self.search()
+    }
+
+    /// Replace the current match and go to the next one. Returns whether the
+    /// text changed.
+    pub fn replace_one(&mut self) -> bool {
+        if self.locked() || self.surface.is_composing() {
+            return false;
+        }
+        let (Some(m), Some(finder)) = (self.find.current_range(), self.find.finder.clone()) else {
+            return false;
+        };
+        // Enough of the text around the match for look-around such as `\b`.
+        let text = self.document.text();
+        let from = floor_char_boundary(text, m.start.saturating_sub(1024));
+        let to = floor_char_boundary(text, (m.end + 1024).min(text.len_bytes()));
+        let window = slice(text, from..to);
+        // The matches may have moved with edits since the search: make sure
+        // this one still matches before replacing it.
+        let local = m.start - from..m.end - from;
+        if finder.find_from(&window, local.start) != Some(local) {
+            self.find.stale = true;
+            return false;
+        }
+        let replacement = finder.replacement(
+            &window,
+            m.start - from..m.end - from,
+            &self.find.replacement,
+        );
+        let change = self.document.replace_range(m.clone(), &replacement);
+        let changed = self.show(change);
+        // The other matches moved along; go to the next one after this.
+        self.find.stale = false;
+        let after = m.start + replacement.len();
+        if let Some(index) = self.find.found.next_from(after) {
+            self.go_to_match(index);
+        } else {
+            self.find.current = None;
+        }
+        // A replacement may itself match, or join two pieces into a match:
+        // look again soon.
+        self.find.stale = true;
+        changed
+    }
+
+    /// Replace every match. A small document is done at once, and this
+    /// returns `None`; a large one returns a job to run on another thread,
+    /// and the document takes no edits until [`Self::replace_all_finished`].
+    pub fn replace_all(&mut self) -> Option<ReplaceJob> {
+        if self.locked() || self.surface.is_composing() {
+            return None;
+        }
+        let finder = match Finder::new(&self.find.query) {
+            Ok(Some(finder)) => finder,
+            _ => return None,
+        };
+        self.find.cancel();
+        self.find.generation += 1;
+        if self.document.len() <= SEARCH_INLINE {
+            let text = self.document.text().to_string();
+            let never = AtomicBool::new(false);
+            let found = finder.find_all(&text, &never, |_| {}).unwrap_or_default();
+            let count = found.len();
+            if let Some((range, inserted)) =
+                finder.replace_all(&text, &found.matches, &self.find.replacement, &never)
+            {
+                let change = self.document.replace_range(range, &inserted);
+                self.show(change);
+            }
+            // Nothing left to replace (a second press, say) keeps the count
+            // of the last replacement; the bar already says there is no match.
+            if count > 0 {
+                self.find.replaced = Some(count);
+            }
+            self.find.finder = Some(finder);
+            self.search();
+            return None;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.find.cancel = Some(cancel.clone());
+        self.find.replacing = true;
+        self.find.searching = false;
+        Some(ReplaceJob {
+            generation: self.find.generation,
+            finder,
+            text: self.document.text().clone(),
+            replacement: self.find.replacement.clone(),
+            cancel,
+        })
+    }
+
+    /// A replacement from [`ReplaceJob::run`] finished. Returns whether the
+    /// text changed. Ignored if it was cancelled and replaced since.
+    pub fn replace_all_finished(&mut self, replaced: Option<Replaced>) -> bool {
+        let Some(replaced) = replaced else {
+            self.find.replacing = false;
+            return false;
+        };
+        if replaced.generation != self.find.generation {
+            return false;
+        }
+        self.find.replacing = false;
+        self.find.cancel = None;
+        if replaced.count == 0 {
+            return false;
+        }
+        let count = replaced.count;
+        let change = self.document.replace_with(
+            replaced.range,
+            replaced.inserted,
+            replaced.removed,
+            replaced.text,
+        );
+        let changed = self.show(Some(change));
+        self.find.replaced = Some(count);
+        self.find.found = Found::default();
+        self.find.current = None;
+        self.find.stale = true;
+        changed
+    }
+
+    /// Stop a running "replace all": the document is left as it was.
+    pub fn cancel_replace_all(&mut self) {
+        if self.find.replacing {
+            self.find.cancel();
+            self.find.replacing = false;
+            self.find.generation += 1;
+        }
     }
 
     /// The text version, for matching a count made elsewhere to the text it
@@ -653,7 +1219,7 @@ impl MarkdownEditor {
     /// Carry out an edit. Returns whether the text changed. While the input
     /// method is composing it owns the keyboard, and edits are ignored.
     pub fn edit(&mut self, command: EditCommand) -> bool {
-        if self.surface.is_composing() {
+        if self.surface.is_composing() || self.locked() {
             return false;
         }
         let change = self.document.apply(command);
@@ -699,6 +1265,7 @@ impl MarkdownEditor {
     pub fn ime(&mut self, event: ImeEvent) -> bool {
         match event {
             ImeEvent::Enabled => false,
+            ImeEvent::Preedit { .. } if self.locked() => false,
             ImeEvent::Preedit { text, cursor } => {
                 let mut changed = false;
                 if !text.is_empty() && !self.surface.is_composing() {
@@ -722,7 +1289,7 @@ impl MarkdownEditor {
     }
 
     pub fn undo(&mut self) -> bool {
-        if self.surface.is_composing() {
+        if self.surface.is_composing() || self.locked() {
             return false;
         }
         let change = self.document.undo();
@@ -730,7 +1297,7 @@ impl MarkdownEditor {
     }
 
     pub fn redo(&mut self) -> bool {
-        if self.surface.is_composing() {
+        if self.surface.is_composing() || self.locked() {
             return false;
         }
         let change = self.document.redo();
@@ -1318,5 +1885,178 @@ mod tests {
         e.set_view_mode(ViewMode::Edit);
         assert!(near(e.surface.top_position(), seen));
         assert!(e.preview_job(1, true, style()).is_none());
+    }
+
+    fn query(pattern: &str) -> Query {
+        Query {
+            pattern: pattern.to_owned(),
+            case_sensitive: true,
+            ..Query::default()
+        }
+    }
+
+    fn text_of(editor: &MarkdownEditor) -> String {
+        editor.document.text().to_string()
+    }
+
+    #[test]
+    fn finding_moves_through_the_matches_and_closing_selects() {
+        let mut e = editor("中文 one 中文 two 中文");
+        e.open_find(false);
+        assert!(
+            e.set_query(query("中文")).is_none(),
+            "small: searched at once"
+        );
+        assert_eq!(e.find.found.len(), 3);
+        assert_eq!(e.find.current, Some(0));
+        e.find_step(true);
+        assert_eq!(e.find.current, Some(1));
+        e.find_step(true);
+        e.find_step(true);
+        assert_eq!(e.find.current, Some(0), "wraps");
+        e.find_step(false);
+        assert_eq!(e.find.current, Some(2));
+        e.close_find();
+        let m = e.find.found.matches[2].clone();
+        assert_eq!(e.document.selection().range(), m);
+        assert_eq!(e.surface.selection(), (m.start, m.end));
+        assert_in_step(&e);
+        // A query that is not a valid regular expression says so.
+        e.open_find(false);
+        e.set_query(Query {
+            regex: true,
+            ..query("(")
+        });
+        assert!(e.find.error.is_some());
+        assert!(e.find.found.is_empty());
+        // An empty query matches nothing.
+        e.set_query(query(""));
+        assert!(e.find.found.is_empty() && e.find.error.is_none());
+    }
+
+    #[test]
+    fn replacing_one_goes_on_to_the_next() {
+        let mut e = editor("cat cat cat");
+        e.open_find(true);
+        e.set_query(query("cat"));
+        e.find.replacement = "狗".into();
+        assert!(e.replace_one());
+        assert_eq!(text_of(&e), "狗 cat cat");
+        assert_eq!(e.find.current_range(), Some(4..7));
+        assert!(e.replace_one());
+        assert_eq!(text_of(&e), "狗 狗 cat");
+        e.undo();
+        assert_eq!(text_of(&e), "狗 cat cat");
+        assert_in_step(&e);
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_step_with_groups() {
+        let mut e = editor("2026-11-23\n2025-01-02 和 2024-12-31");
+        e.open_find(true);
+        e.set_query(Query {
+            regex: true,
+            ..query(r"(\d{4})-(\d{2})-(\d{2})")
+        });
+        e.find.replacement = "$3/$2/$1".into();
+        assert!(e.replace_all().is_none(), "small: done at once");
+        assert_eq!(e.find.replaced, Some(3));
+        assert_eq!(text_of(&e), "23/11/2026\n02/01/2025 和 31/12/2024");
+        assert!(e.find.found.is_empty(), "nothing left to find");
+        e.undo();
+        assert_eq!(text_of(&e), "2026-11-23\n2025-01-02 和 2024-12-31");
+        assert_eq!(e.find.replaced, None, "the count went with the undo");
+        assert_in_step(&e);
+    }
+
+    #[test]
+    fn matches_follow_typing() {
+        let mut e = editor("ab ab");
+        e.open_find(false);
+        e.set_query(query("ab"));
+        e.place_caret(0);
+        type_text(&mut e, "x");
+        assert!(e.find.stale);
+        assert_eq!(e.find.found.matches, [1..3, 4..6]);
+        assert!(e.refresh_search().is_none());
+        assert_eq!(e.find.found.matches, [1..3, 4..6]);
+        assert!(!e.find.stale);
+        // Searching again after typing leaves the caret where it was typed.
+        assert_eq!(e.document.selection().range(), 1..1);
+    }
+
+    #[test]
+    fn finding_during_a_composition_leaves_the_caret_alone() {
+        let mut e = editor("one two one");
+        e.place_caret(3);
+        e.ime(preedit("ni"));
+        e.open_find(false);
+        e.set_query(query("one"));
+        assert!(e.surface.is_composing());
+        assert_eq!(e.document.selection().range(), 3..3);
+        e.ime(ImeEvent::Commit("你".into()));
+        assert_eq!(text_of(&e), "one你 two one");
+        assert_in_step(&e);
+    }
+
+    /// Above the inline limit, searching and replacing go through jobs.
+    #[test]
+    fn a_large_document_searches_and_replaces_through_jobs() {
+        let line = "大文件里的一行 with a needle 和更多文字。\n";
+        let text = line.repeat(LARGE_CHANGE / line.len() + 10);
+        let count = text.matches("needle").count();
+        let mut e = editor(&text);
+        e.open_find(true);
+        let job = e.set_query(query("needle")).expect("a job");
+        assert!(e.find.searching);
+        let (generation, found) = job.run();
+        e.search_finished(generation, found);
+        assert!(!e.find.searching);
+        assert_eq!(e.find.found.len(), count);
+
+        // A cancelled search reports nothing and changes nothing.
+        let job = e.set_query(query("needle")).unwrap();
+        let stale = e.set_query(query("文字")).unwrap();
+        let (old_generation, old) = job.run();
+        assert!(old.is_none(), "replaced by a newer search");
+        e.search_finished(old_generation, old);
+        let (generation, found) = stale.run();
+        e.search_finished(generation, found);
+        assert!(e.find.found.len() >= count);
+
+        // Replace all: locked until it is done, then one undo step.
+        if let Some(job) = e.set_query(query("needle")) {
+            let (generation, found) = job.run();
+            e.search_finished(generation, found);
+        }
+        e.find.replacement = "针".into();
+        let job = e.replace_all().expect("a job");
+        assert!(e.locked());
+        assert!(
+            !e.key(Action::Insert("x".into())),
+            "no edits while replacing"
+        );
+        let replaced = job.run();
+        assert!(e.replace_all_finished(replaced));
+        assert!(!e.locked());
+        assert_eq!(e.find.replaced, Some(count));
+        assert_eq!(text_of(&e), text.replace("needle", "针"));
+        assert_in_step(&e);
+        // Too large to highlight incrementally: rebuilt elsewhere.
+        assert!(e.highlight_stale);
+        let (version, rope) = e.highlight_job().expect("a rebuild");
+        e.highlighted(version, Highlighter::new(&rope));
+        assert!(!e.highlight_stale);
+        // The recovery record is checkpointed rather than given the edit.
+        let step = e.journal_step(|| 1);
+        assert!(matches!(step, JournalStep::Open(_)));
+        e.undo();
+        assert_eq!(text_of(&e), text);
+        assert_in_step(&e);
+        let step = e.journal_step(|| 1);
+        assert!(
+            matches!(step, JournalStep::Discard),
+            "back to what is on disk"
+        );
     }
 }

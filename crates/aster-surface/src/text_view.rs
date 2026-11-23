@@ -755,34 +755,34 @@ impl TextView {
     /// `range` become `inserted`. Ends any composition. The caret goes after
     /// the new text.
     pub fn replace_range(&mut self, range: Range<usize>, inserted: &str) {
+        let mut text = self.text.clone();
+        let start = text.byte_to_char(range.start);
+        let end = text.byte_to_char(range.end);
+        if end > start {
+            text.remove(start..end);
+        }
+        if !inserted.is_empty() {
+            text.insert(start, inserted);
+        }
+        self.apply_change(range, inserted.len(), text);
+    }
+
+    /// Take an edit the host has already made to its own copy of the text:
+    /// `text` is the whole text after the committed bytes in `range` became
+    /// `inserted` bytes. The view then shares the host's rope instead of
+    /// keeping a second copy. Ends any composition; the caret goes after
+    /// the new text.
+    pub fn apply_change(&mut self, range: Range<usize>, inserted: usize, text: Rope) {
         self.end_composition();
         let first = self.text.byte_to_line(range.start);
         let last = self.text.byte_to_line(range.end);
         let start_in_line = range.start - self.line_start(first);
         let first_segment = self.segment_of(first, start_in_line);
-
-        let start = self.text.byte_to_char(range.start);
-        let end = self.text.byte_to_char(range.end);
-        if end > start {
-            self.text.remove(start..end);
-        }
-        if !inserted.is_empty() {
-            self.text.insert(start, inserted);
-        }
+        self.text = text;
 
         // Lines `first..=last` became `first..=new_last`.
-        let new_last = self.text.byte_to_line(range.start + inserted.len());
-        let new_lens: Vec<u32> = (first..=new_last)
-            .map(|line| {
-                let from = self.text.line_to_byte(line);
-                let to = if line + 1 < self.text.len_lines() {
-                    self.text.line_to_byte(line + 1) - 1
-                } else {
-                    self.text.len_bytes()
-                };
-                (to - from) as u32
-            })
-            .collect();
+        let new_last = self.text.byte_to_line(range.start + inserted);
+        let new_lens = self.lengths(first..=new_last);
         let added = new_last - first + 1;
         let removed = last - first + 1;
         let same_lines = added == removed;
@@ -839,12 +839,37 @@ impl TextView {
         } else if self.top.0 > new_last {
             self.top = (new_last, 0.0);
         }
-        let caret = self.floor(range.start + inserted.len());
+        let caret = self.floor(range.start + inserted);
         self.anchor = caret;
         self.focus = caret;
         self.upstream = false;
         self.preferred_x = None;
         self.caret_on = true;
+    }
+
+    /// Lengths of a run of lines, in one pass over their text.
+    fn lengths(&self, lines: std::ops::RangeInclusive<usize>) -> Vec<u32> {
+        let (first, last) = (*lines.start(), *lines.end());
+        let start = self.text.line_to_byte(first);
+        let end = if last + 1 < self.text.len_lines() {
+            self.text.line_to_byte(last + 1) - 1
+        } else {
+            self.text.len_bytes()
+        };
+        let mut lens = Vec::with_capacity(last - first + 1);
+        let mut current = 0usize;
+        for chunk in self.text.byte_slice(start..end).chunks() {
+            let bytes = chunk.as_bytes();
+            let mut from = 0;
+            while let Some(at) = bytes[from..].iter().position(|b| *b == b'\n') {
+                lens.push((current + at) as u32);
+                current = 0;
+                from += at + 1;
+            }
+            current += bytes.len() - from;
+        }
+        lens.push(current as u32);
+        lens
     }
 
     pub fn is_composing(&self) -> bool {

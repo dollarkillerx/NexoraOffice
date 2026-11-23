@@ -1,0 +1,324 @@
+// The find bar above a Markdown tab's editor, with an optional replace row.
+// Typing searches at once; Enter goes to the next match, Shift+Enter to the
+// previous one, Esc closes the bar and leaves the current match selected.
+
+import { Tokens, Icons, Strings } from "tokens.slint";
+import { IconButton, TextButton } from "widgets.slint";
+
+// A field: a single-line text input in a filled capsule.
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> error;
+    in-out property <string> text <=> input.text;
+    out property <bool> has-focus: input.has-focus;
+    callback edited(string);
+    callback accepted();
+    height: Tokens.control-height;
+    border-radius: Tokens.radius-md;
+    background: Tokens.fill;
+    border-width: root.error ? 1px : input.has-focus ? 1px : 0px;
+    border-color: root.error ? Tokens.text-secondary : Tokens.accent;
+
+    public function focus-and-select() {
+        input.focus();
+        input.select-all();
+    }
+
+    // 0 select all, 1 cut, 2 copy, 3 paste, 4 undo, 5 redo.
+    public function edit(operation: int) {
+        if (operation == 0) {
+            input.select-all();
+        } else if (operation == 1) {
+            input.cut();
+        } else if (operation == 2) {
+            input.copy();
+        } else if (operation == 3) {
+            input.paste();
+        } else if (operation == 4) {
+            input.undo();
+        } else if (operation == 5) {
+            input.redo();
+        }
+    }
+
+    Text {
+        x: Tokens.space-sm;
+        width: parent.width - 2 * Tokens.space-sm;
+        text: root.placeholder;
+        visible: input.text == "" && !input.has-focus;
+        color: Tokens.text-tertiary;
+        font-size: Tokens.font-md;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+
+    input := TextInput {
+        x: Tokens.space-sm;
+        width: parent.width - 2 * Tokens.space-sm;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        font-size: Tokens.font-md;
+        color: Tokens.text;
+        selection-background-color: Tokens.accent-soft;
+        selection-foreground-color: Tokens.text;
+        edited => {
+            root.edited(self.text);
+        }
+        accepted => {
+            root.accepted();
+        }
+    }
+}
+
+// A small toggle drawn as text, such as "Aa" for matching case.
+component Toggle inherits Rectangle {
+    in property <string> label;
+    in property <string> description;
+    in property <bool> checked;
+    callback toggled();
+    width: Tokens.control-height;
+    height: Tokens.control-height;
+    border-radius: Tokens.radius-md;
+    background: root.checked ? Tokens.accent-soft : touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+    accessible-role: checkbox;
+    accessible-checked: root.checked;
+    accessible-label: root.description;
+    Text {
+        text: root.label;
+        font-size: Tokens.font-sm;
+        font-weight: 600;
+        color: root.checked ? Tokens.accent : Tokens.text-secondary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.toggled();
+        }
+    }
+}
+
+export component FindBar inherits Rectangle {
+    in property <bool> replace-visible;
+    in-out property <string> query;
+    in-out property <string> replacement;
+    // "3 / 120", "无结果", "正在统计…": put together by the shell.
+    in property <string> position;
+    in property <bool> error;
+    in property <bool> match-case;
+    in property <bool> whole-word;
+    in property <bool> use-regex;
+    // Replacing everything is running: the buttons wait.
+    in property <bool> busy;
+    callback query-edited(string);
+    callback replacement-edited(string);
+    callback next();
+    callback previous();
+    callback close();
+    // 0 case, 1 whole word, 2 regular expression.
+    callback toggle(int);
+    callback replace-one();
+    callback replace-all();
+
+    public function focus-query() {
+        query-field.focus-and-select();
+    }
+
+    public function focus-replacement() {
+        replace-field.focus-and-select();
+    }
+
+    // One of the fields has the keyboard: the Edit menu acts on it.
+    out property <bool> editing-text: root.visible && (query-field.has-focus || replace-field.has-focus);
+
+    // An Edit menu command on the field that has the keyboard; see
+    // `Field.edit` for the numbers.
+    public function edit(operation: int) {
+        if (query-field.has-focus) {
+            query-field.edit(operation);
+        } else if (replace-field.has-focus) {
+            replace-field.edit(operation);
+        }
+    }
+
+    height: layout.preferred-height + 1px;
+    background: Tokens.surface;
+
+    // Clicks on the bar stay on the bar.
+    TouchArea { }
+
+    // Enter and Esc are taken before the text fields see them.
+    FocusScope {
+        capture-key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close();
+                return accept;
+            }
+            if (event.text == Key.Return && query-field.has-focus) {
+                if (event.modifiers.shift) {
+                    root.previous();
+                } else {
+                    root.next();
+                }
+                return accept;
+            }
+            if (event.text == Key.Return && replace-field.has-focus) {
+                // Cmd+Return replaces every match, Return the current one.
+                if (event.modifiers.control) {
+                    if (!root.busy) {
+                        root.replace-all();
+                    }
+                } else if (!root.busy) {
+                    root.replace-one();
+                }
+                return accept;
+            }
+            // Cmd+Option+C, W and R switch the options. With Option held,
+            // macOS may report the composed character (ç, ∑, ®) instead.
+            if (event.modifiers.control && event.modifiers.alt) {
+                if (event.text == "c" || event.text == "C" || event.text == "ç") {
+                    root.toggle(0);
+                    return accept;
+                }
+                if (event.text == "w" || event.text == "W" || event.text == "∑") {
+                    root.toggle(1);
+                    return accept;
+                }
+                if (event.text == "r" || event.text == "R" || event.text == "®") {
+                    root.toggle(2);
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
+        layout := VerticalLayout {
+            padding-left: Tokens.space-md;
+            padding-right: Tokens.space-md;
+            padding-top: Tokens.space-xs;
+            padding-bottom: Tokens.space-xs;
+            spacing: Tokens.space-xs;
+
+            HorizontalLayout {
+                spacing: Tokens.space-xs;
+                query-field := Field {
+                    horizontal-stretch: 1;
+                    placeholder: Strings.find-placeholder;
+                    error: root.error;
+                    text <=> root.query;
+                    edited(text) => {
+                        root.query-edited(text);
+                    }
+                }
+
+                Text {
+                    text: root.position;
+                    min-width: 72px;
+                    color: root.error ? Tokens.text-secondary : Tokens.text-tertiary;
+                    font-size: Tokens.font-sm;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                Toggle {
+                    label: "Aa";
+                    description: Strings.find-match-case;
+                    checked: root.match-case;
+                    toggled => {
+                        root.toggle(0);
+                    }
+                }
+
+                Toggle {
+                    label: "ab";
+                    description: Strings.find-whole-word;
+                    checked: root.whole-word;
+                    toggled => {
+                        root.toggle(1);
+                    }
+                }
+
+                Toggle {
+                    label: ".*";
+                    description: Strings.find-regex;
+                    checked: root.use-regex;
+                    toggled => {
+                        root.toggle(2);
+                    }
+                }
+
+                IconButton {
+                    icon: Icons.chevron-up;
+                    accessible-role: button;
+                    accessible-label: Strings.menu-find-previous;
+                    clicked => {
+                        root.previous();
+                    }
+                }
+
+                IconButton {
+                    icon: Icons.chevron-down;
+                    accessible-role: button;
+                    accessible-label: Strings.menu-find-next;
+                    clicked => {
+                        root.next();
+                    }
+                }
+
+                IconButton {
+                    icon: Icons.close;
+                    accessible-role: button;
+                    accessible-label: Strings.find-close;
+                    clicked => {
+                        root.close();
+                    }
+                }
+            }
+
+            // Always there, so the shell can focus its field; folded away
+            // when replacing is not asked for.
+            Rectangle {
+                height: root.replace-visible ? Tokens.control-height : 0px;
+                visible: root.replace-visible;
+                clip: true;
+                HorizontalLayout {
+                    spacing: Tokens.space-xs;
+                    replace-field := Field {
+                        horizontal-stretch: 1;
+                        placeholder: Strings.replace-placeholder;
+                        text <=> root.replacement;
+                        edited(text) => {
+                            root.replacement-edited(text);
+                        }
+                    }
+
+                    TextButton {
+                        text: Strings.replace-one;
+                        clicked => {
+                            if (!root.busy) {
+                                root.replace-one();
+                            }
+                        }
+                    }
+
+                    TextButton {
+                        text: Strings.replace-all;
+                        clicked => {
+                            if (!root.busy) {
+                                root.replace-all();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Tokens.hairline;
+    }
+}

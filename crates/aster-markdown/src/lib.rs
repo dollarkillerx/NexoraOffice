@@ -18,6 +18,7 @@ pub mod highlight;
 mod history;
 pub mod journal;
 pub mod preview;
+pub mod search;
 pub mod syntax;
 
 pub use document::{Change, Document, EditCommand, SavePoint, Selection};

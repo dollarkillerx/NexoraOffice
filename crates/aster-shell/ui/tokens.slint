@@ -53,6 +53,19 @@ export global Tokens {
 // copied in at start-up and whenever the language changes. No .slint file may
 // hold interface text of its own.
 export global Strings {
+    in property <string> menu-find;
+    in property <string> menu-find-next;
+    in property <string> menu-find-previous;
+    in property <string> menu-find-selection;
+    in property <string> menu-replace;
+    in property <string> find-placeholder;
+    in property <string> replace-placeholder;
+    in property <string> find-match-case;
+    in property <string> find-whole-word;
+    in property <string> find-regex;
+    in property <string> find-close;
+    in property <string> replace-one;
+    in property <string> replace-all;
     in property <string> tagline;
     in property <string> new-document;
     in property <string> recent;
@@ -117,6 +130,7 @@ export global Icons {
     in property <string> assistant;
     in property <string> check;
     in property <string> folder-open;
+    in property <string> chevron-up;
 }
 
 export struct TabItem {

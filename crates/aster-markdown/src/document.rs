@@ -317,6 +317,49 @@ impl Document {
         }
     }
 
+    /// Replace a byte range with `text` as one undo step, as find and
+    /// replace does. The caret goes after the new text. `None` if the range
+    /// is empty and so is the text.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) -> Option<Change> {
+        let range = self.clamp(range.start)..self.clamp(range.end.max(range.start));
+        (!range.is_empty() || !text.is_empty()).then(|| self.replace(Kind::Single, range, text))
+    }
+
+    /// Take a replacement that was worked out on another thread: `new_text`
+    /// is the whole text with `range` replaced by `inserted`, and `removed`
+    /// is what `range` held. One undo step. Recorded exactly as
+    /// [`Self::replace_range`] would, without the edit costing anything
+    /// here; for replacing throughout a large document.
+    pub fn replace_with(
+        &mut self,
+        range: Range<usize>,
+        inserted: String,
+        removed: String,
+        new_text: Rope,
+    ) -> Change {
+        debug_assert_eq!(
+            new_text.len_bytes() + range.len(),
+            self.text.len_bytes() + inserted.len()
+        );
+        let before = self.selection;
+        self.text = new_text;
+        self.selection = Selection::caret(range.start + inserted.len());
+        self.history.record(
+            Kind::Single,
+            range.start,
+            removed.clone(),
+            inserted.clone(),
+            before,
+            self.selection,
+        );
+        Change {
+            range,
+            inserted,
+            removed,
+            selection: self.selection,
+        }
+    }
+
     /// An input-method composition is starting. It types over the selection, so
     /// the selection goes now; the text that is eventually committed joins this
     /// removal as one undo step. `None` if nothing was selected.
@@ -789,5 +832,35 @@ mod tests {
         );
         document.select_all();
         assert_eq!(document.selected_text(), "中文");
+    }
+
+    #[test]
+    fn replacing_a_range_is_one_undo_step() {
+        let mut document = Document::new("一二三四");
+        document.apply(EditCommand::Type("x".to_owned()));
+        let change = document.replace_range(4..10, "甲").unwrap();
+        assert_eq!(change.removed, "二三");
+        assert_eq!(document.text(), "x一甲四");
+        assert_eq!(document.selection(), Selection::caret(7));
+        document.undo();
+        assert_eq!(document.text(), "x一二三四");
+        assert!(document.replace_range(2..2, "").is_none());
+    }
+
+    #[test]
+    fn a_replacement_made_elsewhere_undoes_like_any_other() {
+        let mut document = Document::new("aaa bbb aaa");
+        let mut new_text = document.text().clone();
+        replace(&mut new_text, 0..11, "ccc bbb ccc");
+        let change =
+            document.replace_with(0..11, "ccc bbb ccc".into(), "aaa bbb aaa".into(), new_text);
+        assert_eq!(change.range, 0..11);
+        assert_eq!(document.text(), "ccc bbb ccc");
+        assert!(document.is_modified());
+        let undo = document.undo().unwrap();
+        assert_eq!(undo.inserted, "aaa bbb aaa");
+        assert_eq!(document.text(), "aaa bbb aaa");
+        document.redo();
+        assert_eq!(document.text(), "ccc bbb ccc");
     }
 }

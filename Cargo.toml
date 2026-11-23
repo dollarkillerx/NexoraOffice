@@ -65,6 +65,10 @@ pulldown-cmark = { version = "~0.13.6", default-features = false }
 # The text of large documents. Only `\n` ends a line: files are normalised to
 # it when read.
 ropey = { version = "~1.6.1", default-features = false, features = ["simd"] }
+# Find and replace: the engine of the `regex` crate, used directly so that a
+# search can be confined to a window of the text and cancelled between them.
+regex-automata = "~0.4.19"
+regex-syntax = "~0.8.12"
 
 [profile.dev]
 opt-level = 1

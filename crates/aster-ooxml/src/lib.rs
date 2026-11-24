@@ -15,6 +15,7 @@ pub mod error;
 pub mod package;
 pub mod pptx;
 pub mod xlsx;
+pub mod xlsx_save;
 mod xml;
 
 pub use error::{Error, ErrorKind, Result};

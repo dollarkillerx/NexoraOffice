@@ -119,19 +119,19 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
     Ok(workbook)
 }
 
-struct Entry {
-    name: String,
-    rel: String,
-    hidden: bool,
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) rel: String,
+    pub(crate) hidden: bool,
 }
 
-struct Entries {
-    sheets: Vec<Entry>,
+pub(crate) struct Entries {
+    pub(crate) sheets: Vec<Entry>,
     date1904: bool,
     active: usize,
 }
 
-fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
+pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
     let mut reader = XmlReader::new(bytes, part);
     let mut entries = Entries {
         sheets: Vec::new(),
@@ -185,7 +185,7 @@ fn string_item(reader: &mut XmlReader<'_>) -> Result<String> {
     }
 }
 
-fn shared_strings(bytes: &[u8], part: &str) -> Result<Vec<Arc<str>>> {
+pub(crate) fn shared_strings(bytes: &[u8], part: &str) -> Result<Vec<Arc<str>>> {
     let mut reader = XmlReader::new(bytes, part);
     let mut strings = Vec::new();
     loop {

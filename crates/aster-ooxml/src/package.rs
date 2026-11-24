@@ -7,13 +7,15 @@
 //! small sizes and inflate to gigabytes, so sizes are counted while reading,
 //! not taken from the zip directory.
 //!
-//! Following ADR 0001, saving will write untouched parts back as they were
-//! read; this version only reads.
+//! Following ADR 0001, saving writes untouched parts back as they were
+//! read ([`Package::rewrite`]): their compressed bytes are copied, so even
+//! their compression stays the same.
 
-use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read, Write};
 
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::{Error, Result};
 use crate::xml::{Ev, XmlReader};
@@ -132,6 +134,15 @@ impl Package {
         Ok(package)
     }
 
+    /// Every part's name, in the order the zip file holds them.
+    pub fn part_names(&self) -> Vec<String> {
+        (0..self.archive.len())
+            .filter_map(|i| self.archive.name_for_index(i))
+            .filter(|name| !name.ends_with('/'))
+            .map(|name| name.trim_start_matches('/').to_owned())
+            .collect()
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.index.contains_key(&name.to_ascii_lowercase())
     }
@@ -179,6 +190,47 @@ impl Package {
         }
         self.read_total += data.len() as u64;
         Ok(data)
+    }
+
+    /// A new package: every part as it is here, its compressed bytes copied
+    /// as they were, except the parts in `replaced` (by part name, any
+    /// case), written with their new contents, and those in `removed`, left
+    /// out. The parts keep their order and names.
+    pub fn rewrite(
+        &mut self,
+        replaced: &HashMap<String, Vec<u8>>,
+        removed: &HashSet<String>,
+    ) -> Result<Vec<u8>> {
+        let broken = |err: zip::result::ZipError| Error::Broken(format!("writing: {err}"));
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..self.archive.len() {
+            let Some(name) = self.archive.name_for_index(i).map(str::to_owned) else {
+                continue;
+            };
+            let key = name.trim_start_matches('/').to_ascii_lowercase();
+            if removed.contains(&key) {
+                continue;
+            }
+            let entry = self.archive.by_index_raw(i).map_err(broken)?;
+            match replaced.get(&key) {
+                None => out.raw_copy_file(entry).map_err(broken)?,
+                Some(bytes) => {
+                    let method = match entry.compression() {
+                        CompressionMethod::Stored => CompressionMethod::Stored,
+                        _ => CompressionMethod::Deflated,
+                    };
+                    let mut options = SimpleFileOptions::default().compression_method(method);
+                    if let Some(time) = entry.last_modified() {
+                        options = options.last_modified_time(time);
+                    }
+                    drop(entry);
+                    out.start_file(name, options).map_err(broken)?;
+                    out.write_all(bytes)
+                        .map_err(|err| Error::Broken(format!("writing: {err}")))?;
+                }
+            }
+        }
+        Ok(out.finish().map_err(broken)?.into_inner())
     }
 
     fn read_content_types(&mut self) -> Result<()> {

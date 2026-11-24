@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aster_markdown::format::Styles;
@@ -430,9 +431,9 @@ impl Shell {
         }
         let title = files::display_name(&path);
         let content = match loaded {
-            office::Loaded::Workbook(workbook) => {
+            office::Loaded::Workbook(workbook, source) => {
                 let id = self.tabs.open(DocKind::Sheets, title);
-                let tab = SheetTab::new(workbook, Some(path), &self.tokens);
+                let tab = SheetTab::new(workbook, source, Some(path), &self.tokens);
                 self.contents.insert(id, Content::Sheet(Box::new(tab)));
                 return id;
             }
@@ -702,6 +703,14 @@ impl Shell {
     /// never been saved.
     fn save_target(&mut self, id: TabId) -> Option<(Option<PathBuf>, PathBuf)> {
         let title = self.tabs.get(id)?.title.clone();
+        if let Some(Content::Sheet(tab)) = self.contents.get(&id) {
+            let suggested = tab.path.clone().unwrap_or_else(|| {
+                let mut name = files::suggested_file_name(&title);
+                name.set_extension("xlsx");
+                name
+            });
+            return Some((tab.path.clone(), suggested));
+        }
         let editor = self.markdown(id)?;
         let suggested = editor
             .path
@@ -2866,6 +2875,40 @@ fn finish_save(
     }
 }
 
+fn finish_sheet_save(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    job: office::SheetSave,
+    path: PathBuf,
+    result: Result<Arc<Vec<u8>>, String>,
+    after: AfterSave,
+) {
+    if let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) {
+        tab.finish_save(&job, &path, result.as_ref().ok().cloned());
+    }
+    match result {
+        Ok(_) => {
+            shell.tabs.rename(id, files::display_name(&path));
+            shell.sync_modified();
+            shell.remember_file(&path);
+            refresh_sidebar(ui, shell);
+            if after == AfterSave::CloseTab {
+                shell.force_close(id);
+                after_tab_change(ui, shell);
+            } else {
+                refresh_chrome(ui, shell);
+                present(ui, shell);
+            }
+        }
+        Err(reason) => {
+            let strings = shell.language.strings();
+            let title = i18n::fill(strings.save_failed, "name", &files::display_name(&path));
+            show_dialog(ui, shell, 2, title, reason);
+        }
+    }
+}
+
 /// Save the document in tab `id`, asking where to if it has no file yet or if
 /// `ask` is set. The shell is not borrowed while the system dialog is open, and
 /// the dialog is awaited in a task of its own, never inside the event handler
@@ -2889,11 +2932,23 @@ fn save_document(
     match existing {
         Some(path) if !ask => start_save(ui, shell, id, path, after),
         _ => {
+            let is_sheet = matches!(
+                shell
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.contents.get(&id).map(|c| matches!(c, Content::Sheet(_)))),
+                Some(true)
+            );
             let (weak, shell) = (ui.as_weak(), shell.clone());
             let _ = slint::spawn_local(async move {
-                let types = text_file_types(strings);
+                let sheet_types = [FileType {
+                    name: strings.file_type_spreadsheet,
+                    extensions: &["xlsx"],
+                }];
+                let text_types = text_file_types(strings);
+                let types: &[FileType] = if is_sheet { &sheet_types } else { &text_types };
                 let chosen =
-                    dialogs::pick_file_to_save(strings.save_dialog, &suggested, &types).await;
+                    dialogs::pick_file_to_save(strings.save_dialog, &suggested, types).await;
                 // Cancelled: nothing is saved and nothing is closed.
                 if let Some(path) = chosen
                     && let Some(ui) = weak.upgrade()
@@ -2915,6 +2970,32 @@ fn start_save(
     let Ok(mut shell) = shell.try_borrow_mut() else {
         return;
     };
+    if matches!(shell.contents.get(&id), Some(Content::Sheet(_))) {
+        let language = shell.language.tag();
+        let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+            return;
+        };
+        // What is being typed goes in first, as Excel does.
+        if tab.view.is_editing() {
+            let changes = tab.commit(language);
+            tab.recalc(&changes);
+        }
+        if let Some(job) = tab.begin_save() {
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let result = job.write(&path);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    deliver(
+                        ui,
+                        Box::new(move |ui, shell| {
+                            finish_sheet_save(ui, shell, id, job, path, result, after)
+                        }),
+                    );
+                });
+            });
+        }
+        return;
+    }
     if let Some(job) = shell.begin_save(id, path) {
         spawn_save(ui, job, after);
     }
@@ -4326,7 +4407,7 @@ mod tests {
         };
         let id = shell.open_office(
             PathBuf::from("/tmp/表.xlsx"),
-            office::Loaded::Workbook(workbook),
+            office::Loaded::Workbook(workbook, Arc::new(Vec::new())),
         );
         assert!(Command::Undo.is_available(DocKind::Sheets));
         assert!(!shell.run(Command::Undo));

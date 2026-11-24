@@ -41,7 +41,8 @@ pub fn kind_of(path: &Path) -> Option<DocKind> {
 }
 
 pub enum Loaded {
-    Workbook(Workbook),
+    /// The workbook and the file's bytes, which saving starts from.
+    Workbook(Workbook, Arc<Vec<u8>>),
     Presentation(Presentation),
 }
 
@@ -93,10 +94,12 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
             .read(bytes)
             .map(Loaded::Presentation)
             .map_err(LoadError::Format),
-        _ => Xlsx
-            .read(bytes)
-            .map(Loaded::Workbook)
-            .map_err(LoadError::Format),
+        _ => {
+            let source = Arc::new(bytes.clone());
+            Xlsx.read(bytes)
+                .map(|workbook| Loaded::Workbook(workbook, source))
+                .map_err(LoadError::Format)
+        }
     }
 }
 
@@ -282,6 +285,36 @@ impl History {
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.undo.len());
     }
+
+    /// How many steps there are to undo.
+    pub fn depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// The state `depth` steps in is what is on disk now.
+    pub fn mark_saved_at(&mut self, depth: usize) {
+        self.saved = Some(depth);
+    }
+}
+
+/// A workbook being saved: what is written, taken when saving started.
+pub struct SheetSave {
+    pub source: Arc<Vec<u8>>,
+    pub workbook: Arc<Workbook>,
+    pub changes: aster_ooxml::xlsx_save::Changes,
+    depth: usize,
+}
+
+impl SheetSave {
+    /// Make the file and write it in place of `path` in one step. Runs on a
+    /// worker thread. Returns the bytes written.
+    pub fn write(&self, path: &Path) -> Result<Arc<Vec<u8>>, String> {
+        let bytes =
+            aster_ooxml::xlsx_save::save((*self.source).clone(), &self.workbook, &self.changes)
+                .map_err(|err| err.to_string())?;
+        aster_storage::write_atomically(path, &bytes).map_err(|err| err.to_string())?;
+        Ok(Arc::new(bytes))
+    }
 }
 
 pub struct SheetTab {
@@ -295,14 +328,24 @@ pub struct SheetTab {
     /// Cells changed since the file was read or saved: what saving
     /// rewrites.
     pub dirty: BTreeSet<(usize, CellRef)>,
+    /// Of `dirty`, the cells changed by hand rather than by recalculation.
+    pub edited: BTreeSet<(usize, CellRef)>,
     /// A formula appeared or went since the file was read or saved.
     pub formulas_changed: bool,
+    /// The file as last read or saved: saving starts from it.
+    pub source: Arc<Vec<u8>>,
+    pub saving: bool,
     /// What was last copied or cut here.
     pub clip: Option<aster_sheets::Clip>,
 }
 
 impl SheetTab {
-    pub fn new(workbook: Workbook, path: Option<PathBuf>, tokens: &theme::Tokens) -> Self {
+    pub fn new(
+        workbook: Workbook,
+        source: Arc<Vec<u8>>,
+        path: Option<PathBuf>,
+        tokens: &theme::Tokens,
+    ) -> Self {
         let mut view = SheetView::new(Arc::new(workbook));
         view.set_style(sheet_style(tokens));
         let mut history = History::default();
@@ -315,7 +358,10 @@ impl SheetTab {
             circular: Vec::new(),
             history,
             dirty: BTreeSet::new(),
+            edited: BTreeSet::new(),
             formulas_changed: false,
+            source,
+            saving: false,
             clip: None,
         }
     }
@@ -552,8 +598,59 @@ impl SheetTab {
     fn note(&mut self, changes: &[Change]) {
         for change in changes {
             self.dirty.insert((change.sheet, change.at));
+            self.edited.insert((change.sheet, change.at));
             self.formulas_changed |= change.touches_formula();
         }
+    }
+
+    /// What saving now would write. `None` while a save is running.
+    pub fn begin_save(&mut self) -> Option<SheetSave> {
+        if self.saving {
+            return None;
+        }
+        self.saving = true;
+        // What is being typed is not part of the file yet.
+        Some(SheetSave {
+            source: self.source.clone(),
+            workbook: self.view.workbook().clone(),
+            changes: aster_ooxml::xlsx_save::Changes {
+                cells: self.dirty.clone(),
+                edited: self.edited.clone(),
+                formulas_changed: self.formulas_changed,
+            },
+            depth: self.history.depth(),
+        })
+    }
+
+    /// A save has finished. On success the written file is what the next
+    /// save starts from, and what was written no longer counts as changed;
+    /// what changed while it ran still does.
+    pub fn finish_save(&mut self, job: &SheetSave, path: &Path, written: Option<Arc<Vec<u8>>>) {
+        self.saving = false;
+        let Some(bytes) = written else {
+            return;
+        };
+        self.source = bytes;
+        self.path = Some(path.to_owned());
+        let unchanged_since = self.history.depth() == job.depth;
+        for cell in &job.changes.cells {
+            // A cell is still to be written if it changed again since.
+            let now = self
+                .view
+                .workbook()
+                .sheets
+                .get(cell.0)
+                .and_then(|s| s.cell(cell.1));
+            let then = job.workbook.sheets.get(cell.0).and_then(|s| s.cell(cell.1));
+            if now == then {
+                self.dirty.remove(cell);
+                self.edited.remove(cell);
+            }
+        }
+        if unchanged_since {
+            self.formulas_changed = false;
+        }
+        self.history.mark_saved_at(job.depth);
     }
 
     /// Undo the last step. Returns the changes made, to recalculate.
@@ -873,7 +970,7 @@ mod tests {
             ..Workbook::default()
         };
         let tokens = theme::Tokens::of(theme::ThemeMode::Light);
-        SheetTab::new(workbook, None, &tokens)
+        SheetTab::new(workbook, Arc::new(Vec::new()), None, &tokens)
     }
 
     fn at(text: &str) -> CellRef {
@@ -1048,5 +1145,57 @@ mod tests {
         tab.undo();
         assert!(tab.view.sheet().unwrap().cell(at("B3")).is_some());
         assert!(tab.view.sheet().unwrap().cell(at("C9")).is_none());
+    }
+
+    #[test]
+    fn open_type_save_and_open_again() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("新しい.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("ja");
+        };
+        enter(&mut tab, "A1", "東京");
+        enter(&mut tab, "A2", "2026/11/24");
+        enter(&mut tab, "B2", "=A2+1");
+        let job = tab.begin_save().unwrap();
+        // One save at a time.
+        assert!(tab.begin_save().is_none());
+        // Typed while the save runs: still to be saved afterwards.
+        enter(&mut tab, "C3", "後で");
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        assert!(tab.is_modified());
+        assert_eq!(tab.dirty.iter().collect::<Vec<_>>(), [&(0, at("C3"))]);
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        assert!(!tab.is_modified());
+        assert!(tab.dirty.is_empty() && !tab.formulas_changed);
+
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let cell = |c: &str| again.sheets[0].cell(at(c)).unwrap().clone();
+        assert_eq!(cell("A1").value, aster_sheets::Value::Text("東京".into()));
+        assert_eq!(again.display(&cell("A2")).unwrap().text, "2026/11/24");
+        assert_eq!(cell("B2").formula.as_deref(), Some("A2+1"));
+        assert_eq!(cell("C3").value, aster_sheets::Value::Text("後で".into()));
+        // A failed save changes nothing.
+        enter(&mut tab, "D4", "1");
+        let job = tab.begin_save().unwrap();
+        let failed = job.write(&dir.path().join("無い/x.xlsx"));
+        assert!(failed.is_err());
+        tab.finish_save(&job, &file, None);
+        assert!(tab.is_modified() && !tab.saving);
     }
 }

@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use aster_sheets::style::{self, Rgba};
 use aster_sheets::{
-    Anchor, Axis, Borders, Cell, CellRange, CellRef, CellStyle, Font, Format, HAlign, Line,
-    LineStyle, MAX_COLUMNS, MAX_ROWS, Picture, Placement, Sheet, SheetBuilder, SheetKind, VAlign,
-    Value, Workbook,
+    Anchor, AutoFilter, Axis, Borders, Cell, CellRange, CellRef, CellStyle, Font, Format, HAlign,
+    Line, LineStyle, MAX_COLUMNS, MAX_ROWS, Picture, Placement, Sheet, SheetBuilder, SheetKind,
+    Shown, VAlign, Value, Workbook,
 };
 
 use crate::drawingml::{Theme, parse_hex, read_theme};
@@ -759,6 +759,9 @@ fn worksheet(
                     reader.skip()
                 })?;
             }
+            Ev::Open(tag) if tag.is("autoFilter") => {
+                builder.auto_filter = auto_filter(&mut reader, &tag)?;
+            }
             Ev::Open(tag) if tag.is("drawing") => {
                 drawing = tag.attr("id");
                 reader.skip()?;
@@ -774,6 +777,17 @@ fn worksheet(
             _ => {}
         }
     }
+    // Rows hidden inside a filter that filters something are its own.
+    if let Some(filter) = &mut builder.auto_filter
+        && !(filter.columns.is_empty() && filter.others.is_empty())
+    {
+        let rows = filter.data_rows();
+        filter.hidden = row_heights
+            .iter()
+            .filter(|(row, size)| *size == 0.0 && rows.contains(row))
+            .map(|(row, _)| *row)
+            .collect();
+    }
     row_heights.sort_by_key(|(row, _)| *row);
     row_heights.dedup_by_key(|(row, _)| *row);
     builder.row_sizes.set_sorted(
@@ -782,6 +796,59 @@ fn worksheet(
             .map(|(row, size)| (row, row + 1, size)),
     );
     Ok((builder, drawing))
+}
+
+/// An `<autoFilter>`: its range and, per filtered column, the values its
+/// list shows. A column filtered some other way is only noted.
+fn auto_filter(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Option<AutoFilter>> {
+    let Some(range) = tag.attr("ref").as_deref().and_then(CellRange::parse) else {
+        reader.skip()?;
+        return Ok(None);
+    };
+    let mut filter = AutoFilter::new(range);
+    each_child(reader, |reader, child| {
+        if !child.is("filterColumn") {
+            return reader.skip();
+        }
+        let id = child
+            .attr_i64("colId")
+            .unwrap_or(0)
+            .clamp(0, i64::from(MAX_COLUMNS - 1)) as u32;
+        let col = range.first.col.saturating_add(id);
+        let mut shown = Some(Shown::default());
+        let mut any = false;
+        each_child(reader, |reader, kind| {
+            any = true;
+            if !kind.is("filters") {
+                shown = None;
+                return reader.skip();
+            }
+            if let Some(shown) = &mut shown {
+                shown.blanks = kind.attr_bool("blank").unwrap_or(false);
+            }
+            each_child(reader, |reader, item| {
+                match (&mut shown, item.is("filter"), item.attr("val")) {
+                    (Some(shown), true, Some(value)) => {
+                        shown.values.insert(value);
+                    }
+                    _ => shown = None,
+                }
+                reader.skip()
+            })
+        })?;
+        match shown {
+            // A column with only its button settings filters nothing.
+            _ if !any => {}
+            Some(shown) => {
+                filter.columns.insert(col, shown);
+            }
+            None => {
+                filter.others.insert(col);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Some(filter))
 }
 
 fn read_row(

@@ -20,7 +20,8 @@ use aster_surface::cell_editor::EditMode;
 
 use crate::toolbar::{CellLook, Command, font_size_step};
 use aster_sheets::{
-    CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder, Edit, Workbook,
+    AutoFilter, CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder,
+    Edit, Shown, Workbook,
 };
 use aster_slides::Presentation;
 use aster_surface::sheet_view::{Direction, MIN_SIZE, Resize, SheetKey, SheetStyle, SheetView};
@@ -318,6 +319,8 @@ pub struct Step {
     sizes: Vec<(usize, Resize, f64, f64)>,
     /// Frozen rows and columns changed: sheet, before, after.
     frozen: Vec<(usize, Frozen, Frozen)>,
+    /// The autofilter changed: sheet, before, after.
+    filter: Option<Box<FilterStep>>,
     /// How many styles the workbook had before the step.
     styles_before: usize,
     /// The styles undo took away, put back by redo.
@@ -328,6 +331,66 @@ pub struct Step {
     sheets: Option<Box<SheetStep>>,
     /// Whole rows' and columns' own formats changed: sheet, change.
     line_formats: Vec<(usize, aster_sheets::restyle::LineFormat)>,
+}
+
+/// An autofilter put on, changed or taken off: sheet, before, after.
+type FilterStep = (usize, Option<AutoFilter>, Option<AutoFilter>);
+
+/// What a filtered column's list offers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterList {
+    /// The sheet column.
+    pub col: u32,
+    /// Its values, in order, with whether each shows.
+    pub values: Vec<(String, bool)>,
+    /// Whether empty cells show; `None` when the column has none.
+    pub blanks: Option<bool>,
+}
+
+impl FilterList {
+    /// Turn a value on or off: one of `values`, the blank cells after
+    /// them, or (`-1`) all of them, as "select all" does.
+    pub fn toggle(&mut self, index: i32) {
+        let count = self.values.len();
+        if index < 0 {
+            let all = self.values.iter().all(|(_, on)| *on) && self.blanks != Some(false);
+            for (_, on) in &mut self.values {
+                *on = !all;
+            }
+            if let Some(blanks) = &mut self.blanks {
+                *blanks = !all;
+            }
+            return;
+        }
+        let index = index as usize;
+        if let Some((_, on)) = self.values.get_mut(index) {
+            *on = !*on;
+        } else if index == count
+            && let Some(blanks) = &mut self.blanks
+        {
+            *blanks = !*blanks;
+        }
+    }
+
+    /// What the column shows as chosen: `Some(None)` all of it (the
+    /// column is not filtered), `Some(Some(..))` some of it, `None` when
+    /// nothing is chosen, which is not applied.
+    pub fn shown(&self) -> Option<Option<Shown>> {
+        let all = self.values.iter().all(|(_, on)| *on) && self.blanks != Some(false);
+        if all {
+            return Some(None);
+        }
+        let shown = Shown {
+            values: self
+                .values
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(text, _)| text.clone())
+                .collect(),
+            blanks: self.blanks == Some(true),
+        };
+        (!shown.values.is_empty() || shown.blanks).then_some(Some(shown))
+    }
 }
 
 /// What happened to a sheet.
@@ -365,6 +428,8 @@ struct Marks {
     columns: Vec<u32>,
     rows: Vec<u32>,
     line_formats: Vec<(bool, u32)>,
+    frozen: bool,
+    filter: bool,
 }
 
 /// The find bar on a workbook: what to look for and the cells of the sheet
@@ -426,6 +491,8 @@ pub enum Refusal {
     SheetHolds(String),
     /// Merged cells where rows were to be sorted.
     Merged,
+    /// Nothing to filter where the filter was to go.
+    NoData,
 }
 
 impl History {
@@ -437,6 +504,7 @@ impl History {
             && step.sheets.is_none()
             && step.line_formats.is_empty()
             && step.frozen.is_empty()
+            && step.filter.is_none()
         {
             return;
         }
@@ -525,6 +593,8 @@ pub struct SheetTab {
     pub line_formats_changed: BTreeSet<(usize, bool, u32)>,
     /// Sheets whose frozen rows and columns changed since then.
     pub frozen_changed: BTreeSet<usize>,
+    /// Sheets whose autofilter changed since then.
+    pub filter_changed: BTreeSet<usize>,
     /// Rows and columns inserted and deleted since then, in order, by the
     /// file's sheet numbers.
     pub structure: Vec<(usize, Lines)>,
@@ -596,6 +666,7 @@ impl SheetTab {
             rows_changed: BTreeSet::new(),
             line_formats_changed: BTreeSet::new(),
             frozen_changed: BTreeSet::new(),
+            filter_changed: BTreeSet::new(),
             structure: Vec::new(),
             origins: (0..sheet_count).map(Some).collect(),
             file: 0,
@@ -1056,6 +1127,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            filter: None,
         });
         changes
     }
@@ -1108,6 +1180,7 @@ impl SheetTab {
             rows: self.rows_changed.clone(),
             line_styles: self.line_formats_changed.clone(),
             frozen: self.frozen_changed.clone(),
+            filters: self.filter_changed.clone(),
             structure: self.structure.clone(),
             origins: self.origins.clone(),
         }
@@ -1201,6 +1274,7 @@ impl SheetTab {
             self.rows_changed.clear();
             self.line_formats_changed.clear();
             self.frozen_changed.clear();
+            self.filter_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -1238,6 +1312,9 @@ impl SheetTab {
         self.set_line_formats(&step, true);
         for &(sheet, before, _) in &step.frozen {
             self.set_frozen(sheet, before);
+        }
+        if let Some(filter) = &step.filter {
+            self.set_filter(filter.0, filter.1.clone());
         }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
@@ -1284,6 +1361,9 @@ impl SheetTab {
         self.set_line_formats(&step, false);
         for &(sheet, _, after) in &step.frozen {
             self.set_frozen(sheet, after);
+        }
+        if let Some(filter) = &step.filter {
+            self.set_filter(filter.0, filter.2.clone());
         }
         self.note(&step.changes);
         self.show(&step.changes);
@@ -1856,10 +1936,13 @@ impl SheetTab {
             .into_iter()
             .map(|(s, columns, i)| (shift(s), columns, i))
             .collect();
-        self.merges_changed = std::mem::take(&mut self.merges_changed)
-            .into_iter()
-            .map(shift)
-            .collect();
+        for set in [
+            &mut self.merges_changed,
+            &mut self.frozen_changed,
+            &mut self.filter_changed,
+        ] {
+            *set = std::mem::take(set).into_iter().map(shift).collect();
+        }
     }
 
     /// Take away what saving had to write on sheet `index`.
@@ -1888,6 +1971,8 @@ impl SheetTab {
         marks.columns = lines(&mut self.columns_changed);
         marks.rows = lines(&mut self.rows_changed);
         marks.merges = self.merges_changed.remove(&index);
+        marks.frozen = self.frozen_changed.remove(&index);
+        marks.filter = self.filter_changed.remove(&index);
         marks.line_formats = self
             .line_formats_changed
             .iter()
@@ -1908,6 +1993,12 @@ impl SheetTab {
             .extend(marks.rows.iter().map(|&i| (index, i)));
         if marks.merges {
             self.merges_changed.insert(index);
+        }
+        if marks.frozen {
+            self.frozen_changed.insert(index);
+        }
+        if marks.filter {
+            self.filter_changed.insert(index);
         }
         self.line_formats_changed.extend(
             marks
@@ -2060,6 +2151,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            filter: None,
         });
         true
     }
@@ -2107,7 +2199,6 @@ impl SheetTab {
     /// without its header, by the active cell's column, as Excel's "Sort A
     /// to Z" (or "Z to A"). One undo step; the sorted rows are selected.
     pub fn sort(&mut self, descending: bool) -> Result<Vec<Change>, Refusal> {
-        use aster_sheets::sort::SortRefusal;
         self.view.cancel_edit();
         let sheet = self.view.sheet_index();
         let at = self.view.selected();
@@ -2115,6 +2206,18 @@ impl SheetTab {
         let Some(current) = self.view.sheet() else {
             return Ok(Vec::new());
         };
+        // In a filter, its rows.
+        if let Some(filter) = &current.auto_filter
+            && filter.range.contains(at)
+            && selection.first == selection.last
+        {
+            let rows = filter.data_rows();
+            let range = CellRange::new(
+                CellRef::new(*rows.start(), filter.range.first.col),
+                CellRef::new(*rows.end(), filter.range.last.col),
+            );
+            return self.sort_range(sheet, range, at.col, descending);
+        }
         let range = if selection.first == selection.last {
             let region = current.current_region(at);
             if current.has_header(region, at.col) {
@@ -2128,10 +2231,23 @@ impl SheetTab {
         } else {
             selection
         };
+        self.sort_range(sheet, range, at.col, descending)
+    }
+
+    /// Sort the rows of a range by one of its columns. One undo step; the
+    /// sorted rows are selected.
+    fn sort_range(
+        &mut self,
+        sheet: usize,
+        range: CellRange,
+        key: u32,
+        descending: bool,
+    ) -> Result<Vec<Change>, Refusal> {
+        use aster_sheets::sort::SortRefusal;
         let sorted = match self
             .view
             .workbook()
-            .sort_rows(sheet, range, at.col, descending)
+            .sort_rows(sheet, range, key, descending)
         {
             Ok(sorted) => sorted,
             Err(SortRefusal::Merged) => return Err(Refusal::Merged),
@@ -2143,6 +2259,164 @@ impl SheetTab {
         self.view.select(sorted.range.first);
         self.view.extend_to(sorted.range.last);
         Ok(changes)
+    }
+
+    /// Put an autofilter on the block of data around the active cell (or
+    /// on the selection, if it is more than one cell), or take the sheet's
+    /// away, showing the rows it hid, as Excel's "Filter" button. One undo
+    /// step.
+    pub fn toggle_filter(&mut self) -> bool {
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let selection = self.view.selection();
+        let Some(current) = self.view.sheet() else {
+            return false;
+        };
+        if current.auto_filter.is_some() {
+            return self.change_filter(sheet, None);
+        }
+        let range = if selection.first == selection.last {
+            current.current_region(selection.first)
+        } else {
+            selection
+        };
+        // Nothing to filter in empty cells, nor in a block with no data
+        // under its header.
+        if range.rows() < 2 || !current.cells_in(range).any(|(_, c)| !c.is_blank()) {
+            self.refusal = Some(Refusal::NoData);
+            return false;
+        }
+        self.change_filter(sheet, Some(AutoFilter::new(range)))
+    }
+
+    /// Show only some values of a column of the sheet's filter; `None`
+    /// shows all of them. One undo step.
+    pub fn filter_column(&mut self, col: u32, shown: Option<Shown>) -> bool {
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let Some(mut filter) = self.view.sheet().and_then(|s| s.auto_filter.clone()) else {
+            return false;
+        };
+        filter.others.remove(&col);
+        match shown {
+            Some(shown) => filter.columns.insert(col, shown),
+            None => filter.columns.remove(&col),
+        };
+        self.change_filter(sheet, Some(filter))
+    }
+
+    /// Sort the rows of the sheet's filter by one of its columns, as the
+    /// filter list's sort items do: the rows it hides stay where they are.
+    pub fn sort_filter(&mut self, col: u32, descending: bool) -> Result<Vec<Change>, Refusal> {
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let Some(filter) = self.view.sheet().and_then(|s| s.auto_filter.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        let rows = filter.data_rows();
+        let range = CellRange::new(
+            CellRef::new(*rows.start(), filter.range.first.col),
+            CellRef::new(*rows.end(), filter.range.last.col),
+        );
+        self.sort_range(sheet, range, col, descending)
+    }
+
+    /// What the list of a column of the sheet's filter offers: each value
+    /// with whether it shows now, and whether empty cells show (`None`
+    /// when the column has none).
+    pub fn filter_list(&self, col: u32) -> Option<FilterList> {
+        let sheet = self.view.sheet_index();
+        let filter = self.view.sheet()?.auto_filter.as_ref()?;
+        let (values, blanks) = self.view.workbook().filter_values(sheet, filter, col);
+        let shown = filter.columns.get(&col);
+        Some(FilterList {
+            col,
+            values: values
+                .into_iter()
+                .map(|value| {
+                    let on = shown.is_none_or(|s| s.values.contains(&value));
+                    (value, on)
+                })
+                .collect(),
+            blanks: blanks.then(|| shown.is_none_or(|s| s.blanks)),
+        })
+    }
+
+    /// Put `after` as the sheet's filter: the rows it filters out are
+    /// hidden and those the filter before hid that it does not are shown
+    /// at the size they had. Rows hidden by hand stay as they are.
+    fn change_filter(&mut self, sheet: usize, mut after: Option<AutoFilter>) -> bool {
+        let workbook = self.view.workbook();
+        let Some(current) = workbook.sheets.get(sheet) else {
+            return false;
+        };
+        let before = current.auto_filter.clone();
+        let old: BTreeSet<u32> = before
+            .as_ref()
+            .map(|f| f.hidden.clone())
+            .unwrap_or_default();
+        let hidden: BTreeSet<u32> = match &mut after {
+            None => BTreeSet::new(),
+            Some(filter) => {
+                let rows = filter.data_rows();
+                let mut hidden: BTreeSet<u32> = workbook
+                    .filtered_out(sheet, filter)
+                    .into_iter()
+                    .filter(|row| old.contains(row) || current.row_sizes.size(*row) != 0.0)
+                    .collect();
+                // What the file's own conditions hid cannot be told apart.
+                if !filter.others.is_empty() {
+                    hidden.extend(old.iter().filter(|row| rows.contains(row)));
+                }
+                filter.hidden = hidden.clone();
+                hidden
+            }
+        };
+        let default = current.row_sizes.default_size();
+        let mut sizes = Vec::new();
+        let mut kept = Vec::new();
+        for &row in old.difference(&hidden) {
+            if current.row_sizes.size(row) == 0.0 {
+                let size = current
+                    .hidden_sizes
+                    .get(&(false, row))
+                    .copied()
+                    .unwrap_or(default);
+                sizes.push((sheet, Resize::Row(row), 0.0, size));
+            }
+        }
+        for &row in hidden.difference(&old) {
+            let size = current.row_sizes.size(row);
+            sizes.push((sheet, Resize::Row(row), size, 0.0));
+            kept.push((row, size));
+        }
+        if before == after && sizes.is_empty() {
+            return false;
+        }
+        let styles_before = workbook.styles.len();
+        let target = &mut self.view.workbook_mut().sheets[sheet];
+        for (row, size) in kept {
+            target.hidden_sizes.insert((false, row), size);
+        }
+        for &(sheet, resize, _, size) in &sizes {
+            self.set_size(sheet, resize, size);
+        }
+        self.set_filter(sheet, after.clone());
+        self.history.push(Step {
+            styles_before,
+            sizes,
+            filter: Some(Box::new((sheet, before, after))),
+            ..Step::default()
+        });
+        self.refusal = None;
+        true
+    }
+
+    fn set_filter(&mut self, sheet: usize, filter: Option<AutoFilter>) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            target.auto_filter = filter;
+        }
+        self.filter_changed.insert(sheet);
     }
 
     /// Freeze the rows above and the columns left of a point of the sheet
@@ -2288,6 +2562,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            filter: None,
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -3180,6 +3455,141 @@ mod tests {
         tab.view.select(at("C3"));
         tab.view.extend_to(at("D6"));
         assert_eq!(tab.sort(false), Err(Refusal::Merged));
+    }
+
+    #[test]
+    fn a_filter_hides_rows_is_undone_saved_and_moves_with_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("筛选.xlsx");
+        std::fs::write(&file, blank_workbook("ja")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let rows: Vec<Vec<String>> = [
+            ["城市", "人口"],
+            ["大阪", "270"],
+            ["東京", "1400"],
+            ["札幌", "197"],
+            ["東京", "9"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|s| s.to_string()).collect())
+        .collect();
+        tab.type_cells(at("B2"), &rows, "ja");
+        let hidden = |tab: &SheetTab| -> Vec<u32> {
+            let sheet = tab.view.sheet().unwrap();
+            (0..10)
+                .filter(|&r| sheet.row_sizes.size(r) == 0.0)
+                .collect()
+        };
+        // A row hidden by hand stays hidden through the filter.
+        tab.view.select(at("A6"));
+        assert!(tab.hide_lines(false, true));
+        tab.view.select(at("C4"));
+        assert!(tab.toggle_filter());
+        let filter = tab.view.sheet().unwrap().auto_filter.clone().unwrap();
+        assert_eq!(filter.range, CellRange::parse("B2:C6").unwrap());
+        let list = tab.filter_list(1).unwrap();
+        assert_eq!(
+            list.values,
+            [
+                ("大阪".to_owned(), true),
+                ("札幌".to_owned(), true),
+                ("東京".to_owned(), true)
+            ]
+        );
+        assert_eq!(list.blanks, None);
+        assert!(tab.filter_column(
+            1,
+            Some(Shown {
+                values: ["東京".to_owned()].into(),
+                blanks: false,
+            })
+        ));
+        assert_eq!(hidden(&tab), [2, 4, 5]);
+        assert_eq!(
+            tab.filter_list(1).unwrap().values[2],
+            ("東京".to_owned(), true)
+        );
+        assert_eq!(
+            tab.filter_list(1).unwrap().values[0],
+            ("大阪".to_owned(), false)
+        );
+        // Sorting in the filter leaves the hidden rows where they are.
+        tab.view.select(at("C4"));
+        tab.sort(false).unwrap();
+        let text = |tab: &SheetTab, cell: &str| {
+            tab.view
+                .sheet()
+                .and_then(|s| s.cell(at(cell)))
+                .map(|c| tab.view.workbook().input_text(c))
+        };
+        assert_eq!(text(&tab, "C4").as_deref(), Some("9"));
+        assert_eq!(text(&tab, "C6").as_deref(), Some("1400"));
+        assert_eq!(
+            text(&tab, "C3").as_deref(),
+            Some("270"),
+            "hidden: not moved"
+        );
+        tab.undo();
+        assert_eq!(text(&tab, "C4").as_deref(), Some("1400"));
+        // Saved: the filter and its hidden rows.
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+        let xml = String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"<autoFilter ref="B2:C6"><filterColumn colId="0"><filters><filter val="東京"/></filters></filterColumn></autoFilter>"#),
+            "{xml}"
+        );
+        let Ok(Loaded::Workbook(again, source)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let read = again.sheets[0].auto_filter.clone().unwrap();
+        assert_eq!(read.columns, filter_with("東京"));
+        assert_eq!(
+            read.hidden,
+            [2, 4, 5].into(),
+            "the hand-hidden row counts too"
+        );
+        // Reopened, a column inserted before it moves the filter along.
+        let mut tab = SheetTab::new(again, source, Some(file.clone()), &tokens);
+        tab.view.select(at("A1"));
+        tab.change_lines(true, true).unwrap();
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+        let xml = String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"<autoFilter ref="C2:D6"><filterColumn colId="0">"#),
+            "{xml}"
+        );
+        // Taken off: every row the filter hid shows again.
+        assert!(tab.toggle_filter());
+        assert_eq!(hidden(&tab), Vec::<u32>::new());
+        assert!(tab.view.sheet().unwrap().auto_filter.is_none());
+        tab.undo();
+        assert_eq!(hidden(&tab), [2, 4, 5]);
+        // Undoing the inserted column moves it back.
+        tab.undo();
+        let filter = tab.view.sheet().unwrap().auto_filter.clone().unwrap();
+        assert_eq!(filter.range, CellRange::parse("B2:C6").unwrap());
+        assert_eq!(filter.columns, filter_with("東京"));
+    }
+
+    fn filter_with(value: &str) -> std::collections::BTreeMap<u32, Shown> {
+        [(
+            1,
+            Shown {
+                values: [value.to_owned()].into(),
+                blanks: false,
+            },
+        )]
+        .into()
     }
 
     #[test]

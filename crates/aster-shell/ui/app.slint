@@ -3,7 +3,8 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice, FilterChoice } from "tokens.slint";
+import { FilterList } from "filter_list.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -16,7 +17,7 @@ import { LinkDialog } from "link_dialog.slint";
 import { PromptDialog } from "prompt_dialog.slint";
 import { EncodingDialog } from "encoding_dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
-import { Hairline, ScrollBar } from "widgets.slint";
+import { Hairline, ScrollBar, MenuFrame } from "widgets.slint";
 import { FindBar } from "findbar.slint";
 import { FormulaBar, SheetBar } from "sheetbar.slint";
 import { NotesPanel } from "notes.slint";
@@ -324,6 +325,20 @@ export component AppWindow inherits Window {
     // Freeze panes: 0 the top row, 1 the first column, 2 at the active
     // cell, 3 none.
     callback sheet-freeze(int);
+    // The autofilter: put on or taken off; a column's list sorted by it,
+    // a value toggled (-1: all), the choice applied.
+    callback sheet-filter();
+    callback filter-sort(/* descending */ bool);
+    callback filter-toggle(int);
+    callback filter-apply();
+    // Where the open filter list goes, logical pixels in the document
+    // pane, and what it offers.
+    in property <length> filter-x;
+    in property <length> filter-y;
+    in property <[FilterChoice]> filter-choices;
+    in property <bool> filter-all-on;
+    in property <bool> filter-some-on;
+    in property <bool> sheet-filtered;
     // Hide (or show) the columns (or rows) the selection spans.
     callback sheet-hide(/* columns */ bool, /* hide */ bool);
     callback dialog-save();
@@ -383,6 +398,10 @@ export component AppWindow inherits Window {
     callback preview-released();
 
     // Give the keyboard to the document surface.
+    public function show-filter-list() {
+        filter-popup.show();
+    }
+
     public function focus-document() {
         // With the preview alone on screen, the keyboard scrolls it.
         if (root.view-mode == 2) {
@@ -779,6 +798,18 @@ export component AppWindow inherits Window {
                 enabled: root.viewer == 1 && root.can-save;
                 activated => {
                     root.sheet-sort(true);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-filter;
+                checkable: true;
+                checked: root.sheet-filtered;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-filter();
                 }
             }
         }
@@ -1534,6 +1565,37 @@ export component AppWindow inherits Window {
                                     scroll-event(event) => {
                                         root.scrolled(event.delta-x, event.delta-y, self.mouse-x);
                                         return accept;
+                                    }
+                                }
+                            }
+
+                            filter-popup := PopupWindow {
+                                x: max(0px, min(root.filter-x, parent.width - self.width));
+                                y: root.filter-y;
+                                width: 240px;
+                                close-policy: PopupClosePolicy.close-on-click-outside;
+                                MenuFrame { }
+
+                                FilterList {
+                                    choices: root.filter-choices;
+                                    all-on: root.filter-all-on;
+                                    some-on: root.filter-some-on;
+                                    sort(descending) => {
+                                        filter-popup.close();
+                                        root.filter-sort(descending);
+                                        scope.focus();
+                                    }
+                                    toggle(index) => {
+                                        root.filter-toggle(index);
+                                    }
+                                    apply => {
+                                        filter-popup.close();
+                                        root.filter-apply();
+                                        scope.focus();
+                                    }
+                                    cancel => {
+                                        filter-popup.close();
+                                        scope.focus();
                                     }
                                 }
                             }

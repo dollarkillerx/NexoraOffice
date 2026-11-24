@@ -67,6 +67,9 @@ pub struct Changes {
     /// Sheets whose frozen rows and columns changed: their first
     /// `<sheetView>` gets its `<pane>` and selection again.
     pub frozen: BTreeSet<usize>,
+    /// Sheets whose autofilter changed: `<autoFilter>` is written again
+    /// from the sheet's filter.
+    pub filters: BTreeSet<usize>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -207,6 +210,9 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             } else {
                 sheets::frozen_xml(&bytes, sheet.frozen)
             };
+            if let Some(filter) = &sheet.auto_filter {
+                bytes = sheets::filter_xml(&bytes, Some(filter));
+            }
             bytes.splice(0..0, XML_DECLARATION.bytes());
             added.push((part.clone(), bytes));
             new_sheets.push((index, part));
@@ -255,8 +261,12 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             .collect();
         let rules = !elsewhere.is_empty() || plan.changed();
         let frozen = changes.frozen.contains(&index).then_some(sheet.frozen);
-        let cells_changed =
-            !(cells.is_empty() && merges.is_none() && sizes.is_empty() && frozen.is_none());
+        let filter = changes.filters.contains(&index);
+        let cells_changed = !(cells.is_empty()
+            && merges.is_none()
+            && sizes.is_empty()
+            && frozen.is_none()
+            && !filter);
         if !cells_changed && !rules {
             continue;
         }
@@ -290,6 +300,9 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             rewrite_sheet(&bytes, &part, sheet, &cells, merges, &sizes, &mut strings)?;
         if let Some(frozen) = frozen {
             rewritten = sheets::frozen_xml(&rewritten, frozen);
+        }
+        if filter {
+            rewritten = sheets::filter_xml(&rewritten, sheet.auto_filter.as_ref());
         }
         replaced.insert(key(&part), rewritten);
     }

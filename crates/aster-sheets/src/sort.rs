@@ -6,7 +6,8 @@
 //! sort goes. Rows that compare equal keep their order. A formula moves
 //! with its row, its relative references with it, as a paste would move
 //! them. One cell selected sorts the block of data around it, without its
-//! header row if it seems to have one.
+//! header row if it seems to have one. Rows an autofilter hides are left
+//! where they are.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -128,7 +129,11 @@ impl Workbook {
             return Err(SortRefusal::Empty);
         }
         let range = CellRange::new(range.first, CellRef::new(last_row, range.last.col));
-        let rows: Vec<u32> = (range.first.row..=range.last.row).collect();
+        // Rows a filter hides stay where they are, as in Excel.
+        let filtered = sheet.auto_filter.as_ref().map(|f| &f.hidden);
+        let rows: Vec<u32> = (range.first.row..=range.last.row)
+            .filter(|row| !filtered.is_some_and(|hidden| hidden.contains(row)))
+            .collect();
         let row_cells = |row: u32| -> Vec<Option<Cell>> {
             (range.first.col..=range.last.col)
                 .map(|col| sheet.cell(CellRef::new(row, col)).cloned())

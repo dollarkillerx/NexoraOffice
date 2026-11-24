@@ -49,9 +49,8 @@ const HANDLED: [&str; 27] = [
 
 /// The first element of a worksheet whose references would not follow
 /// inserted and deleted rows and columns, if any: one this file does not
-/// move, a filter with criteria or sorting (they count columns from the
-/// filter's edge), or newer conditional formats, validations and
-/// sparklines in the extension list.
+/// move, or newer conditional formats, validations and sparklines in the
+/// extension list.
 pub(crate) fn blocker(bytes: &[u8]) -> Option<String> {
     let (_, xml) = split_bom(bytes);
     for (name, start, end) in top_level(xml) {
@@ -60,9 +59,7 @@ pub(crate) fn blocker(bytes: &[u8]) -> Option<String> {
         }
         let text = &xml[start..end];
         let has = |what: &[u8]| text.windows(what.len()).any(|w| w == what);
-        let refused = !HANDLED.contains(&name.as_str())
-            || (name == "autoFilter" && (has(b"filterColumn") || has(b"sortState")))
-            || (name == "extLst" && has(b"sqref"));
+        let refused = !HANDLED.contains(&name.as_str()) || (name == "extLst" && has(b"sqref"));
         if refused {
             return Some(name);
         }
@@ -166,7 +163,7 @@ fn apply(bytes: &[u8], part: &str, name: &str, lines: &Lines) -> Result<Vec<u8>>
             "ignoredErrors" => Some(listed(&element, "ignoredError", |item| {
                 kept_with(item, "sqref", lines)
             })),
-            "autoFilter" => kept_with(&element, "ref", lines).or(Some(String::new())),
+            "autoFilter" => Some(auto_filter(&element, lines)),
             "rowBreaks" if !lines.columns => Some(breaks(&element, lines)),
             "colBreaks" if lines.columns => Some(breaks(&element, lines)),
             _ => None,
@@ -271,6 +268,49 @@ fn kept_with(element: &str, name: &str, lines: &Lines) -> Option<String> {
         set_attribute(tag, name, &moved),
         &element[tag.len()..]
     ))
+}
+
+/// `<autoFilter>` after the change: its range moved, its filtered
+/// columns (counted from the filter's left edge) renumbered or dropped
+/// with their column, its sort ranges moved; nothing if all of it goes.
+fn auto_filter(element: &str, lines: &Lines) -> String {
+    let (tag, name) = start_tag(element);
+    let Some(range) = super::attribute(tag.as_bytes(), "ref")
+        .as_deref()
+        .and_then(CellRange::parse)
+    else {
+        return element.to_owned();
+    };
+    let Some(moved) = lines.moved_range(range) else {
+        return String::new();
+    };
+    let tag = set_attribute(tag, "ref", &moved.to_string());
+    if tag.ends_with("/>") {
+        return tag;
+    }
+    let mut out = tag;
+    for (child, raw) in children(element) {
+        match child.as_str() {
+            "filterColumn" if lines.columns => {
+                let (inner, _) = start_tag(&raw);
+                let id = super::attribute(inner.as_bytes(), "colId")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                if let Some(col) = lines.moved(range.first.col + id) {
+                    let id = (col - moved.first.col).to_string();
+                    out.push_str(&set_attribute(inner, "colId", &id));
+                    out.push_str(&raw[inner.len()..]);
+                }
+            }
+            "sortState" => {
+                let sorted = map_attributes(&raw, &["ref"], |v| ranges(v, lines));
+                out.push_str(&sorted);
+            }
+            _ => out.push_str(&raw),
+        }
+    }
+    out.push_str(&format!("</{name}>"));
+    out
 }
 
 /// A list element whose `item` children pass through `keep` (which may

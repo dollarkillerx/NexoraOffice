@@ -437,6 +437,130 @@ fn children_of_views(element: &str, pane: &str) -> String {
     out
 }
 
+/// The worksheet children that come after `<autoFilter>`, in the schema's
+/// order: a new filter goes before the first of them.
+const AFTER_FILTER: [&str; 28] = [
+    "sortState",
+    "dataConsolidate",
+    "customSheetViews",
+    "mergeCells",
+    "phoneticPr",
+    "conditionalFormatting",
+    "dataValidations",
+    "hyperlinks",
+    "printOptions",
+    "pageMargins",
+    "pageSetup",
+    "headerFooter",
+    "rowBreaks",
+    "colBreaks",
+    "customProperties",
+    "cellWatches",
+    "ignoredErrors",
+    "smartTags",
+    "drawing",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "drawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+];
+
+/// A worksheet with its `<autoFilter>` written from `filter`, or without
+/// one. Columns the file filtered some other way keep their elements.
+pub(super) fn filter_xml(bytes: &[u8], filter: Option<&aster_sheets::AutoFilter>) -> Vec<u8> {
+    let (bom, xml) = split_bom(bytes);
+    let text = String::from_utf8_lossy(xml).into_owned();
+    let children = top_level(xml);
+    let p = children
+        .iter()
+        .find(|(name, ..)| name == "sheetData")
+        .map(|(_, start, _)| {
+            let (_, name) = start_tag(&text[*start..]);
+            name.rsplit_once(':')
+                .map_or(String::new(), |(p, _)| format!("{p}:"))
+        })
+        .unwrap_or_default();
+    let found = children.iter().find(|(name, ..)| name == "autoFilter");
+    let old = found.map(|&(_, start, end)| &text[start..end]);
+    let new = filter.map_or_else(String::new, |filter| filter_element(filter, old, &p));
+    let (start, end) = match found {
+        Some(&(_, start, end)) => (start, end),
+        None if new.is_empty() => return bytes.to_vec(),
+        None => {
+            let at = children
+                .iter()
+                .find(|(name, ..)| AFTER_FILTER.contains(&name.as_str()))
+                .map(|(_, start, _)| *start)
+                .unwrap_or_else(|| text.rfind("</").unwrap_or(text.len()));
+            (at, at)
+        }
+    };
+    [bom, &xml[..start], new.as_bytes(), &xml[end..]].concat()
+}
+
+/// `<autoFilter>` for a filter; `old` is the file's, whose columns
+/// filtered some other way are kept, renumbered from the new left edge.
+fn filter_element(filter: &aster_sheets::AutoFilter, old: Option<&str>, p: &str) -> String {
+    let first = filter.range.first.col;
+    let mut kept = std::collections::BTreeMap::new();
+    if let Some(old) = old {
+        let (tag, _) = start_tag(old);
+        let edge = super::attribute(tag.as_bytes(), "ref")
+            .as_deref()
+            .and_then(aster_sheets::CellRange::parse)
+            .map_or(first, |range| range.first.col);
+        for (name, raw) in children(old) {
+            if name != "filterColumn" {
+                continue;
+            }
+            let (inner, _) = start_tag(&raw);
+            let id = super::attribute(inner.as_bytes(), "colId")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            let col = edge + id;
+            if filter.others.contains(&col) && col >= first {
+                let id = (col - first).to_string();
+                kept.insert(
+                    col,
+                    format!(
+                        "{}{}",
+                        set_attribute(inner, "colId", &id),
+                        &raw[inner.len()..]
+                    ),
+                );
+            }
+        }
+    }
+    for (&col, shown) in &filter.columns {
+        let mut column = format!("<{p}filterColumn colId=\"{}\"><{p}filters", col - first);
+        if shown.blanks {
+            column.push_str(" blank=\"1\"");
+        }
+        if shown.values.is_empty() {
+            column.push_str("/>");
+        } else {
+            column.push('>');
+            for value in &shown.values {
+                column.push_str(&format!("<{p}filter val=\"{}\"/>", escape(value)));
+            }
+            column.push_str(&format!("</{p}filters>"));
+        }
+        column.push_str(&format!("</{p}filterColumn>"));
+        kept.insert(col, column);
+    }
+    let range = filter.range.to_string();
+    if kept.is_empty() {
+        return format!("<{p}autoFilter ref=\"{range}\"/>");
+    }
+    let columns: String = kept.into_values().collect();
+    format!("<{p}autoFilter ref=\"{range}\">{columns}</{p}autoFilter>")
+}
+
 /// Text inserted before the closing tag of the root element.
 pub(super) fn append_to_root(bytes: &[u8], items: &str) -> Vec<u8> {
     let (bom, xml) = split_bom(bytes);

@@ -141,6 +141,19 @@ pub enum Resize {
     Row(u32),
 }
 
+/// A filter button in a header cell whose right and bottom edges are at
+/// `right` and `bottom` (logical pixels): a square as tall as the row
+/// allows, up to 16, inside the cell's right edge. `None` when the cell is
+/// too small to hold one.
+fn filter_button(right: f64, bottom: f64, width: f64, height: f64) -> Option<Rect> {
+    let size = (height - 3.0).min(16.0).min(width - 3.0);
+    if size < 8.0 {
+        return None;
+    }
+    let (x1, y1) = (right - 2.0, bottom - 2.0);
+    Some(Rect::new(x1 - size, y1 - size, x1, y1))
+}
+
 /// The smallest size a drag leaves, logical pixels.
 pub const MIN_SIZE: f64 = 4.0;
 
@@ -719,6 +732,58 @@ impl SheetView {
         let (_, right) = self.column_span(range.last.col);
         let (_, bottom) = self.row_span(range.last.row);
         (x - right).abs() <= NEAR && (y - bottom).abs() <= NEAR
+    }
+
+    /// The column of the filter button under a point (physical pixels), if
+    /// any: the square at the right of each header cell of the sheet's
+    /// autofilter.
+    pub fn filter_button_hit(&self, x: f64, y: f64) -> Option<u32> {
+        let sheet = self.sheet()?;
+        let filter = sheet.auto_filter.as_ref()?;
+        if self.editor.is_some() {
+            return None;
+        }
+        let at = match self.hit(x, y)? {
+            Hit::Cell(at) => at,
+            _ => return None,
+        };
+        let at = sheet
+            .merge_at(at)
+            .map_or(at, |m| CellRef::new(m.first.row, m.last.col));
+        if at.row != filter.range.first.row
+            || !(filter.range.first.col..=filter.range.last.col).contains(&at.col)
+        {
+            return None;
+        }
+        let (_, right) = self.column_span(at.col);
+        let (_, bottom) = self.row_span(at.row);
+        let button = filter_button(
+            right,
+            bottom,
+            sheet.columns.size(at.col),
+            sheet.row_sizes.size(at.row),
+        )?;
+        let (x, y) = (x / self.s(), y / self.s());
+        let on = (button.x0..=button.x1).contains(&x) && (button.y0..=button.y1).contains(&y);
+        on.then_some(at.col)
+    }
+
+    /// Where the filter button of a column is: its bottom left and bottom
+    /// right corners' x and their y, physical pixels from the view's top
+    /// left, to open its list under it.
+    pub fn filter_button_point(&self, col: u32) -> Option<(f64, f64, f64)> {
+        let sheet = self.sheet()?;
+        let filter = sheet.auto_filter.as_ref()?;
+        let (_, right) = self.column_span(col);
+        let (_, bottom) = self.row_span(filter.range.first.row);
+        let button = filter_button(
+            right,
+            bottom,
+            sheet.columns.size(col),
+            sheet.row_sizes.size(filter.range.first.row),
+        )?;
+        let s = self.s();
+        Some((button.x0 * s, button.x1 * s, button.y1 * s))
     }
 
     /// Where the fill handle is, physical pixels from the view's top left.
@@ -1640,6 +1705,33 @@ impl SheetView {
             self.draw_cell(&laid, rect, room, s);
         }
 
+        // The autofilter's buttons, at the right of its header cells.
+        if let Some(filter) = &sheet.auto_filter {
+            let row = filter.range.first.row;
+            let first = filter.range.first.col.max(first_col);
+            let last = filter.range.last.col.min(last_col);
+            if (first_row..=last_row).contains(&row) && sheet.row_sizes.size(row) > 0.0 {
+                for col in first..=last {
+                    if sheet.columns.size(col) == 0.0 {
+                        continue;
+                    }
+                    let right = x_of(col + 1) / s;
+                    let bottom = y_of(row + 1) / s;
+                    let height = sheet.row_sizes.size(row);
+                    let width = sheet.columns.size(col);
+                    if let Some(button) = filter_button(right, bottom, width, height) {
+                        let rect = Rect::new(
+                            (button.x0 * s).round(),
+                            (button.y0 * s).round(),
+                            (button.x1 * s).round(),
+                            (button.y1 * s).round(),
+                        );
+                        self.draw_filter_button(rect, filter.filters(col));
+                    }
+                }
+            }
+        }
+
         // Pictures float over the cells; each is drawn in the pane its top
         // left corner is fastened in.
         for picture in &sheet.pictures {
@@ -1684,6 +1776,49 @@ impl SheetView {
             self.draw_picture(picture, rect);
         }
         self.ctx.pop_layer();
+    }
+
+    /// A filter button (physical pixels): a raised square with an arrow
+    /// pointing down; a filtered column's is tinted and its arrow takes the
+    /// accent colour, with a bar over it.
+    fn draw_filter_button(&mut self, rect: Rect, filtered: bool) {
+        let style = self.style;
+        let s = self.s();
+        let line = s.round().max(1.0);
+        let face = if filtered {
+            style.header_active
+        } else {
+            style.header
+        };
+        self.ctx.set_paint(color(face));
+        self.ctx.fill_rect(&rect);
+        self.ctx.set_paint(color(style.grid));
+        self.ctx.set_stroke(Stroke::new(line));
+        self.ctx.stroke_rect(&rect.inset(-line / 2.0));
+        let mark = if filtered {
+            style.accent
+        } else {
+            style.header_text
+        };
+        self.ctx.set_paint(color(mark));
+        let (cx, cy) = (rect.center().x, rect.center().y);
+        let half = (rect.width() * 0.25).max(2.0 * s);
+        let mut arrow = vello_cpu::kurbo::BezPath::new();
+        let top = if filtered {
+            cy - half * 0.3
+        } else {
+            cy - half * 0.5
+        };
+        arrow.move_to((cx - half, top));
+        arrow.line_to((cx + half, top));
+        arrow.line_to((cx, top + half));
+        arrow.close_path();
+        self.ctx.fill_path(&arrow);
+        if filtered {
+            let bar = (top - line * 2.0).round();
+            self.ctx
+                .fill_rect(&Rect::new(cx - half, bar - line, cx + half, bar));
+        }
     }
 
     /// The text being typed, over the active cell (`cell`, physical

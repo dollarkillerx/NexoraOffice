@@ -950,3 +950,115 @@ fn a_text_colour_is_written_only_where_it_changed() {
             .color
     );
 }
+
+/// One sheet with an autofilter on A1:C5: column A picks two values,
+/// column C keeps only numbers over 5 (a condition this program does not
+/// offer), row 3 is hidden by them.
+fn filtered() -> Vec<u8> {
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let workbook = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="表" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let sheet = format!(
+        r#"<worksheet xmlns="{MAIN}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>城市</t></is></c><c r="B1" t="inlineStr"><is><t>区</t></is></c><c r="C1" t="inlineStr"><is><t>数</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>東京</t></is></c><c r="C2"><v>9</v></c></row><row r="3" hidden="1" ht="18" customHeight="1"><c r="A3" t="inlineStr"><is><t>大阪</t></is></c><c r="C3"><v>1</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>札幌</t></is></c><c r="C4"><v>7</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>東京</t></is></c><c r="C5"><v>6</v></c></row></sheetData><autoFilter ref="A1:C5"><filterColumn colId="0"><filters blank="1"><filter val="東京"/><filter val="札幌"/></filters></filterColumn><filterColumn colId="2"><customFilters><customFilter operator="greaterThan" val="5"/></customFilters></filterColumn></autoFilter><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>"#
+    );
+    let types = format!(
+        r#"{CONTENT_TYPES_HEAD}<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
+    );
+    package(&[
+        ("[Content_Types].xml", types.as_bytes()),
+        ("_rels/.rels", root_rels("xl/workbook.xml").as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ])
+}
+
+#[test]
+fn a_files_filter_is_read_kept_and_moved_with_its_columns() {
+    use aster_sheets::structure::Lines;
+    use aster_sheets::{CellRange, Shown};
+    let source = filtered();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let filter = book.sheets[0]
+        .auto_filter
+        .clone()
+        .expect("the filter is read");
+    assert_eq!(filter.range, CellRange::parse("A1:C5").unwrap());
+    assert_eq!(
+        filter.columns.get(&0),
+        Some(&Shown {
+            values: ["東京".to_owned(), "札幌".to_owned()].into(),
+            blanks: true,
+        })
+    );
+    assert_eq!(filter.others, [2].into(), "the condition is noted");
+    assert_eq!(filter.hidden, [2].into());
+    assert_eq!(
+        book.sheets[0].structure_blocker, None,
+        "a filter no longer blocks"
+    );
+
+    // Column B deleted: the condition's column is renumbered.
+    let mut changes = Changes::default();
+    restructure(
+        &mut book,
+        &mut changes,
+        Lines {
+            columns: true,
+            at: 1,
+            count: 1,
+            insert: false,
+        },
+    );
+    let saved = save(source, &book, &changes).unwrap();
+    let xml = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(
+        xml.contains(r#"<autoFilter ref="A1:B5"><filterColumn colId="0"><filters blank="1"><filter val="東京"/><filter val="札幌"/></filters></filterColumn><filterColumn colId="1"><customFilters>"#),
+        "{xml}"
+    );
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(
+        again.sheets[0].auto_filter.as_ref().unwrap().others,
+        [1].into()
+    );
+
+    // The picked values changed: written from the model, the condition
+    // kept as the file had it, before the page margins.
+    let mut book = again;
+    let filter = book.sheets[0].auto_filter.as_mut().unwrap();
+    filter.columns.insert(
+        0,
+        Shown {
+            values: ["東京".to_owned()].into(),
+            blanks: false,
+        },
+    );
+    let mut changes = Changes::default();
+    changes.filters.insert(0);
+    let saved = save(saved, &book, &changes).unwrap();
+    let xml = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(
+        xml.contains(r#"<autoFilter ref="A1:B5"><filterColumn colId="0"><filters><filter val="東京"/></filters></filterColumn><filterColumn colId="1"><customFilters><customFilter operator="greaterThan" val="5"/></customFilters></filterColumn></autoFilter><pageMargins"#),
+        "{xml}"
+    );
+    // Taken off: no element is left.
+    let mut book = Xlsx.read(saved.clone()).unwrap();
+    book.sheets[0].auto_filter = None;
+    let saved = save(saved, &book, &changes).unwrap();
+    assert!(!part(&saved, "xl/worksheets/sheet1.xml").contains("autoFilter"));
+    // Put on a sheet that had none: after the cells, before the margins.
+    let mut book = Xlsx.read(saved.clone()).unwrap();
+    book.sheets[0].auto_filter = Some(aster_sheets::AutoFilter::new(
+        CellRange::parse("A1:B5").unwrap(),
+    ));
+    let saved = save(saved, &book, &changes).unwrap();
+    let xml = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(
+        xml.contains(r#"</sheetData><autoFilter ref="A1:B5"/><pageMargins"#),
+        "{xml}"
+    );
+}

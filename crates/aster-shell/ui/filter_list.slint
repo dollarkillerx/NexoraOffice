@@ -1,0 +1,150 @@
+import { Tokens, Strings, FilterChoice } from "tokens.slint";
+import { MenuRow, Hairline, TextButton } from "widgets.slint";
+
+// A row with a check box: on, off, or (for "select all") some on.
+component CheckRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    in property <bool> mixed;
+    callback toggled;
+    height: Tokens.control-height;
+    border-radius: Tokens.radius-sm;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        root.toggled();
+    }
+    background: touch.has-hover ? Tokens.hover : transparent;
+    HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        padding-right: Tokens.space-sm;
+        spacing: Tokens.space-sm;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                border-width: root.checked || root.mixed ? 0px : 1px;
+                border-color: Tokens.text-tertiary;
+                background: root.checked || root.mixed ? Tokens.accent : transparent;
+                if root.checked: Path {
+                    width: 100%;
+                    height: 100%;
+                    viewbox-width: 14;
+                    viewbox-height: 14;
+                    commands: "M3.5 7.2 L6 9.6 L10.5 4.6";
+                    stroke: Tokens.on-accent;
+                    stroke-width: 1.6px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                }
+                if root.mixed && !root.checked: Rectangle {
+                    width: 8px;
+                    height: 2px;
+                    background: Tokens.on-accent;
+                }
+            }
+        }
+
+        Text {
+            text: root.text;
+            font-size: Tokens.font-md;
+            color: Tokens.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.toggled();
+        }
+    }
+}
+
+// What an autofilter button opens: sorting by the column, then its values
+// to show, each with a check box, and OK or Cancel.
+export component FilterList inherits VerticalLayout {
+    in property <[FilterChoice]> choices;
+    // All values are on; some are.
+    in property <bool> all-on;
+    in property <bool> some-on;
+    callback sort(/* descending */ bool);
+    // A value's check box was clicked; -1 is "select all".
+    callback toggle(int);
+    callback apply();
+    callback cancel();
+    padding: Tokens.space-xs + 2px;
+    spacing: 1px;
+    MenuRow {
+        text: Strings.sort-ascending;
+        clicked => {
+            root.sort(false);
+        }
+    }
+
+    MenuRow {
+        text: Strings.sort-descending;
+        clicked => {
+            root.sort(true);
+        }
+    }
+
+    Rectangle {
+        height: Tokens.space-xs * 2 + 1px;
+        Hairline {
+            y: Tokens.space-xs;
+            width: parent.width;
+        }
+    }
+
+    CheckRow {
+        text: Strings.filter-select-all;
+        checked: root.all-on;
+        mixed: root.some-on;
+        toggled => {
+            root.toggle(-1);
+        }
+    }
+
+    Flickable {
+        height: min(root.choices.length * Tokens.control-height, 8 * Tokens.control-height);
+        content-height: root.choices.length * Tokens.control-height;
+        for choice[index] in root.choices: CheckRow {
+            y: index * Tokens.control-height;
+            width: parent.width;
+            text: choice.text;
+            checked: choice.on;
+            toggled => {
+                root.toggle(index);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-top: Tokens.space-sm;
+        padding-right: Tokens.space-xs;
+        padding-bottom: Tokens.space-xs;
+        spacing: Tokens.space-sm;
+        alignment: end;
+        TextButton {
+            text: Strings.button-cancel;
+            clicked => {
+                root.cancel();
+            }
+        }
+
+        ok := TextButton {
+            text: Strings.button-ok;
+            primary: true;
+            clicked => {
+                root.apply();
+            }
+        }
+    }
+}

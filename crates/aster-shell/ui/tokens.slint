@@ -121,6 +121,8 @@ export global Strings {
     in property <string> sort-ascending;
     in property <string> sort-descending;
     in property <string> menu-filter;
+    in property <string> filter-select-all;
+    in property <string> filter-blanks;
     in property <string> sheet-add;
     in property <string> sheet-rename;
     in property <string> sheet-delete;
@@ -406,4 +408,10 @@ export struct OutlineItem {
     text: string,
     // The heading the caret is under.
     current: bool,
+}
+
+// A value in an autofilter's list, with whether it shows.
+export struct FilterChoice {
+    text: string,
+    on: bool,
 }

@@ -140,6 +140,8 @@ pub struct Sheet {
     /// The size hidden lines had, to come back with when shown: columns
     /// (`true`) or rows, and the line.
     pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
+    /// The autofilter, if the sheet has one.
+    pub auto_filter: Option<crate::filter::AutoFilter>,
 }
 
 impl Sheet {
@@ -356,6 +358,7 @@ pub struct SheetBuilder {
     pub row_styles: Vec<(u32, u32)>,
     pub pictures: Vec<Picture>,
     pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
+    pub auto_filter: Option<crate::filter::AutoFilter>,
 }
 
 impl SheetBuilder {
@@ -374,6 +377,7 @@ impl SheetBuilder {
             row_styles: Vec::new(),
             pictures: Vec::new(),
             hidden_sizes: std::collections::BTreeMap::new(),
+            auto_filter: None,
         }
     }
 
@@ -450,6 +454,7 @@ impl SheetBuilder {
             structure_blocker: None,
             delete_blocker: None,
             hidden_sizes: self.hidden_sizes,
+            auto_filter: self.auto_filter,
         }
     }
 }

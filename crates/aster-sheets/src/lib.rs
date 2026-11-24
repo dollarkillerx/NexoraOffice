@@ -21,6 +21,7 @@ pub mod calc;
 pub mod clipboard;
 pub mod edit;
 pub mod fill;
+pub mod filter;
 pub mod format;
 pub mod formula;
 pub mod input;
@@ -36,6 +37,7 @@ pub use axis::Axis;
 pub use calc::{CalcEngine, CalcError, Cancel, Computed, Edit, Mismatch};
 pub use clipboard::{Clip, parse_tsv};
 pub use edit::Change;
+pub use filter::{AutoFilter, Shown};
 pub use format::{DateOrder, Format, date_parts, date_serial};
 pub use model::{
     Anchor, Cell, Display, DisplayKind, Picture, Placement, Row, Sheet, SheetBuilder, SheetKind,

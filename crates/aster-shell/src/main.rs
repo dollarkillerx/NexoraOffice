@@ -213,6 +213,8 @@ struct Shell {
     shown_styles: Styles,
     /// How the toolbar shows the active cell of a workbook.
     shown_cell: CellLook,
+    /// The autofilter list open on screen: the column and what it offers.
+    filter_list: Option<office::FilterList>,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -282,6 +284,7 @@ impl Shell {
             shown_heading: 0,
             shown_styles: Styles::default(),
             shown_cell: CellLook::default(),
+            filter_list: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1204,6 +1207,8 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_sort_ascending(strings.sort_ascending.into());
     s.set_sort_descending(strings.sort_descending.into());
     s.set_menu_filter(strings.menu_filter.into());
+    s.set_filter_select_all(strings.filter_select_all.into());
+    s.set_filter_blanks(strings.filter_blanks.into());
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
@@ -1699,6 +1704,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     notice = i18n::fill(strings.sheet_holds, "what", &what);
                 }
                 Some(office::Refusal::Merged) => notice = strings.sort_merged.to_owned(),
+                Some(office::Refusal::NoData) => notice = strings.filter_empty.to_owned(),
                 None => {
                     if let Some(count) = tab.find.replaced {
                         notice = i18n::fill(strings.notice_replaced, "count", &group_digits(count));
@@ -3980,6 +3986,7 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_cell_address(address.into());
         ui.set_cell_content(content.into());
         ui.set_viewer_note(note.into());
+        ui.set_sheet_filtered(view.sheet().is_some_and(|s| s.auto_filter.is_some()));
         return;
     }
     if let Some(tab) = shell.active_slides() {
@@ -3996,6 +4003,67 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
     ui.set_viewer(0);
     ui.set_viewer_note(SharedString::new());
     ui.set_slide_notes(SharedString::new());
+}
+
+/// Open the list of the filter button of a column of the sheet in front,
+/// under the button.
+fn open_filter_list(ui: &AppWindow, shell: &mut Shell, col: u32) {
+    let language = shell.language.tag();
+    let Some(tab) = shell.active_sheet() else {
+        return;
+    };
+    if tab.view.is_editing() {
+        let changes = tab.commit(language);
+        tab.recalc(&changes);
+    }
+    let (Some(list), Some((_, right, bottom))) =
+        (tab.filter_list(col), tab.view.filter_button_point(col))
+    else {
+        return;
+    };
+    let scale = ui.window().scale_factor();
+    // The list's right edge under the button's, as far as it fits.
+    ui.set_filter_x(((right as f32) / scale - 240.0).max(0.0));
+    ui.set_filter_y((bottom as f32) / scale + 2.0);
+    show_filter_choices(ui, &list);
+    shell.filter_list = Some(list);
+    ui.invoke_show_filter_list();
+}
+
+/// The values of the open filter list, and its "select all" box.
+fn show_filter_choices(ui: &AppWindow, list: &office::FilterList) {
+    let strings = ui.global::<Strings>();
+    let mut choices: Vec<FilterChoice> = list
+        .values
+        .iter()
+        .map(|(text, on)| FilterChoice {
+            text: text.as_str().into(),
+            on: *on,
+        })
+        .collect();
+    if let Some(on) = list.blanks {
+        choices.push(FilterChoice {
+            text: strings.get_filter_blanks(),
+            on,
+        });
+    }
+    let on = choices.iter().filter(|c| c.on).count();
+    ui.set_filter_all_on(on == choices.len());
+    ui.set_filter_some_on(on > 0 && on < choices.len());
+    // The same list: its rows change in place, so the rows on screen (and
+    // where the list is scrolled to) stay.
+    let shown = ui.get_filter_choices();
+    if shown.row_count() == choices.len()
+        && shown.iter().zip(&choices).all(|(a, b)| a.text == b.text)
+    {
+        for (i, choice) in choices.into_iter().enumerate() {
+            if shown.row_data(i).is_some_and(|row| row.on != choice.on) {
+                shown.set_row_data(i, choice);
+            }
+        }
+    } else {
+        ui.set_filter_choices(model(choices));
+    }
 }
 
 /// After cells changed (or only the selection moved, with no changes):
@@ -4764,6 +4832,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             Some(Content::Sheet(tab)) => {
                 if tab.begin_resize(x, y) || tab.begin_fill(x, y) {
                     present(&ui, shell);
+                    return;
+                }
+                if let Some(col) = tab.view.filter_button_hit(x, y) {
+                    open_filter_list(&ui, shell, col);
                     return;
                 }
                 let Some(tab) = shell.active_sheet() else {
@@ -6020,6 +6092,64 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             Ok(sorted) => changes.extend(sorted),
             Err(refusal) => tab.refusal = Some(refusal),
         }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
+    ui.on_sheet_filter(handler!(|ui, shell| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        tab.toggle_filter();
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
+    ui.on_filter_toggle(handler!(|ui, shell, index| {
+        let Some(list) = &mut shell.filter_list else {
+            return;
+        };
+        list.toggle(index);
+        show_filter_choices(&ui, list);
+    }));
+    ui.on_filter_apply(handler!(|ui, shell| {
+        let Some(list) = shell.filter_list.take() else {
+            return;
+        };
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        if let Some(shown) = list.shown() {
+            tab.filter_column(list.col, shown);
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, Vec::new());
+    }));
+    ui.on_filter_sort(handler!(|ui, shell, descending| {
+        let Some(list) = shell.filter_list.take() else {
+            return;
+        };
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = match tab.sort_filter(list.col, descending) {
+            Ok(changes) => changes,
+            Err(refusal) => {
+                tab.refusal = Some(refusal);
+                Vec::new()
+            }
+        };
         if shell.sync_modified() {
             refresh_tabs(&ui, shell);
         }
@@ -7488,6 +7618,73 @@ mod ui_tests {
         ui.invoke_show_key(char::from(Key::Escape).to_string().into(), false);
         assert!(!ui.get_presenting());
         assert!(!with_slides(&app, |tab| tab.view.is_presenting()));
+    }
+
+    #[test]
+    fn a_filter_list_shows_only_the_values_ticked() {
+        let app = app();
+        let ui = &app.ui;
+        let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+        with_sheet(&app, |tab| {
+            let rows: Vec<Vec<String>> = [
+                ["城市", "人口"],
+                ["大阪", "270"],
+                ["東京", "1400"],
+                ["札幌", "197"],
+            ]
+            .iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect();
+            tab.type_cells(at("B2"), &rows, "ja");
+            tab.view.select(at("C3"));
+        });
+        ui.invoke_sheet_filter();
+        assert!(ui.get_sheet_filtered(), "the Data menu shows the filter on");
+        // Scrolled to the top, the header row under the column letters.
+        with_sheet(&app, |tab| tab.view.select(at("A1")));
+        present(ui, &mut app.shell.borrow_mut());
+        // A click on B2's button opens its list.
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = ui.window().scale_factor();
+        let (x0, x1, bottom) =
+            with_sheet(&app, |tab| tab.view.filter_button_point(1)).expect("a button on B2");
+        let button = (
+            origin.x + ((x0 + x1) / 2.0) as f32 / scale,
+            origin.y + bottom as f32 / scale - 6.0,
+        );
+        drag(ui, &[button]);
+        assert_eq!(ui.get_filter_choices().row_count(), 3);
+        assert!(ui.get_filter_all_on());
+        let row = |label: &str| {
+            ElementHandle::find_by_accessible_label(ui, label)
+                .next()
+                .unwrap_or_else(|| panic!("a row for {label}"))
+        };
+        // Everything off, then Tokyo on.
+        let all = ui.global::<Strings>().get_filter_select_all();
+        click(&row(&all));
+        assert!(!ui.get_filter_all_on() && !ui.get_filter_some_on());
+        click(&row("東京"));
+        assert!(ui.get_filter_some_on());
+        let ok = ElementHandle::find_by_element_id(ui, "FilterList::ok")
+            .next()
+            .expect("the OK button");
+        click(&ok);
+        let hidden: Vec<u32> = with_sheet(&app, |tab| {
+            let sheet = tab.view.sheet().unwrap();
+            (0..6).filter(|&r| sheet.row_sizes.size(r) == 0.0).collect()
+        });
+        assert_eq!(hidden, [2, 4], "Osaka and Sapporo are hidden");
+        // The menu takes it off again.
+        ui.invoke_sheet_filter();
+        assert!(!ui.get_sheet_filtered());
+        with_sheet(&app, |tab| {
+            let sheet = tab.view.sheet().unwrap();
+            assert!((0..6).all(|r| sheet.row_sizes.size(r) > 0.0));
+        });
     }
 
     #[test]

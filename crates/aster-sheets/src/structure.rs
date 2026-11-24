@@ -501,6 +501,30 @@ impl crate::model::Workbook {
         } else {
             axis.remove(lines.at, lines.count);
         }
+        // The filter's block and what it filters move with the lines.
+        if let Some(filter) = &mut host.auto_filter {
+            match lines.moved_range(filter.range) {
+                None => host.auto_filter = None,
+                Some(range) => {
+                    filter.range = range;
+                    if lines.columns {
+                        filter.columns = std::mem::take(&mut filter.columns)
+                            .into_iter()
+                            .filter_map(|(col, shown)| Some((lines.moved(col)?, shown)))
+                            .collect();
+                        filter.others = std::mem::take(&mut filter.others)
+                            .into_iter()
+                            .filter_map(|col| lines.moved(col))
+                            .collect();
+                    } else {
+                        filter.hidden = std::mem::take(&mut filter.hidden)
+                            .into_iter()
+                            .filter_map(|row| lines.moved(row))
+                            .collect();
+                    }
+                }
+            }
+        }
         host.hidden_sizes = std::mem::take(&mut host.hidden_sizes)
             .into_iter()
             .filter_map(|((columns, line), size)| {

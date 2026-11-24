@@ -424,6 +424,8 @@ pub enum Refusal {
     /// The sheet holds something deleting it would leave broken (an Excel
     /// table, a pivot table): its name in the file.
     SheetHolds(String),
+    /// Merged cells where rows were to be sorted.
+    Merged,
 }
 
 impl History {
@@ -2101,6 +2103,48 @@ impl SheetTab {
         changes
     }
 
+    /// Sort the selected rows, or the block of data around the active cell
+    /// without its header, by the active cell's column, as Excel's "Sort A
+    /// to Z" (or "Z to A"). One undo step; the sorted rows are selected.
+    pub fn sort(&mut self, descending: bool) -> Result<Vec<Change>, Refusal> {
+        use aster_sheets::sort::SortRefusal;
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let at = self.view.selected();
+        let selection = self.view.selection();
+        let Some(current) = self.view.sheet() else {
+            return Ok(Vec::new());
+        };
+        let range = if selection.first == selection.last {
+            let region = current.current_region(at);
+            if current.has_header(region, at.col) {
+                CellRange::new(
+                    CellRef::new(region.first.row + 1, region.first.col),
+                    region.last,
+                )
+            } else {
+                region
+            }
+        } else {
+            selection
+        };
+        let sorted = match self
+            .view
+            .workbook()
+            .sort_rows(sheet, range, at.col, descending)
+        {
+            Ok(sorted) => sorted,
+            Err(SortRefusal::Merged) => return Err(Refusal::Merged),
+            Err(SortRefusal::Empty) => return Ok(Vec::new()),
+        };
+        let styles_before = self.view.workbook().styles.len();
+        let changes = self.view.workbook_mut().set_cells(sheet, sorted.cells);
+        let changes = self.record(changes, styles_before);
+        self.view.select(sorted.range.first);
+        self.view.extend_to(sorted.range.last);
+        Ok(changes)
+    }
+
     /// Freeze the rows above and the columns left of a point of the sheet
     /// in front: `(1, 0)` the top row, `(0, 1)` the first column, `(0, 0)`
     /// nothing. One undo step.
@@ -3098,6 +3142,44 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn sorting_keeps_the_header_and_is_one_step() {
+        let mut tab = tab();
+        let rows = [
+            vec!["城市".to_owned(), "人口".to_owned()],
+            vec!["大阪".to_owned(), "270".to_owned()],
+            vec!["東京".to_owned(), "1400".to_owned()],
+            vec!["札幌".to_owned(), "197".to_owned()],
+        ];
+        tab.type_cells(at("C3"), &rows, "ja");
+        tab.view.select(at("D5"));
+        let changes = tab.sort(true).unwrap();
+        assert!(!changes.is_empty());
+        let text = |tab: &SheetTab, cell: &str| {
+            tab.view
+                .sheet()
+                .and_then(|s| s.cell(at(cell)))
+                .map(|c| tab.view.workbook().input_text(c))
+        };
+        assert_eq!(
+            text(&tab, "C3").as_deref(),
+            Some("城市"),
+            "the header stays"
+        );
+        assert_eq!(text(&tab, "C4").as_deref(), Some("東京"));
+        assert_eq!(text(&tab, "D6").as_deref(), Some("197"));
+        assert_eq!(tab.view.selection(), CellRange::parse("C4:D6").unwrap());
+        tab.undo();
+        assert_eq!(text(&tab, "C4").as_deref(), Some("大阪"));
+        // Merged cells refuse.
+        tab.view.select(at("C4"));
+        tab.view.extend_to(at("D4"));
+        tab.merge();
+        tab.view.select(at("C3"));
+        tab.view.extend_to(at("D6"));
+        assert_eq!(tab.sort(false), Err(Refusal::Merged));
     }
 
     #[test]

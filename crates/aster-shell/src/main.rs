@@ -1200,6 +1200,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_freeze_first_column(strings.menu_freeze_first_column.into());
     s.set_menu_freeze_panes(strings.menu_freeze_panes.into());
     s.set_menu_unfreeze(strings.menu_unfreeze.into());
+    s.set_menu_data(strings.menu_data.into());
+    s.set_sort_ascending(strings.sort_ascending.into());
+    s.set_sort_descending(strings.sort_descending.into());
+    s.set_menu_filter(strings.menu_filter.into());
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
@@ -1694,6 +1698,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     let what = blocker_label(strings, what);
                     notice = i18n::fill(strings.sheet_holds, "what", &what);
                 }
+                Some(office::Refusal::Merged) => notice = strings.sort_merged.to_owned(),
                 None => {
                     if let Some(count) = tab.find.replaced {
                         notice = i18n::fill(strings.notice_replaced, "count", &group_digits(count));
@@ -5249,6 +5254,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             }
             return;
         }
+        // Sort from the toolbar's sort list: A to Z, Z to A.
+        if Command::from_id(id) == Some(Command::SortRange) {
+            ui.invoke_sheet_sort(index == 1);
+            return;
+        }
         // A colour from a colour button's palette.
         if let Some(command @ (Command::FillColor | Command::TextColor)) = Command::from_id(id)
             && let Some(color) = usize::try_from(index).ok().and_then(toolbar::palette_color)
@@ -5996,6 +6006,25 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             shell.sync_slide_records();
         }),
     );
+    ui.on_sheet_sort(handler!(|ui, shell, descending| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let mut changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        match tab.sort(descending) {
+            Ok(sorted) => changes.extend(sorted),
+            Err(refusal) => tab.refusal = Some(refusal),
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
     ui.on_sheet_freeze(handler!(|ui, shell, how| {
         let Some(tab) = shell.active_sheet() else {
             return;

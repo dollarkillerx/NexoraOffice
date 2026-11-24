@@ -318,6 +318,9 @@ export component AppWindow inherits Window {
     callback edit-select-all();
     // Insert (or delete) the columns (or rows) the selection spans.
     callback sheet-lines(/* columns */ bool, /* insert */ bool);
+    // Sort the selection's rows (or the data around the active cell) by
+    // the active cell's column.
+    callback sheet-sort(/* descending */ bool);
     // Freeze panes: 0 the top row, 1 the first column, 2 at the active
     // cell, 3 none.
     callback sheet-freeze(int);
@@ -755,6 +758,27 @@ export component AppWindow inherits Window {
                 enabled: root.editing;
                 activated => {
                     root.menu-go-to-line();
+                }
+            }
+        }
+
+        // A workbook's data: sorting and filtering.
+        Menu {
+            title: Strings.menu-data;
+
+            MenuItem {
+                title: Strings.sort-ascending;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-sort(false);
+                }
+            }
+
+            MenuItem {
+                title: Strings.sort-descending;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-sort(true);
                 }
             }
         }

@@ -27,6 +27,7 @@ pub mod input;
 pub mod model;
 pub mod restyle;
 pub mod sheets;
+pub mod sort;
 pub mod structure;
 pub mod style;
 

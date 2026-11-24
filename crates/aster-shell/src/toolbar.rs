@@ -202,6 +202,7 @@ impl Command {
                     | Command::AlignRight
                     | Command::WrapText
                     | Command::AutoSum
+                    | Command::SortRange
             ),
             DocKind::Slides => matches!(
                 self,
@@ -838,8 +839,14 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
                 .icon(Icon::WrapText, Command::WrapText)
                 .sep()
                 .icon(Icon::Sum, Command::AutoSum)
-                .icon(Icon::Sort, Command::SortRange)
-                .icon(Icon::Filter, Command::FilterRange)
+                .icon(Icon::Sort, Command::SortRange);
+            if let Some(item) = b.items.last_mut() {
+                item.options = vec![
+                    strings.sort_ascending.to_owned(),
+                    strings.sort_descending.to_owned(),
+                ];
+            }
+            b.icon(Icon::Filter, Command::FilterRange)
                 .icon(Icon::Chart, Command::InsertChart)
                 .spacer()
                 .icon(Icon::More, Command::More);
@@ -1114,7 +1121,8 @@ mod tests {
                         Command::AlignCenter,
                         Command::AlignRight,
                         Command::WrapText,
-                        Command::AutoSum
+                        Command::AutoSum,
+                        Command::SortRange
                     ]
                 ),
                 DocKind::Slides => assert_eq!(

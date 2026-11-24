@@ -1048,6 +1048,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_code(strings.format_code.into());
     s.set_format_code_block(strings.format_code_block.into());
     s.set_format_rule(strings.format_rule.into());
+    s.set_format_toc(strings.format_toc.into());
     s.set_link_title(strings.link_title.into());
     s.set_image_title(strings.image_title.into());
     s.set_link_label(strings.link_label.into());
@@ -1769,6 +1770,66 @@ fn undo_state(shell: &mut Shell) -> (bool, bool) {
     }
 }
 
+/// Save a picture from the clipboard beside the document in front, on a
+/// worker thread, then put a reference to it at the caret.
+fn paste_picture(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    picture: aster_platform::clipboard::ClipboardPicture,
+) {
+    let strings = shell.language.strings();
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(document) = shell.markdown(id).and_then(|editor| editor.path.clone()) else {
+        show_dialog(
+            ui,
+            shell,
+            2,
+            strings.paste_picture_title.to_owned(),
+            strings.paste_picture_body.to_owned(),
+        );
+        return;
+    };
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let saved =
+            files::save_pasted_picture(&document, &stamp, picture.extension, &picture.bytes);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| match saved {
+                    Ok(path) => {
+                        let Some(editor) = shell.markdown(id) else {
+                            return;
+                        };
+                        let reference = files::picture_reference(Some(&document), &path);
+                        let at = editor.document.selection().range();
+                        let end = at.start + reference.len();
+                        if editor
+                            .apply_external(at, &reference, aster_markdown::Selection::caret(end))
+                            .is_ok()
+                        {
+                            after_edit(ui, shell, true);
+                        }
+                    }
+                    Err(err) => {
+                        let strings = shell.language.strings();
+                        show_dialog(
+                            ui,
+                            shell,
+                            2,
+                            strings.paste_picture_failed.to_owned(),
+                            err.to_string(),
+                        );
+                    }
+                }),
+            );
+        });
+    });
+}
+
 /// Body text size of an exported PDF, in points.
 const PDF_FONT_SIZE: f32 = 10.5;
 
@@ -1926,6 +1987,7 @@ fn format_of_menu(code: i32) -> Option<Format> {
         10 => Command::InsertTable,
         11 => return Some(Format::CodeBlock),
         12 => return Some(Format::Rule),
+        13 => return Some(Format::Toc),
         20..=26 => return Some(Format::Heading((code - 20) as u8)),
         30..=38 => {
             use aster_markdown::table::TableEdit;
@@ -3855,6 +3917,17 @@ fn start_save(
         return;
     };
     if matches!(shell.contents.get(&id), Some(Content::Sheet(_))) {
+        start_sheet_save(ui, &mut shell, id, path, after);
+        return;
+    }
+    if let Some(job) = shell.begin_save(id, path) {
+        spawn_save(ui, job, after);
+    }
+}
+
+/// Write a workbook to `path` on a worker thread.
+fn start_sheet_save(ui: &AppWindow, shell: &mut Shell, id: TabId, path: PathBuf, after: AfterSave) {
+    {
         let language = shell.language.tag();
         let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
             return;
@@ -3878,10 +3951,6 @@ fn start_save(
                 });
             });
         }
-        return;
-    }
-    if let Some(job) = shell.begin_save(id, path) {
-        spawn_save(ui, job, after);
     }
 }
 
@@ -4990,6 +5059,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 ..content::preview_style(&theme::Tokens::of(ThemeMode::Light), strings)
             };
             drop(borrowed);
+            // Letter where people print on it, A4 elsewhere.
+            let page = match aster_platform::locale::region() {
+                Some(region) if aster_platform::locale::uses_letter_paper(&region) => {
+                    aster_surface::pdf::PdfPage::LETTER
+                }
+                _ => aster_surface::pdf::PdfPage::A4,
+            };
             let suggested = existing.unwrap_or(suggested).with_extension("pdf");
             let weak = ui.as_weak();
             let _ = slint::spawn_local(async move {
@@ -5004,16 +5080,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 // Laying out and writing a long document takes a moment.
                 std::thread::spawn(move || {
-                    let written = aster_surface::pdf::export_pdf(
-                        &source,
-                        base.as_deref(),
-                        &style,
-                        aster_surface::pdf::PdfPage::A4,
-                    )
-                    .and_then(|bytes| {
-                        aster_storage::write_atomically(&path, &bytes)
-                            .map_err(|err| err.to_string())
-                    });
+                    let written =
+                        aster_surface::pdf::export_pdf(&source, base.as_deref(), &style, page)
+                            .and_then(|bytes| {
+                                aster_storage::write_atomically(&path, &bytes)
+                                    .map_err(|err| err.to_string())
+                            });
                     if let Err(err) = written {
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             deliver(
@@ -5125,6 +5197,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         let text = ui.invoke_clipboard_text();
+        // No text: a picture, such as a screenshot, becomes a file beside
+        // the document and a reference to it.
+        if text.is_empty()
+            && let Some(picture) = aster_platform::clipboard::picture()
+        {
+            paste_picture(&ui, shell, picture);
+            return;
+        }
         if let Some(editor) = shell.active_markdown()
             && editor.paste(text.as_str())
         {

@@ -79,8 +79,33 @@ pub fn body(source: &str) -> String {
             other => one(sanitize(other)),
         }
     });
-    html::push_html(&mut out, events);
+    html::push_html(&mut out, with_heading_ids(events.collect()).into_iter());
     out
+}
+
+/// Headings get the anchors the preview gives them, so a table of contents
+/// (`[Notes](#notes)`) works in the exported page too. A heading that names
+/// its own id keeps it.
+fn with_heading_ids(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    let mut slugs = crate::structure::Slugs::default();
+    for at in 0..events.len() {
+        let Event::Start(Tag::Heading { id: None, .. }) = &events[at] else {
+            continue;
+        };
+        let mut text = String::new();
+        for event in &events[at + 1..] {
+            match event {
+                Event::End(TagEnd::Heading(_)) => break,
+                Event::Text(t) | Event::Code(t) => text.push_str(t),
+                _ => {}
+            }
+        }
+        let anchor = slugs.next(&text);
+        if let Event::Start(Tag::Heading { id, .. }) = &mut events[at] {
+            *id = Some(CowStr::from(anchor));
+        }
+    }
+    events
 }
 
 /// Whether a picture's address may stay a picture in the exported page:
@@ -234,13 +259,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn headings_get_the_anchors_a_table_of_contents_links_to() {
+        let page = body("- [第二章](#第二章-notes)\n\n## 第二章 Notes!\n\n## 第二章 Notes!\n");
+        assert!(page.contains("<h2 id=\"第二章-notes\">"), "{page}");
+        assert!(page.contains("<h2 id=\"第二章-notes-1\">"), "{page}");
+        // Escaped in the link, which browsers match against the id.
+        assert!(
+            page.contains("href=\"#%E7%AC%AC%E4%BA%8C%E7%AB%A0-notes\""),
+            "{page}"
+        );
+    }
+
+    #[test]
     fn front_matter_is_left_out_and_its_title_used() {
         let source = "---\ntitle: \"周报\"\ntags: [a, b]\n---\n# 正文\n";
         let page = page(source, "file.md");
         assert!(page.contains("<title>周报</title>"), "{page}");
         assert!(!page.contains("tags"));
         assert!(!page.contains("<hr"));
-        assert!(page.contains("<h1>正文</h1>"));
+        assert!(page.contains("<h1 id=\"正文\">正文</h1>"));
         // Without front matter the given title stays.
         assert!(super::page("# x\n", "file.md").contains("<title>file.md</title>"));
     }
@@ -253,7 +290,7 @@ mod tests {
         );
         assert!(page.starts_with("<!DOCTYPE html>"));
         assert!(page.contains("<title>笔记 &lt;草稿&gt;</title>"));
-        assert!(page.contains("<h1>标题</h1>"));
+        assert!(page.contains("<h1 id=\"标题\">标题</h1>"));
         assert!(page.contains("<strong>粗体</strong>"));
         assert!(page.contains("<a href=\"a.md\">链接</a>"));
         assert!(page.contains("<table>"));

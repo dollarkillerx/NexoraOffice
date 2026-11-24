@@ -73,9 +73,89 @@ fn heading_level(level: HeadingLevel) -> u8 {
     }
 }
 
+/// The anchor a heading gets, as GitHub makes it: lower case, spaces and
+/// hyphens to `-`, other punctuation dropped; letters and digits of every
+/// script kept (`## 第二章 Notes!` is `第二章-notes`).
+pub fn slug(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                Some(c.to_lowercase().collect::<String>())
+            } else if c == ' ' || c == '-' {
+                Some("-".to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Gives each heading its anchor, numbering repeats as GitHub does: the
+/// second `Notes` is `notes-1`.
+#[derive(Debug, Default)]
+pub struct Slugs {
+    seen: std::collections::HashMap<String, usize>,
+}
+
+impl Slugs {
+    pub fn next(&mut self, text: &str) -> String {
+        let base = slug(text);
+        let count = self.seen.entry(base.clone()).or_insert(0);
+        let anchor = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{count}")
+        };
+        *count += 1;
+        anchor
+    }
+}
+
+/// A table of contents for `source`: a nested list linking to each heading,
+/// indented by level relative to the highest level present. `None` when
+/// there are no headings.
+pub fn table_of_contents(source: &str) -> Option<String> {
+    let headings = headings(source);
+    let top = headings.iter().map(|h| h.level).min()?;
+    let mut slugs = Slugs::default();
+    let mut out = String::new();
+    for heading in &headings {
+        let indent = "  ".repeat(usize::from(heading.level - top));
+        let label = heading.text.replace('[', "\\[").replace(']', "\\]");
+        out.push_str(&format!(
+            "{indent}- [{label}](#{})\n",
+            slugs.next(&heading.text)
+        ));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_are_made_as_github_makes_them() {
+        assert_eq!(slug("Hello World"), "hello-world");
+        assert_eq!(slug("第二章 Notes!"), "第二章-notes");
+        assert_eq!(slug("C++ & Rust: 2026"), "c--rust-2026");
+        assert_eq!(slug("a_b-c"), "a_b-c");
+        let mut slugs = Slugs::default();
+        assert_eq!(slugs.next("Notes"), "notes");
+        assert_eq!(slugs.next("Notes"), "notes-1");
+        assert_eq!(slugs.next("notes"), "notes-2");
+    }
+
+    #[test]
+    fn a_table_of_contents_links_every_heading() {
+        let source = "## 概述\n\n文字\n\n### 细节 [1]\n\n## 概述\n\n```\n# 不是标题\n```\n";
+        assert_eq!(
+            table_of_contents(source).unwrap(),
+            "- [概述](#概述)\n  - [细节 \\[1\\]](#细节-1)\n- [概述](#概述-1)\n"
+        );
+        assert_eq!(table_of_contents("没有标题\n"), None);
+    }
 
     #[test]
     fn headings_with_levels_and_lines() {

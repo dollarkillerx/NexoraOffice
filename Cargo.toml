@@ -87,6 +87,12 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 rfd = "~0.18.0"
 # Reading and writing files in legacy encodings (GB18030, Shift_JIS, ...).
 encoding_rs = "0.8.35"
+# The system's language and region, for the paper size of exported PDFs.
+sys-locale = "0.3.2"
+# Pictures on the macOS clipboard (NSPasteboard), for pasting them into
+# Markdown documents. The same versions winit and rfd already use.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSString"] }
 # Moving files to the system trash rather than deleting them.
 trash = { version = "5.4", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"] }
 # JSON for the tool layer, MCP and the AI providers' wire formats.

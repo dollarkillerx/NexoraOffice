@@ -291,6 +291,52 @@ pub fn picture_reference(document: Option<&Path>, picture: &Path) -> String {
     format!("![{name}]({address})")
 }
 
+/// The folder pasted pictures go in, next to the document.
+pub const PASTED_FOLDER: &str = "images";
+
+/// Save a picture pasted into the document at `document`: into the
+/// `images` folder beside it (made if missing), named after `stamp` (such
+/// as `20261124-153012`), with a number added if that name is taken. Never
+/// overwrites a file. Returns where it went.
+pub fn save_pasted_picture(
+    document: &Path,
+    stamp: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> io::Result<PathBuf> {
+    use std::io::Write;
+    let folder = document
+        .parent()
+        .ok_or_else(|| io::Error::other("the document has no folder"))?
+        .join(PASTED_FOLDER);
+    std::fs::create_dir_all(&folder)?;
+    for n in 1..1000 {
+        let name = if n == 1 {
+            format!("pasted-{stamp}.{extension}")
+        } else {
+            format!("pasted-{stamp}-{n}.{extension}")
+        };
+        let path = folder.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "too many pictures with the same name",
+    ))
+}
+
 /// `target` relative to `folder`, going up at most three folders.
 fn relative(folder: &Path, target: &Path) -> Option<String> {
     let folder: Vec<_> = folder.components().collect();
@@ -335,6 +381,24 @@ pub fn dropped(path: &Path) -> Dropped {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_pictures_go_beside_the_document_and_never_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let document = dir.path().join("笔记.md");
+        let first = save_pasted_picture(&document, "20261124-120000", "png", b"one").unwrap();
+        assert_eq!(first, dir.path().join("images/pasted-20261124-120000.png"));
+        let second = save_pasted_picture(&document, "20261124-120000", "png", b"two").unwrap();
+        assert_eq!(
+            second,
+            dir.path().join("images/pasted-20261124-120000-2.png")
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(
+            picture_reference(Some(&document), &second),
+            "![pasted-20261124-120000-2](images/pasted-20261124-120000-2.png)"
+        );
+    }
 
     #[test]
     fn a_file_in_another_encoding_is_offered_in_the_ones_it_reads_as() {

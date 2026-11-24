@@ -122,6 +122,28 @@ impl TextBox {
     }
 }
 
+/// `%XX` escapes decoded; anything that is not UTF-8 afterwards is kept
+/// as written.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[at + 1]), hex(bytes[at + 2]))
+        {
+            out.push((high * 16 + low) as u8);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
 /// Where a block of the source ended up, for scrolling the editor and the
 /// preview to the same place.
 #[derive(Clone, Debug, PartialEq)]
@@ -313,9 +335,14 @@ impl PreviewLayout {
         })
     }
 
-    /// Where a `#name` link goes, in document coordinates.
+    /// Where a `#name` link goes, in document coordinates: a footnote, or
+    /// a heading by its anchor (`#第二章-notes`, escaped or not, any case).
     pub fn target(&self, name: &str) -> Option<f64> {
-        self.targets.get(name).copied()
+        if let Some(y) = self.targets.get(name) {
+            return Some(*y);
+        }
+        let decoded = percent_decoded(name).to_lowercase();
+        self.targets.get(&decoded).copied()
     }
 
     /// The link under a point in document coordinates, if any.
@@ -438,6 +465,8 @@ struct Pass<'a> {
     links: Vec<(Rect, String)>,
     texts: Vec<TextBox>,
     targets: HashMap<String, f64>,
+    /// The anchors headings get, so `#heading` links can jump to them.
+    slugs: aster_markdown::structure::Slugs,
     /// Separator before the next selectable text, in copied text.
     before: &'static str,
 }
@@ -505,6 +534,7 @@ impl PreviewBuilder {
             links: Vec::new(),
             texts: Vec::new(),
             targets: HashMap::new(),
+            slugs: Default::default(),
             before: "",
         };
         let context = Context {
@@ -587,6 +617,8 @@ impl Pass<'_> {
                 bottom
             }
             BlockKind::Heading { level, text } => {
+                let anchor = self.slugs.next(&text.text);
+                self.targets.entry(anchor).or_insert(y);
                 let factor =
                     [2.0, 1.6, 1.3, 1.12, 1.0, 0.92][usize::from((*level).clamp(1, 6) - 1)];
                 let color = if *level >= 6 {
@@ -2135,6 +2167,26 @@ mod tests {
         assert!(!view.follow("https://example.com"));
         let urls: Vec<&str> = layout.links.iter().map(|(_, url)| url.as_str()).collect();
         assert!(urls.contains(&"#fn:注") && urls.contains(&"#fnref:注"));
+    }
+
+    #[test]
+    fn links_to_headings_jump_to_them() {
+        let filler: String = (0..60).map(|i| format!("第 {i} 段。\n\n")).collect();
+        let source = format!(
+            "[去第二章](#第二章-notes)\n\n{filler}## 第二章 Notes!\n\n文字\n\n## 第二章 Notes!\n"
+        );
+        let mut view = view(&source, 900, 600);
+        let layout = view.layout().unwrap().clone();
+        let first = layout.target("第二章-notes").expect("heading target");
+        let second = layout.target("第二章-notes-1").expect("repeated heading");
+        assert!(second > first && first > 1000.0);
+        // Escaped, or in another case, it is found too.
+        assert_eq!(
+            layout.target("%E7%AC%AC%E4%BA%8C%E7%AB%A0-Notes"),
+            Some(first)
+        );
+        assert!(view.follow("#第二章-notes"));
+        assert!(view.scroll_range().0 > 900.0);
     }
 
     #[test]

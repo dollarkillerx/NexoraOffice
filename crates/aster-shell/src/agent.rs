@@ -40,7 +40,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::{
     AfterSave, AppWindow, ApprovalItem, ChatItem, Content, Shell, after_edit, after_sheet_change,
-    after_tab_change, deliver, refresh_tabs, spawn_save, start_load,
+    after_tab_change, deliver, refresh_tabs, spawn_save, start_load, start_sheet_save,
 };
 
 /// How long a tool waits for the interface thread before giving up.
@@ -1512,6 +1512,7 @@ fn effect(shell: &mut Shell, request: &ApprovalRequest) -> (String, String, Stri
         "save_document" => {
             let path = editor
                 .and_then(|e| e.path.clone())
+                .or_else(|| id.and_then(|id| document_path(shell, id)))
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
             (
@@ -1727,7 +1728,15 @@ fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str, args: &Value) -> Opt
     if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
         return Some(match tool {
             "write_cells" => sheet_tools::fingerprint(tab, args),
-            _ => format!("d{}:{}", tab.history.depth(), tab.edited.len()),
+            // Saving also checks where to: see the Markdown case below.
+            _ => format!(
+                "d{}:{}:{}",
+                tab.history.depth(),
+                tab.edited.len(),
+                tab.path
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            ),
         });
     }
     let editor = shell.markdown(id)?;
@@ -1839,9 +1848,20 @@ impl ShellHost {
             {
                 return Err(aster_tools::CHANGED_WHILE_ASKING);
             }
+            if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
+                let path = tab
+                    .path
+                    .clone()
+                    .ok_or("this workbook was never saved; ask the user to save it first")?;
+                if tab.saving {
+                    return Err("a save of this workbook is already running");
+                }
+                start_sheet_save(ui, shell, id, path, AfterSave::Nothing);
+                return Ok(());
+            }
             let editor = shell
                 .markdown(id)
-                .ok_or("only Markdown documents can be saved this way")?;
+                .ok_or("only Markdown documents and workbooks can be saved this way")?;
             let path = editor
                 .path
                 .clone()
@@ -1859,9 +1879,11 @@ impl ShellHost {
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
             let state = on_ui(&self.ui, UI_WAIT, move |_, shell| {
-                shell
-                    .markdown(id)
-                    .map(|e| (e.saving, e.document.is_modified()))
+                match shell.contents.get(&id)? {
+                    Content::Sheet(tab) => Some((tab.saving, tab.is_modified())),
+                    Content::Markdown(editor) => Some((editor.saving, editor.is_modified())),
+                    _ => None,
+                }
             });
             match state {
                 Some(Some((false, modified))) => {

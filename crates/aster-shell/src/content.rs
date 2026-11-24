@@ -249,6 +249,8 @@ pub enum Format {
     CodeBlock,
     /// A horizontal rule after the caret's line.
     Rule,
+    /// A table of contents linking to the headings, after the caret's line.
+    Toc,
 }
 
 /// The find bar of a tab and what it found.
@@ -1546,6 +1548,10 @@ impl MarkdownEditor {
             Format::Table => format::insert_table(text, selection),
             Format::CodeBlock => format::toggle_code_block(text, selection),
             Format::Rule => format::insert_rule(text, selection),
+            Format::Toc => match format::insert_toc(text, selection) {
+                Some(edit) => edit,
+                None => return false,
+            },
             Format::TableEdit(what) => {
                 match table::edit_table(text, self.fresh_highlighter(), selection, what) {
                     Some(edit) => edit,

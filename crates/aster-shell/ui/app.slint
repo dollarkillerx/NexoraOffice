@@ -770,6 +770,14 @@ export component AppWindow inherits Window {
                 }
             }
 
+            MenuItem {
+                title: Strings.format-toc;
+                enabled: root.formatting;
+                activated => {
+                    root.format(13);
+                }
+            }
+
             // Rows and columns of the table with the caret; greyed out
             // elsewhere.
             Menu {

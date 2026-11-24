@@ -10,6 +10,12 @@ publish.workspace = true
 [dependencies]
 rfd = { workspace = true }
 trash = { workspace = true }
+sys-locale = { workspace = true }
+
+# Reading pictures from the clipboard (clipboard.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { workspace = true }
+objc2-foundation = { workspace = true }
 
 # Telling local disks from network ones (volumes.rs).
 [target.'cfg(unix)'.dependencies]

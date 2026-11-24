@@ -6,9 +6,11 @@
 //! move in as they are needed. Nothing in this crate knows about the GUI
 //! toolkit.
 
+pub mod clipboard;
 pub mod dialogs;
 pub mod files;
 pub mod links;
+pub mod locale;
 pub mod paths;
 pub mod reveal;
 pub mod volumes;

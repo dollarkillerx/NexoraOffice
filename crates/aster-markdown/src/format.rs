@@ -1424,6 +1424,37 @@ pub fn insert_rule(text: &Rope, selection: Selection) -> Edit {
     }
 }
 
+/// A table of contents linking to every heading, put in as its own block
+/// after the caret's line (in place of it when it is empty). `None` when
+/// the document has no headings, or is too large to read them all here.
+pub fn insert_toc(text: &Rope, selection: Selection) -> Option<Edit> {
+    if text.len_bytes() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let toc = crate::structure::table_of_contents(&text.to_string())?;
+    let at = selection.range().end;
+    let line = line_span(text, &(at..at));
+    let current = slice(text, line.clone());
+    if current.trim().is_empty() {
+        let after_text = line_before(text, line.start).is_some_and(|(_, l)| !l.trim().is_empty());
+        let out = format!("{}{toc}", if after_text { "\n" } else { "" });
+        let caret = line.start + out.len();
+        return Some(Edit {
+            range: line,
+            text: out,
+            selection: Selection::caret(caret),
+        });
+    }
+    // Before the line break that ends the caret's line: that break then
+    // ends the last entry.
+    let out = format!("\n\n{}", toc.trim_end());
+    Some(Edit {
+        range: line.end..line.end,
+        selection: Selection::caret(line.end + out.len()),
+        text: out,
+    })
+}
+
 /// Pasting a web or mail address over selected text on one line makes that
 /// text a link to the address. `None` for any other paste.
 pub fn paste_link(text: &Rope, selection: Selection, pasted: &str) -> Option<Edit> {
@@ -1631,6 +1662,20 @@ pub fn insert_table(text: &Rope, selection: Selection) -> Edit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_table_of_contents_goes_in_as_a_block_of_its_own() {
+        let text = Rope::from_str("# 标题\n\n## 一\n\n## 二\n");
+        let edit = insert_toc(&text, Selection::caret(8)).unwrap();
+        let mut done = text.clone();
+        done.remove(text.byte_to_char(edit.range.start)..text.byte_to_char(edit.range.end));
+        done.insert(text.byte_to_char(edit.range.start), &edit.text);
+        assert_eq!(
+            done.to_string(),
+            "# 标题\n\n- [标题](#标题)\n  - [一](#一)\n  - [二](#二)\n\n## 一\n\n## 二\n"
+        );
+        assert!(insert_toc(&Rope::from_str("没有标题"), Selection::caret(0)).is_none());
+    }
 
     /// Apply an edit to plain text; returns the text and the selected part
     /// marked with `[` and `]` (a caret as `|`).

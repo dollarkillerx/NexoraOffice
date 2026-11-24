@@ -30,7 +30,8 @@ use run::Scenario;
 const USAGE: &str = "usage: g4-ooxml run [--only <candidate>] [dir ...]
        g4-ooxml summary [--only <candidate>] [dir ...]
        g4-ooxml detail <candidate> <resave|edit> <sample> [dir ...]
-       g4-ooxml export <out-dir> [dir ...]";
+       g4-ooxml export <out-dir> [dir ...]
+       g4-ooxml diff <before> <after>";
 
 fn samples(dirs: &[String]) -> Result<Vec<Sample>, String> {
     let mut samples = corpus::built_in()?;
@@ -124,6 +125,50 @@ fn export(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Compare two files part by part: which parts have the same bytes, which
+/// have other bytes with the same content, which differ and how, which are
+/// gone or new. Used to check what saving an edited file changed.
+fn diff(args: &[String]) -> Result<(), String> {
+    let [before, after] = args else {
+        return Err(USAGE.into());
+    };
+    let read = |path: &str| -> Result<package::Package, String> {
+        let bytes = std::fs::read(path).map_err(|err| format!("{path}: {err}"))?;
+        package::Package::read(&bytes).map_err(|err| format!("{path}: {err}"))
+    };
+    let comparison = compare::compare(&read(before)?, &read(after)?);
+    let mut same = 0;
+    for (name, change) in &comparison.parts {
+        match change {
+            compare::Change::Identical => same += 1,
+            compare::Change::Different(delta) => {
+                println!("{name}: different");
+                for (what, count) in delta.lost_elements.iter().chain(&delta.gained_elements) {
+                    println!("    element {what} ×{count}");
+                }
+                for (what, before, after) in &delta.changed_attributes {
+                    println!("    {what}: {before} → {after}");
+                }
+                for (what, count) in delta.lost_text.iter() {
+                    println!("    text gone: {what} ×{count}");
+                }
+                for (what, count) in delta.gained_text.iter() {
+                    println!("    text new: {what} ×{count}");
+                }
+            }
+            other => println!("{name}: {other:?}"),
+        }
+    }
+    for name in &comparison.added {
+        println!("{name}: added");
+    }
+    println!(
+        "{same} of {} parts byte for byte the same",
+        comparison.parts.len()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
@@ -131,6 +176,7 @@ fn main() -> ExitCode {
         Some((command, rest)) if command == "summary" => run(rest, false),
         Some((command, rest)) if command == "detail" => detail(rest),
         Some((command, rest)) if command == "export" => export(rest),
+        Some((command, rest)) if command == "diff" => diff(rest),
         _ => Err(USAGE.into()),
     };
     match result {

@@ -170,6 +170,7 @@ cargo run -- run                      # 三份内置样本的结果表
 cargo run -- summary <目录> ...       # 加上目录里的文件，只看汇总和丢失最多的内容
 cargo run -- detail betteroffice resave aster.docx   # 一个结果丢了什么
 cargo run -- export out/              # 把样本和所有产物写成文件，拿去用 Office 打开
+cargo run --no-default-features -- diff 之前.xlsx 之后.xlsx   # 两个文件逐部件比较：相同、等价、哪里不同
 cargo test                            # 34 个测试，含记录的结果
 cargo test --no-default-features      # 只测框架和 own layer，几秒钟
 ```

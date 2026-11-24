@@ -439,15 +439,19 @@ pub fn set_base_url(ui: &AppWindow, shell: &mut Shell, url: &str) {
             url.to_owned()
         };
         let changed = provider.base_url != url;
-        let moved = aster_ai::url_host(&provider.base_url) != aster_ai::url_host(&url);
+        let old_host = aster_ai::url_host(&provider.base_url);
+        let moved = old_host != aster_ai::url_host(&url);
         provider.base_url = url;
         let id = provider.id.clone();
         if moved {
             // A key belongs to the host it was saved for: one typed for one
             // service must not go to another. It is deleted, and the user
             // saves it again for the new host. Insecure http is allowed
-            // per address, so it goes too.
-            provider.key_host = None;
+            // per address, so it goes too. A key that is still there
+            // (deleting it failed, or it was never recorded with a host)
+            // stays bound to the old host, so it cannot follow the address;
+            // saving a key again binds it to the new one.
+            provider.key_host = provider.key_host.take().or(old_host);
             provider.allow_insecure = false;
             if key_known(ai, &id) {
                 let _ = ai.keys.delete(&id);

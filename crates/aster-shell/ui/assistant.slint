@@ -409,6 +409,8 @@ export component AssistantPanel inherits Rectangle {
     in property <bool> allow-insecure;
 
     callback send(string);
+    // A quick action: 0 rewrite, 1 proofread, 2 summarise, 3 continue.
+    callback quick(int);
     callback stop();
     callback new-chat();
     callback set-access(int);
@@ -564,6 +566,38 @@ export component AssistantPanel inherits Rectangle {
                     enabled: root.access-level >= 0;
                     picked(level) => {
                         root.set-access(level);
+                    }
+                }
+            }
+
+            // Quick actions: a request ready-made for the document in front.
+            HorizontalLayout {
+                padding-left: Tokens.space-md;
+                padding-right: Tokens.space-md;
+                spacing: Tokens.space-xs;
+                for name[index] in [Strings.ai-quick-rewrite, Strings.ai-quick-proofread, Strings.ai-quick-summarize, Strings.ai-quick-continue]: Rectangle {
+                    property <bool> usable: root.configured && !root.running && root.access-level > 0;
+                    height: 24px;
+                    horizontal-stretch: 1;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Tokens.hairline;
+                    background: quick-touch.has-hover && self.usable ? Tokens.hover : transparent;
+                    accessible-role: button;
+                    accessible-label: name;
+                    Text {
+                        text: name;
+                        font-size: Tokens.font-sm;
+                        color: parent.usable ? Tokens.text-secondary : Tokens.text-disabled;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    quick-touch := TouchArea {
+                        enabled: parent.usable;
+                        clicked => {
+                            root.quick(index);
+                        }
                     }
                 }
             }

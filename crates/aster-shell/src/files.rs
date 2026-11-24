@@ -110,6 +110,68 @@ pub enum Dropped {
     Unsupported,
 }
 
+/// Whether a file is a picture a Markdown document can show or link to.
+pub fn is_picture(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp"
+        )
+    })
+}
+
+/// The Markdown for a picture dropped into a document: `![name](address)`,
+/// where the address is relative to the document's folder when the
+/// picture is under it (or a few folders up), and absolute otherwise or for
+/// a document that was never saved. Paths use `/`; one with spaces or
+/// parentheses is written between `<` and `>`.
+pub fn picture_reference(document: Option<&Path>, picture: &Path) -> String {
+    let name = picture
+        .file_stem()
+        .map(|s| s.to_string_lossy().replace(['[', ']'], ""))
+        .unwrap_or_default();
+    let address = document
+        .and_then(Path::parent)
+        .and_then(|folder| relative(folder, picture))
+        .unwrap_or_else(|| picture.to_string_lossy().replace('\\', "/"));
+    let address = if address.contains(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+        format!("<{address}>")
+    } else {
+        address
+    };
+    format!("![{name}]({address})")
+}
+
+/// `target` relative to `folder`, going up at most three folders.
+fn relative(folder: &Path, target: &Path) -> Option<String> {
+    let folder: Vec<_> = folder.components().collect();
+    let target: Vec<_> = target.components().collect();
+    let common = folder
+        .iter()
+        .zip(&target)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Sharing only the root (or a drive) is no folder in common.
+    let shared = folder[..common]
+        .iter()
+        .filter(|part| matches!(part, std::path::Component::Normal(_)))
+        .count();
+    if shared == 0 {
+        return None;
+    }
+    let up = folder.len() - common;
+    if up > 3 {
+        return None;
+    }
+    let mut parts: Vec<String> = vec!["..".to_owned(); up];
+    parts.extend(
+        target[common..]
+            .iter()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned()),
+    );
+    Some(parts.join("/"))
+}
+
 /// Decide what a dropped path is. Reads whether it is a folder.
 pub fn dropped(path: &Path) -> Dropped {
     if path.is_dir() {
@@ -245,5 +307,29 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn dropped_pictures_are_written_relative_to_the_document() {
+        let doc = Path::new("/notes/2026/会议.md");
+        assert_eq!(
+            picture_reference(Some(doc), Path::new("/notes/2026/图/白板.png")),
+            "![白板](图/白板.png)"
+        );
+        assert_eq!(
+            picture_reference(Some(doc), Path::new("/notes/附件/a b.jpg")),
+            "![a b](<../附件/a b.jpg>)"
+        );
+        // Far away or a document never saved: the whole path.
+        assert_eq!(
+            picture_reference(Some(doc), Path::new("/Users/x/Desktop/a.png")),
+            "![a](/Users/x/Desktop/a.png)"
+        );
+        assert_eq!(
+            picture_reference(None, Path::new("/tmp/p.gif")),
+            "![p](/tmp/p.gif)"
+        );
+        assert!(is_picture(Path::new("/a/B.PNG")));
+        assert!(!is_picture(Path::new("/a/b.md")));
     }
 }

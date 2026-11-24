@@ -3,7 +3,7 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem } from "tokens.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -12,6 +12,7 @@ import { Placeholder } from "placeholder.slint";
 import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
+import { LinkDialog } from "link_dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
 import { Hairline, ScrollBar } from "widgets.slint";
 import { FindBar } from "findbar.slint";
@@ -79,7 +80,19 @@ export component AppWindow inherits Window {
     in property <string> ai-models-state;
     in property <bool> ai-insecure;
     in property <bool> ai-allow-insecure;
+    // The link dialog: open, for an image, and what its fields hold.
+    in property <bool> link-open;
+    in property <bool> link-image;
+    in-out property <string> link-label;
+    in-out property <string> link-address;
+    callback link-accept();
+    callback link-cancel();
+    // The sidebar's outline of the Markdown document in front.
+    in property <[OutlineItem]> outline;
+    in property <bool> has-outline;
+    callback outline-clicked(int);
     callback ai-send(string);
+    callback ai-quick(int);
     callback ai-stop();
     callback ai-new-chat();
     callback ai-set-access(int);
@@ -110,6 +123,14 @@ export component AppWindow inherits Window {
     property <bool> formatting: root.editing && root.view-mode != 2;
     // The caret is in a table: the table's row and column commands apply.
     in property <bool> in-table;
+    // The styles at the caret, for check marks in the Format menu: block 0
+    // none, 1 bullets, 2 numbers, 3 tasks, 4 quote; heading 0 body text.
+    in property <bool> mark-bold;
+    in property <bool> mark-italic;
+    in property <bool> mark-strike;
+    in property <bool> mark-code;
+    in property <int> mark-block;
+    in property <int> mark-heading;
     in property <bool> can-undo;
     in property <bool> can-redo;
     // 0 while no question is open; see dialog.slint for the kinds.
@@ -537,6 +558,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-bold;
+                checked: root.formatting && root.mark-bold;
                 shortcut: @keys(Control + B);
                 enabled: root.formatting;
                 activated => {
@@ -546,6 +568,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-italic;
+                checked: root.formatting && root.mark-italic;
                 shortcut: @keys(Control + I);
                 enabled: root.formatting;
                 activated => {
@@ -555,6 +578,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-strike;
+                checked: root.formatting && root.mark-strike;
                 shortcut: @keys(Control + Shift + X);
                 enabled: root.formatting;
                 activated => {
@@ -564,6 +588,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-code;
+                checked: root.formatting && root.mark-code;
                 enabled: root.formatting;
                 activated => {
                     root.format(3);
@@ -583,6 +608,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-bullet;
+                checked: root.formatting && root.mark-block == 1;
                 shortcut: @keys(Control + Alt + U);
                 enabled: root.formatting;
                 activated => {
@@ -592,6 +618,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-numbered;
+                checked: root.formatting && root.mark-block == 2;
                 shortcut: @keys(Control + Alt + O);
                 enabled: root.formatting;
                 activated => {
@@ -601,6 +628,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-task;
+                checked: root.formatting && root.mark-block == 3;
                 shortcut: @keys(Control + Alt + X);
                 enabled: root.formatting;
                 activated => {
@@ -610,6 +638,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-quote;
+                checked: root.formatting && root.mark-block == 4;
                 shortcut: @keys(Control + Alt + Q);
                 enabled: root.formatting;
                 activated => {
@@ -709,6 +738,32 @@ export component AppWindow inherits Window {
                         root.format(35);
                     }
                 }
+
+                MenuSeparator { }
+
+                MenuItem {
+                    title: Strings.table-align-left;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(36);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-align-center;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(37);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-align-right;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(38);
+                    }
+                }
             }
 
             MenuSeparator { }
@@ -716,6 +771,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 // No Cmd+0: Writer tabs reset the zoom with it.
                 title: root.heading-names[0];
+                checked: root.formatting && root.mark-heading == 0;
                 enabled: root.formatting;
                 activated => {
                     root.format(20);
@@ -724,6 +780,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[1];
+                checked: root.formatting && root.mark-heading == 1;
                 shortcut: @keys(Control + "1");
                 enabled: root.formatting;
                 activated => {
@@ -733,6 +790,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[2];
+                checked: root.formatting && root.mark-heading == 2;
                 shortcut: @keys(Control + "2");
                 enabled: root.formatting;
                 activated => {
@@ -742,6 +800,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[3];
+                checked: root.formatting && root.mark-heading == 3;
                 shortcut: @keys(Control + "3");
                 enabled: root.formatting;
                 activated => {
@@ -751,6 +810,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[4];
+                checked: root.formatting && root.mark-heading == 4;
                 shortcut: @keys(Control + "4");
                 enabled: root.formatting;
                 activated => {
@@ -760,6 +820,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[5];
+                checked: root.formatting && root.mark-heading == 5;
                 shortcut: @keys(Control + "5");
                 enabled: root.formatting;
                 activated => {
@@ -769,6 +830,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: root.heading-names[6];
+                checked: root.formatting && root.mark-heading == 6;
                 shortcut: @keys(Control + "6");
                 enabled: root.formatting;
                 activated => {
@@ -862,6 +924,11 @@ export component AppWindow inherits Window {
                 }
                 refresh => {
                     root.refresh-folder();
+                }
+                outline: root.outline;
+                has-outline: root.has-outline;
+                outline-clicked(index) => {
+                    root.outline-clicked(index);
                 }
             }
 
@@ -1201,6 +1268,9 @@ export component AppWindow inherits Window {
                 send(text) => {
                     root.ai-send(text);
                 }
+                quick(action) => {
+                    root.ai-quick(action);
+                }
                 stop => {
                     root.ai-stop();
                 }
@@ -1286,6 +1356,18 @@ export component AppWindow inherits Window {
         }
         later => {
             root.recovery-later();
+        }
+    }
+
+    if root.link-open: LinkDialog {
+        image: root.link-image;
+        label <=> root.link-label;
+        address <=> root.link-address;
+        confirmed => {
+            root.link-accept();
+        }
+        dismissed => {
+            root.link-cancel();
         }
     }
 

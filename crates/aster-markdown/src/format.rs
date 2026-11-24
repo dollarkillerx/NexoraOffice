@@ -1452,8 +1452,125 @@ pub fn paste_link(text: &Rope, selection: Selection, pasted: &str) -> Option<Edi
     })
 }
 
+/// A link or image written inline on one line: `[text](address)` or
+/// `![text](address)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkAt {
+    /// Where it is written, `!` included for an image.
+    pub range: Range<usize>,
+    pub label: String,
+    pub address: String,
+    pub image: bool,
+}
+
+/// The inline link or image the selection is in, if any: what the link
+/// dialog edits instead of inserting a new one. Only the selection's line
+/// is read, and only if it is not huge.
+pub fn link_around(text: &Rope, selection: Selection) -> Option<LinkAt> {
+    let range = selection.range();
+    let line = line_span(text, &(range.start..range.start));
+    if range.end > line.end || line.len() > 16 * 1024 {
+        return None;
+    }
+    let source = slice(text, line.clone());
+    let bytes = source.as_bytes();
+    let mut at = 0;
+    while let Some(open) = source[at..].find('[').map(|i| at + i) {
+        at = open + 1;
+        if open > 0 && bytes[open - 1] == b'\\' {
+            continue;
+        }
+        // The label: up to the matching `]`, skipping escaped brackets.
+        let mut depth = 0;
+        let mut close = None;
+        let mut i = open + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' => depth += 1,
+                b']' if depth == 0 => {
+                    close = Some(i);
+                    break;
+                }
+                b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(close) = close else {
+            continue;
+        };
+        if bytes.get(close + 1) != Some(&b'(') {
+            continue;
+        }
+        // The address: up to the matching `)`.
+        let mut depth = 0;
+        let mut end = None;
+        let mut j = close + 2;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'\\' => j += 1,
+                b'(' => depth += 1,
+                b')' if depth == 0 => {
+                    end = Some(j);
+                    break;
+                }
+                b')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(end) = end else {
+            continue;
+        };
+        let image = open > 0 && bytes[open - 1] == b'!';
+        let start = line.start + if image { open - 1 } else { open };
+        let stop = line.start + end + 1;
+        if range.start >= start && range.end <= stop {
+            let address = source[close + 2..end].trim();
+            let address = address
+                .strip_prefix('<')
+                .and_then(|a| a.strip_suffix('>'))
+                .unwrap_or(address);
+            return Some(LinkAt {
+                range: start..stop,
+                label: source[open + 1..close]
+                    .replace("\\[", "[")
+                    .replace("\\]", "]"),
+                address: address.to_owned(),
+                image,
+            });
+        }
+        at = end + 1;
+    }
+    None
+}
+
+/// Write a link or image over `range`, as the link dialog does: brackets in
+/// the label are escaped, and an address with spaces or unbalanced
+/// parentheses is written between `<` and `>`. The caret goes after it.
+pub fn write_link(range: Range<usize>, label: &str, address: &str, image: bool) -> Edit {
+    let label = label
+        .replace('\n', " ")
+        .replace('[', "\\[")
+        .replace(']', "\\]");
+    let address = address.trim();
+    let balanced = address.matches('(').count() == address.matches(')').count();
+    let address = if address.contains(char::is_whitespace) || !balanced || address.contains('<') {
+        format!("<{}>", address.replace(['<', '>'], ""))
+    } else {
+        address.to_owned()
+    };
+    let text = format!("{}[{label}]({address})", if image { "!" } else { "" });
+    Edit {
+        selection: Selection::caret(range.start + text.len()),
+        range,
+        text,
+    }
+}
+
 /// Whether text looks like a link target rather than link text.
-fn is_address(text: &str) -> bool {
+pub fn is_address(text: &str) -> bool {
     let text = text.trim();
     !text.contains(char::is_whitespace)
         && ["http://", "https://", "www.", "mailto:", "./", "../", "/"]
@@ -2295,5 +2412,44 @@ mod tests {
         assert_eq!(paste("看|吧", "https://example.com"), None);
         assert_eq!(paste("«一\n二»", "https://example.com"), None);
         assert_eq!(paste("«https://old.example»", "https://example.com"), None);
+    }
+
+    #[test]
+    fn the_link_around_the_caret_is_found_and_rewritten() {
+        let found = |input: &str| {
+            let (text, range) = marked(input);
+            link_around(
+                &Rope::from_str(&text),
+                Selection {
+                    anchor: range.start,
+                    focus: range.end,
+                },
+            )
+        };
+        let link = found("看 [官|网](https://example.com/a(b)) 吧").unwrap();
+        assert_eq!(link.label, "官网");
+        assert_eq!(link.address, "https://example.com/a(b)");
+        assert!(!link.image);
+        assert_eq!(
+            &"看 [官网](https://example.com/a(b)) 吧"[link.range.clone()],
+            "[官网](https://example.com/a(b))"
+        );
+        let image = found("![图|片](<my pic.png>)").unwrap();
+        assert!(image.image);
+        assert_eq!(image.address, "my pic.png");
+        assert_eq!(image.range.start, 0);
+        // Escaped brackets in the label; outside any link; a reference link.
+        assert_eq!(found("[a \\] |b](x)").unwrap().label, "a ] b");
+        assert_eq!(found("前 [a](x) 后|"), None);
+        assert_eq!(found("[only|brackets]"), None);
+        // Writing one back.
+        let edit = write_link(2..5, "官[网]", "https://example.com/a b", false);
+        assert_eq!(edit.text, "[官\\[网\\]](<https://example.com/a b>)");
+        assert_eq!(edit.selection, Selection::caret(2 + edit.text.len()));
+        assert_eq!(
+            write_link(0..0, "图", "pic.png", true).text,
+            "![图](pic.png)"
+        );
+        assert_eq!(write_link(0..0, "x", "a(b", false).text, "[x](<a(b>)");
     }
 }

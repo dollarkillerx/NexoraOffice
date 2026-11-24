@@ -202,6 +202,14 @@ struct Shell {
     tree: Option<FileTree>,
     /// The built-in assistant and MCP; set up once the window exists.
     ai: Option<agent::Assistant>,
+    /// The headings of the Markdown document in front, for the sidebar's
+    /// outline, and which document and text version they are of.
+    outline: Vec<aster_markdown::structure::Heading>,
+    outline_of: Option<(TabId, u64)>,
+    outline_timer: Timer,
+    /// The link dialog is open for this tab, over this range of its text as
+    /// it was at this version, for an image or not.
+    link_edit: Option<(TabId, std::ops::Range<usize>, u64, bool)>,
     /// Whether the remembered folder has been looked up; until then the
     /// sidebar state is not written back.
     workspace_loaded: bool,
@@ -244,6 +252,10 @@ impl Shell {
             recent_loaded: false,
             tree: None,
             ai: None,
+            outline: Vec::new(),
+            outline_of: None,
+            outline_timer: Timer::default(),
+            link_edit: None,
             workspace_loaded: false,
             filter: None,
             sidebar_recent: Vec::new(),
@@ -899,6 +911,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_new_document(strings.new_document.into());
     s.set_recent(strings.recent.into());
     s.set_files(strings.files.into());
+    s.set_outline(strings.outline.into());
+    s.set_outline_empty(strings.outline_empty.into());
+    s.set_outline_none(strings.outline_none.into());
     s.set_placeholder(strings.placeholder.into());
     s.set_placeholder_view(strings.placeholder_view.into());
     s.set_search_files(strings.search_files.into());
@@ -968,6 +983,12 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_code(strings.format_code.into());
     s.set_format_code_block(strings.format_code_block.into());
     s.set_format_rule(strings.format_rule.into());
+    s.set_link_title(strings.link_title.into());
+    s.set_image_title(strings.image_title.into());
+    s.set_link_label(strings.link_label.into());
+    s.set_link_address(strings.link_address.into());
+    s.set_image_label(strings.image_label.into());
+    s.set_image_address(strings.image_address.into());
     s.set_format_bullet(strings.format_bullet.into());
     s.set_format_numbered(strings.format_numbered.into());
     s.set_format_task(strings.format_task.into());
@@ -983,6 +1004,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_ai_settings(strings.ai_settings.into());
     s.set_ai_back(strings.ai_back.into());
     s.set_ai_send(strings.ai_send.into());
+    s.set_ai_quick_rewrite(strings.ai_quick_rewrite.into());
+    s.set_ai_quick_proofread(strings.ai_quick_proofread.into());
+    s.set_ai_quick_summarize(strings.ai_quick_summarize.into());
+    s.set_ai_quick_continue(strings.ai_quick_continue.into());
     s.set_ai_stop(strings.ai_stop.into());
     s.set_ai_input_hint(strings.ai_input_hint.into());
     s.set_ai_empty(strings.ai_empty.into());
@@ -1031,6 +1056,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_table_column_right(strings.table_column_right.into());
     s.set_table_delete_row(strings.table_delete_row.into());
     s.set_table_delete_column(strings.table_delete_column.into());
+    s.set_table_align_left(strings.table_align_left.into());
+    s.set_table_align_center(strings.table_align_center.into());
+    s.set_table_align_right(strings.table_align_right.into());
     ui.set_heading_names(model(
         toolbar::heading_names(strings)
             .into_iter()
@@ -1148,6 +1176,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
     ui.set_editing(shell.active_markdown().is_some());
     ui.set_can_save(shell.active_markdown().is_some() || shell.active_sheet().is_some());
     agent::refresh(ui, shell);
+    schedule_outline(ui, shell);
     refresh_viewer(ui, shell);
     refresh_toolbar(ui, shell);
     refresh_status(ui, shell);
@@ -1179,6 +1208,22 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     shell.shown_heading = view.heading;
     shell.shown_styles = view.styles;
     ui.set_in_table(view.styles.table);
+    {
+        use aster_markdown::format::Block;
+        let styles = view.styles;
+        ui.set_mark_bold(styles.bold);
+        ui.set_mark_italic(styles.italic);
+        ui.set_mark_strike(styles.strike);
+        ui.set_mark_code(styles.code);
+        ui.set_mark_block(match styles.block {
+            Some(Block::Bullet) => 1,
+            Some(Block::Numbered) => 2,
+            Some(Block::Task) => 3,
+            Some(Block::Quote) => 4,
+            None => 0,
+        });
+        ui.set_mark_heading(i32::from(view.heading));
+    }
     ui.set_toolbar_items(model(
         toolbar::toolbar(kind, view, shell.language.strings())
             .iter()
@@ -1608,6 +1653,7 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
             refresh_toolbar(ui, shell);
         }
         schedule_preview(ui, shell);
+        schedule_outline(ui, shell);
         schedule_count(ui, shell);
         schedule_search(ui, shell);
         schedule_highlight(ui, shell);
@@ -1629,6 +1675,89 @@ fn undo_state(shell: &mut Shell) -> (bool, bool) {
     }
 }
 
+/// Documents up to this size get their outline worked out at once, as they
+/// are typed; larger ones once typing pauses.
+const OUTLINE_AT_ONCE: usize = 256 * 1024;
+/// Larger documents have no outline: reading all of their headings on the
+/// interface thread would hold it up.
+const OUTLINE_LIMIT: usize = 16 * 1024 * 1024;
+const OUTLINE_DELAY: Duration = Duration::from_millis(400);
+
+/// Bring the sidebar's outline up to date with the document in front: at
+/// once for small documents, after a pause in typing for large ones.
+fn schedule_outline(ui: &AppWindow, shell: &mut Shell) {
+    let active = shell.tabs.active_id();
+    let state = active.and_then(|id| {
+        shell
+            .markdown(id)
+            .map(|editor| (id, editor.text_version(), editor.document.len()))
+    });
+    let Some((id, version, len)) = state else {
+        shell.outline.clear();
+        shell.outline_of = None;
+        ui.set_has_outline(false);
+        ui.set_outline(model(Vec::new()));
+        return;
+    };
+    ui.set_has_outline(true);
+    if shell.outline_of == Some((id, version)) {
+        mark_outline(ui, shell);
+        return;
+    }
+    if len <= OUTLINE_AT_ONCE || shell.outline_of.is_none_or(|(shown, _)| shown != id) {
+        build_outline(ui, shell);
+        return;
+    }
+    let weak = ui.as_weak();
+    shell
+        .outline_timer
+        .start(TimerMode::SingleShot, OUTLINE_DELAY, move || {
+            if let Some(ui) = weak.upgrade() {
+                deliver(ui, Box::new(build_outline));
+            }
+        });
+}
+
+fn build_outline(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    let version = editor.text_version();
+    let headings = if editor.document.len() <= OUTLINE_LIMIT {
+        aster_markdown::structure::headings(&editor.document.text().to_string())
+    } else {
+        Vec::new()
+    };
+    shell.outline = headings;
+    shell.outline_of = Some((id, version));
+    mark_outline(ui, shell);
+}
+
+/// Show the outline with the heading the caret is under marked.
+fn mark_outline(ui: &AppWindow, shell: &mut Shell) {
+    let caret = shell
+        .active_markdown()
+        .map_or(0, |editor| editor.document.selection().focus);
+    let current = shell
+        .outline
+        .partition_point(|heading| heading.offset <= caret)
+        .checked_sub(1);
+    let items: Vec<OutlineItem> = shell
+        .outline
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| OutlineItem {
+            level: i32::from(heading.level),
+            text: heading.text.as_str().into(),
+            current: Some(index) == current,
+        })
+        .collect();
+    ui.set_outline(model(items));
+}
+
 /// Rebuild the toolbar if the paragraph style field or the pressed format
 /// buttons no longer match the selection.
 fn follow_selection(ui: &AppWindow, shell: &mut Shell) {
@@ -1640,6 +1769,7 @@ fn follow_selection(ui: &AppWindow, shell: &mut Shell) {
     if shown != (shell.shown_heading, shell.shown_styles) {
         refresh_toolbar(ui, shell);
     }
+    schedule_outline(ui, shell);
 }
 
 /// The formatting a toolbar command stands for in a Markdown tab.
@@ -1679,7 +1809,7 @@ fn format_of_menu(code: i32) -> Option<Format> {
         11 => return Some(Format::CodeBlock),
         12 => return Some(Format::Rule),
         20..=26 => return Some(Format::Heading((code - 20) as u8)),
-        30..=35 => {
+        30..=38 => {
             use aster_markdown::table::TableEdit;
             return Some(Format::TableEdit(match code {
                 30 => TableEdit::RowAbove,
@@ -1687,7 +1817,10 @@ fn format_of_menu(code: i32) -> Option<Format> {
                 32 => TableEdit::ColumnLeft,
                 33 => TableEdit::ColumnRight,
                 34 => TableEdit::DeleteRow,
-                _ => TableEdit::DeleteColumn,
+                35 => TableEdit::DeleteColumn,
+                36 => TableEdit::AlignLeft,
+                37 => TableEdit::AlignCenter,
+                _ => TableEdit::AlignRight,
             }));
         }
         _ => return None,
@@ -1697,6 +1830,10 @@ fn format_of_menu(code: i32) -> Option<Format> {
 
 /// Carry out a formatting command on the Markdown tab in front.
 fn apply_format(ui: &AppWindow, shell: &mut Shell, format: Format) {
+    if matches!(format, Format::Link | Format::Image) {
+        open_link_dialog(ui, shell, format == Format::Image);
+        return;
+    }
     let changed = shell
         .active_markdown()
         .is_some_and(|editor| editor.format(format));
@@ -1704,6 +1841,76 @@ fn apply_format(ui: &AppWindow, shell: &mut Shell, format: Format) {
         after_edit(ui, shell, true);
         refresh_toolbar(ui, shell);
     }
+}
+
+/// Open the link dialog: on the link or image around the selection to
+/// change it, or else for a new one, with the selected text as its text (or
+/// as its address, if it looks like one).
+fn open_link_dialog(ui: &AppWindow, shell: &mut Shell, image: bool) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    if !editor.view_mode.shows_source() || editor.locked() {
+        return;
+    }
+    let text = editor.document.text();
+    let selection = editor.document.selection();
+    let (range, label, address, image) = match aster_markdown::format::link_around(text, selection)
+    {
+        Some(link) => (link.range, link.label, link.address, link.image),
+        None => {
+            let range = selection.range();
+            let selected = if range.len() <= 4096 {
+                aster_markdown::document::slice(text, range.clone())
+            } else {
+                String::new()
+            };
+            let selected = if selected.contains('\n') {
+                String::new()
+            } else {
+                selected
+            };
+            if aster_markdown::format::is_address(&selected) {
+                (range, String::new(), selected.trim().to_owned(), image)
+            } else {
+                (range, selected, String::new(), image)
+            }
+        }
+    };
+    let version = editor.text_version();
+    shell.link_edit = Some((id, range, version, image));
+    ui.set_link_image(image);
+    ui.set_link_label(label.into());
+    ui.set_link_address(address.into());
+    ui.set_link_open(true);
+}
+
+/// OK in the link dialog: write the link, one undo step. Nothing is written
+/// if the document changed while the dialog was open.
+fn accept_link(ui: &AppWindow, shell: &mut Shell) {
+    ui.set_link_open(false);
+    let Some((id, range, version, image)) = shell.link_edit.take() else {
+        return;
+    };
+    let label = ui.get_link_label().to_string();
+    let address = ui.get_link_address().to_string();
+    if let Some(editor) = shell.markdown(id)
+        && editor.text_version() == version
+        && !(label.trim().is_empty() && address.trim().is_empty())
+    {
+        let edit = aster_markdown::format::write_link(range, &label, &address, image);
+        if editor
+            .apply_external(edit.range, &edit.text, edit.selection)
+            .is_ok()
+        {
+            after_edit(ui, shell, true);
+            refresh_toolbar(ui, shell);
+        }
+    }
+    ui.invoke_focus_document();
 }
 
 /// Shortcuts the shell handles before the document sees the key.
@@ -2115,6 +2322,41 @@ fn open_recent(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
 /// while a question is on screen, which the new tab would hide.
 fn open_dropped(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
     if ui.get_dialog_kind() != 0 || !shell.candidates.is_empty() {
+        return;
+    }
+    // A picture dropped on a Markdown document whose source is on screen
+    // goes into the document, at the caret, on a line of its own.
+    if files::is_picture(&path)
+        && let Some(editor) = shell.active_markdown()
+        && editor.view_mode.shows_source()
+    {
+        let reference = files::picture_reference(editor.path.as_deref(), &path);
+        let caret = editor.document.selection().focus;
+        let text = editor.document.text();
+        let line_start = text.line_to_byte(text.byte_to_line(caret));
+        let line_end = if text.byte_to_line(caret) + 1 < text.len_lines() {
+            text.line_to_byte(text.byte_to_line(caret) + 1) - 1
+        } else {
+            text.len_bytes()
+        };
+        let inserted = if caret == line_start && caret == line_end {
+            reference
+        } else {
+            format!("\n{reference}\n")
+        };
+        let at = if caret == line_start && caret == line_end {
+            caret
+        } else {
+            line_end
+        };
+        let end = at + inserted.len();
+        if editor
+            .apply_external(at..at, &inserted, aster_markdown::Selection::caret(end))
+            .is_ok()
+        {
+            after_edit(ui, shell, true);
+            ui.invoke_focus_document();
+        }
         return;
     }
     match files::dropped(&path) {
@@ -3683,8 +3925,34 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     agent::Assistant::start(&ui, &mut shell.borrow_mut());
+    ui.on_link_accept(handler!(|ui, shell| {
+        accept_link(&ui, shell);
+    }));
+    ui.on_link_cancel(handler!(|ui, shell| {
+        ui.set_link_open(false);
+        shell.link_edit = None;
+        ui.invoke_focus_document();
+    }));
+    ui.on_outline_clicked(handler!(|ui, shell, index| {
+        let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| shell.outline.get(index))
+            .map(|heading| heading.offset)
+        else {
+            return;
+        };
+        if let Some(editor) = shell.active_markdown() {
+            editor.place_caret(offset);
+            editor.scroll_caret_to_top();
+        }
+        after_edit(&ui, shell, false);
+        present(&ui, shell);
+    }));
     ui.on_ai_send(handler!(|ui, shell, text| {
         agent::send(&ui, shell, text.as_str());
+    }));
+    ui.on_ai_quick(handler!(|ui, shell, action| {
+        agent::quick(&ui, shell, action);
     }));
     ui.on_ai_stop(handler!(|ui, shell| {
         agent::stop(&ui, shell);

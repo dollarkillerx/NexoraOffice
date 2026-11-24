@@ -1590,6 +1590,13 @@ impl MarkdownEditor {
 
     /// Put the caret at a byte offset, as a click there would, and bring it
     /// into view.
+    /// Scroll so the caret's line is at the top of the view, as when
+    /// jumping to a heading from the outline.
+    pub fn scroll_caret_to_top(&mut self) {
+        let caret = self.document.selection().focus;
+        self.surface.scroll_to_position(caret as f64);
+    }
+
     pub fn place_caret(&mut self, at: usize) {
         if self.surface.is_composing() {
             return;

@@ -1,5 +1,5 @@
 import { ListView } from "std-widgets.slint";
-import { Tokens, Icons, Strings, RecentItem, TreeItem } from "tokens.slint";
+import { Tokens, Icons, Strings, RecentItem, TreeItem, OutlineItem } from "tokens.slint";
 import { Icon, KindGlyph, IconButton, TextButton, VHairline, MenuFrame, MenuRow, RecentMenuItems } from "widgets.slint";
 
 component SectionHeader inherits Rectangle {
@@ -229,6 +229,12 @@ export component Sidebar inherits Rectangle {
     callback reveal-tree(int);
     callback open-folder();
     callback refresh();
+    // The headings of the Markdown document in front, and whether one is.
+    in property <[OutlineItem]> outline;
+    in property <bool> has-outline;
+    // The lower part shows 0 the folder, 1 the outline.
+    in-out property <int> lower-page;
+    callback outline-clicked(int);
     background: Tokens.panel;
     clip: true;
 
@@ -378,7 +384,83 @@ export component Sidebar inherits Rectangle {
             height: Tokens.space-sm;
         }
 
-        SectionHeader {
+        // The lower part: the folder or the document's outline.
+        HorizontalLayout {
+            padding-left: Tokens.space-md;
+            padding-right: Tokens.space-md;
+            spacing: 2px;
+            height: 26px;
+            for name[index] in [Strings.files, Strings.outline]: Rectangle {
+                horizontal-stretch: 1;
+                border-radius: Tokens.radius-sm;
+                background: root.lower-page == index ? Tokens.accent-soft : page-touch.has-hover ? Tokens.hover : transparent;
+                accessible-role: tab;
+                accessible-label: name;
+                Text {
+                    text: name;
+                    font-size: Tokens.font-sm;
+                    font-weight: root.lower-page == index ? 600 : 400;
+                    color: root.lower-page == index ? Tokens.accent : Tokens.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                page-touch := TouchArea {
+                    clicked => {
+                        root.lower-page = index;
+                    }
+                }
+            }
+        }
+
+        if root.lower-page == 1: VerticalLayout {
+            vertical-stretch: 1;
+            padding-top: Tokens.space-xs;
+            if !root.has-outline || root.outline.length == 0: HorizontalLayout {
+                padding-left: Tokens.space-md + 2px;
+                padding-right: Tokens.space-md;
+                Text {
+                    text: root.has-outline ? Strings.outline-empty : Strings.outline-none;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-tertiary;
+                    wrap: word-wrap;
+                }
+            }
+
+            ListView {
+                vertical-stretch: 1;
+                for heading[index] in root.outline: Rectangle {
+                    height: Tokens.control-height - 2px;
+                    RowBackground {
+                        x: Tokens.space-xs;
+                        width: parent.width - 2 * Tokens.space-xs;
+                        current: heading.current;
+                        hover: outline-touch.has-hover;
+                        pressed: outline-touch.pressed;
+                    }
+
+                    Text {
+                        x: Tokens.space-md + 2px + (heading.level - 1) * 12px;
+                        width: parent.width - self.x - Tokens.space-md;
+                        height: parent.height;
+                        text: heading.text;
+                        font-size: Tokens.font-md;
+                        font-weight: heading.level == 1 ? 600 : 400;
+                        color: heading.current ? Tokens.accent : heading.level <= 2 ? Tokens.text : Tokens.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    outline-touch := TouchArea {
+                        clicked => {
+                            root.outline-clicked(index);
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.lower-page == 0: SectionHeader {
             title: root.folder-name != "" ? root.folder-name : Strings.files;
             if root.folder-name != "": IconButton {
                 icon: Icons.refresh;
@@ -402,7 +484,7 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        if root.folder-name == "": VerticalLayout {
+        if root.lower-page == 0 && root.folder-name == "": VerticalLayout {
             padding-left: Tokens.space-md + 2px;
             padding-right: Tokens.space-md;
             spacing: Tokens.space-sm;
@@ -425,7 +507,7 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        if root.folder-name != "" && root.filtering && root.tree.length == 0: HorizontalLayout {
+        if root.lower-page == 0 && root.folder-name != "" && root.filtering && root.tree.length == 0: HorizontalLayout {
             padding-left: Tokens.space-md + 2px;
             height: Tokens.control-height;
             Text {
@@ -436,7 +518,7 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        if root.folder-name != "": ListView {
+        if root.lower-page == 0 && root.folder-name != "": ListView {
             vertical-stretch: 1;
             for item[index] in root.tree: TreeRow {
                 item: item;
@@ -449,7 +531,7 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        if root.folder-name == "": Rectangle {
+        if root.lower-page == 0 && root.folder-name == "": Rectangle {
             vertical-stretch: 1;
         }
     }

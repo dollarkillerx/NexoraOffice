@@ -867,6 +867,20 @@ fn drain(ui: &AppWindow, shell: &mut Shell) {
     let _ = ui;
 }
 
+/// A quick action from the panel: a request ready-made in the interface
+/// language, sent like one the user typed (0 rewrite, 1 proofread, 2
+/// summarise, 3 continue writing at the caret).
+pub fn quick(ui: &AppWindow, shell: &mut Shell, action: i32) {
+    let strings = shell.language.strings();
+    let prompt = match action {
+        0 => strings.ai_prompt_rewrite,
+        1 => strings.ai_prompt_proofread,
+        2 => strings.ai_prompt_summarize,
+        _ => strings.ai_prompt_continue,
+    };
+    send(ui, shell, prompt);
+}
+
 pub fn stop(ui: &AppWindow, shell: &mut Shell) {
     if let Some(ai) = &shell.ai
         && let Some(cancel) = &ai.cancel

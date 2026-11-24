@@ -271,6 +271,10 @@ pub enum TableEdit {
     ColumnRight,
     DeleteRow,
     DeleteColumn,
+    /// The caret's column, by the colons of the delimiter row.
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
 }
 
 /// Whether the caret is in a table, for offering the table commands.
@@ -344,6 +348,22 @@ pub fn edit_table(
                 if row == 1 { 0 } else { row },
                 column.min(table.columns - 2),
             )
+        }
+        TableEdit::AlignLeft | TableEdit::AlignCenter | TableEdit::AlignRight => {
+            let marker = match what {
+                TableEdit::AlignLeft => ":---",
+                TableEdit::AlignCenter => ":---:",
+                _ => "---:",
+            };
+            // Only the delimiter row changes; the other rows keep their
+            // spacing and pipes exactly.
+            lines[1] = rebuild(&lines[1], |cells| {
+                while cells.len() <= column {
+                    cells.push(" --- ".to_owned());
+                }
+                cells[column] = format!(" {marker} ");
+            });
+            (if row == 1 { 0 } else { row }, column)
         }
     };
 
@@ -714,5 +734,22 @@ mod tests {
         let highlighter = Highlighter::new(&rope);
         assert!(!in_table(&rope, Some(&highlighter), 0));
         assert!(!in_table(&rope, Some(&highlighter), rope.len_bytes() - 6));
+    }
+
+    #[test]
+    fn columns_are_aligned_by_the_delimiter_row() {
+        let input = with_caret("3");
+        assert_eq!(
+            table_edit(&input, TableEdit::AlignLeft).unwrap(),
+            "| 名称 | 数量 |\n| --- | :--- |\n| 苹果 | «3» |\n| 梨 |  |"
+        );
+        assert_eq!(
+            table_edit(&with_caret("名称"), TableEdit::AlignCenter).unwrap(),
+            "| «名称» | 数量 |\n| :---: | ---: |\n| 苹果 | 3 |\n| 梨 |  |"
+        );
+        assert_eq!(
+            table_edit(&with_caret("苹果"), TableEdit::AlignRight).unwrap(),
+            "| 名称 | 数量 |\n| ---: | ---: |\n| «苹果» | 3 |\n| 梨 |  |"
+        );
     }
 }

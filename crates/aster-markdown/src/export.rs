@@ -42,8 +42,8 @@ pub fn body(source: &str) -> String {
         None => source,
     };
     let mut out = String::with_capacity(source.len() * 3 / 2);
-    // Whether each picture being written is one from the web, turned into a
-    // link: its end must end the link.
+    // Whether each picture being written was turned into a link: its end
+    // must end the link.
     let mut pictures: Vec<bool> = Vec::new();
     let events = Parser::new_ext(source, syntax::options()).flat_map(move |event| {
         let one = |event| vec![event];
@@ -53,12 +53,12 @@ pub fn body(source: &str) -> String {
                 dest_url,
                 title,
                 id,
-            }) if is_web(&dest_url) => {
+            }) if !embeds(&dest_url) => {
                 pictures.push(true);
                 vec![
                     Event::Start(Tag::Link {
                         link_type,
-                        dest_url,
+                        dest_url: safe_address(dest_url, false),
                         title,
                         id,
                     }),
@@ -83,10 +83,55 @@ pub fn body(source: &str) -> String {
     out
 }
 
-/// Whether an address is on the web.
-fn is_web(address: &str) -> bool {
-    let address = address.trim_start().to_ascii_lowercase();
-    address.starts_with("http://") || address.starts_with("https://") || address.starts_with("//")
+/// Whether a picture's address may stay a picture in the exported page:
+/// only a path relative to the page, or the picture's own `data:image`.
+/// Anything else is fetched by the browser as soon as the page opens: a web
+/// address tells its server; a share (`\\host`, `//host`, `/\host`,
+/// `file://host`) makes Windows connect to it over SMB; an absolute path
+/// names a place on this computer that the page's reader does not have.
+fn embeds(address: &str) -> bool {
+    let address = address.trim();
+    let lower = address.to_ascii_lowercase();
+    if lower.starts_with("data:image/") {
+        return true;
+    }
+    // Look at the address as the browser will, escapes decoded.
+    let decoded = percent_decoded(address);
+    let mut chars = decoded.chars();
+    let first = chars.next();
+    let second = chars.next();
+    let rooted = matches!(first, Some('/' | '\\'));
+    // `C:\x.png`, `C:/x.png`: a drive.
+    let drive = first.is_some_and(|c| c.is_ascii_alphabetic()) && second == Some(':');
+    let scheme = decoded.split_once(':').is_some_and(|(before, _)| {
+        !before.is_empty()
+            && before
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    !(decoded.is_empty() || rooted || drive || scheme)
+}
+
+/// `%XX` escapes turned into the bytes they stand for; invalid UTF-8 is
+/// replaced, which only matters for looking at the address.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[at + 1]), hex(bytes[at + 2]))
+        {
+            out.push((high * 16 + low) as u8);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Raw HTML as text, and addresses that could run code taken away.
@@ -255,6 +300,36 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("<img src=\"pic.png\" alt=\"本地\""), "{page}");
+        // Only relative paths and a picture's own data stay pictures: shares
+        // (which Windows would connect to on opening the page), file URLs,
+        // absolute paths and drives become links.
+        for address in [
+            "\\\\host\\x.png",
+            "/\\host/x.png",
+            "//host/x.png",
+            "%5C%5Chost%5Cx.png",
+            "%2F%2Fhost/x.png",
+            "file://host/x.png",
+            "file:///Users/me/x.png",
+            "/Users/me/x.png",
+            "C:\\pics\\x.png",
+            "c:/pics/x.png",
+            "javascript:alert(1)",
+        ] {
+            let page = body(&format!("![图](<{address}>)"));
+            assert!(!page.contains("<img"), "{address}: {page}");
+            assert!(page.contains("🖼 图</a>"), "{address}: {page}");
+            assert!(!page.contains("javascript"), "{address}: {page}");
+        }
+        for address in [
+            "pics/x.png",
+            "../x.png",
+            "x%20y.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            let page = body(&format!("![图](<{address}>)"));
+            assert!(page.contains("<img"), "{address}: {page}");
+        }
         // A picture inside a link: the link still closes properly.
         let linked = body("[![图](https://example.com/p.png)](https://example.com)");
         assert_eq!(

@@ -883,10 +883,15 @@ fn a_key_is_not_sent_to_another_host_than_it_was_saved_for() {
     );
     assert!(server.requests().is_empty(), "nothing reached the server");
 
-    // Saved for this host: sent.
+    // Saved for this address: sent.
     let mut here = custom(&base);
-    here.key_host = aster_ai::url_host(&base);
-    assert_eq!(here.key_host.as_deref(), Some("127.0.0.1"));
+    here.key_host = aster_ai::url_origin(&base);
+    assert!(
+        here.key_host
+            .as_deref()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
     let turn = run_turn(
         &*connect(here, Some("secret".into())),
         hello(),

@@ -35,7 +35,7 @@ pub use error::AiError;
 pub use prompt::SYSTEM_PROMPT;
 pub use provider::{
     ModelInfo, ModelResponse, Preset, Provider, ProviderConfig, ProviderKind, StopReason, ToolDef,
-    connect, is_loopback_url, tool_defs, url_host, url_origin,
+    connect, is_loopback_url, tool_defs, url_host, url_origin, with_scheme,
 };
 pub use redact::{Redacted, redact};
 pub use settings::{AiSettings, KeyStore, KeyStoreError, MemoryKeyStore, SystemKeyStore};

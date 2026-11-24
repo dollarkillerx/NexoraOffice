@@ -145,9 +145,11 @@ pub struct ProviderConfig {
     /// (scheme, host and port), so a key typed for `http://localhost:11434`
     /// goes neither to another port nor, once the address turns to https or
     /// back, over another scheme. Settings written before origins were kept
-    /// hold a bare host, compared as a host. `None` for keys saved before
-    /// either was kept; those go to whatever the address is, as they always
-    /// did.
+    /// hold a bare host: on loading it becomes the origin of the address
+    /// when that is still on the same host (see
+    /// [`Self::upgrade_key_binding`]), and otherwise the key is not sent
+    /// until it is saved again. `None` for keys saved before either was
+    /// kept; those go to whatever the address is, as they always did.
     pub key_host: Option<String>,
 }
 
@@ -162,6 +164,30 @@ impl ProviderConfig {
             model: preset.default_model().to_string(),
             allow_insecure: false,
             key_host: None,
+        }
+    }
+
+    /// Settings from before origins were kept hold a bare host. Where the
+    /// address is still on that host, the key was saved for that address's
+    /// scheme and port as well, so they are filled in. Returns whether the
+    /// binding changed. A bare host on another address stays as it is and
+    /// matches nothing: the key has to be saved again.
+    pub fn upgrade_key_binding(&mut self) -> bool {
+        let Some(saved) = self.key_host.as_deref() else {
+            return false;
+        };
+        if saved.contains("://") {
+            return false;
+        }
+        let saved = saved.trim_start_matches('[').trim_end_matches(']');
+        let same_host =
+            url_host(&self.base_url).is_some_and(|host| host.eq_ignore_ascii_case(saved));
+        match url_origin(&self.base_url).filter(|_| same_host) {
+            Some(origin) => {
+                self.key_host = Some(origin);
+                true
+            }
+            None => false,
         }
     }
 
@@ -302,20 +328,29 @@ fn uri_origin(uri: &ureq::http::Uri) -> Option<String> {
     Some(format!("{scheme}://{host}:{port}"))
 }
 
-/// Whether a key saved for `saved` may go to `uri`: the same origin, or for
-/// an older setting holding a bare host, the same host.
+/// Whether a key saved for `saved` may go to `uri`: the same origin. A bare
+/// host left from older settings, which [`ProviderConfig::upgrade_key_binding`]
+/// could not turn into an origin, says nothing about scheme and port and
+/// matches nothing.
 fn key_matches(saved: Option<&str>, uri: &ureq::http::Uri) -> bool {
     let Some(saved) = saved else {
         return true;
     };
     let saved = saved.trim();
-    if saved.contains("://") {
-        // Written by hand, the origin may lack its port or have capitals:
-        // compare it as `url_origin` would give it.
-        return url_origin(saved).is_some_and(|saved| uri_origin(uri) == Some(saved));
+    // Written by hand, the origin may lack its port or have capitals:
+    // compare it as `url_origin` would give it.
+    saved.contains("://") && url_origin(saved).is_some_and(|saved| uri_origin(uri) == Some(saved))
+}
+
+/// An address as typed, with `https://` put in front when it has no scheme
+/// (`api.example.com/v1`). Anything else is left as it is.
+pub fn with_scheme(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() || url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
     }
-    let saved = saved.trim_start_matches('[').trim_end_matches(']');
-    uri_host(uri).is_some_and(|host| host.eq_ignore_ascii_case(saved))
 }
 
 /// A tool as the model sees it.
@@ -747,12 +782,13 @@ mod tests {
                 .check_request("https://api.example.com/v1/x", true)
                 .is_ok()
         );
-        // An older setting with a bare host is compared as a host.
+        // A bare host left from older settings says nothing of scheme and
+        // port: the key is not sent until it is saved again.
         secure.key_host = Some("api.example.com".into());
         assert!(
             secure
-                .check_request("https://api.example.com:8443/v1/x", true)
-                .is_ok()
+                .check_request("https://api.example.com/v1/x", true)
+                .is_err()
         );
     }
 
@@ -766,7 +802,7 @@ mod tests {
                 .is_ok()
         );
 
-        config.key_host = Some("api.example.com".into());
+        config.key_host = Some("https://api.example.com".into());
         assert!(config.key_matches_host());
         assert!(
             config
@@ -788,16 +824,59 @@ mod tests {
                 .is_ok()
         );
 
-        // The saved host is compared as `url_host` gives it.
+        // The saved origin is compared as `url_origin` gives it.
         config.base_url = "http://[::1]:11434/v1".into();
-        config.key_host = Some("[::1]".into());
+        config.key_host = Some("http://[::1]:11434".into());
         assert!(config.key_matches_host());
         config.base_url = "https://API.EXAMPLE.com".into();
-        config.key_host = Some("Api.Example.Com".into());
+        config.key_host = Some("HTTPS://Api.Example.Com".into());
         assert!(config.key_matches_host());
         // A base URL without a host never matches a saved host.
         config.base_url = "nowhere".into();
         assert!(!config.key_matches_host());
+    }
+
+    #[test]
+    fn a_bare_host_from_older_settings_becomes_an_origin_or_matches_nothing() {
+        // Still on the host it was saved for: scheme and port are the
+        // address's.
+        let mut config = custom("http://localhost:11434/v1");
+        config.key_host = Some("localhost".into());
+        assert!(config.upgrade_key_binding());
+        assert_eq!(config.key_host.as_deref(), Some("http://localhost:11434"));
+        assert!(config.key_matches_host());
+        config.base_url = "http://localhost:8080/v1".into();
+        assert!(!config.key_matches_host(), "another port");
+        // Moved to another host before the upgrade: it cannot be told which
+        // scheme and port the key was for, so it goes nowhere.
+        let mut moved = custom("https://other.example.com/v1");
+        moved.key_host = Some("api.example.com".into());
+        assert!(!moved.upgrade_key_binding());
+        assert!(!moved.key_matches_host());
+        assert!(
+            moved
+                .check_request("https://api.example.com/v1", true)
+                .is_err()
+        );
+        // An origin or no binding at all is left alone.
+        let mut fine = custom("https://api.example.com/v1");
+        assert!(!fine.upgrade_key_binding());
+        fine.key_host = Some("https://api.example.com:443".into());
+        assert!(!fine.upgrade_key_binding());
+    }
+
+    #[test]
+    fn addresses_without_a_scheme_get_https() {
+        assert_eq!(
+            with_scheme(" api.example.com/v1 "),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(with_scheme("http://localhost:1"), "http://localhost:1");
+        assert_eq!(with_scheme(""), "");
+        assert_eq!(
+            url_origin(&with_scheme("api.example.com")).as_deref(),
+            Some("https://api.example.com:443")
+        );
     }
 
     #[test]

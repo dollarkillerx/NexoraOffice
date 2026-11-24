@@ -3230,15 +3230,54 @@ fn tree_file_action(ui: &AppWindow, shell: &mut Shell, action: i32, row: Row) {
     }
 }
 
+/// Whether a document kept at `path`, or in the folder `path`, is being
+/// saved. Renaming then would have the save land under the old name.
+fn saving_under(shell: &Shell, path: &Path) -> bool {
+    shell.contents.values().any(|content| match content {
+        Content::Markdown(editor) => {
+            editor.saving
+                && editor
+                    .path
+                    .as_deref()
+                    .is_some_and(|kept| kept.starts_with(path))
+        }
+        Content::Sheet(tab) => {
+            tab.saving
+                && tab
+                    .path
+                    .as_deref()
+                    .is_some_and(|kept| kept.starts_with(path))
+        }
+        _ => false,
+    })
+}
+
 /// Give `from` the name the user typed. Open documents in it follow it.
 fn rename_entry(ui: &AppWindow, shell: &mut Shell, from: PathBuf) {
     let strings = shell.language.strings();
+    if saving_under(shell, &from) {
+        ui.set_prompt_problem(strings.rename_while_saving.into());
+        return;
+    }
     let typed = ui.get_prompt_text().to_string();
     match aster_platform::files::rename(&from, typed.trim()) {
         Ok(to) => {
             hide_prompt(ui, shell);
             let ids: Vec<TabId> = shell.contents.keys().copied().collect();
             for id in ids {
+                // Workbooks follow too.
+                if let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id)
+                    && let Some(rest) = tab.path.as_deref().and_then(|p| p.strip_prefix(&from).ok())
+                {
+                    let moved = if rest.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(rest)
+                    };
+                    tab.path = Some(moved.clone());
+                    shell.tabs.rename(id, files::display_name(&moved));
+                    continue;
+                }
                 let Some(editor) = shell.markdown(id) else {
                     continue;
                 };
@@ -5389,6 +5428,21 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use aster_markdown::{EditCommand, LineEnding};
+
+    #[test]
+    fn renaming_waits_for_saves_under_the_name() {
+        let mut shell = shell();
+        let id = shell.open_untitled(DocKind::Markdown);
+        let editor = shell.markdown(id).unwrap();
+        editor.path = Some(PathBuf::from("/notes/sub/a.md"));
+        assert!(!saving_under(&shell, Path::new("/notes/sub/a.md")));
+        shell.markdown(id).unwrap().saving = true;
+        assert!(saving_under(&shell, Path::new("/notes/sub/a.md")));
+        // Its folder too, and not a folder beside it.
+        assert!(saving_under(&shell, Path::new("/notes/sub")));
+        assert!(!saving_under(&shell, Path::new("/notes/su")));
+        assert!(!saving_under(&shell, Path::new("/other")));
+    }
 
     fn shell() -> Shell {
         Shell::new(ThemeMode::Light, Language::ZhHans)

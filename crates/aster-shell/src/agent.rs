@@ -105,6 +105,9 @@ pub struct Assistant {
     /// Providers whose key was deleted because their endpoint moved to
     /// another host, until a key is saved again.
     keys_cleared: std::collections::HashSet<String>,
+    /// Why the last attempt to save a key was refused, shown where the key
+    /// state is until the next attempt.
+    key_note: Option<&'static str>,
 }
 
 /// What listing a provider's models came to.
@@ -167,6 +170,7 @@ impl Assistant {
             streaming_text: String::new(),
             models: HashMap::new(),
             keys_cleared: Default::default(),
+            key_note: None,
         });
         if mcp_enabled {
             set_mcp(ui, shell, true);
@@ -293,8 +297,13 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
     let cleared = provider
         .as_ref()
         .is_some_and(|p| ai.keys_cleared.contains(&p.id));
+    let elsewhere = provider.as_ref().is_some_and(|p| !p.key_matches_host());
     ui.set_ai_key_state(
-        if has_key {
+        if let Some(note) = ai.key_note {
+            note
+        } else if has_key && elsewhere {
+            strings.ai_key_elsewhere
+        } else if has_key {
             strings.ai_key_saved
         } else if cleared {
             strings.ai_key_cleared
@@ -408,6 +417,7 @@ pub fn set_provider(ui: &AppWindow, shell: &mut Shell, index: i32) {
     let Some(preset) = Preset::ALL.get(index.max(0) as usize).copied() else {
         return;
     };
+    ai.key_note = None;
     let id = match ai.settings.providers.iter().find(|p| p.preset == preset) {
         Some(provider) => provider.id.clone(),
         None => {
@@ -486,13 +496,25 @@ pub fn save_key(ui: &AppWindow, shell: &mut Shell, key: &str) {
         && let Some(id) = ai.settings.selected.clone()
         && !key.trim().is_empty()
     {
+        // The key is bound to the address it is saved for; without a
+        // scheme there is no address to bind it to.
+        let origin = selected_mut(ai).and_then(|provider| {
+            provider.base_url = aster_ai::with_scheme(&provider.base_url);
+            aster_ai::url_origin(&provider.base_url)
+        });
+        ai.key_note = None;
+        if origin.is_none() {
+            ai.key_note = Some(strings.ai_key_needs_address);
+            refresh(ui, shell);
+            return;
+        }
         match ai.keys.set(&id, key.trim()) {
             Ok(()) => {
                 ai.has_key.insert(id.clone(), true);
                 ai.keys_cleared.remove(&id);
-                // The key is for this host only.
+                // The key is for this address only.
                 if let Some(provider) = selected_mut(ai) {
-                    provider.key_host = aster_ai::url_origin(&provider.base_url);
+                    provider.key_host = origin;
                 }
                 save_settings(ai);
                 // A new key may see other models.
@@ -1407,6 +1429,15 @@ fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str) -> Option<String> {
         "replace_selection" | "insert_text" => {
             format!("v{version}:{}-{}", selection.start, selection.end)
         }
+        // Where it would be saved too: a document saved under another name
+        // while the user was deciding is not saved there unasked.
+        "save_document" => format!(
+            "v{version}:{}",
+            editor
+                .path
+                .as_deref()
+                .map_or_else(String::new, |path| path.display().to_string())
+        ),
         _ => format!("v{version}"),
     })
 }
@@ -1557,6 +1588,26 @@ fn list_folder(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_save_is_checked_against_the_path_as_well() {
+        use aster_shell::i18n::Language;
+        use aster_shell::theme::ThemeMode;
+        let mut shell = Shell::new(ThemeMode::Light, Language::ZhHans);
+        let id = shell.open_untitled(DocKind::Markdown);
+        shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/a.md"));
+        let before = fingerprint_of(&mut shell, id, "save_document").unwrap();
+        // The same text, saved meanwhile under another name.
+        shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/b.md"));
+        assert_ne!(
+            fingerprint_of(&mut shell, id, "save_document"),
+            Some(before)
+        );
+        // Other tools look at the text only.
+        let edit = fingerprint_of(&mut shell, id, "replace_lines").unwrap();
+        shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/c.md"));
+        assert_eq!(fingerprint_of(&mut shell, id, "replace_lines"), Some(edit));
+    }
 
     #[test]
     fn only_models_one_can_chat_with_are_listed() {

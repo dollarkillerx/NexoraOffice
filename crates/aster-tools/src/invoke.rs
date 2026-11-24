@@ -72,7 +72,10 @@ pub trait Host: Send + Sync {
     /// What the call would act on, as it is now: something that changes
     /// whenever what the user is shown on an approval card would be out of
     /// date (the document's text, the selection a tool replaces). Taken
-    /// before the user is asked. `None` for calls with nothing to compare.
+    /// before the user is asked. An empty string for calls with nothing to
+    /// compare (the default). `None` when the application could not tell,
+    /// for instance because it did not answer in time: a call on a document
+    /// is then refused rather than run unchecked.
     fn fingerprint(
         &self,
         tool: &ToolSpec,
@@ -80,7 +83,7 @@ pub trait Host: Send + Sync {
         args: &Value,
     ) -> Option<String> {
         let _ = (tool, document, args);
-        None
+        Some(String::new())
     }
 
     /// Run a call the user approved, only if what it acts on is still what
@@ -356,6 +359,12 @@ impl Invoker {
             Verdict::Ask(reason) => {
                 record.verdict = "ask";
                 expect = self.host.fingerprint(tool, document.as_ref(), args);
+                if expect.is_none() && tool.on_document {
+                    // What the user would be shown cannot be checked later:
+                    // asking would let an approval run on a document that
+                    // has changed since.
+                    return ToolResult::error(UNCHECKABLE);
+                }
                 let request = ApprovalRequest {
                     id: self.next_request.fetch_add(1, Ordering::Relaxed),
                     origin: origin.clone(),
@@ -438,6 +447,10 @@ impl Invoker {
     }
 }
 
+/// Said when the application cannot tell what a document holds, so an
+/// approval could not be checked against it.
+pub const UNCHECKABLE: &str = "Aster Office could not tell what the document holds now, so the action was not taken; try again";
+
 fn unknown_document(id: &str) -> String {
     format!("no open document `{id}` that you may see; call list_documents")
 }
@@ -469,6 +482,8 @@ mod tests {
         runs: Mutex<Vec<(String, Value)>>,
         /// The documents' text version; tests change it while asking.
         version: Mutex<u64>,
+        /// The application does not answer when asked for a fingerprint.
+        silent: Mutex<bool>,
     }
 
     impl Host for FakeHost {
@@ -482,8 +497,14 @@ mod tests {
             _: Option<&DocumentInfo>,
             _: &Value,
         ) -> Option<String> {
-            tool.on_document
-                .then(|| format!("v{}", self.version.lock().unwrap()))
+            if *self.silent.lock().unwrap() {
+                return None;
+            }
+            Some(if tool.on_document {
+                format!("v{}", self.version.lock().unwrap())
+            } else {
+                String::new()
+            })
         }
 
         fn run(
@@ -537,6 +558,7 @@ mod tests {
             ],
             runs: Mutex::new(Vec::new()),
             version: Mutex::new(1),
+            silent: Mutex::new(false),
         });
         let approver = Arc::new(FakeApprover {
             answer,
@@ -794,5 +816,16 @@ mod tests {
         let (invoker, host, _) = setup(Approval::Allow);
         assert!(!invoker.call(&ai(), "replace_lines", &args).is_error);
         assert_eq!(host.runs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_document_call_that_cannot_be_checked_is_not_asked_or_run() {
+        let (invoker, host, approver) = setup(Approval::Allow);
+        *host.silent.lock().unwrap() = true;
+        let args = json!({"document": "1", "start_line": 1, "end_line": 1, "text": ""});
+        let result = invoker.call(&ai(), "replace_lines", &args);
+        assert_eq!(result, ToolResult::error(UNCHECKABLE));
+        assert!(approver.asked.lock().unwrap().is_empty());
+        assert!(host.runs.lock().unwrap().is_empty());
     }
 }

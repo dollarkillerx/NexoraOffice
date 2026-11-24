@@ -185,6 +185,7 @@ fn provider_from(entry: &Map<String, Value>) -> Option<ProviderConfig> {
     provider.key_host = text("key_host")
         .map(|host| host.trim().to_ascii_lowercase())
         .filter(|host| !host.is_empty());
+    provider.upgrade_key_binding();
     Some(provider)
 }
 
@@ -298,7 +299,7 @@ mod tests {
         let mut lan = ProviderConfig::from_preset("lan", Preset::Custom);
         lan.base_url = "http://192.168.1.5:8080/v1".into();
         lan.allow_insecure = true;
-        lan.key_host = Some("192.168.1.5".into());
+        lan.key_host = Some("http://192.168.1.5:8080".into());
         settings.providers.push(lan);
         settings.selected = Some("local".into());
         settings.redact = false;
@@ -332,7 +333,7 @@ mod tests {
             }
         }
         assert_eq!(saved["providers"][4]["allow_insecure"], true);
-        assert_eq!(saved["providers"][4]["key_host"], "192.168.1.5");
+        assert_eq!(saved["providers"][4]["key_host"], "http://192.168.1.5:8080");
         assert_eq!(saved["providers"][0]["allow_insecure"], false);
         assert_eq!(saved["providers"][0]["key_host"], Value::Null);
     }
@@ -355,7 +356,19 @@ mod tests {
         }
         let set = settings.provider("set").unwrap();
         assert!(set.allow_insecure);
+        // A bare host on another address than the provider's: kept, and it
+        // matches nothing until the key is saved again.
         assert_eq!(set.key_host.as_deref(), Some("api.example.com"));
+        assert!(!set.key_matches_host());
+        // On the provider's own address it becomes that address's origin.
+        let older = AiSettings::from_json(&json!({
+            "providers": [{"id": "lan", "kind": "openai_compatible",
+                "base_url": "http://192.168.1.5:8080/v1", "key_host": "192.168.1.5"}]
+        }));
+        assert_eq!(
+            older.provider("lan").unwrap().key_host.as_deref(),
+            Some("http://192.168.1.5:8080")
+        );
         // Defaults have neither.
         for provider in AiSettings::default().providers {
             assert!(!provider.allow_insecure);

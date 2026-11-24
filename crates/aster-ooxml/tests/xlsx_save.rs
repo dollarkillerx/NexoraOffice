@@ -378,3 +378,76 @@ fn typed_dates_and_percentages_add_the_formats_they_need() {
     // Saved once, the formats are the file's own: saving again adds none.
     assert_eq!(again.styles.len(), 7);
 }
+
+#[test]
+fn typed_amounts_add_a_currency_format_once() {
+    use aster_sheets::input::{Reading, read};
+
+    let reading = Reading {
+        order: aster_sheets::DateOrder::Ymd,
+        date1904: false,
+        this_year: 2026,
+    };
+    let type_in = |book: &mut Workbook, changes: &mut Changes, cell: &str, text: &str| {
+        let (entry, look) = read(text, &reading);
+        let made = book.entry_cell(0, at(cell), entry, look);
+        edit(book, changes, vec![(cell, made)]);
+    };
+    // G4 has "¥"#,##0.00 as format 164, with borders.
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    type_in(&mut book, &mut changes, "G6", "¥1,200");
+    type_in(&mut book, &mut changes, "G7", "¥3,000");
+    type_in(&mut book, &mut changes, "G8", "¥5.50");
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from([
+            "xl/styles.xml".to_owned(),
+            "xl/worksheets/sheet1.xml".to_owned()
+        ])
+    );
+    let styles = part(&saved, "xl/styles.xml");
+    let before = part(&source, "xl/styles.xml");
+    // One new number format; the one with decimals is the file's own 164.
+    let expected = before
+        .replace(r#"<numFmts count="2">"#, r#"<numFmts count="3">"#)
+        .replace(
+            "\n  </numFmts>",
+            "\n  <numFmt numFmtId=\"166\" formatCode=\"&quot;¥&quot;#,##0\"/></numFmts>",
+        )
+        .replace(r#"<cellXfs count="5">"#, r#"<cellXfs count="7">"#)
+        .replace(
+            "  </cellXfs>",
+            r#"  <xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"><alignment vertical="center"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"><alignment vertical="center"/></xf></cellXfs>"#,
+        );
+    assert_eq!(styles, expected);
+    let again = Xlsx.read(saved).unwrap();
+    let shown = |c: &str| {
+        again
+            .display(again.sheets[0].cell(at(c)).unwrap())
+            .unwrap()
+            .text
+    };
+    assert_eq!(shown("G6"), "¥1,200");
+    assert_eq!(shown("G7"), "¥3,000");
+    assert_eq!(shown("G8"), "¥5.50");
+
+    // A styles part without <numFmts> gets one at its start.
+    let source = aster_ooxml::xlsx_save::blank("Sheet1", "Calibri");
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    type_in(&mut book, &mut changes, "A1", "$2.5");
+    let saved = save(source, &book, &changes).unwrap();
+    let styles = part(&saved, "xl/styles.xml");
+    assert!(styles.contains(r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/></numFmts><fonts"#));
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(
+        again
+            .display(again.sheets[0].cell(at("A1")).unwrap())
+            .unwrap()
+            .text,
+        "$2.50"
+    );
+}

@@ -144,6 +144,11 @@ impl Borders {
     }
 }
 
+/// [`CellStyle::format_id`] of a style added with a number format of its
+/// own (a currency format): the file has no id for it yet, saving gives it
+/// one.
+pub const UNNUMBERED_FORMAT: u32 = u32::MAX;
+
 /// A cell format: number format, alignment, font, fill and borders.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellStyle {

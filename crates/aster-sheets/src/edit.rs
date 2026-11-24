@@ -8,7 +8,7 @@ use crate::calc::Computed;
 use crate::format::Format;
 use crate::input::{Entry, Look};
 use crate::model::{Cell, Sheet, Value, Workbook};
-use crate::style::CellStyle;
+use crate::style::{CellStyle, UNNUMBERED_FORMAT};
 
 /// One cell before and after a change. `None` is no cell at all.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,16 +82,27 @@ impl Sheet {
     }
 }
 
-/// The built-in number format Excel gives a typed entry: dates 14, date
-/// and time 22, times 20 (21 with seconds), percentages 9 (10 with
-/// decimals), grouped numbers 3 (4 with decimals).
-fn builtin_for(look: Look, value: &Value) -> Option<u32> {
+/// The number format Excel gives a typed entry: built-in ones for dates
+/// (14), date and time (22), times (20, 21 with seconds), percentages (9,
+/// 10 with decimals) and grouped numbers (3, 4 with decimals); a format of
+/// the workbook's own for an amount with a currency sign, such as
+/// `"¥"#,##0` or `#,##0.00"€"`.
+fn format_for(look: Look, value: &Value) -> Option<(u32, Format)> {
     let Value::Number(n) = value else {
         return None;
     };
     let fraction = |x: f64| (x - x.round()).abs() > 1e-9;
-    Some(match look {
+    let id = match look {
         Look::Plain => return None,
+        Look::Currency { symbol, before } => {
+            let digits = if fraction(*n) { "#,##0.00" } else { "#,##0" };
+            let code = if before {
+                format!("\"{symbol}\"{digits}")
+            } else {
+                format!("{digits}\"{symbol}\"")
+            };
+            return Some((UNNUMBERED_FORMAT, Format::parse(&code)));
+        }
         Look::Percent if fraction(n * 100.0) => 10,
         Look::Percent => 9,
         Look::Grouped if fraction(*n) => 4,
@@ -100,7 +111,8 @@ fn builtin_for(look: Look, value: &Value) -> Option<u32> {
         Look::DateTime => 22,
         Look::Time if fraction(n * 1440.0) => 21,
         Look::Time => 20,
-    })
+    };
+    Some((id, Format::builtin(id)))
 }
 
 impl Workbook {
@@ -145,15 +157,24 @@ impl Workbook {
         if look == Look::Plain || code != "General" && !code.is_empty() {
             return current;
         }
-        let Some(id) = builtin_for(look, value) else {
+        let Some((id, format)) = format_for(look, value) else {
             return current;
         };
-        let decimals = matches!(id, 4 | 10);
+        let decimals = matches!(id, 4 | 10) || format.code().contains('.');
         let seconds = id == 21;
         let fits = |code: &str, is_date: bool, ordered: bool| match look {
+            Look::Currency { symbol, .. } => {
+                code.contains(symbol)
+                    && code.contains("#,##0")
+                    && !code.contains('%')
+                    && code.contains('.') == decimals
+            }
             Look::Percent => code.contains('%') && code.contains('.') == decimals,
             Look::Grouped => {
-                code.contains("#,##0") && !code.contains('%') && code.contains('.') == decimals
+                code.contains("#,##0")
+                    && !code.contains('%')
+                    && code.contains('.') == decimals
+                    && !code.contains(['$', '¥', '￥', '€', '£', '₩'])
             }
             Look::Date => is_date && ordered && !code.contains('h'),
             Look::Time => {
@@ -186,7 +207,7 @@ impl Workbook {
             return current;
         }
         let made = CellStyle {
-            format: Arc::new(Format::builtin(id)),
+            format: Arc::new(format),
             format_id: id,
             xf: base.xf.or(Some(0)),
             ..base
@@ -326,6 +347,11 @@ mod tests {
         assert!(book.sheets[0].row(8).is_none());
     }
 
+    fn book_entry(book: &mut Workbook, reading: &Reading, text: &str, cell: &str) -> Option<Cell> {
+        let (entry, look) = read(text, reading);
+        book.entry_cell(0, at(cell), entry, look)
+    }
+
     #[test]
     fn entries_keep_or_take_a_format() {
         let mut book = workbook();
@@ -334,10 +360,7 @@ mod tests {
             date1904: false,
             this_year: 2026,
         };
-        let mut entry = |text: &str, cell: &str| {
-            let (entry, look) = read(text, &reading);
-            book.entry_cell(0, at(cell), entry, look)
-        };
+        let mut entry = |text: &str, cell: &str| book_entry(&mut book, &reading, text, cell);
         // A date in a General cell takes the date format the book has.
         let date = entry("2026/11/24", "B2").unwrap();
         assert_eq!(
@@ -380,6 +403,17 @@ mod tests {
         );
         assert_eq!(book.style(4).format.number(0.5, false), "50%");
         assert_eq!(book.style(6).format.number(1000.5, false), "1,000.50");
+        // Amounts with a currency sign take a format of their own, once.
+        let yen = book_entry(&mut book, &reading, "¥1,200", "D1").unwrap();
+        assert_eq!(book.style(yen.style).format.code(), "\"¥\"#,##0");
+        assert_eq!(book.style(yen.style).format_id, UNNUMBERED_FORMAT);
+        assert_eq!(book.display(&yen).unwrap().text, "¥1,200");
+        let again = book_entry(&mut book, &reading, "¥3,000", "D2").unwrap();
+        assert_eq!(again.style, yen.style);
+        let euro = book_entry(&mut book, &reading, "5,50€", "D3");
+        assert_eq!(euro.map(|c| c.style), Some(0), "5,50 is not a number here");
+        let euro = book_entry(&mut book, &reading, "5.50€", "D3").unwrap();
+        assert_eq!(book.display(&euro).unwrap().text, "5.50€");
         // A workbook without cell formats gets none.
         let mut bare = Workbook {
             sheets: book.sheets.clone(),

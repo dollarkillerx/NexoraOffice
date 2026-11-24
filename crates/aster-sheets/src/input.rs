@@ -23,8 +23,13 @@ pub enum Entry {
 pub enum Look {
     Plain,
     Percent,
-    /// With a thousands separator or a currency sign.
+    /// With a thousands separator.
     Grouped,
+    /// With a currency sign before or after the number.
+    Currency {
+        symbol: char,
+        before: bool,
+    },
     Date,
     Time,
     DateTime,
@@ -93,14 +98,20 @@ fn number(text: &str) -> Option<(f64, Look)> {
         s = rest.trim_end();
     }
     if let Some(rest) = s.strip_prefix(CURRENCY) {
-        look = Look::Grouped;
+        look = Look::Currency {
+            symbol: s.chars().next().unwrap_or('$'),
+            before: true,
+        };
         s = rest.trim_start();
         if let Some(rest) = s.strip_prefix('-') {
             negative = !negative;
             s = rest;
         }
     } else if let Some(rest) = s.strip_suffix(CURRENCY) {
-        look = Look::Grouped;
+        look = Look::Currency {
+            symbol: s.chars().next_back().unwrap_or('$'),
+            before: false,
+        };
         s = rest.trim_end();
     }
     if s.is_empty() || !s.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
@@ -114,7 +125,9 @@ fn number(text: &str) -> Option<(f64, Look)> {
         if first.is_empty() || first.len() > 3 || !groups.all(|g| g.len() == 3) {
             return None;
         }
-        look = Look::Grouped;
+        if look == Look::Plain {
+            look = Look::Grouped;
+        }
         let joined = int.replace(',', "");
         let rebuilt = match frac {
             Some(frac) => format!("{joined}.{frac}"),
@@ -385,7 +398,13 @@ mod tests {
         );
         assert_eq!(
             read("¥1,200", &reading(DateOrder::Ymd)),
-            (num(1200.0), Look::Grouped)
+            (
+                num(1200.0),
+                Look::Currency {
+                    symbol: '¥',
+                    before: true
+                }
+            )
         );
         assert_eq!(value("$-5"), num(-5.0));
         assert_eq!(value("(12)"), num(-12.0));

@@ -246,6 +246,13 @@ impl SlideView {
         &self.selection
     }
 
+    /// Where a point of the current slide (EMU) is on the view, physical
+    /// pixels.
+    pub fn screen_point(&self, x: i64, y: i64) -> (f64, f64) {
+        let (page, per) = self.page();
+        (page.x0 + x as f64 * per, page.y0 + y as f64 * per)
+    }
+
     /// Select shape `index` of the current slide, as a click would.
     pub fn select_shape(&mut self, index: usize) {
         self.leave_text();

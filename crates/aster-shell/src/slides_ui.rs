@@ -277,6 +277,25 @@ pub(crate) fn key(
             left
         }
     };
+    // Cmd+B, Cmd+I, Cmd+U, when the Format menu did not take them.
+    if primary && (editing || selected) {
+        let command = match text {
+            "b" | "B" => Some(Command::Bold),
+            "i" | "I" => Some(Command::Italic),
+            "u" | "U" => Some(Command::Underline),
+            _ => None,
+        };
+        if let Some(command) = command {
+            if run(shell, command) {
+                after_change(ui, shell);
+            }
+            return true;
+        }
+    }
+    let Some(tab) = shell.active_slides() else {
+        return false;
+    };
+    let view = &mut tab.view;
     let changed = if is(Key::Escape) {
         view.escape()
     } else if is(Key::Backspace) || is(Key::Delete) {

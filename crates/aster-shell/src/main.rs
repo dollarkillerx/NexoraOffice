@@ -7313,6 +7313,154 @@ mod ui_tests {
         assert_eq!(value("B7"), None);
     }
 
+    /// The app with a new presentation in front.
+    fn slides_app() -> App {
+        let app = app();
+        app.shell.borrow_mut().open_untitled(DocKind::Slides);
+        {
+            let mut shell = app.shell.borrow_mut();
+            after_tab_change(&app.ui, &mut shell);
+        }
+        app
+    }
+
+    fn with_slides<T>(app: &App, f: impl FnOnce(&mut SlidesTab) -> T) -> T {
+        let mut shell = app.shell.borrow_mut();
+        let tab = shell.active_slides().expect("a presentation in front");
+        f(tab)
+    }
+
+    /// Where a point of the current slide (EMU) is in the window.
+    fn on_slide(app: &App, x: i64, y: i64) -> (f32, f32) {
+        let ui = &app.ui;
+        present(ui, &mut app.shell.borrow_mut());
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = ui.window().scale_factor();
+        let (px, py) = with_slides(app, |tab| tab.view.screen_point(x, y));
+        (origin.x + px as f32 / scale, origin.y + py as f32 / scale)
+    }
+
+    fn click_at(ui: &AppWindow, (x, y): (f32, f32)) {
+        drag(ui, &[(x, y)]);
+    }
+
+    fn slide_title(app: &App) -> String {
+        with_slides(app, |tab| {
+            let slide = &tab.view.presentation().slides[tab.view.current()];
+            slide.shapes[0].text.as_ref().unwrap().plain_text()
+        })
+    }
+
+    #[test]
+    fn a_click_in_a_new_slide_title_types_formats_and_undoes() {
+        let app = slides_app();
+        let ui = &app.ui;
+        // The middle of the title placeholder of the new title slide.
+        let title = on_slide(&app, 6_096_000, 2_316_000);
+        click_at(ui, title);
+        assert!(with_slides(&app, |tab| tab.view.is_editing_text()));
+        type_text(ui, "Hello 東京");
+        assert_eq!(slide_title(&app), "Hello 東京");
+        // Return makes a new paragraph; Backspace joins it again.
+        type_text(ui, &char::from(Key::Return).to_string());
+        type_text(ui, "x");
+        assert_eq!(slide_title(&app), "Hello 東京\nx");
+        type_text(ui, &char::from(Key::Backspace).to_string());
+        type_text(ui, &char::from(Key::Backspace).to_string());
+        assert_eq!(slide_title(&app), "Hello 東京");
+        // Select all and make it bold, as from the Format menu; Cmd+I.
+        command(ui, "a");
+        ui.invoke_sheet_format(0);
+        command(ui, "i");
+        let look = with_slides(&app, |tab| tab.view.look().unwrap());
+        assert!(look.bold && look.italic, "{look:?}");
+        // The tab shows unsaved changes; undo goes back to nothing typed.
+        assert!(with_slides(&app, |tab| tab.is_modified()));
+        for _ in 0..9 {
+            ui.invoke_edit_undo();
+        }
+        assert_eq!(slide_title(&app), "");
+        assert!(!with_slides(&app, |tab| tab.is_modified()));
+    }
+
+    #[test]
+    fn a_shape_is_inserted_dragged_and_ordered() {
+        let app = slides_app();
+        let ui = &app.ui;
+        ui.invoke_toolbar_option(Command::InsertShape.id(), 2);
+        let (index, frame) = with_slides(&app, |tab| {
+            let index = tab.view.selection().shape().unwrap();
+            (index, tab.view.presentation().slides[0].shapes[index].frame)
+        });
+        let middle = on_slide(&app, frame.x + frame.width / 2, frame.y + frame.height / 2);
+        drag(
+            ui,
+            &[
+                middle,
+                (middle.0 + 10.0, middle.1),
+                (middle.0 + 60.0, middle.1 + 30.0),
+            ],
+        );
+        let moved = with_slides(&app, |tab| {
+            tab.view.presentation().slides[0].shapes[index].frame
+        });
+        assert!(
+            moved.x > frame.x && moved.y > frame.y,
+            "{frame:?} {moved:?}"
+        );
+        assert_eq!(moved.width, frame.width);
+        // Send to back: behind the placeholders.
+        ui.invoke_slide_command(6);
+        let first = with_slides(&app, |tab| {
+            tab.view.presentation().slides[0].shapes[0].geometry.clone()
+        });
+        assert_eq!(first, aster_slides::Geometry::Ellipse);
+        // The arrow keys nudge it; Delete takes it away.
+        ui.invoke_focus_document();
+        type_text(ui, &char::from(Key::RightArrow).to_string());
+        let nudged = with_slides(&app, |tab| {
+            tab.view.presentation().slides[0].shapes[0].frame
+        });
+        assert_eq!(nudged.x, moved.x + 76_200);
+        type_text(ui, &char::from(Key::Delete).to_string());
+        assert_eq!(
+            with_slides(&app, |tab| tab.view.presentation().slides[0].shapes.len()),
+            2
+        );
+    }
+
+    #[test]
+    fn slides_notes_and_the_show() {
+        let app = slides_app();
+        let ui = &app.ui;
+        ui.invoke_slide_command(0);
+        ui.invoke_slide_command(1);
+        assert_eq!(
+            with_slides(&app, |tab| (tab.view.count(), tab.view.current())),
+            (3, 2)
+        );
+        ui.invoke_notes_edited("話すこと".into());
+        assert_eq!(
+            with_slides(&app, |tab| tab.view.presentation().slides[2].notes.clone()),
+            Some("話すこと".to_owned())
+        );
+        // From the first slide: the show moves on with keys and clicks, and
+        // Esc leaves it.
+        with_slides(&app, |tab| tab.view.go_to(0));
+        ui.invoke_slide_command(9);
+        assert!(ui.get_presenting());
+        ui.invoke_show_key(char::from(Key::RightArrow).to_string().into(), false);
+        assert_eq!(with_slides(&app, |tab| tab.view.current()), 1);
+        ui.invoke_show_click();
+        assert_eq!(with_slides(&app, |tab| tab.view.current()), 2);
+        ui.invoke_show_key(char::from(Key::Escape).to_string().into(), false);
+        assert!(!ui.get_presenting());
+        assert!(!with_slides(&app, |tab| tab.view.is_presenting()));
+    }
+
     #[test]
     fn dragging_a_sheet_tab_moves_the_sheet() {
         let app = app();

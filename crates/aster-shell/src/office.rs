@@ -358,6 +358,8 @@ struct Restructure {
     before: Vec<aster_sheets::Sheet>,
     after: Vec<aster_sheets::Sheet>,
     others: Vec<(usize, CellRef)>,
+    /// What inserted lines took from the line before them.
+    inherited: aster_sheets::structure::Inherited,
 }
 
 /// Why rows or columns cannot be inserted or deleted here.
@@ -964,6 +966,7 @@ impl SheetTab {
         if let Some(change) = &step.lines {
             self.view.workbook_mut().sheets = change.after.clone();
             self.moved(change.sheet, change.lines, &change.others);
+            self.mark_inherited(change.sheet, change.lines, &change.inherited);
             if change.lines.insert {
                 self.restored(change.sheet, change.lines);
             }
@@ -1023,8 +1026,10 @@ impl SheetTab {
         self.view.cancel_edit();
         let before = self.view.workbook().sheets.clone();
         let others = self.view.workbook_mut().restructure(sheet, &lines);
+        let inherited = self.view.workbook_mut().inherit_format(sheet, &lines);
         let after = self.view.workbook().sheets.clone();
         self.moved(sheet, lines, &others);
+        self.mark_inherited(sheet, lines, &inherited);
         self.history.push(Step {
             styles_before: self.view.workbook().styles.len(),
             lines: Some(Box::new(Restructure {
@@ -1033,6 +1038,7 @@ impl SheetTab {
                 before,
                 after,
                 others,
+                inherited,
             })),
             ..Step::default()
         });
@@ -1085,7 +1091,44 @@ impl SheetTab {
         self.formulas_changed = true;
         self.merges_changed.insert(sheet);
         if let Some(Some(file)) = self.origins.get(sheet) {
-            self.structure.push((*file, lines));
+            // Undoing the last move still to be saved takes it out rather
+            // than adding its opposite: the file's rows keep their bytes
+            // (styles, hidden, heights) and pictures their anchors. Not
+            // while a save is writing what is listed.
+            let undone = (
+                *file,
+                Lines {
+                    insert: !lines.insert,
+                    ..lines
+                },
+            );
+            if !self.saving && self.structure.last() == Some(&undone) {
+                self.structure.pop();
+            } else {
+                self.structure.push((*file, lines));
+            }
+        }
+    }
+
+    /// Cells and sizes inserted lines took from their neighbour are for
+    /// saving.
+    fn mark_inherited(
+        &mut self,
+        sheet: usize,
+        lines: Lines,
+        inherited: &aster_sheets::structure::Inherited,
+    ) {
+        self.dirty
+            .extend(inherited.cells.iter().map(|&at| (sheet, at)));
+        self.edited
+            .extend(inherited.cells.iter().map(|&at| (sheet, at)));
+        if inherited.sized {
+            let resized = if lines.columns {
+                &mut self.columns_changed
+            } else {
+                &mut self.rows_changed
+            };
+            resized.extend((lines.at..lines.at + lines.count).map(|i| (sheet, i)));
         }
     }
 
@@ -2335,6 +2378,77 @@ mod tests {
     }
 
     #[test]
+    fn undone_deletes_leave_the_file_alone_and_inserts_take_formats() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("格式.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        for (cell, text) in [("A1", "1"), ("A2", "2"), ("B2", "x"), ("A3", "3")] {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("en");
+        }
+        tab.view.select(at("A2"));
+        tab.view.extend_to(at("B2"));
+        tab.format(&StyleEdit::Bold(true));
+        tab.view.workbook_mut().sheets[0].row_sizes.set(1, 2, 40.0);
+        tab.rows_changed.insert((0, 1));
+        let save = |tab: &mut SheetTab| {
+            let job = tab.begin_save().unwrap();
+            let written = job.write(&file).unwrap();
+            tab.finish_save(&job, &file, Some(written));
+        };
+        let sheet_xml = || {
+            let bytes = std::fs::read(&file).unwrap();
+            let mut package = aster_ooxml::Package::open(bytes).unwrap();
+            package.read("xl/worksheets/sheet1.xml").unwrap()
+        };
+        save(&mut tab);
+        let saved = sheet_xml();
+
+        // Row 2 deleted and brought back: nothing is left to move.
+        tab.view.select(at("A2"));
+        tab.change_lines(false, false).unwrap();
+        tab.undo();
+        assert!(tab.structure.is_empty());
+        save(&mut tab);
+        assert_eq!(sheet_xml(), saved);
+
+        // A row inserted below the bold one is bold and as tall.
+        tab.view.select(at("A3"));
+        tab.change_lines(false, true).unwrap();
+        let bold = |tab: &SheetTab, cell: &str| {
+            let sheet = tab.view.sheet().unwrap();
+            let style = sheet.cell(at(cell)).map_or(0, |c| c.style);
+            tab.view.workbook().style(style).font.bold
+        };
+        assert!(bold(&tab, "A3") && bold(&tab, "B3"));
+        save(&mut tab);
+        // Empty cells with a format are written; reading drops those that
+        // draw nothing, so look at the file.
+        let xml = String::from_utf8(sheet_xml()).unwrap();
+        assert!(
+            xml.contains(r#"<row r="3" ht="30" customHeight="1"><c r="A3" s="#),
+            "{xml}"
+        );
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let sheet = &again.sheets[0];
+        assert_eq!(sheet.row_sizes.size(2), 40.0);
+        assert_eq!(
+            sheet.cell(at("A4")).map(|c| c.value.clone()),
+            Some(aster_sheets::Value::Number(3.0))
+        );
+    }
+
+    #[test]
     fn rows_and_columns_go_in_and_out_with_undo_and_save() {
         use aster_surface::cell_editor::EditMode;
 
@@ -2387,7 +2501,9 @@ mod tests {
         assert!(tab.view.sheet().unwrap().cell(at("A5")).is_none());
         tab.undo();
         assert_eq!(formula(&tab, "A5").as_deref(), Some("SUM(A1:A4)"));
-        assert_eq!(tab.structure.len(), 5);
+        // Each undo took its move out again: only the redone insert is
+        // left to replay on the file.
+        assert_eq!(tab.structure.len(), 1);
 
         let job = tab.begin_save().unwrap();
         let written = job.write(&file).unwrap();

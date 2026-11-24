@@ -335,7 +335,84 @@ pub fn adjust(formula: &str, host: Option<&str>, target: &str, lines: &Lines) ->
     out
 }
 
+/// What inserted lines took from the line before them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Inherited {
+    /// Empty cells given the format of their neighbour.
+    pub cells: Vec<CellRef>,
+    /// The lines were given its height or width.
+    pub sized: bool,
+}
+
+/// More formatted cells than this are not copied into inserted lines.
+const MAX_INHERITED: usize = 200_000;
+
 impl crate::model::Workbook {
+    /// Lines just inserted look like the one before them, as Excel's
+    /// "format same as above" (or left): each formatted cell of that line
+    /// gives an empty cell with its format, and the line its size.
+    pub fn inherit_format(&mut self, sheet: usize, lines: &Lines) -> Inherited {
+        let mut out = Inherited::default();
+        if !lines.insert || lines.at == 0 {
+            return out;
+        }
+        let Some(target) = self.sheets.get_mut(sheet) else {
+            return out;
+        };
+        let source = lines.at - 1;
+        // The other coordinate and the format of each formatted cell.
+        let styled: Vec<(u32, u32)> = if lines.columns {
+            target
+                .rows()
+                .iter()
+                .filter_map(|row| {
+                    let cell = row.cells.iter().find(|c| c.col == source)?;
+                    (cell.style != 0).then_some((row.index, cell.style))
+                })
+                .collect()
+        } else {
+            target
+                .row(source)
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .filter(|c| c.style != 0)
+                        .map(|c| (c.col, c.style))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let axis = if lines.columns {
+            &mut target.columns
+        } else {
+            &mut target.row_sizes
+        };
+        let size = axis.size(source);
+        if size != axis.size(lines.at) || size != axis.default_size() {
+            axis.set(lines.at, lines.at + lines.count, size);
+            out.sized = size != axis.default_size();
+        }
+        if styled.len().saturating_mul(lines.count as usize) > MAX_INHERITED {
+            return out;
+        }
+        let mut cells = Vec::with_capacity(styled.len() * lines.count as usize);
+        for line in lines.at..lines.at + lines.count {
+            for &(other, style) in &styled {
+                let at = if lines.columns {
+                    CellRef::new(other, line)
+                } else {
+                    CellRef::new(line, other)
+                };
+                let mut cell = crate::model::Cell::new(at.col, crate::model::Value::Empty);
+                cell.style = style;
+                cells.push((at, Some(cell)));
+                out.cells.push(at);
+            }
+        }
+        self.set_cells(sheet, cells);
+        out
+    }
+
     /// Insert or delete rows or columns on sheet `sheet`: its cells, merged
     /// areas, sizes, row and column formats and pictures move, and every
     /// formula in the workbook that refers to it follows. Returns the
@@ -551,6 +628,46 @@ mod tests {
         assert_eq!(delete.moved_range(range).unwrap().to_string(), "B3:C9");
         assert_eq!(delete.moved_range(CellRange::parse("A6:A8").unwrap()), None);
         assert_eq!(insert.moved_range(range).unwrap().to_string(), "B3:C15");
+    }
+
+    #[test]
+    fn inserted_lines_take_the_format_of_the_one_before() {
+        use crate::model::{Cell, SheetBuilder, SheetKind, Value, Workbook};
+        let mut sheet = SheetBuilder::new("表", SheetKind::Worksheet);
+        let styled = |col: u32, style: u32| Cell {
+            style,
+            ..Cell::new(col, Value::Number(1.0))
+        };
+        sheet.push(0, styled(0, 2));
+        sheet.push(0, styled(1, 0));
+        sheet.push(0, styled(2, 3));
+        sheet.row_sizes.set(0, 1, 30.0);
+        let mut book = Workbook {
+            sheets: vec![sheet.finish()],
+            ..Workbook::default()
+        };
+        let lines = Lines {
+            columns: false,
+            at: 1,
+            count: 2,
+            insert: true,
+        };
+        book.restructure(0, &lines);
+        let inherited = book.inherit_format(0, &lines);
+        assert!(inherited.sized);
+        assert_eq!(inherited.cells.len(), 4);
+        let s = &book.sheets[0];
+        let cell = |text: &str| s.cell(CellRef::parse(text).unwrap()).cloned();
+        assert_eq!(
+            cell("A2").map(|c| (c.style, c.value)),
+            Some((2, Value::Empty))
+        );
+        assert_eq!(cell("C3").map(|c| c.style), Some(3));
+        assert!(cell("B2").is_none());
+        assert_eq!(s.row_sizes.size(2), 30.0);
+        // Nothing before the first line: nothing to take.
+        let first = Lines { at: 0, ..lines };
+        assert_eq!(book.inherit_format(0, &first), Inherited::default());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use aster_markdown::document::{floor_char_boundary, slice};
 use aster_markdown::format;
 use aster_markdown::highlight::{Highlighter, Marks, Span};
 use aster_markdown::search::{Finder, Found, Query};
+use aster_markdown::table;
 use aster_markdown::{Change, Document, EditCommand, Rope, SavePoint, Selection, TextFormat};
 use aster_storage::{Fingerprint, RecordKey};
 use aster_surface::preview::{PreviewJob, PreviewLayout, PreviewStyle, PreviewView};
@@ -1364,6 +1365,20 @@ impl MarkdownEditor {
         self.show(Some(change))
     }
 
+    /// Make an edit, or with an edit that changes no text only move the
+    /// selection, as going to another table cell does.
+    fn apply_or_select(&mut self, edit: format::Edit) -> bool {
+        if edit.range.is_empty() && edit.text.is_empty() {
+            self.document.set_selection(edit.selection);
+            let selection = self.document.selection();
+            self.surface
+                .set_selection(selection.anchor, selection.focus);
+            self.surface.reveal_caret();
+            return false;
+        }
+        self.apply(edit)
+    }
+
     /// Make an edit that moves list items, then put the numbers of the lists
     /// below right; one undo step.
     fn apply_renumbered(&mut self, edit: format::Edit) -> bool {
@@ -1377,11 +1392,20 @@ impl MarkdownEditor {
         shown
     }
 
-    /// Tab and Shift+Tab: list items move a level in or out; elsewhere Tab
-    /// types a tab and Shift+Tab does nothing.
+    /// Tab and Shift+Tab: in a table the caret goes to the next or previous
+    /// cell (Tab in the last cell adds a row); list items move a level in or
+    /// out; elsewhere Tab types a tab and Shift+Tab does nothing.
     fn indent(&mut self, outdent: bool) -> bool {
         if self.surface.is_composing() || self.locked() {
             return false;
+        }
+        if let Some(edit) = table::tab(
+            self.document.text(),
+            self.fresh_highlighter(),
+            self.document.selection(),
+            outdent,
+        ) {
+            return self.apply_or_select(edit);
         }
         match format::indent(self.document.text(), self.document.selection(), outdent) {
             Some(edit) => self.apply_renumbered(edit),
@@ -1390,11 +1414,19 @@ impl MarkdownEditor {
         }
     }
 
-    /// Enter: on a list item or in a quote the next line gets the same
-    /// markers, or an empty item ends the list; elsewhere a line break.
+    /// Enter: in a table a new row below; on a list item or in a quote the
+    /// next line gets the same markers, or an empty item ends the list;
+    /// elsewhere a line break.
     fn newline(&mut self) -> bool {
         if self.surface.is_composing() || self.locked() {
             return false;
+        }
+        if let Some(edit) = table::line_break(
+            self.document.text(),
+            self.fresh_highlighter(),
+            self.document.selection(),
+        ) {
+            return self.apply(edit);
         }
         let edit = format::line_break(
             self.document.text(),
@@ -2287,6 +2319,49 @@ mod tests {
         assert!(plain.key(Action::Indent));
         assert_eq!(text_of(&plain), "正文\t");
         assert!(!plain.key(Action::Outdent));
+    }
+
+    #[test]
+    fn tab_and_enter_fill_in_a_table() {
+        let mut e = editor("");
+        assert!(e.format(Format::Table));
+        type_text(&mut e, "名称");
+        // Going to the next cell changes no text.
+        assert!(!e.key(Action::Indent));
+        type_text(&mut e, "数量");
+        assert!(!e.key(Action::Indent));
+        type_text(&mut e, "苹果");
+        assert!(!e.key(Action::Indent));
+        type_text(&mut e, "3");
+        assert_eq!(
+            text_of(&e),
+            "| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |\n"
+        );
+        // Back to the cell before, its text selected; typing replaces it.
+        assert!(!e.key(Action::Outdent));
+        type_text(&mut e, "梨");
+        assert_eq!(text_of(&e), "| 名称 | 数量 |\n| --- | --- |\n| 梨 | 3 |\n");
+        assert_in_step(&e);
+        // Tab in the last cell adds a row; Enter on it, still empty, ends
+        // the table.
+        assert!(!e.key(Action::Indent));
+        assert!(e.key(Action::Indent));
+        assert_eq!(
+            text_of(&e),
+            "| 名称 | 数量 |\n| --- | --- |\n| 梨 | 3 |\n|  |  |\n"
+        );
+        assert!(e.key(Action::Newline));
+        type_text(&mut e, "后文");
+        assert_eq!(
+            text_of(&e),
+            "| 名称 | 数量 |\n| --- | --- |\n| 梨 | 3 |\n\n后文\n"
+        );
+        assert_in_step(&e);
+        // Enter in a row with text adds a row under it.
+        let start = text_of(&e).find("梨").unwrap();
+        e.document.set_selection(Selection::caret(start));
+        assert!(e.key(Action::Newline));
+        assert!(text_of(&e).contains("| 梨 | 3 |\n|  |  |\n\n后文"));
     }
 
     #[test]

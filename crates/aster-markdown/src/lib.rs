@@ -21,6 +21,7 @@ pub mod journal;
 pub mod preview;
 pub mod search;
 pub mod syntax;
+pub mod table;
 
 pub use document::{Change, Document, EditCommand, SavePoint, Selection};
 pub use file::{DecodeError, Decoded, LineEnding, TextFormat, decode, encode, encode_rope};

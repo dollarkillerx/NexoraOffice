@@ -431,7 +431,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-cut;
                 shortcut: @keys(Control + X);
-                enabled: root.editing;
+                enabled: root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(1);
@@ -444,7 +444,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-copy;
                 shortcut: @keys(Control + C);
-                enabled: root.editing;
+                enabled: root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(2);
@@ -457,7 +457,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-paste;
                 shortcut: @keys(Control + V);
-                enabled: root.editing;
+                enabled: root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(3);

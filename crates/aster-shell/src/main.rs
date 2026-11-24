@@ -3022,6 +3022,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(Content::Slides(tab)) => {
                 if tab.view.press(x, y) {
+                    refresh_viewer(&ui, shell);
                     refresh_status(&ui, shell);
                     present(&ui, shell);
                 }
@@ -3055,6 +3056,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(tab) = shell.active_slides() {
             if tab.view.wheel(f64::from(pointer_x) * scale, dy) {
+                refresh_viewer(&ui, shell);
                 refresh_status(&ui, shell);
                 present(&ui, shell);
             }

@@ -176,7 +176,8 @@ impl Command {
                         | Command::ViewPreview
                 ) || self.formats_markdown()
             }
-            DocKind::Sheets | DocKind::Slides | DocKind::Pdf => false,
+            DocKind::Sheets => matches!(self, Command::Undo | Command::Redo),
+            DocKind::Slides | DocKind::Pdf => false,
         }
     }
 }
@@ -769,6 +770,7 @@ mod tests {
                         Command::ViewPreview
                     ]
                 ),
+                DocKind::Sheets => assert_eq!(enabled, [Command::Undo, Command::Redo]),
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }

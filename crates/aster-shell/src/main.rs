@@ -573,10 +573,12 @@ impl Shell {
         let Some(id) = self.tabs.tabs().get(index).map(|tab| tab.id) else {
             return Closing::NoSuchTab;
         };
-        if self
-            .markdown(id)
-            .is_some_and(|editor| editor.document.is_modified())
-        {
+        let modified = match self.contents.get(&id) {
+            Some(Content::Markdown(editor)) => editor.document.is_modified(),
+            Some(Content::Sheet(tab)) => tab.is_modified(),
+            _ => false,
+        };
+        if modified {
             return Closing::NeedsAnswer(id);
         }
         self.force_close(id);
@@ -638,6 +640,15 @@ impl Shell {
             }
             (Some(Content::Markdown(editor)), Command::Undo) => editor.undo(),
             (Some(Content::Markdown(editor)), Command::Redo) => editor.redo(),
+            (Some(Content::Sheet(tab)), Command::Undo | Command::Redo) => {
+                let changes = if command == Command::Undo {
+                    tab.undo()
+                } else {
+                    tab.redo()
+                };
+                tab.recalc(&changes);
+                !changes.is_empty()
+            }
             (
                 Some(Content::Markdown(editor)),
                 Command::ViewSource | Command::ViewSplit | Command::ViewPreview,
@@ -1126,9 +1137,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
 }
 
 fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
-    let (can_undo, can_redo) = shell.active_markdown().map_or((false, false), |editor| {
-        (editor.document.can_undo(), editor.document.can_redo())
-    });
+    let (can_undo, can_redo) = undo_state(shell);
     ui.set_can_undo(can_undo);
     ui.set_can_redo(can_redo);
     let Some(kind) = shell.tabs.active().map(|tab| tab.kind) else {
@@ -1573,9 +1582,7 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         }
         shell.sync_records();
         // Rebuild the toolbar only when what it shows has changed.
-        let (can_undo, can_redo) = shell.active_markdown().map_or((false, false), |editor| {
-            (editor.document.can_undo(), editor.document.can_redo())
-        });
+        let (can_undo, can_redo) = undo_state(shell);
         if (can_undo, can_redo) != (ui.get_can_undo(), ui.get_can_redo()) {
             refresh_toolbar(ui, shell);
         }
@@ -1584,9 +1591,21 @@ fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
         schedule_search(ui, shell);
         schedule_highlight(ui, shell);
     }
+    if shell.active_sheet().is_some() {
+        refresh_viewer(ui, shell);
+    }
     follow_selection(ui, shell);
     refresh_status(ui, shell);
     present(ui, shell);
+}
+
+/// Whether the document in front can undo and redo.
+fn undo_state(shell: &mut Shell) -> (bool, bool) {
+    match shell.active_content() {
+        Some(Content::Markdown(editor)) => (editor.document.can_undo(), editor.document.can_redo()),
+        Some(Content::Sheet(tab)) => (tab.history.can_undo(), tab.history.can_redo()),
+        _ => (false, false),
+    }
 }
 
 /// Rebuild the toolbar if the paragraph style field or the pressed format
@@ -2652,8 +2671,13 @@ fn after_sheet_change(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_shee
     if let Some(tab) = shell.active_sheet() {
         tab.recalc(&changes);
     }
-    if !changes.is_empty() && shell.sync_modified() {
-        refresh_tabs(ui, shell);
+    if !changes.is_empty() {
+        if shell.sync_modified() {
+            refresh_tabs(ui, shell);
+        }
+        if undo_state(shell) != (ui.get_can_undo(), ui.get_can_redo()) {
+            refresh_toolbar(ui, shell);
+        }
     }
     refresh_viewer(ui, shell);
     refresh_status(ui, shell);
@@ -4285,6 +4309,36 @@ mod tests {
         type_into_active(&mut shell, "x");
         shell.force_close(id);
         assert!(shell.tabs.is_empty() && shell.contents.is_empty());
+    }
+
+    #[test]
+    fn a_changed_workbook_asks_before_closing_and_undoes_through_the_shell() {
+        let mut shell = shell();
+        let mut sheet =
+            aster_sheets::SheetBuilder::new("Sheet1", aster_sheets::SheetKind::Worksheet);
+        sheet.push(
+            0,
+            aster_sheets::Cell::new(0, aster_sheets::Value::Number(1.0)),
+        );
+        let workbook = aster_sheets::Workbook {
+            sheets: vec![sheet.finish()],
+            ..aster_sheets::Workbook::default()
+        };
+        let id = shell.open_office(
+            PathBuf::from("/tmp/表.xlsx"),
+            office::Loaded::Workbook(workbook),
+        );
+        assert!(Command::Undo.is_available(DocKind::Sheets));
+        assert!(!shell.run(Command::Undo));
+        let tab = shell.active_sheet().unwrap();
+        tab.view.select(aster_sheets::CellRef::new(0, 1));
+        tab.view.begin_edit(EditMode::Enter, Some("2".into()));
+        tab.commit("en");
+        assert!(shell.sync_modified());
+        assert_eq!(shell.close(0), Closing::NeedsAnswer(id));
+        assert!(shell.run(Command::Undo));
+        assert!(shell.sync_modified());
+        assert_eq!(shell.close(0), Closing::Closed);
     }
 
     #[test]

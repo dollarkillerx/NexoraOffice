@@ -205,13 +205,34 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         let merges = (changes.merges.contains(&index) || !moves.is_empty())
             .then_some(sheet.merges.as_slice());
         let sizes = sizes_of(sheet, index, changes, digit);
-        if cells.is_empty() && merges.is_none() && sizes.is_empty() {
+        // Lines moved on other sheets, which this sheet's conditional
+        // formats and validations may name, by the file's sheet names.
+        let elsewhere: Vec<(&str, aster_sheets::structure::Lines)> = changes
+            .structure
+            .iter()
+            .filter(|(sheet, _)| *sheet != file_index)
+            .filter_map(|(sheet, lines)| Some((plan.file_names.get(*sheet)?.as_str(), *lines)))
+            .collect();
+        let rules = !elsewhere.is_empty() || plan.changed();
+        let cells_changed = !(cells.is_empty() && merges.is_none() && sizes.is_empty());
+        if !cells_changed && !rules {
             continue;
         }
         let Some(part) = target(&entry.rel).filter(|part| package.has(part)) else {
             continue;
         };
         let mut bytes = package.read(&part)?;
+        let mut touched = cells_changed;
+        if rules
+            && let Some(edited) =
+                structure::rule_formulas(&bytes, &entry.name, &elsewhere, &|f| plan.formula(f))
+        {
+            bytes = edited;
+            touched = true;
+        }
+        if !touched {
+            continue;
+        }
         if !moves.is_empty() {
             bytes = structure::restructure_sheet(&bytes, &part, &entry.name, &moves)?;
             for rel in package.relationships(&part)? {
@@ -292,6 +313,22 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                 }
             }
             bytes = sheets::workbook_xml(&bytes, &plan, &ids);
+            // The worksheets' names as the file listed them and as they
+            // are now, for the document properties.
+            let worksheet_names: (Vec<String>, Vec<String>) = (
+                entries
+                    .sheets
+                    .iter()
+                    .filter(|e| rels.iter().any(|r| r.id == e.rel && r.kind == "worksheet"))
+                    .map(|e| e.name.clone())
+                    .collect(),
+                workbook
+                    .sheets
+                    .iter()
+                    .filter(|s| s.kind == SheetKind::Worksheet)
+                    .map(|s| s.name.clone())
+                    .collect(),
+            );
             replaced.insert(key(&rels_part), rels_bytes);
             replaced.insert(key(types), types_bytes);
             // Charts plot cells by sheet name; Excel lists the sheets in
@@ -304,7 +341,7 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                     let edited = if chart {
                         sheets::chart_xml(&bytes, &plan)
                     } else {
-                        sheets::app_xml(&bytes, &plan)
+                        sheets::app_xml(&bytes, &plan, &worksheet_names)
                     };
                     if let Some(edited) = edited {
                         replaced.insert(key(&name), edited);

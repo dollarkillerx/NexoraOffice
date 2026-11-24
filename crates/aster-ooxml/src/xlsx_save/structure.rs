@@ -459,6 +459,32 @@ pub(super) fn map_texts(element: &str, names: &[&str], change: impl Fn(&str) -> 
     out
 }
 
+/// A worksheet whose conditional formats' and validations' formulas name
+/// sheets that changed: lines moved on `elsewhere` (target sheet, lines,
+/// in order), then `sheets` (renamed and deleted sheets). `host` is this
+/// sheet's name in the file. `None` when nothing changed.
+pub(super) fn rule_formulas(
+    bytes: &[u8],
+    host: &str,
+    elsewhere: &[(&str, Lines)],
+    sheets: &dyn Fn(&str) -> String,
+) -> Option<Vec<u8>> {
+    let (bom, xml) = split_bom(bytes);
+    let has = |what: &[u8]| xml.windows(what.len()).any(|w| w == what);
+    if !has(b"formula") {
+        return None;
+    }
+    let text = std::str::from_utf8(xml).ok()?;
+    let new = map_texts(text, &["formula", "formula1", "formula2"], |f| {
+        let mut out = f.to_owned();
+        for (target, lines) in elsewhere {
+            out = adjust(&out, Some(host), target, lines);
+        }
+        sheets(&out)
+    });
+    (new != text).then(|| [bom, new.as_bytes()].concat())
+}
+
 /// A drawing part with its anchors' cells moved; a picture whose cell is
 /// deleted goes to the first line after the deleted ones, as the model
 /// places it.

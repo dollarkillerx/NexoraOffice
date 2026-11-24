@@ -255,11 +255,23 @@ pub(super) fn chart_xml(bytes: &[u8], plan: &Plan) -> Option<Vec<u8>> {
     (new != text).then(|| [bom, new.as_bytes()].concat())
 }
 
-/// `docProps/app.xml` with renamed sheets' titles changed.
-pub(super) fn app_xml(bytes: &[u8], plan: &Plan) -> Option<Vec<u8>> {
+/// `docProps/app.xml` with the worksheets' titles as they are now. Excel
+/// lists them first in `TitlesOfParts`, counted by the first group of
+/// `HeadingPairs`; when the file's list is that, it is written again with
+/// the new names and count. Otherwise only renamed titles change.
+/// `worksheets` are the worksheet names as the file had them and as they
+/// are now.
+pub(super) fn app_xml(
+    bytes: &[u8],
+    plan: &Plan,
+    worksheets: &(Vec<String>, Vec<String>),
+) -> Option<Vec<u8>> {
     let (bom, xml) = split_bom(bytes);
     let mut text = std::str::from_utf8(xml).ok()?.to_owned();
     let original = text.clone();
+    if let Some(listed) = titles(&text, worksheets) {
+        return (listed != original).then(|| [bom, listed.as_bytes()].concat());
+    }
     for (old, new) in plan.renames() {
         for prefix in ["vt:", ""] {
             let from = format!("<{prefix}lpstr>{}</{prefix}lpstr>", escape(&old));
@@ -271,6 +283,60 @@ pub(super) fn app_xml(bytes: &[u8], plan: &Plan) -> Option<Vec<u8>> {
         }
     }
     (text != original).then(|| [bom, text.as_bytes()].concat())
+}
+
+/// `app.xml` with the worksheet group of its titles rewritten, if the file
+/// lists the worksheets as Excel does.
+fn titles(text: &str, (old, new): &(Vec<String>, Vec<String>)) -> Option<String> {
+    let pairs_at = text.find("HeadingPairs>")?;
+    // The first group's count.
+    let i4_open = text[pairs_at..].find("i4>")? + pairs_at + "i4>".len();
+    let i4_close = i4_open + text[i4_open..].find('<')?;
+    let count: usize = text[i4_open..i4_close].trim().parse().ok()?;
+    if count != old.len() {
+        return None;
+    }
+    let titles_at = text.find("TitlesOfParts>")?;
+    let vector_tag = titles_at + text[titles_at..].find("vector")?;
+    let vector_open = vector_tag + text[vector_tag..].find('>')? + 1;
+    // The lpstr items: where each starts and ends, and its text.
+    let (prefix, _) = text[vector_open..].split_once("lpstr>")?;
+    let prefix = prefix.trim_start().trim_start_matches('<');
+    let open = format!("<{prefix}lpstr>");
+    let close = format!("</{prefix}lpstr>");
+    let mut items = Vec::new();
+    let mut at = vector_open;
+    while items.len() < count {
+        let start = at + text[at..].find(&open)?;
+        let body = start + open.len();
+        let end = body + text[body..].find(&close)?;
+        items.push((start, end + close.len(), super::unescape(&text[body..end])));
+        at = end + close.len();
+    }
+    if items.iter().map(|(_, _, t)| t).ne(old.iter()) {
+        return None;
+    }
+    let first = items.first().map_or(vector_open, |(s, _, _)| *s);
+    let last = items.last().map_or(vector_open, |(_, e, _)| *e);
+    let listed: String = new
+        .iter()
+        .map(|name| format!("{open}{}{close}", escape(name)))
+        .collect();
+    let size_text = &text[vector_tag..vector_open];
+    let size: usize = super::attribute(size_text.as_bytes(), "size")?
+        .parse()
+        .ok()?;
+    let new_size = size + new.len() - count;
+    let tag = set_attribute(size_text, "size", &new_size.to_string());
+    let mut out = String::with_capacity(text.len() + 64);
+    out.push_str(&text[..i4_open]);
+    out.push_str(&new.len().to_string());
+    out.push_str(&text[i4_close..vector_tag]);
+    out.push_str(&tag);
+    out.push_str(&text[vector_open..first]);
+    out.push_str(&listed);
+    out.push_str(&text[last..]);
+    Some(out)
 }
 
 /// Text inserted before the closing tag of the root element.

@@ -573,7 +573,7 @@ fn linked() -> Vec<u8> {
         r#"<worksheet xmlns="{MAIN}"><dimension ref="A1:C5"/><sheetViews><sheetView workbookViewId="0"><selection activeCell="B4" sqref="B4"/></sheetView></sheetViews><cols><col min="2" max="3" width="20" customWidth="1"/></cols><sheetData><row r="1" spans="1:3"><c r="A1"><v>1</v></c><c r="B1"><v>10</v></c></row><row r="2" ht="30" customHeight="1"><c r="A2"><v>2</v></c><c r="C2"><v>20</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="4"><c r="A4"><f>SUM(A1:A3)</f><v>6</v></c><c r="B4" t="str"><f>A3&amp;"x"</f><v>3x</v></c></row><row r="5"><c r="A5"><v>5</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="B3:C3"/></mergeCells><conditionalFormatting sqref="A1:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>A1&gt;$A$4</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="whole" sqref="C1:C5"><formula1>0</formula1><formula2>$A$5</formula2></dataValidation><dataValidation type="list" sqref="A2"><formula1>$A$1:$A$3</formula1></dataValidation></dataValidations><rowBreaks count="1" manualBreakCount="1"><brk id="3" max="16383" man="1"/></rowBreaks></worksheet>"#
     );
     let summary = format!(
-        r#"<worksheet xmlns="{MAIN}"><sheetData><row r="1"><c r="A1"><f>数据!A4*2</f><v>12</v></c><c r="B1"><f>SUM(数据!A1:A5)</f><v>11</v></c></row></sheetData></worksheet>"#
+        r#"<worksheet xmlns="{MAIN}"><sheetData><row r="1"><c r="A1"><f>数据!A4*2</f><v>12</v></c><c r="B1"><f>SUM(数据!A1:A5)</f><v>11</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="expression" dxfId="0" priority="1"><formula>数据!$A$4&gt;0</formula></cfRule></conditionalFormatting></worksheet>"#
     );
     let types = format!(
         r#"{CONTENT_TYPES_HEAD}<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
@@ -592,8 +592,13 @@ fn linked() -> Vec<u8> {
         ),
         ("xl/worksheets/sheet1.xml", data.as_bytes()),
         ("xl/worksheets/sheet2.xml", summary.as_bytes()),
+        ("docProps/app.xml", APP.as_bytes()),
     ])
 }
+
+/// Document properties as Excel writes them: the worksheets, then the
+/// named ranges.
+const APP: &str = r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><HeadingPairs><vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>工作表</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant><vt:variant><vt:lpstr>命名范围</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="3" baseType="lpstr"><vt:lpstr>数据</vt:lpstr><vt:lpstr>汇总</vt:lpstr><vt:lpstr>区域</vt:lpstr></vt:vector></TitlesOfParts></Properties>"#;
 
 /// Move lines in the model as the shell does, and say so to the saver.
 fn restructure(book: &mut Workbook, changes: &mut Changes, lines: aster_sheets::structure::Lines) {
@@ -686,6 +691,11 @@ fn deleting_a_row_moves_cells_ranges_names_and_other_sheets_formulas() {
     let other = part(&saved, "xl/worksheets/sheet2.xml");
     assert!(other.contains("<f>数据!A3*2</f>"), "{other}");
     assert!(other.contains("<f>SUM(数据!A1:A4)</f>"), "{other}");
+    // So does the other sheet's conditional format.
+    assert!(
+        other.contains("<formula>数据!$A$3&gt;0</formula>"),
+        "{other}"
+    );
     let names = part(&saved, "xl/workbook.xml");
     assert!(
         names.contains(r#"<definedName name="区域">数据!$A$2:$A$3</definedName>"#),
@@ -777,9 +787,17 @@ fn renaming_a_sheet_renames_it_everywhere() {
     assert_eq!(
         differences(&source, &saved),
         BTreeSet::from([
+            "docProps/app.xml".to_owned(),
             "xl/workbook.xml".to_owned(),
             "xl/worksheets/sheet2.xml".to_owned()
         ])
+    );
+    let app = part(&saved, "docProps/app.xml");
+    assert!(
+        app.contains(
+            "<vt:lpstr>Q1 数据</vt:lpstr><vt:lpstr>汇总</vt:lpstr><vt:lpstr>区域</vt:lpstr>"
+        ),
+        "{app}"
     );
     let names = part(&saved, "xl/workbook.xml");
     assert!(
@@ -792,6 +810,10 @@ fn renaming_a_sheet_renames_it_everywhere() {
     );
     let other = part(&saved, "xl/worksheets/sheet2.xml");
     assert!(other.contains("<f>'Q1 数据'!A4*2</f>"), "{other}");
+    assert!(
+        other.contains("<formula>'Q1 数据'!$A$4&gt;0</formula>"),
+        "{other}"
+    );
     let again = Xlsx.read(saved).unwrap();
     assert_eq!(again.sheets[0].name, "Q1 数据");
     assert_eq!(contents(&again), contents(&book));
@@ -854,6 +876,11 @@ fn added_and_deleted_sheets_get_and_lose_their_parts() {
     assert!(new_sheet.starts_with("<?xml"), "{new_sheet}");
     let other = part(&saved, "xl/worksheets/sheet2.xml");
     assert!(other.contains("<f>#REF!*2</f>"), "{other}");
+    assert!(other.contains("<formula>#REF!&gt;0</formula>"), "{other}");
+    // The document properties list the worksheets there are now.
+    let app = part(&saved, "docProps/app.xml");
+    assert!(app.contains("<vt:i4>2</vt:i4><"), "{app}");
+    assert!(app.contains(r#"<vt:vector size="3" baseType="lpstr"><vt:lpstr>汇总</vt:lpstr><vt:lpstr>Sheet3</vt:lpstr><vt:lpstr>区域</vt:lpstr>"#), "{app}");
     let again = Xlsx.read(saved).unwrap();
     assert_eq!(
         again

@@ -1329,6 +1329,129 @@ pub fn toggle_block(text: &Rope, selection: Selection, kind: Block) -> Edit {
     })
 }
 
+/// Whether a line is a code fence: three or more backticks or tildes.
+fn is_fence(line: &str) -> bool {
+    let body = line.trim_start_matches(' ');
+    line.len() - body.len() <= 3 && (body.starts_with("```") || body.starts_with("~~~"))
+}
+
+/// The line before or after a byte range of whole lines, with its range
+/// (without the line break), if there is one.
+fn line_before(text: &Rope, start: usize) -> Option<(Range<usize>, String)> {
+    if start == 0 {
+        return None;
+    }
+    let line = text.byte_to_line(start - 1);
+    let begin = text.line_to_byte(line);
+    Some((begin..start - 1, slice(text, begin..start - 1)))
+}
+
+fn line_after(text: &Rope, end: usize) -> Option<(Range<usize>, String)> {
+    if end >= text.len_bytes() {
+        return None;
+    }
+    let range = line_span(text, &(end + 1..end + 1));
+    Some((range.clone(), slice(text, range)))
+}
+
+/// Code block: put the selection's lines between ``` fences, or take the
+/// fences away if the lines are exactly the inside of a fenced block. On an
+/// empty line the block is empty with the caret inside. The fence is longer
+/// than any run of backticks in the lines.
+pub fn toggle_code_block(text: &Rope, selection: Selection) -> Edit {
+    let range = selection.range();
+    let span = line_span(text, &range);
+    if let (Some((above, above_text)), Some((below, below_text))) =
+        (line_before(text, span.start), line_after(text, span.end))
+        && is_fence(&above_text)
+        && is_fence(&below_text)
+    {
+        let inner = slice(text, span.clone());
+        let shift = |offset: usize| offset - (span.start - above.start);
+        return Edit {
+            range: above.start..below.end,
+            text: inner,
+            selection: Selection {
+                anchor: shift(selection.anchor),
+                focus: shift(selection.focus),
+            },
+        };
+    }
+    let body = slice(text, span.clone());
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    if body.trim().is_empty() {
+        let out = format!("{fence}\n\n{fence}");
+        return Edit {
+            range: span.clone(),
+            text: out,
+            selection: Selection::caret(span.start + fence.len() + 1),
+        };
+    }
+    let shift = |offset: usize| offset + fence.len() + 1;
+    Edit {
+        range: span.clone(),
+        text: format!("{fence}\n{body}\n{fence}"),
+        selection: Selection {
+            anchor: shift(selection.anchor),
+            focus: shift(selection.focus),
+        },
+    }
+}
+
+/// A horizontal rule (`---`) after the caret's line, on a paragraph of its
+/// own: right after text a `---` would turn the text into a heading. The
+/// caret goes to the line after the rule.
+pub fn insert_rule(text: &Rope, selection: Selection) -> Edit {
+    let at = selection.range().end;
+    let line = line_span(text, &(at..at));
+    let current = slice(text, line.clone());
+    if current.trim().is_empty() {
+        let after_text = line_before(text, line.start).is_some_and(|(_, l)| !l.trim().is_empty());
+        let out = format!("{}---\n", if after_text { "\n" } else { "" });
+        let caret = line.start + out.len();
+        return Edit {
+            range: line,
+            text: out,
+            selection: Selection::caret(caret),
+        };
+    }
+    let out = "\n\n---\n".to_owned();
+    Edit {
+        range: line.end..line.end,
+        selection: Selection::caret(line.end + out.len()),
+        text: out,
+    }
+}
+
+/// Pasting a web or mail address over selected text on one line makes that
+/// text a link to the address. `None` for any other paste.
+pub fn paste_link(text: &Rope, selection: Selection, pasted: &str) -> Option<Edit> {
+    let range = selection.range();
+    if range.is_empty() || range.len() > 2048 {
+        return None;
+    }
+    let address = pasted.trim();
+    let is_web = ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|prefix| address.starts_with(prefix))
+        && address.len() > 8
+        && !address.contains(char::is_whitespace);
+    if !is_web {
+        return None;
+    }
+    let selected = slice(text, range.clone());
+    if selected.contains('\n') || is_address(&selected) {
+        return None;
+    }
+    let out = format!("[{selected}]({address})");
+    Some(Edit {
+        selection: Selection::caret(range.start + out.len()),
+        range,
+        text: out,
+    })
+}
+
 /// Whether text looks like a link target rather than link text.
 fn is_address(text: &str) -> bool {
     let text = text.trim();
@@ -2112,5 +2235,65 @@ mod tests {
         // not end a list, so the item below counts on from the one above.
         let before = "1. a\n2. \n3. b";
         assert_eq!(delete(before, "2. "), "1. a\n|\n2. b");
+    }
+
+    #[test]
+    fn code_blocks_go_around_lines_and_come_off_again() {
+        let wrap = |input: &str| {
+            let (text, range) = marked(input);
+            run(&text, range, toggle_code_block)
+        };
+        assert_eq!(
+            wrap("前\nfn «main»() {}\n后"),
+            "前\n```\nfn [main]() {}\n```\n后"
+        );
+        assert_eq!(wrap("a «b\nc» d"), "```\na [b\nc] d\n```");
+        // Back again.
+        assert_eq!(wrap("x\n```\nfn «main»()\n```\ny"), "x\nfn [main]()\ny");
+        // An empty line: an empty block, caret inside.
+        assert_eq!(wrap("正文\n|\n"), "正文\n```\n|\n```\n");
+        // Backticks inside need a longer fence.
+        assert_eq!(wrap("|用 ``` 围起来"), "````\n|用 ``` 围起来\n````");
+    }
+
+    #[test]
+    fn rules_go_on_a_paragraph_of_their_own() {
+        let rule = |input: &str| {
+            let (text, range) = marked(input);
+            run(&text, range, insert_rule)
+        };
+        assert_eq!(rule("正文|\n下一段"), "正文\n\n---\n|\n下一段");
+        assert_eq!(rule("正文|"), "正文\n\n---\n|");
+        // On an empty line right after text, a blank line first.
+        assert_eq!(rule("正文\n|"), "正文\n\n---\n|");
+        assert_eq!(rule("正文\n\n|\n后文"), "正文\n\n---\n|\n后文");
+    }
+
+    #[test]
+    fn pasting_an_address_over_text_makes_a_link() {
+        let paste = |input: &str, pasted: &str| {
+            let (text, range) = marked(input);
+            let rope = Rope::from_str(&text);
+            let selection = Selection {
+                anchor: range.start,
+                focus: range.end,
+            };
+            paste_link(&rope, selection, pasted)?;
+            Some(run(&text, range, |r, s| paste_link(r, s, pasted).unwrap()))
+        };
+        assert_eq!(
+            paste("看«官网»吧", "https://example.com/a?b=1").as_deref(),
+            Some("看[官网](https://example.com/a?b=1)|吧")
+        );
+        assert_eq!(
+            paste("看«官网»吧", "  mailto:a@b.c\n").as_deref(),
+            Some("看[官网](mailto:a@b.c)|吧")
+        );
+        // Not an address, nothing selected, several lines, or an address
+        // selected: an ordinary paste.
+        assert_eq!(paste("看«官网»吧", "普通文字"), None);
+        assert_eq!(paste("看|吧", "https://example.com"), None);
+        assert_eq!(paste("«一\n二»", "https://example.com"), None);
+        assert_eq!(paste("«https://old.example»", "https://example.com"), None);
     }
 }

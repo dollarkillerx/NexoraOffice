@@ -96,6 +96,12 @@ pub fn decode_key(text: &str, shift: bool, primary: bool, alt: bool) -> Option<A
         if is(Key::Home) {
             return Some(Action::LineStart { select: shift });
         }
+        if is(Key::PageUp) {
+            return Some(Action::PageUp { select: shift });
+        }
+        if is(Key::PageDown) {
+            return Some(Action::PageDown { select: shift });
+        }
         if is(Key::End) {
             return Some(Action::LineEnd { select: shift });
         }
@@ -262,6 +268,10 @@ mod tests {
         assert_eq!(
             decode_key(&key(Key::DownArrow), true, false, false),
             Some(Action::Down { select: true })
+        );
+        assert_eq!(
+            decode_key(&key(Key::PageDown), false, false, false),
+            Some(Action::PageDown { select: false })
         );
     }
 

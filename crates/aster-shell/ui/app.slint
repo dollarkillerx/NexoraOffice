@@ -172,6 +172,7 @@ export component AppWindow inherits Window {
     callback file-open();
     callback file-save();
     callback file-save-as();
+    callback file-export-html();
     callback file-close();
     callback quit-requested();
     callback edit-undo();
@@ -319,6 +320,14 @@ export component AppWindow inherits Window {
                 enabled: root.editing;
                 activated => {
                     root.file-save-as();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-export-html;
+                enabled: root.editing;
+                activated => {
+                    root.file-export-html();
                 }
             }
 
@@ -514,6 +523,15 @@ export component AppWindow inherits Window {
                 }
             }
 
+            MenuItem {
+                title: Strings.format-code-block;
+                shortcut: @keys(Control + Alt + C);
+                enabled: root.formatting;
+                activated => {
+                    root.format(11);
+                }
+            }
+
             MenuSeparator { }
 
             MenuItem {
@@ -577,6 +595,14 @@ export component AppWindow inherits Window {
                 enabled: root.formatting;
                 activated => {
                     root.format(10);
+                }
+            }
+
+            MenuItem {
+                title: Strings.format-rule;
+                enabled: root.formatting;
+                activated => {
+                    root.format(12);
                 }
             }
 

@@ -1066,6 +1066,10 @@ impl TextView {
             Action::LineEnd { select } => (select, self.line_edge(true)),
             Action::TextStart { select } => (select, (0, false, false)),
             Action::TextEnd { select } => (select, (self.text.len_bytes(), false, false)),
+            Action::PageUp { select } | Action::PageDown { select } => {
+                let down = matches!(action, Action::PageDown { .. });
+                (select, self.page(down))
+            }
             Action::SelectAll => {
                 self.anchor = 0;
                 self.focus = self.text.len_bytes();
@@ -1092,6 +1096,29 @@ impl TextView {
         }
         self.caret_on = true;
         self.reveal_caret();
+    }
+
+    /// A screenful of lines up or down, less one so a line stays in view,
+    /// keeping the caret's horizontal position.
+    fn page(&mut self, down: bool) -> (usize, bool, bool) {
+        let line = f64::from(self.lines.line_height.max(1.0));
+        let lines = ((f64::from(self.height) / line) as usize)
+            .saturating_sub(1)
+            .max(1);
+        let (start, start_upstream) = (self.focus, self.upstream);
+        let mut target = (self.focus, self.upstream, true);
+        for _ in 0..lines {
+            target = self.vertical(down);
+            if target.0 == self.focus {
+                break;
+            }
+            self.focus = target.0;
+            self.upstream = target.1;
+        }
+        // `apply` sets the focus; leave it as it was until then.
+        self.focus = start;
+        self.upstream = start_upstream;
+        target
     }
 
     /// Left or right by a character or a word. Returns the new focus.
@@ -1706,6 +1733,22 @@ mod tests {
                 assert!((v.lines.total() - sum).abs() < 0.5, "step {step}");
             }
         }
+    }
+
+    #[test]
+    fn page_keys_and_cmd_arrows_move_far() {
+        let text: String = (0..300).map(|n| format!("第 {n} 行\n")).collect();
+        let mut v = view(&text);
+        v.set_selection(0, 0);
+        let paged = apply(&mut v, Action::PageDown { select: false });
+        let line_of = |at: usize| text[..at].matches('\n').count();
+        assert!(line_of(paged) > 3, "{}", line_of(paged));
+        let back = apply(&mut v, Action::PageUp { select: false });
+        assert_eq!(line_of(back), 0);
+        assert_eq!(apply(&mut v, Action::TextEnd { select: false }), text.len());
+        let start = apply(&mut v, Action::TextStart { select: true });
+        assert_eq!(start, 0);
+        assert_eq!(v.selection(), (text.len(), 0));
     }
 
     #[test]

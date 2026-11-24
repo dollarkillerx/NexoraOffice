@@ -10,6 +10,7 @@
 
 mod glyphs;
 pub mod host;
+pub mod md_picture;
 mod picture;
 pub mod preview;
 pub mod sheet_view;

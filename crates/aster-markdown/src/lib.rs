@@ -13,6 +13,7 @@
 //! selection is.
 
 pub mod document;
+pub mod export;
 pub mod file;
 pub mod format;
 pub mod highlight;
@@ -20,6 +21,7 @@ mod history;
 pub mod journal;
 pub mod preview;
 pub mod search;
+pub mod structure;
 pub mod syntax;
 pub mod table;
 

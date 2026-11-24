@@ -51,7 +51,9 @@ impl ImageCache {
     }
 }
 
-fn to_pixmap(image: aster_image::Rgba) -> Option<Pixmap> {
+/// A decoded picture as a premultiplied pixmap; `None` if a side does not
+/// fit a pixmap.
+pub(crate) fn to_pixmap(image: aster_image::Rgba) -> Option<Pixmap> {
     let width = u16::try_from(image.width).ok()?;
     let height = u16::try_from(image.height).ok()?;
     let transparent = image.has_transparency();

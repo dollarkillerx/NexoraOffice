@@ -878,6 +878,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_open(strings.menu_open.into());
     s.set_menu_save(strings.menu_save.into());
     s.set_menu_save_as(strings.menu_save_as.into());
+    s.set_menu_export_html(strings.menu_export_html.into());
     s.set_menu_close_tab(strings.menu_close_tab.into());
     s.set_menu_quit(strings.menu_quit.into());
     s.set_menu_undo(strings.menu_undo.into());
@@ -927,6 +928,8 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_italic(strings.format_italic.into());
     s.set_format_strike(strings.format_strike.into());
     s.set_format_code(strings.format_code.into());
+    s.set_format_code_block(strings.format_code_block.into());
+    s.set_format_rule(strings.format_rule.into());
     s.set_format_bullet(strings.format_bullet.into());
     s.set_format_numbered(strings.format_numbered.into());
     s.set_format_task(strings.format_task.into());
@@ -1405,6 +1408,7 @@ fn first_preview_at_once(shell: &mut Shell, width: u16, height: u16, scale: f32)
     {
         editor.preview.resize(width, height, scale);
         if let Some(job) = editor.preview_job(u64::from(id.0), true, style) {
+            builder.set_base(job.base.clone());
             let layout = builder.build(&job.source, job.width, job.scale, &job.style);
             editor.show_preview(layout);
         }
@@ -1565,6 +1569,8 @@ fn format_of_menu(code: i32) -> Option<Format> {
         8 => Command::InsertLink,
         9 => Command::InsertImage,
         10 => Command::InsertTable,
+        11 => return Some(Format::CodeBlock),
+        12 => return Some(Format::Rule),
         20..=26 => return Some(Format::Heading((code - 20) as u8)),
         30..=35 => {
             use aster_markdown::table::TableEdit;
@@ -3429,6 +3435,58 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }),
         );
+    }
+
+    {
+        let shell = shell.clone();
+        let weak = ui.as_weak();
+        ui.on_file_export_html(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Ok(mut borrowed) = shell.try_borrow_mut() else {
+                return;
+            };
+            let strings = borrowed.language.strings();
+            let Some(id) = borrowed.tabs.active_id() else {
+                return;
+            };
+            let Some((existing, suggested)) = borrowed.save_target(id) else {
+                return;
+            };
+            let title = borrowed
+                .tabs
+                .get(id)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default();
+            let Some(editor) = borrowed.markdown(id) else {
+                return;
+            };
+            let source = editor.document.text().to_string();
+            drop(borrowed);
+            let suggested = existing.unwrap_or(suggested).with_extension("html");
+            let (weak, shell) = (ui.as_weak(), shell.clone());
+            let _ = slint::spawn_local(async move {
+                let types = [FileType {
+                    name: strings.file_type_html,
+                    extensions: &["html", "htm"],
+                }];
+                let Some(path) =
+                    dialogs::pick_file_to_save(strings.menu_export_html, &suggested, &types).await
+                else {
+                    return;
+                };
+                let page = aster_markdown::export::page(&source, title.trim_end_matches(".md"));
+                if let Err(err) = aster_storage::write_atomically(&path, page.as_bytes())
+                    && let Some(ui) = weak.upgrade()
+                    && let Ok(mut shell) = shell.try_borrow_mut()
+                {
+                    let title =
+                        i18n::fill(strings.export_failed, "name", &files::display_name(&path));
+                    show_dialog(&ui, &mut shell, 2, title, err.to_string());
+                }
+            });
+        });
     }
 
     ui.on_file_close(handler!(|ui, shell| {

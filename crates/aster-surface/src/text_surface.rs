@@ -185,6 +185,13 @@ pub enum Action {
     TextEnd {
         select: bool,
     },
+    /// Page Up and Page Down: a screenful of lines up or down.
+    PageUp {
+        select: bool,
+    },
+    PageDown {
+        select: bool,
+    },
     SelectAll,
 }
 
@@ -647,6 +654,25 @@ impl TextSurface {
             Action::TextStart { select: true } => drv.select_to_text_start(),
             Action::TextEnd { select: false } => drv.move_to_text_end(),
             Action::TextEnd { select: true } => drv.select_to_text_end(),
+            // Parley's editor has no page movement; twenty lines stand in.
+            Action::PageUp { select } => {
+                for _ in 0..20 {
+                    if select {
+                        drv.select_up();
+                    } else {
+                        drv.move_up();
+                    }
+                }
+            }
+            Action::PageDown { select } => {
+                for _ in 0..20 {
+                    if select {
+                        drv.select_down();
+                    } else {
+                        drv.move_down();
+                    }
+                }
+            }
             Action::SelectAll => drv.select_all(),
         }
         self.caret_on = true;

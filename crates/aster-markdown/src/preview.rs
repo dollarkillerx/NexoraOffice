@@ -64,10 +64,13 @@ pub enum BlockKind {
         rows: Vec<Vec<Inline>>,
     },
     Rule,
-    /// An image on a paragraph of its own, shown as a box with its
-    /// description. Images inside text are runs.
+    /// An image on a paragraph of its own: the picture, or where it cannot
+    /// be shown, a box with its description. Images inside text are runs.
     Image {
         description: String,
+        /// The image's address as written: a relative or absolute path, a
+        /// `file:` URL, or a web address.
+        url: String,
     },
     /// Every footnote of the document, in number order; always the last
     /// block.
@@ -154,6 +157,8 @@ pub struct Run {
     /// Where a link goes, as written; `mailto:` is added to e-mail autolinks
     /// and `http://` to bare `www.` addresses.
     pub link: Option<String>,
+    /// For an image's description: the image's address, as written.
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -253,13 +258,19 @@ impl InlineBuilder {
         }
         let end = self.inline.text.len();
         match self.inline.runs.last_mut() {
-            Some(last) if last.range.end == start && last.style == style && last.link == link => {
+            Some(last)
+                if last.range.end == start
+                    && last.style == style
+                    && last.link == link
+                    && last.image.is_none() =>
+            {
                 last.range.end = end;
             }
             _ => self.inline.runs.push(Run {
                 range: start..end,
                 style,
                 link,
+                image: None,
             }),
         }
     }
@@ -863,6 +874,9 @@ impl Builder {
                     };
                     let link = inline.links.last().cloned();
                     inline.push(&shown, style, link);
+                    if let Some(run) = inline.inline.runs.last_mut() {
+                        run.image = Some(url);
+                    }
                 }
             }
             TagEnd::TableRow
@@ -932,6 +946,7 @@ fn push_back_link(inline: &mut Inline, link: String) {
         range: start..inline.text.len(),
         style: Style::default(),
         link: Some(link),
+        image: None,
     });
 }
 
@@ -942,6 +957,7 @@ fn paragraph_kind(inline: Inline) -> BlockKind {
         && run.range == (0..inline.text.len())
     {
         return BlockKind::Image {
+            url: run.image.clone().unwrap_or_default(),
             description: inline.text,
         };
     }
@@ -1097,13 +1113,15 @@ mod tests {
         assert_eq!(
             kinds("![一张图](pic.png)"),
             [BlockKind::Image {
-                description: "一张图".into()
+                description: "一张图".into(),
+                url: "pic.png".into(),
             }]
         );
         assert_eq!(
             kinds("![](dir/photo.jpg)"),
             [BlockKind::Image {
-                description: "photo.jpg".into()
+                description: "photo.jpg".into(),
+                url: "dir/photo.jpg".into(),
             }]
         );
         let inline = paragraph("文字 ![小图](a.png) 文字");

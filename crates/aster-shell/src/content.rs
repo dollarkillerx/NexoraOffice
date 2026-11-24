@@ -233,6 +233,10 @@ pub enum Format {
     Table,
     /// Add or delete a row or column of the table with the caret.
     TableEdit(table::TableEdit),
+    /// Put the lines between ``` fences, or take them out.
+    CodeBlock,
+    /// A horizontal rule after the caret's line.
+    Rule,
 }
 
 /// The find bar of a tab and what it found.
@@ -795,6 +799,11 @@ impl MarkdownEditor {
             width,
             scale,
             style,
+            base: self
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|dir| dir.to_owned()),
         })
     }
 
@@ -1353,6 +1362,8 @@ impl MarkdownEditor {
             Format::Link => format::insert_link(text, selection, false),
             Format::Image => format::insert_link(text, selection, true),
             Format::Table => format::insert_table(text, selection),
+            Format::CodeBlock => format::toggle_code_block(text, selection),
+            Format::Rule => format::insert_rule(text, selection),
             Format::TableEdit(what) => {
                 match table::edit_table(text, self.fresh_highlighter(), selection, what) {
                     Some(edit) => edit,
@@ -1585,6 +1596,13 @@ impl MarkdownEditor {
     }
 
     pub fn paste(&mut self, text: &str) -> bool {
+        if !self.surface.is_composing()
+            && !self.locked()
+            && let Some(edit) =
+                format::paste_link(self.document.text(), self.document.selection(), text)
+        {
+            return self.apply(edit);
+        }
         self.edit(EditCommand::Paste(text.to_owned()))
     }
 

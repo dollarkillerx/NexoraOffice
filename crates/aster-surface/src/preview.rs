@@ -89,6 +89,10 @@ enum Piece {
         color: Rgba8,
         width: f64,
     },
+    Picture {
+        rect: Rect,
+        pixmap: Arc<Pixmap>,
+    },
 }
 
 struct Painted {
@@ -288,6 +292,7 @@ impl PreviewLayout {
 /// Lays out documents. Owns its own fonts, so it can live on another thread.
 pub struct PreviewBuilder {
     shaper: Shaper,
+    pictures: crate::md_picture::Pictures,
 }
 
 impl Default for PreviewBuilder {
@@ -349,7 +354,16 @@ impl PreviewBuilder {
     pub fn new() -> Self {
         let mut shaper = Shaper::new();
         shaper.set_han_fallbacks(&HAN_FALLBACK_FAMILIES);
-        Self { shaper }
+        Self {
+            shaper,
+            pictures: crate::md_picture::Pictures::default(),
+        }
+    }
+
+    /// The folder pictures with relative addresses are looked for in: the
+    /// document's own, or `None` for one that was never saved.
+    pub fn set_base(&mut self, base: Option<std::path::PathBuf>) {
+        self.pictures.set_base(base);
     }
 
     /// Lay out `source` for a surface `width` physical pixels wide.
@@ -586,7 +600,19 @@ impl Pass<'_> {
                 self.anchor(y, bottom, block.source.clone());
                 bottom
             }
-            BlockKind::Image { description } => {
+            BlockKind::Image { description, url } => {
+                if let Some(pixmap) = self.builder.pictures.get(url) {
+                    // One picture pixel to one logical pixel, never wider
+                    // than the text.
+                    let (pw, ph) = (f64::from(pixmap.width()), f64::from(pixmap.height()));
+                    let shown = (pw * s).min(width);
+                    let height = shown * ph / pw;
+                    let rect = Rect::new(x, y, x + shown, y + height);
+                    self.push(Piece::Picture { rect, pixmap }, y, y + height);
+                    let bottom = y + height;
+                    self.anchor(y, bottom, block.source.clone());
+                    return bottom;
+                }
                 let height = em * 6.0;
                 let rect = Rect::new(x, y, x + width, y + height);
                 self.push(
@@ -1469,6 +1495,21 @@ fn draw_shape(ctx: &mut RenderContext, shape: &Piece, scale: f32) {
             ctx.set_stroke(Stroke::new(*width));
             ctx.stroke_path(&path);
         }
+        Piece::Picture { rect, pixmap } => {
+            let (pw, ph) = (f64::from(pixmap.width()), f64::from(pixmap.height()));
+            let brush = vello_cpu::Image {
+                image: vello_cpu::ImageSource::Pixmap(pixmap.clone()),
+                sampler: Default::default(),
+            }
+            .with_quality(vello_cpu::peniko::ImageQuality::Medium);
+            ctx.set_paint(brush);
+            ctx.set_paint_transform(
+                Affine::translate((rect.x0, rect.y0))
+                    * Affine::scale_non_uniform(rect.width() / pw, rect.height() / ph),
+            );
+            ctx.fill_rect(rect);
+            ctx.set_paint_transform(Affine::IDENTITY);
+        }
     }
 }
 
@@ -1520,6 +1561,8 @@ pub struct PreviewJob {
     pub width: u16,
     pub scale: f32,
     pub style: PreviewStyle,
+    /// The document's folder, for pictures with relative addresses.
+    pub base: Option<std::path::PathBuf>,
 }
 
 /// A thread that lays out previews. Jobs that arrive while it is busy
@@ -1548,6 +1591,7 @@ impl PreviewWorker {
                     }
                     for key in order {
                         if let Some(job) = latest.remove(&key) {
+                            builder.set_base(job.base.clone());
                             let layout =
                                 builder.build(&job.source, job.width, job.scale, &job.style);
                             done(job.key, job.generation, layout);
@@ -1824,6 +1868,7 @@ mod tests {
                 width: 800,
                 scale: 1.0,
                 style: style(),
+                base: None,
             });
         }
         let mut last = 0;
@@ -1891,5 +1936,30 @@ mod tests {
             slanted > upright + 5.0,
             "upright {upright}, slanted {slanted}"
         );
+    }
+
+    #[test]
+    fn local_pictures_are_drawn_and_web_ones_stay_boxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = crate::md_picture::png_bytes(60, 30, [255, 0, 0, 255]);
+        std::fs::write(dir.path().join("红.png"), bytes).unwrap();
+        let red = |source: &str| {
+            let mut builder = PreviewBuilder::new();
+            builder.set_base(Some(dir.path().to_owned()));
+            let layout = builder.build(source, 400, 1.0, &style());
+            let mut view = PreviewView::new();
+            view.resize(400, 300, 1.0);
+            view.set_layout(Arc::new(layout));
+            let pixmap = view.render();
+            pixmap
+                .data()
+                .iter()
+                .filter(|p| p.r > 240 && p.g < 20 && p.b < 20 && p.a == 255)
+                .count()
+        };
+        // 60 by 30 logical pixels at scale 1, all of them red.
+        assert!(red("# 图\n\n![红色](红.png)") >= 60 * 30 - 120);
+        assert_eq!(red("![红色](https://example.com/红.png)"), 0);
+        assert_eq!(red("![红色](缺.png)"), 0);
     }
 }

@@ -1,9 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/aster-ai",
     "crates/aster-calc",
     "crates/aster-image",
     "crates/aster-markdown",
+    "crates/aster-mcp",
+    "crates/aster-mcp-bridge",
     "crates/aster-platform",
     "crates/aster-ooxml",
     "crates/aster-sheets",
@@ -36,9 +39,11 @@ publish = false
 # API both change between minor releases; upgrading means re-running the Phase 0
 # gate tests (G1 input method, G2 frame path).
 [workspace.dependencies]
+aster-ai = { path = "crates/aster-ai" }
 aster-calc = { path = "crates/aster-calc" }
 aster-markdown = { path = "crates/aster-markdown" }
 aster-image = { path = "crates/aster-image" }
+aster-mcp = { path = "crates/aster-mcp" }
 aster-ooxml = { path = "crates/aster-ooxml" }
 aster-platform = { path = "crates/aster-platform" }
 aster-sheets = { path = "crates/aster-sheets" }
@@ -82,8 +87,18 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 rfd = "~0.18.0"
 # JSON for the tool layer, MCP and the AI providers' wire formats.
 serde_json = "1.0.150"
-# CommonMark and GitHub extensions. Without its HTML writer and command line.
-pulldown-cmark = { version = "~0.13.6", default-features = false }
+# The assistant's HTTPS client. Blocking, on the assistant's own thread.
+# rustls with ring, and the system's certificate store through the platform
+# verifier (webpki-roots is CDLA-licensed, not on the allow list).
+ureq = { version = "~3.5.0", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# API keys live in the system's key store.
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
+# Peer credentials of local socket connections (getpeereid, SO_PEERCRED).
+libc = "0.2"
+# CommonMark and GitHub extensions, with its HTML writer for exporting;
+# without its command line.
+pulldown-cmark = { version = "~0.13.6", default-features = false, features = ["html"] }
 # The text of large documents. Only `\n` ends a line: files are normalised to
 # it when read.
 ropey = { version = "~1.6.1", default-features = false, features = ["simd"] }

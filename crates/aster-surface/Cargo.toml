@@ -20,4 +20,6 @@ vello_cpu = { workspace = true }
 bytemuck = { workspace = true }
 
 [dev-dependencies]
+png = { workspace = true }
+tempfile = { workspace = true }
 aster-ooxml = { workspace = true }

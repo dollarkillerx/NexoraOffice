@@ -152,9 +152,17 @@ impl Default for Theme {
                 latin: Some("Calibri".to_owned()),
                 ..ThemeFonts::default()
             },
-            fills: Vec::new(),
-            lines: Vec::new(),
-            background_fills: Vec::new(),
+            // Office's format scheme, with its gradients drawn solid.
+            fills: vec![FillSpec::Solid(ColorSpec::scheme("phClr")); 3],
+            lines: [6_350, 12_700, 19_050]
+                .into_iter()
+                .map(|width| LineSpec {
+                    width: Some(width),
+                    fill: Some(FillSpec::Solid(ColorSpec::scheme("phClr"))),
+                    dash: None,
+                })
+                .collect(),
+            background_fills: vec![FillSpec::Solid(ColorSpec::scheme("phClr")); 3],
         }
     }
 }
@@ -496,7 +504,10 @@ pub fn read_fill(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Option<Fil
             reader.skip()?;
             Some(FillSpec::Group)
         }
-        b"solidFill" => read_color_in(reader)?.map(FillSpec::Solid),
+        // A solid fill that names no colour is black.
+        b"solidFill" => Some(FillSpec::Solid(
+            read_color_in(reader)?.unwrap_or(ColorSpec::rgb([0, 0, 0, 0xff])),
+        )),
         b"gradFill" => {
             let mut stops = Vec::new();
             let mut angle = 90.0;
@@ -639,14 +650,16 @@ pub fn read_theme(bytes: &[u8], part: &str) -> Result<Theme> {
                 }
             }
             crate::xml::Ev::Open(tag) if tag.is("lnStyleLst") => {
+                let mut lines = Vec::new();
                 each_child(&mut reader, |reader, child| {
                     if child.is("ln") {
-                        theme.lines.push(read_line(reader, &child)?);
+                        lines.push(read_line(reader, &child)?);
                         Ok(())
                     } else {
                         reader.skip()
                     }
                 })?;
+                theme.lines = lines;
             }
             // Extra colour lists and object defaults hold colours too; only
             // the scheme counts.

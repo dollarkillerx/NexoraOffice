@@ -10,19 +10,33 @@
 //! positions, text sizes, bullets and body insets come from there when the
 //! slide does not set them, and the shapes of the layout and master that are
 //! not placeholders (logos, rules) are drawn behind the slide's own unless
-//! the slide or layout turns that off. Themes, colours, fills, pictures and
-//! animations are not read.
+//! the slide or layout turns that off.
+//!
+//! Colours go through the master's theme and colour map: backgrounds, shape
+//! fills and outlines (their own or the theme style they refer to), text
+//! colours and theme fonts. Pictures are read with their cropping, tables
+//! with their cells, merges, fills and borders (their own or the table
+//! style's), and each slide's speaker notes as plain text. Animations,
+//! charts, effects and 3-D are not read.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aster_slides::{
-    Align, Anchor, DEFAULT_TEXT_POINTS, Frame, Geometry, Paragraph, Presentation, Role, Run, Shape,
-    Slide, TextBody,
+    Align, Anchor, DEFAULT_TEXT_POINTS, Fill, Frame, Geometry, Outline, Paragraph, Picture,
+    Presentation, Role, Run, Shape, Slide, Table, TableCell, TableRow, TextBody,
 };
 
+use crate::drawingml::{
+    ColorContext, ColorMap, ColorSpec, FillSpec, LineSpec, Theme, is_color, is_fill, read_color,
+    read_color_in, read_fill, read_line, read_theme,
+};
 use crate::error::Result;
 use crate::package::{Kind, Package};
 use crate::xml::{Ev, Tag, XmlReader, each_child};
+
+/// A line the file shows but does not size: 0.75 points.
+const DEFAULT_LINE: i64 = 9_525;
 
 pub fn read(bytes: Vec<u8>) -> Result<Presentation> {
     let mut package = Package::open(bytes)?;
@@ -31,14 +45,27 @@ pub fn read(bytes: Vec<u8>) -> Result<Presentation> {
 
 pub fn read_package(package: &mut Package) -> Result<Presentation> {
     let main = package.expect(Kind::Pptx)?;
-    let rels: HashMap<String, Option<String>> = package
-        .relationships(&main)?
-        .into_iter()
-        .map(|rel| (rel.id, rel.target))
+    let main_rels = package.relationships(&main)?;
+    let rels: HashMap<String, Option<String>> = main_rels
+        .iter()
+        .map(|rel| (rel.id.clone(), rel.target.clone()))
         .collect();
     let bytes = package.read(&main)?;
     let head = presentation(&bytes, &main)?;
+    let mut table_styles = builtin_table_styles();
+    if let Some(part) = main_rels
+        .iter()
+        .find(|rel| rel.kind == "tableStyles")
+        .and_then(|rel| rel.target.clone())
+        .filter(|part| package.has(part))
+    {
+        // A table style list that does not parse only loses table styles.
+        if let Ok(styles) = read_table_styles(&package.read(&part)?, &part) {
+            table_styles.extend(styles);
+        }
+    }
 
+    let mut images = Images::default();
     let mut layouts: HashMap<String, Option<Template>> = HashMap::new();
     let mut masters: HashMap<String, Option<Master>> = HashMap::new();
     let mut slides = Vec::with_capacity(head.slide_ids.len());
@@ -50,13 +77,18 @@ pub fn read_package(package: &mut Package) -> Result<Presentation> {
             continue;
         }
         let bytes = package.read(part)?;
-        let slide = template(&bytes, part)?;
+        let mut slide = template(&bytes, part)?;
+        images.attach(package, part, &mut slide)?;
         let layout_part = linked(package, part, "slideLayout")?;
         if let Some(layout_part) = &layout_part
             && !layouts.contains_key(layout_part)
         {
             let parsed = match package.has(layout_part) {
-                true => Some(template(&package.read(layout_part)?, layout_part)?),
+                true => {
+                    let mut layout = template(&package.read(layout_part)?, layout_part)?;
+                    images.attach(package, layout_part, &mut layout)?;
+                    Some(layout)
+                }
                 false => None,
             };
             layouts.insert(layout_part.clone(), parsed);
@@ -70,18 +102,96 @@ pub fn read_package(package: &mut Package) -> Result<Presentation> {
             && !masters.contains_key(master_part)
         {
             let parsed = match package.has(master_part) {
-                true => Some(master(&package.read(master_part)?, master_part)?),
+                true => {
+                    let mut parsed = master(&package.read(master_part)?, master_part)?;
+                    images.attach(package, master_part, &mut parsed.template)?;
+                    if let Some(theme_part) = linked(package, master_part, "theme")?
+                        && package.has(&theme_part)
+                    {
+                        parsed.theme = read_theme(&package.read(&theme_part)?, &theme_part)
+                            .unwrap_or_default();
+                    }
+                    Some(parsed)
+                }
                 false => None,
             };
             masters.insert(master_part.clone(), parsed);
         }
         let master = master_part.as_ref().and_then(|p| masters[p].as_ref());
-        slides.push(resolve_slide(&slide, layout, master, &head.default_style));
+        let notes = match linked(package, part, "notesSlide")? {
+            // Notes that do not parse are left out rather than failing the
+            // slide.
+            Some(notes) if package.has(&notes) => {
+                notes_text(&package.read(&notes)?, &notes).ok().flatten()
+            }
+            _ => None,
+        };
+        let context = Context {
+            master,
+            defaults: &head.default_style,
+            table_styles: &table_styles,
+        };
+        let mut resolved = resolve_slide(&slide, layout, &context);
+        resolved.notes = notes;
+        slides.push(resolved);
     }
     Ok(Presentation {
         size: head.size,
         slides,
     })
+}
+
+/// Picture bytes by part name, read once and shared by every slide that
+/// shows them.
+#[derive(Default)]
+struct Images(HashMap<String, Arc<[u8]>>);
+
+impl Images {
+    /// Read the pictures a template's shapes and background refer to.
+    fn attach(&mut self, package: &mut Package, part: &str, template: &mut Template) -> Result<()> {
+        let wanted = template
+            .shapes
+            .iter()
+            .flat_map(|shape| [shape.blip.as_ref().map(|b| &b.0), shape.fill_picture()])
+            .chain([template.background_picture()])
+            .flatten()
+            .next()
+            .is_some();
+        if !wanted {
+            return Ok(());
+        }
+        let rels: HashMap<String, String> = package
+            .relationships(part)?
+            .into_iter()
+            .filter_map(|rel| Some((rel.id, rel.target?)))
+            .collect();
+        let mut load = |id: &str| -> Result<Option<Arc<[u8]>>> {
+            let Some(target) = rels.get(id) else {
+                return Ok(None);
+            };
+            if let Some(found) = self.0.get(target) {
+                return Ok(Some(found.clone()));
+            }
+            if !package.has(target) {
+                return Ok(None);
+            }
+            let bytes: Arc<[u8]> = Arc::from(package.read(target)?);
+            self.0.insert(target.clone(), bytes.clone());
+            Ok(Some(bytes))
+        };
+        for shape in &mut template.shapes {
+            if let Some((id, _)) = &shape.blip {
+                shape.image = load(id)?;
+            }
+            if let Some(id) = shape.fill_picture().cloned() {
+                shape.fill_image = load(&id)?;
+            }
+        }
+        if let Some(id) = template.background_picture().cloned() {
+            template.background_image = load(&id)?;
+        }
+        Ok(())
+    }
 }
 
 /// The part `source` points at with a relationship of `kind`.
@@ -147,6 +257,9 @@ struct Level {
     size: Option<f32>,
     bold: Option<bool>,
     italic: Option<bool>,
+    color: Option<ColorSpec>,
+    latin: Option<String>,
+    east_asian: Option<String>,
     align: Option<Align>,
     /// `Some(None)` is an explicit "no bullet".
     bullet: Option<Option<Bullet>>,
@@ -177,6 +290,12 @@ struct RawRun {
     bold: Option<bool>,
     italic: Option<bool>,
     underline: bool,
+    strike: bool,
+    color: Option<ColorSpec>,
+    latin: Option<String>,
+    east_asian: Option<String>,
+    /// `lang`, which picks the theme's East Asian font.
+    language: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -213,6 +332,14 @@ impl Placeholder {
     }
 }
 
+/// A theme style a shape refers to: its index and the colour that stands
+/// in for `phClr`.
+#[derive(Clone, Debug, PartialEq)]
+struct StyleRef {
+    index: i64,
+    color: Option<ColorSpec>,
+}
+
 #[derive(Clone, Debug)]
 struct RawShape {
     frame: Option<Frame>,
@@ -222,12 +349,19 @@ struct RawShape {
     geometry: Option<Geometry>,
     role: Role,
     placeholder: Option<Placeholder>,
-    text_box: bool,
-    /// `Some(false)` when the line is explicitly not drawn.
-    line: Option<bool>,
-    /// The shape style refers to a theme line.
-    styled_line: bool,
+    fill: Option<FillSpec>,
+    line: Option<LineSpec>,
+    fill_ref: Option<StyleRef>,
+    line_ref: Option<StyleRef>,
+    /// The text colour of the shape's style.
+    font_color: Option<ColorSpec>,
     body: Option<RawBody>,
+    /// A picture's relationship id and crop (left, top, right, bottom).
+    blip: Option<(String, [f64; 4])>,
+    image: Option<Arc<[u8]>>,
+    /// The picture of a picture fill.
+    fill_image: Option<Arc<[u8]>>,
+    table: Option<RawTable>,
 }
 
 impl RawShape {
@@ -240,12 +374,32 @@ impl RawShape {
             geometry: None,
             role,
             placeholder: None,
-            text_box: false,
+            fill: None,
             line: None,
-            styled_line: false,
+            fill_ref: None,
+            line_ref: None,
+            font_color: None,
             body: None,
+            blip: None,
+            image: None,
+            fill_image: None,
+            table: None,
         }
     }
+
+    fn fill_picture(&self) -> Option<&String> {
+        match &self.fill {
+            Some(FillSpec::Picture(id)) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// A background as written: a fill, or a theme background style.
+#[derive(Clone, Debug)]
+enum Background {
+    Fill(FillSpec),
+    Ref(StyleRef),
 }
 
 /// A slide, layout or master: its shapes and whether the shapes of the
@@ -255,11 +409,25 @@ struct Template {
     shapes: Vec<RawShape>,
     show_master_shapes: bool,
     hidden: bool,
+    background: Option<Background>,
+    background_image: Option<Arc<[u8]>>,
+    /// A master's `clrMap`, or a layout's or slide's override of it.
+    color_map: Option<ColorMap>,
+}
+
+impl Template {
+    fn background_picture(&self) -> Option<&String> {
+        match &self.background {
+            Some(Background::Fill(FillSpec::Picture(id))) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct Master {
     template: Template,
+    theme: Theme,
     title: Levels,
     body: Levels,
     other: Levels,
@@ -279,6 +447,33 @@ fn template(bytes: &[u8], part: &str) -> Result<Template> {
             }
             Ev::Open(tag) if tag.is("spTree") => {
                 shape_tree(&mut reader, Transform::IDENTITY, &mut out.shapes)?;
+            }
+            Ev::Open(tag) if tag.is("bg") => {
+                each_child(&mut reader, |reader, child| {
+                    if child.is("bgPr") {
+                        each_child(reader, |reader, fill| {
+                            if is_fill(&fill) {
+                                if let Some(fill) = read_fill(reader, &fill)? {
+                                    out.background = Some(Background::Fill(fill));
+                                }
+                                Ok(())
+                            } else {
+                                reader.skip()
+                            }
+                        })
+                    } else if child.is("bgRef") {
+                        let index = child.attr_i64("idx").unwrap_or(0);
+                        let color = read_color_in(reader)?;
+                        out.background = Some(Background::Ref(StyleRef { index, color }));
+                        Ok(())
+                    } else {
+                        reader.skip()
+                    }
+                })?;
+            }
+            Ev::Open(tag) if tag.is("clrMap") || tag.is("overrideClrMapping") => {
+                out.color_map = Some(ColorMap::from_tag(&tag));
+                reader.skip()?;
             }
             Ev::Open(tag) if tag.is("txStyles") || tag.is("extLst") || tag.is("timing") => {
                 reader.skip()?
@@ -490,16 +685,61 @@ fn shape(reader: &mut XmlReader<'_>, role: Role) -> Result<RawShape> {
                         } else {
                             Role::Graphic
                         };
+                        if shape.role == Role::Table {
+                            return each_child(reader, |reader, child| {
+                                if child.is("tbl") {
+                                    shape.table = Some(table(reader)?);
+                                    Ok(())
+                                } else {
+                                    reader.skip()
+                                }
+                            });
+                        }
                     }
                     reader.skip()
                 })?;
             }
-            b"style" => {
+            b"blipFill" => {
+                let mut crop = [0.0; 4];
+                let mut embed = None;
                 each_child(reader, |reader, child| {
-                    if child.is("lnRef") {
-                        shape.styled_line = child.attr_i64("idx").unwrap_or(0) > 0;
+                    if child.is("blip") {
+                        embed = child.attr("embed");
+                    } else if child.is("srcRect") {
+                        let share = |name: &str| {
+                            (child.attr_f64(name).unwrap_or(0.0) / 100_000.0).clamp(-1.0, 1.0)
+                        };
+                        crop = [share("l"), share("t"), share("r"), share("b")];
                     }
                     reader.skip()
+                })?;
+                shape.blip = embed.map(|id| (id, crop));
+            }
+            b"style" => {
+                each_child(reader, |reader, child| {
+                    let reference = || StyleRef {
+                        index: child.attr_i64("idx").unwrap_or(0),
+                        color: None,
+                    };
+                    match child.local() {
+                        b"lnRef" => {
+                            let mut style = reference();
+                            style.color = read_color_in(reader)?;
+                            shape.line_ref = Some(style);
+                            Ok(())
+                        }
+                        b"fillRef" => {
+                            let mut style = reference();
+                            style.color = read_color_in(reader)?;
+                            shape.fill_ref = Some(style);
+                            Ok(())
+                        }
+                        b"fontRef" => {
+                            shape.font_color = read_color_in(reader)?;
+                            Ok(())
+                        }
+                        _ => reader.skip(),
+                    }
                 })?;
             }
             b"txBody" => shape.body = Some(text_body(reader)?),
@@ -513,10 +753,6 @@ fn shape(reader: &mut XmlReader<'_>, role: Role) -> Result<RawShape> {
 fn non_visual(reader: &mut XmlReader<'_>, shape: &mut RawShape) -> Result<()> {
     each_child(reader, |reader, tag| {
         match tag.local() {
-            b"cNvSpPr" => {
-                shape.text_box = tag.attr_bool("txBox").unwrap_or(false);
-                reader.skip()?;
-            }
             b"nvPr" => {
                 each_child(reader, |reader, child| {
                     if child.is("ph") {
@@ -560,17 +796,11 @@ fn shape_props(reader: &mut XmlReader<'_>, shape: &mut RawShape) -> Result<()> {
                 shape.geometry = Some(Geometry::Other("custom".to_owned()));
                 reader.skip()?;
             }
-            b"ln" => {
-                let mut visible = None;
-                each_child(reader, |reader, child| {
-                    match child.local() {
-                        b"noFill" => visible = Some(false),
-                        b"solidFill" | b"gradFill" | b"pattFill" => visible = Some(true),
-                        _ => {}
-                    }
-                    reader.skip()
-                })?;
-                shape.line = visible.or(shape.line);
+            b"ln" => shape.line = Some(read_line(reader, &tag)?),
+            _ if is_fill(&tag) => {
+                if let Some(fill) = read_fill(reader, &tag)? {
+                    shape.fill = Some(fill);
+                }
             }
             _ => reader.skip()?,
         }
@@ -654,10 +884,14 @@ fn level_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Level> {
     each_child(reader, |reader, child| {
         match child.local() {
             b"defRPr" => {
-                let run = run_props(&child);
+                let run = run_props(reader, &child)?;
                 level.size = run.size;
                 level.bold = run.bold;
                 level.italic = run.italic;
+                level.color = run.color;
+                level.latin = run.latin;
+                level.east_asian = run.east_asian;
+                return Ok(());
             }
             b"buNone" => level.bullet = Some(None),
             b"buChar" => {
@@ -676,8 +910,10 @@ fn level_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Level> {
     Ok(level)
 }
 
-fn run_props(tag: &Tag<'_>) -> RawRun {
-    RawRun {
+/// After the open of `rPr`, `defRPr` or `endParaRPr`: the run properties,
+/// with the colour and fonts inside.
+fn run_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<RawRun> {
+    let mut run = RawRun {
         text: String::new(),
         size: tag
             .attr_f64("sz")
@@ -686,7 +922,32 @@ fn run_props(tag: &Tag<'_>) -> RawRun {
         bold: tag.attr_bool("b"),
         italic: tag.attr_bool("i"),
         underline: tag.attr("u").is_some_and(|u| u != "none"),
-    }
+        strike: tag.attr("strike").is_some_and(|s| s != "noStrike"),
+        language: tag.attr("lang"),
+        ..RawRun::default()
+    };
+    each_child(reader, |reader, child| match child.local() {
+        b"solidFill" => {
+            run.color = read_color_in(reader)?;
+            Ok(())
+        }
+        b"gradFill" => {
+            if let Some(FillSpec::Gradient(stops, _)) = read_fill(reader, &child)? {
+                run.color = stops.into_iter().next().map(|(_, color)| color);
+            }
+            Ok(())
+        }
+        b"latin" => {
+            run.latin = child.attr("typeface").filter(|face| !face.is_empty());
+            reader.skip()
+        }
+        b"ea" => {
+            run.east_asian = child.attr("typeface").filter(|face| !face.is_empty());
+            reader.skip()
+        }
+        _ => reader.skip(),
+    })?;
+    Ok(run)
 }
 
 fn paragraph(reader: &mut XmlReader<'_>) -> Result<RawParagraph> {
@@ -704,9 +965,9 @@ fn paragraph(reader: &mut XmlReader<'_>) -> Result<RawParagraph> {
                     if child.is("rPr") {
                         run = RawRun {
                             text: std::mem::take(&mut run.text),
-                            ..run_props(&child)
+                            ..run_props(reader, &child)?
                         };
-                        reader.skip()
+                        Ok(())
                     } else if child.is("t") {
                         run.text.push_str(&reader.text()?);
                         Ok(())
@@ -721,15 +982,297 @@ fn paragraph(reader: &mut XmlReader<'_>) -> Result<RawParagraph> {
                 run.text = run.text.replace('\u{b}', "\n");
                 out.runs.push(run);
             }
-            b"endParaRPr" => {
-                out.end_size = run_props(&tag).size;
-                reader.skip()?;
-            }
+            b"endParaRPr" => out.end_size = run_props(reader, &tag)?.size,
             _ => reader.skip()?,
         }
         Ok(())
     })?;
     Ok(out)
+}
+
+/// A table as written, before styles and colours are applied.
+#[derive(Clone, Debug, Default)]
+struct RawTable {
+    style_id: Option<String>,
+    first_row: bool,
+    last_row: bool,
+    first_col: bool,
+    last_col: bool,
+    band_row: bool,
+    band_col: bool,
+    columns: Vec<i64>,
+    rows: Vec<(i64, Vec<RawCell>)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RawCell {
+    body: Option<RawBody>,
+    span: (u32, u32),
+    merged: bool,
+    fill: Option<FillSpec>,
+    /// Left, top, right, bottom.
+    borders: [Option<LineSpec>; 4],
+    /// Left, top, right, bottom, EMU.
+    margins: [Option<i64>; 4],
+    anchor: Option<Anchor>,
+}
+
+/// After the open of `a:tbl`.
+fn table(reader: &mut XmlReader<'_>) -> Result<RawTable> {
+    let mut out = RawTable::default();
+    each_child(reader, |reader, tag| match tag.local() {
+        b"tblPr" => {
+            let flag = |name: &str| tag.attr_bool(name).unwrap_or(false);
+            out.first_row = flag("firstRow");
+            out.last_row = flag("lastRow");
+            out.first_col = flag("firstCol");
+            out.last_col = flag("lastCol");
+            out.band_row = flag("bandRow");
+            out.band_col = flag("bandCol");
+            each_child(reader, |reader, child| {
+                if child.is("tableStyleId") {
+                    out.style_id = Some(reader.text()?.trim().to_owned());
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            })
+        }
+        b"tblGrid" => each_child(reader, |reader, column| {
+            if column.is("gridCol") {
+                out.columns.push(column.attr_i64("w").unwrap_or(0).max(0));
+            }
+            reader.skip()
+        }),
+        b"tr" => {
+            let height = tag.attr_i64("h").unwrap_or(0).max(0);
+            let mut cells = Vec::new();
+            each_child(reader, |reader, cell| {
+                if cell.is("tc") {
+                    cells.push(table_cell(reader, &cell)?);
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            })?;
+            out.rows.push((height, cells));
+            Ok(())
+        }
+        _ => reader.skip(),
+    })?;
+    Ok(out)
+}
+
+fn table_cell(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<RawCell> {
+    let span = |name: &str| tag.attr_i64(name).unwrap_or(1).clamp(1, 1_000) as u32;
+    let mut cell = RawCell {
+        span: (span("gridSpan"), span("rowSpan")),
+        merged: tag.attr_bool("hMerge").unwrap_or(false)
+            || tag.attr_bool("vMerge").unwrap_or(false),
+        ..RawCell::default()
+    };
+    each_child(reader, |reader, child| match child.local() {
+        b"txBody" => {
+            cell.body = Some(text_body(reader)?);
+            Ok(())
+        }
+        b"tcPr" => {
+            cell.margins = [
+                child.attr_i64("marL"),
+                child.attr_i64("marT"),
+                child.attr_i64("marR"),
+                child.attr_i64("marB"),
+            ];
+            cell.anchor = match child.attr("anchor").as_deref() {
+                Some("t") => Some(Anchor::Top),
+                Some("ctr") => Some(Anchor::Middle),
+                Some("b") => Some(Anchor::Bottom),
+                _ => None,
+            };
+            each_child(reader, |reader, property| {
+                let side = match property.local() {
+                    b"lnL" => Some(0),
+                    b"lnT" => Some(1),
+                    b"lnR" => Some(2),
+                    b"lnB" => Some(3),
+                    _ => None,
+                };
+                if let Some(side) = side {
+                    cell.borders[side] = Some(read_line(reader, &property)?);
+                    Ok(())
+                } else if is_fill(&property) {
+                    if let Some(fill) = read_fill(reader, &property)? {
+                        cell.fill = Some(fill);
+                    }
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            })
+        }
+        _ => reader.skip(),
+    })?;
+    Ok(cell)
+}
+
+/// One part of a table style (`wholeTbl`, `firstRow`, `band1H` ...).
+#[derive(Clone, Debug, Default)]
+struct TablePart {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    color: Option<ColorSpec>,
+    fill: Option<FillSpec>,
+    /// Left, top, right, bottom, then the lines between cells: inside
+    /// horizontal and inside vertical.
+    borders: [Option<LineSpec>; 6],
+}
+
+type TableStyle = HashMap<String, TablePart>;
+
+/// The cells a table style part covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region {
+    Table,
+    Row,
+    Column,
+}
+
+/// The table styles of `tableStyles.xml` by their ids.
+fn read_table_styles(bytes: &[u8], part: &str) -> Result<HashMap<String, TableStyle>> {
+    let mut reader = XmlReader::new(bytes, part);
+    let mut styles = HashMap::new();
+    loop {
+        match reader.next()? {
+            Ev::Open(tag) if tag.is("tblStyle") => {
+                let id = tag.attr("styleId").unwrap_or_default();
+                let mut style = TableStyle::new();
+                each_child(&mut reader, |reader, part| {
+                    let name = String::from_utf8_lossy(part.local()).into_owned();
+                    style.insert(name, table_part(reader)?);
+                    Ok(())
+                })?;
+                styles.insert(id, style);
+            }
+            Ev::Eof => return Ok(styles),
+            _ => {}
+        }
+    }
+}
+
+fn table_part(reader: &mut XmlReader<'_>) -> Result<TablePart> {
+    let mut part = TablePart::default();
+    each_child(reader, |reader, child| match child.local() {
+        b"tcTxStyle" => {
+            part.bold = child.attr("b").map(|b| b == "on");
+            part.italic = child.attr("i").map(|i| i == "on");
+            each_child(reader, |reader, inner| {
+                if is_color(&inner) {
+                    part.color = read_color(reader, &inner)?;
+                    Ok(())
+                } else if inner.is("fontRef") && part.color.is_none() {
+                    part.color = read_color_in(reader)?;
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            })
+        }
+        b"tcStyle" => each_child(reader, |reader, inner| match inner.local() {
+            b"tcBdr" => each_child(reader, |reader, side| {
+                let slot = match side.local() {
+                    b"left" => 0,
+                    b"top" => 1,
+                    b"right" => 2,
+                    b"bottom" => 3,
+                    b"insideH" => 4,
+                    b"insideV" => 5,
+                    _ => return reader.skip(),
+                };
+                each_child(reader, |reader, line| {
+                    if line.is("ln") {
+                        part.borders[slot] = Some(read_line(reader, &line)?);
+                        Ok(())
+                    } else {
+                        reader.skip()
+                    }
+                })
+            }),
+            b"fill" => each_child(reader, |reader, fill| {
+                if is_fill(&fill) {
+                    part.fill = read_fill(reader, &fill)?;
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            }),
+            _ => reader.skip(),
+        }),
+        _ => reader.skip(),
+    })?;
+    Ok(part)
+}
+
+/// PowerPoint's default table style, "Medium Style 2 – Accent 1". Files
+/// that use it usually leave it out of `tableStyles.xml`, since every copy
+/// of PowerPoint knows it.
+const MEDIUM_STYLE_2_ACCENT_1: &str = r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<a:tblStyle styleId="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" styleName="Medium Style 2 - Accent 1">
+ <a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="dk1"/></a:tcTxStyle>
+  <a:tcStyle><a:tcBdr>
+   <a:left><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:left>
+   <a:right><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:right>
+   <a:top><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:top>
+   <a:bottom><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:bottom>
+   <a:insideH><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:insideH>
+   <a:insideV><a:ln w="12700"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:insideV>
+  </a:tcBdr><a:fill><a:solidFill><a:schemeClr val="accent1"><a:tint val="20000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:wholeTbl>
+ <a:band1H><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="accent1"><a:tint val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1H>
+ <a:band2H><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2H>
+ <a:band1V><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="accent1"><a:tint val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1V>
+ <a:band2V><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2V>
+ <a:lastCol><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill></a:tcStyle></a:lastCol>
+ <a:firstCol><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill></a:tcStyle></a:firstCol>
+ <a:lastRow><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:top><a:ln w="38100"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:top></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill></a:tcStyle></a:lastRow>
+ <a:firstRow><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:bottom><a:ln w="38100"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:bottom></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill></a:tcStyle></a:firstRow>
+</a:tblStyle></a:tblStyleLst>"#;
+
+fn builtin_table_styles() -> HashMap<String, TableStyle> {
+    read_table_styles(MEDIUM_STYLE_2_ACCENT_1.as_bytes(), "built-in table style")
+        .expect("the built-in table style parses")
+}
+
+/// The text of a notes slide's notes placeholder, one paragraph per line.
+fn notes_text(bytes: &[u8], part: &str) -> Result<Option<String>> {
+    let notes = template(bytes, part)?;
+    let text = notes
+        .shapes
+        .iter()
+        .filter(|shape| {
+            shape
+                .placeholder
+                .as_ref()
+                .is_some_and(|ph| ph.kind == "body")
+        })
+        .filter_map(|shape| shape.body.as_ref())
+        .flat_map(|body| &body.paragraphs)
+        .map(|paragraph| {
+            paragraph
+                .runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim_end().to_owned();
+    Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// What every shape of a slide is resolved against.
+struct Context<'a> {
+    master: Option<&'a Master>,
+    defaults: &'a Levels,
+    table_styles: &'a HashMap<String, TableStyle>,
 }
 
 /// Where a slide placeholder's inherited properties come from.
@@ -768,14 +1311,127 @@ fn find_on_master<'a>(master: &'a Master, ph: &Placeholder) -> Option<&'a RawSha
     })
 }
 
-fn resolve_slide(
+/// Colours of one slide: its master's theme through the colour map the
+/// slide, its layout or its master sets.
+struct Colors<'a> {
+    theme: &'a Theme,
+    map: ColorMap,
+}
+
+impl Colors<'_> {
+    fn context(&self, placeholder: Option<[u8; 4]>) -> ColorContext<'_> {
+        ColorContext {
+            theme: self.theme,
+            map: &self.map,
+            placeholder,
+        }
+    }
+
+    fn color(&self, spec: &ColorSpec) -> [u8; 4] {
+        self.context(None).resolve(spec)
+    }
+
+    /// A fill as drawn; `None` for no fill.
+    fn fill(
+        &self,
+        spec: &FillSpec,
+        placeholder: Option<[u8; 4]>,
+        image: Option<&Arc<[u8]>>,
+    ) -> Option<Fill> {
+        let context = self.context(placeholder);
+        match spec {
+            FillSpec::None | FillSpec::Group => None,
+            FillSpec::Solid(color) => Some(Fill::Solid(context.resolve(color))),
+            FillSpec::Gradient(stops, angle) => Some(Fill::Gradient {
+                stops: stops
+                    .iter()
+                    .map(|(at, color)| (*at as f32, context.resolve(color)))
+                    .collect(),
+                angle: *angle,
+            }),
+            FillSpec::Pattern(fg, bg) => fg
+                .as_ref()
+                .or(bg.as_ref())
+                .map(|c| Fill::Solid(context.resolve(c))),
+            FillSpec::Picture(_) => image.map(|image| {
+                Fill::Picture(Picture {
+                    image: image.clone(),
+                    crop: [0.0; 4],
+                })
+            }),
+        }
+    }
+
+    /// A theme fill style by its reference.
+    fn styled_fill(&self, reference: &StyleRef) -> Option<Fill> {
+        let placeholder = reference.color.as_ref().map(|c| self.color(c));
+        let spec = match reference.index {
+            i @ 1..=999 => self.theme.fills.get(i as usize - 1),
+            i if i > 1000 => self.theme.background_fills.get(i as usize - 1001),
+            _ => None,
+        };
+        match spec {
+            Some(spec) => self.fill(spec, placeholder, None),
+            // A theme without fill styles: the reference colour itself.
+            None if reference.index > 0 => placeholder.map(Fill::Solid),
+            None => None,
+        }
+    }
+
+    /// An outline from a shape's own line over its style's.
+    fn line(&self, own: Option<&LineSpec>, reference: Option<&StyleRef>) -> Option<Outline> {
+        let styled = reference.filter(|r| r.index > 0).map(|r| {
+            (
+                self.theme.lines.get(r.index as usize - 1),
+                r.color.as_ref().map(|c| self.color(c)),
+            )
+        });
+        let width = own
+            .and_then(|l| l.width)
+            .or_else(|| styled.and_then(|(line, _)| line?.width))
+            .unwrap_or(DEFAULT_LINE);
+        let placeholder = styled.and_then(|(_, color)| color);
+        let fill = match own.and_then(|l| l.fill.as_ref()) {
+            Some(fill) => Some(fill.clone()),
+            None => match styled {
+                Some((Some(line), _)) => line.fill.clone(),
+                Some((None, color)) => color.map(|c| FillSpec::Solid(ColorSpec::rgb(c))),
+                None => None,
+            },
+        }?;
+        let color = self.fill(&fill, placeholder, None)?.main_color()?;
+        Some(Outline {
+            color,
+            width: width.max(0),
+        })
+    }
+}
+
+fn colors<'a>(
     slide: &Template,
     layout: Option<&Template>,
-    master: Option<&Master>,
-    defaults: &Levels,
-) -> Slide {
+    master: Option<&'a Master>,
+    fallback: &'a Theme,
+) -> Colors<'a> {
+    let map = slide
+        .color_map
+        .clone()
+        .or_else(|| layout.and_then(|l| l.color_map.clone()))
+        .or_else(|| master.and_then(|m| m.template.color_map.clone()))
+        .unwrap_or_default();
+    Colors {
+        theme: master.map_or(fallback, |m| &m.theme),
+        map,
+    }
+}
+
+fn resolve_slide(slide: &Template, layout: Option<&Template>, context: &Context<'_>) -> Slide {
+    let fallback = Theme::default();
+    let master = context.master;
+    let colors = colors(slide, layout, master, &fallback);
     let mut shapes = Vec::new();
     let layout_shows_master = layout.is_none_or(|l| l.show_master_shapes);
+    let other = master.map(|m| &m.other);
     if slide.show_master_shapes {
         if layout_shows_master && let Some(master) = master {
             for raw in master
@@ -787,9 +1443,9 @@ fn resolve_slide(
                 let sources = Sources {
                     layout: None,
                     master: None,
-                    style: Some(&master.other),
+                    style: other,
                 };
-                if let Some(mut shape) = resolve_shape(raw, &sources, defaults) {
+                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors) {
                     shape.inherited = true;
                     shapes.push(shape);
                 }
@@ -800,9 +1456,9 @@ fn resolve_slide(
                 let sources = Sources {
                     layout: None,
                     master: None,
-                    style: master.map(|m| &m.other),
+                    style: other,
                 };
-                if let Some(mut shape) = resolve_shape(raw, &sources, defaults) {
+                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors) {
                     shape.inherited = true;
                     shapes.push(shape);
                 }
@@ -829,20 +1485,36 @@ fn resolve_slide(
             None => Sources {
                 layout: None,
                 master: None,
-                style: master.map(|m| &m.other),
+                style: other,
             },
         };
-        if let Some(shape) = resolve_shape(raw, &sources, defaults) {
+        if let Some(shape) = resolve_shape(raw, &sources, context, &colors) {
             shapes.push(shape);
         }
     }
+    // The slide's background, else its layout's, else its master's.
+    let templates = [Some(slide), layout, master.map(|m| &m.template)];
+    let background = templates.iter().flatten().find_map(|template| {
+        let background = template.background.as_ref()?;
+        Some(match background {
+            Background::Fill(spec) => colors.fill(spec, None, template.background_image.as_ref()),
+            Background::Ref(reference) => colors.styled_fill(reference),
+        })
+    });
     Slide {
         shapes,
         hidden: slide.hidden,
+        background: background.flatten(),
+        notes: None,
     }
 }
 
-fn resolve_shape(raw: &RawShape, sources: &Sources<'_>, defaults: &Levels) -> Option<Shape> {
+fn resolve_shape(
+    raw: &RawShape,
+    sources: &Sources<'_>,
+    context: &Context<'_>,
+    colors: &Colors<'_>,
+) -> Option<Shape> {
     let chain = [Some(raw), sources.layout, sources.master];
     let frame = chain.iter().flatten().find_map(|s| s.frame)?;
     let geometry = chain
@@ -858,10 +1530,28 @@ fn resolve_shape(raw: &RawShape, sources: &Sources<'_>, defaults: &Levels) -> Op
         },
         (None, role) => role,
     };
-    let outlined = match raw.line {
-        Some(visible) => visible,
-        None => raw.placeholder.is_none() && !raw.text_box && raw.styled_line,
-    } && matches!(role, Role::Shape | Role::Title | Role::Body | Role::Footer);
+    // Fill and outline: the shape's own, else the theme style it refers
+    // to, looking through the placeholders it inherits from.
+    let fill = chain.iter().flatten().find_map(|s| {
+        if let Some(spec) = &s.fill {
+            return Some(colors.fill(spec, None, s.fill_image.as_ref()));
+        }
+        s.fill_ref.as_ref().map(|r| colors.styled_fill(r))
+    });
+    let fill = fill.flatten();
+    let line_spec = chain.iter().flatten().find_map(|s| s.line.as_ref());
+    let line_ref = chain.iter().flatten().find_map(|s| s.line_ref.as_ref());
+    let line = match role {
+        Role::Shape | Role::Title | Role::Body | Role::Footer | Role::Picture => {
+            colors.line(line_spec, line_ref)
+        }
+        _ => None,
+    };
+    let font_color = chain
+        .iter()
+        .flatten()
+        .find_map(|s| s.font_color.as_ref())
+        .map(|c| colors.color(c));
     let text = raw.body.as_ref().and_then(|body| {
         let bodies: Vec<&RawBody> = chain
             .iter()
@@ -869,8 +1559,29 @@ fn resolve_shape(raw: &RawShape, sources: &Sources<'_>, defaults: &Levels) -> Op
             .flatten()
             .filter_map(|s| s.body.as_ref())
             .collect();
-        resolve_body(body, &bodies, sources.style, defaults)
+        resolve_body(
+            body,
+            &bodies,
+            &TextDefaults {
+                style: sources.style,
+                defaults: context.defaults,
+                color: font_color,
+                table: None,
+            },
+            colors,
+        )
     });
+    let picture = match (&raw.blip, &raw.image) {
+        (Some((_, crop)), Some(image)) => Some(Picture {
+            image: image.clone(),
+            crop: *crop,
+        }),
+        _ => None,
+    };
+    let table = raw
+        .table
+        .as_ref()
+        .map(|table| resolve_table(table, context, colors));
     Some(Shape {
         frame,
         rotation: raw.rotation,
@@ -878,17 +1589,34 @@ fn resolve_shape(raw: &RawShape, sources: &Sources<'_>, defaults: &Levels) -> Op
         flip_v: raw.flip_v,
         geometry,
         role,
-        outlined,
+        fill,
+        line,
         text,
+        picture,
+        table,
         inherited: false,
     })
 }
 
+/// What a text body falls back on.
+struct TextDefaults<'a> {
+    /// The master's text style for this kind of shape.
+    style: Option<&'a Levels>,
+    defaults: &'a Levels,
+    /// The shape style's text colour.
+    color: Option<[u8; 4]>,
+    /// A table style's text.
+    table: Option<TableText>,
+}
+
+/// Text formatting a table style gives its cells: bold, italic, colour.
+type TableText = (Option<bool>, Option<bool>, Option<[u8; 4]>);
+
 fn resolve_body(
     body: &RawBody,
     inherited: &[&RawBody],
-    style: Option<&Levels>,
-    defaults: &Levels,
+    fallback: &TextDefaults<'_>,
+    colors: &Colors<'_>,
 ) -> Option<TextBody> {
     // An empty placeholder: PowerPoint shows its prompt only while editing.
     if body
@@ -914,23 +1642,52 @@ fn resolve_body(
         out.wrap = wrap;
     }
     out.font_scale = body.props.font_scale.unwrap_or(1.0);
+    let (table_bold, table_italic, table_color) = fallback.table.unwrap_or_default();
 
     let mut numbers = [0u32; 9];
     for raw in &body.paragraphs {
         let lvl = usize::from(raw.level);
-        // Most specific first.
-        let mut levels: Vec<&Level> = vec![&raw.props, &body.list[lvl]];
-        levels.extend(inherited.iter().map(|b| &b.list[lvl]));
-        if let Some(style) = style {
+        // Most specific first: the shape's own, then the placeholders it
+        // inherits from, then the master's and the presentation's styles.
+        let mut own: Vec<&Level> = vec![&raw.props, &body.list[lvl]];
+        own.extend(inherited.iter().map(|b| &b.list[lvl]));
+        let mut levels = own.clone();
+        if let Some(style) = fallback.style {
             levels.push(&style[lvl]);
         }
-        levels.push(&defaults[lvl]);
+        levels.push(&fallback.defaults[lvl]);
         let size = levels
             .iter()
             .find_map(|l| l.size)
             .unwrap_or(DEFAULT_TEXT_POINTS);
-        let bold = levels.iter().find_map(|l| l.bold).unwrap_or(false);
-        let italic = levels.iter().find_map(|l| l.italic).unwrap_or(false);
+        let bold = own
+            .iter()
+            .find_map(|l| l.bold)
+            .or(table_bold)
+            .or_else(|| levels.iter().find_map(|l| l.bold))
+            .unwrap_or(false);
+        let italic = own
+            .iter()
+            .find_map(|l| l.italic)
+            .or(table_italic)
+            .or_else(|| levels.iter().find_map(|l| l.italic))
+            .unwrap_or(false);
+        // A shape style's or table style's text colour wins over the master
+        // and presentation text styles, not over the shape's own.
+        let color = own
+            .iter()
+            .find_map(|l| l.color.as_ref())
+            .map(|c| colors.color(c))
+            .or(table_color)
+            .or(fallback.color)
+            .or_else(|| {
+                levels
+                    .iter()
+                    .find_map(|l| l.color.as_ref())
+                    .map(|c| colors.color(c))
+            });
+        let latin = levels.iter().find_map(|l| l.latin.clone());
+        let east_asian = levels.iter().find_map(|l| l.east_asian.clone());
         let align = levels.iter().find_map(|l| l.align).unwrap_or_default();
         let bullet = levels.iter().find_map(|l| l.bullet.clone()).flatten();
         let has_text = raw.runs.iter().any(|r| !r.text.trim().is_empty());
@@ -958,12 +1715,24 @@ fn resolve_body(
                 .runs
                 .iter()
                 .filter(|run| !run.text.is_empty())
-                .map(|run| Run {
-                    text: run.text.clone(),
-                    size: run.size.unwrap_or(size),
-                    bold: run.bold.unwrap_or(bold),
-                    italic: run.italic.unwrap_or(italic),
-                    underline: run.underline,
+                .map(|run| {
+                    let language = run.language.as_deref().unwrap_or("en");
+                    let face = |name: Option<&String>| {
+                        name.and_then(|name| colors.theme.typeface(name, language))
+                    };
+                    Run {
+                        text: run.text.clone(),
+                        size: run.size.unwrap_or(size),
+                        bold: run.bold.unwrap_or(bold),
+                        italic: run.italic.unwrap_or(italic),
+                        underline: run.underline,
+                        strike: run.strike,
+                        color: run.color.as_ref().map(|c| colors.color(c)).or(color),
+                        font: face(run.latin.as_ref().or(latin.as_ref()))
+                            .or_else(|| colors.theme.typeface("+mn-lt", language)),
+                        east_asian_font: face(run.east_asian.as_ref().or(east_asian.as_ref()))
+                            .or_else(|| colors.theme.typeface("+mn-ea", language)),
+                    }
                 })
                 .collect(),
             align,
@@ -975,4 +1744,148 @@ fn resolve_body(
         });
     }
     Some(out)
+}
+
+/// Apply a table's style and its cells' own formatting.
+fn resolve_table(raw: &RawTable, context: &Context<'_>, colors: &Colors<'_>) -> Table {
+    let style = raw
+        .style_id
+        .as_ref()
+        .and_then(|id| context.table_styles.get(id));
+    let rows = raw.rows.len();
+    let cols = raw.columns.len();
+    let mut out = Table {
+        columns: raw.columns.clone(),
+        rows: Vec::with_capacity(rows),
+    };
+    let master_other = context.master.map(|m| &m.other);
+    for (r, (height, cells)) in raw.rows.iter().enumerate() {
+        let mut row = TableRow {
+            height: *height,
+            cells: Vec::with_capacity(cols),
+        };
+        for c in 0..cols {
+            let Some(cell) = cells.get(c) else {
+                row.cells.push(TableCell::default());
+                continue;
+            };
+            // The style's parts that apply to this cell, later ones winning,
+            // with the shape of the area each covers: the table, a row or
+            // a column.
+            let mut parts: Vec<(&TablePart, Region)> = Vec::new();
+            if let Some(style) = style {
+                let mut add = |name: &str, region: Region| {
+                    if let Some(part) = style.get(name) {
+                        parts.push((part, region));
+                    }
+                };
+                add("wholeTbl", Region::Table);
+                let body_row = r >= usize::from(raw.first_row) && !(raw.last_row && r + 1 == rows);
+                if raw.band_row && body_row {
+                    let band = r - usize::from(raw.first_row);
+                    add(if band % 2 == 0 { "band1H" } else { "band2H" }, Region::Row);
+                }
+                let body_col = c >= usize::from(raw.first_col) && !(raw.last_col && c + 1 == cols);
+                if raw.band_col && body_col {
+                    let band = c - usize::from(raw.first_col);
+                    add(
+                        if band % 2 == 0 { "band1V" } else { "band2V" },
+                        Region::Column,
+                    );
+                }
+                if raw.first_col && c == 0 {
+                    add("firstCol", Region::Column);
+                }
+                if raw.last_col && c + 1 == cols {
+                    add("lastCol", Region::Column);
+                }
+                if raw.last_row && r + 1 == rows {
+                    add("lastRow", Region::Row);
+                }
+                if raw.first_row && r == 0 {
+                    add("firstRow", Region::Row);
+                }
+            }
+            let fill = match &cell.fill {
+                Some(spec) => colors.fill(spec, None, None),
+                None => parts
+                    .iter()
+                    .rev()
+                    .find_map(|(p, _)| p.fill.as_ref())
+                    .and_then(|spec| colors.fill(spec, None, None)),
+            };
+            // Edges: the cell's own, else the style's: a part's outer line
+            // where the cell's edge is on the edge of the part's area, its
+            // inside line elsewhere.
+            let edges = [
+                c == 0,
+                r == 0,
+                c + cell.span.0 as usize >= cols,
+                r + cell.span.1 as usize >= rows,
+            ];
+            let styled: [Option<&LineSpec>; 4] = std::array::from_fn(|side| {
+                parts.iter().rev().find_map(|(part, region)| {
+                    let horizontal = side % 2 == 1;
+                    let outer = match region {
+                        Region::Table => edges[side],
+                        Region::Row => horizontal || edges[side],
+                        Region::Column => !horizontal || edges[side],
+                    };
+                    let slot = match (outer, horizontal) {
+                        (true, _) => side,
+                        (false, true) => 4,
+                        (false, false) => 5,
+                    };
+                    part.borders[slot].as_ref()
+                })
+            });
+            let mut borders = [None; 4];
+            for side in 0..4 {
+                let spec = cell.borders[side].as_ref().or(styled[side]);
+                borders[side] = spec.and_then(|spec| colors.line(Some(spec), None));
+            }
+            let text_style = (
+                parts.iter().rev().find_map(|(p, _)| p.bold),
+                parts.iter().rev().find_map(|(p, _)| p.italic),
+                parts
+                    .iter()
+                    .rev()
+                    .find_map(|(p, _)| p.color.as_ref())
+                    .map(|c| colors.color(c)),
+            );
+            let text = cell.body.as_ref().and_then(|body| {
+                let mut body = body.clone();
+                // Table cells' own default margins: 0.1 inch left and right,
+                // 0.05 top and bottom.
+                for (i, margin) in cell.margins.iter().enumerate() {
+                    if margin.is_some() {
+                        body.props.insets[i] = *margin;
+                    }
+                }
+                if body.props.anchor.is_none() {
+                    body.props.anchor = cell.anchor;
+                }
+                resolve_body(
+                    &body,
+                    &[],
+                    &TextDefaults {
+                        style: master_other,
+                        defaults: context.defaults,
+                        color: None,
+                        table: Some(text_style),
+                    },
+                    colors,
+                )
+            });
+            row.cells.push(TableCell {
+                text,
+                fill,
+                borders,
+                span: cell.span,
+                merged: cell.merged,
+            });
+        }
+        out.rows.push(row);
+    }
+    out
 }

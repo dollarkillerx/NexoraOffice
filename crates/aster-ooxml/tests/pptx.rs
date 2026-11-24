@@ -157,9 +157,12 @@ fn slides_inherit_from_layout_and_master() {
     let inherited: Vec<_> = slide.shapes.iter().filter(|s| s.inherited).collect();
     assert_eq!(inherited.len(), 2);
     assert_eq!(inherited[0].frame, Frame::new(8000, 6000, 500, 300));
-    assert!(inherited[0].outlined, "a styled master shape has a line");
+    assert!(
+        inherited[0].line.is_some(),
+        "a styled master shape has a line"
+    );
     assert_eq!(inherited[1].geometry, Geometry::Line);
-    assert!(inherited[1].outlined);
+    assert!(inherited[1].line.is_some());
 
     let own: Vec<_> = slide.shapes.iter().filter(|s| !s.inherited).collect();
     // Title: frame from the layout, size and alignment from the master's
@@ -167,7 +170,7 @@ fn slides_inherit_from_layout_and_master() {
     let title = own[0];
     assert_eq!(title.role, Role::Title);
     assert_eq!(title.frame, Frame::new(200, 300, 8000, 900));
-    assert!(!title.outlined);
+    assert!(!title.line.is_some());
     let text = title.text.as_ref().unwrap();
     assert_eq!(text.anchor, Anchor::Middle);
     let paragraph = &text.paragraphs[0];
@@ -210,7 +213,7 @@ fn slides_inherit_from_layout_and_master() {
     assert_eq!(text_box.role, Role::Shape);
     assert_eq!(text_box.frame, Frame::new(10, 20, 300, 400));
     assert_eq!((text_box.rotation, text_box.flip_h), (90.0, true));
-    assert!(!text_box.outlined);
+    assert!(!text_box.line.is_some());
     let body = text_box.text.as_ref().unwrap();
     assert_eq!(body.insets, [1, 2, 3, 4]);
     assert_eq!((body.anchor, body.wrap), (Anchor::Bottom, false));
@@ -222,11 +225,14 @@ fn slides_inherit_from_layout_and_master() {
     let oval = own[3];
     assert_eq!(oval.geometry, Geometry::Ellipse);
     assert_eq!(oval.frame, Frame::new(2000, 2500, 200, 200));
-    assert!(oval.outlined);
+    assert!(oval.line.is_some());
     let star = own[4];
     assert_eq!(star.geometry, Geometry::Other("star5".to_owned()));
     assert_eq!(star.frame, Frame::new(1100, 2050, 100, 50));
-    assert!(!star.outlined, "an explicit no-line wins over the style");
+    assert!(
+        !star.line.is_some(),
+        "an explicit no-line wins over the style"
+    );
 
     assert_eq!(own[5].role, Role::Picture);
     assert_eq!(own[6].role, Role::Table);
@@ -325,4 +331,238 @@ fn a_workbook_is_not_a_presentation() {
         ("xl/workbook.xml", b"<workbook/>"),
     ]);
     assert_eq!(Pptx.read(bytes).unwrap_err().kind(), ErrorKind::WrongKind);
+}
+
+/// A deck with a theme: backgrounds, fills, outlines, text colours and
+/// fonts from the theme, a cropped picture, a table in PowerPoint's default
+/// style, and speaker notes.
+fn themed() -> Vec<u8> {
+    let presentation = format!(
+        r#"<p:presentation {NS}>
+  <p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/></p:sldIdLst>
+  <p:sldSz cx="12192000" cy="6858000"/>
+</p:presentation>"#
+    );
+    let presentation_rels = rels(&[
+        ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ("rId2", "slide", "slides/slide1.xml"),
+        ("rId3", "slide", "slides/slide2.xml"),
+        ("rId4", "tableStyles", "tableStyles.xml"),
+    ]);
+    let theme = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+  <a:clrScheme name="T"><a:dk1><a:srgbClr val="101010"/></a:dk1><a:lt1><a:srgbClr val="FAFAFA"/></a:lt1>
+   <a:dk2><a:srgbClr val="1F2937"/></a:dk2><a:lt2><a:srgbClr val="E5E7EB"/></a:lt2>
+   <a:accent1><a:srgbClr val="7C5CE0"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2></a:clrScheme>
+  <a:fontScheme name="F"><a:majorFont><a:latin typeface="Georgia"/><a:ea typeface=""/></a:majorFont>
+   <a:minorFont><a:latin typeface="Verdana"/><a:ea typeface=""/><a:font script="Jpan" typeface="Hiragino Sans"/></a:minorFont></a:fontScheme>
+  <a:fmtScheme name="S">
+   <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"><a:tint val="50000"/></a:schemeClr></a:solidFill><a:noFill/></a:fillStyleLst>
+   <a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="25400"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
+   <a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:gradFill><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"/></a:gs><a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="50000"/></a:schemeClr></a:gs></a:gsLst><a:lin ang="5400000"/></a:gradFill></a:bgFillStyleLst>
+  </a:fmtScheme></a:themeElements></a:theme>"#;
+    // The master swaps the background and text colours: a dark deck.
+    let master = format!(
+        r#"<p:sldMaster {NS}><p:cSld><p:bg><p:bgRef idx="1002"><a:schemeClr val="bg1"/></p:bgRef></p:bg><p:spTree>
+  <p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+    <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="12192000" cy="1000000"/></a:xfrm></p:spPr></p:sp>
+</p:spTree></p:cSld>
+<p:clrMap bg1="dk1" tx1="lt1" bg2="dk2" tx2="lt2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+<p:txStyles><p:titleStyle><a:lvl1pPr><a:defRPr sz="4000"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill><a:latin typeface="+mj-lt"/></a:defRPr></a:lvl1pPr></p:titleStyle>
+<p:otherStyle><a:lvl1pPr><a:defRPr sz="1800"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:defRPr></a:lvl1pPr></p:otherStyle></p:txStyles></p:sldMaster>"#
+    );
+    let layout = format!(r#"<p:sldLayout {NS}><p:cSld><p:spTree/></p:cSld></p:sldLayout>"#);
+    let slide_one = format!(
+        r#"<p:sld {NS}><p:cSld><p:spTree>
+  <p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/>
+    <p:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="ja-JP"/><a:t>テーマの色</a:t></a:r></a:p></p:txBody></p:sp>
+  <p:sp><p:nvSpPr><p:cNvPr id="3" name="Card"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+    <p:spPr><a:xfrm><a:off x="100" y="100"/><a:ext cx="1000" cy="1000"/></a:xfrm><a:prstGeom prst="roundRect"/>
+      <a:solidFill><a:schemeClr val="accent1"><a:lumMod val="50000"/></a:schemeClr></a:solidFill>
+      <a:ln w="38100"><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></a:ln></p:spPr>
+    <p:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="ja-JP" strike="sngStrike"><a:solidFill><a:schemeClr val="accent2"/></a:solidFill><a:ea typeface="+mn-ea"/></a:rPr><a:t>本文</a:t></a:r></a:p></p:txBody></p:sp>
+  <p:sp><p:nvSpPr><p:cNvPr id="4" name="Styled"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+    <p:spPr><a:xfrm><a:off x="200" y="200"/><a:ext cx="1000" cy="1000"/></a:xfrm><a:prstGeom prst="ellipse"/></p:spPr>
+    <p:style><a:lnRef idx="2"><a:schemeClr val="accent2"/></a:lnRef><a:fillRef idx="2"><a:schemeClr val="accent1"/></a:fillRef>
+      <a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef></p:style>
+    <p:txBody><a:bodyPr/><a:p><a:r><a:t>white</a:t></a:r></a:p></p:txBody></p:sp>
+  <p:pic><p:nvPicPr><p:cNvPr id="5" name="Photo"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+    <p:blipFill><a:blip r:embed="rId2"/><a:srcRect l="10000" t="0" r="25000" b="5000"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+    <p:spPr><a:xfrm><a:off x="300" y="300"/><a:ext cx="400" cy="300"/></a:xfrm><a:prstGeom prst="rect"/></p:spPr></p:pic>
+  <p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="6" name="Table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>
+    <p:xfrm><a:off x="1000" y="3000000"/><a:ext cx="6000000" cy="1200000"/></p:xfrm>
+    <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl>
+      <a:tblPr firstRow="1" bandRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>
+      <a:tblGrid><a:gridCol w="2000000"/><a:gridCol w="2000000"/><a:gridCol w="2000000"/></a:tblGrid>
+      <a:tr h="400000"><a:tc gridSpan="2"><a:txBody><a:bodyPr/><a:p><a:r><a:t>見出し</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>
+        <a:tc hMerge="1"><a:txBody><a:bodyPr/><a:p><a:endParaRPr/></a:p></a:txBody><a:tcPr/></a:tc>
+        <a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>列 3</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr>
+      <a:tr h="400000"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>一</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>
+        <a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:rPr><a:t>二</a:t></a:r></a:p></a:txBody>
+          <a:tcPr marL="0" anchor="ctr"><a:lnB w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnB><a:solidFill><a:srgbClr val="FFFF00"/></a:solidFill></a:tcPr></a:tc>
+        <a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>三</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr>
+      <a:tr h="400000"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>四</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>
+        <a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>五</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr>
+    </a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+</p:spTree></p:cSld></p:sld>"#
+    );
+    let slide_two = format!(
+        r#"<p:sld {NS}><p:cSld><p:bg><p:bgPr><a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst><a:lin ang="0"/></a:gradFill></p:bgPr></p:bg><p:spTree/></p:cSld>
+<p:clrMapOvr><a:overrideClrMapping bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/></p:clrMapOvr></p:sld>"#
+    );
+    let notes = format!(
+        r#"<p:notes {NS}><p:cSld><p:spTree>
+  <p:sp><p:nvSpPr><p:cNvPr id="2" name="Image"/><p:cNvSpPr/><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>
+  <p:sp><p:nvSpPr><p:cNvPr id="3" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>
+    <p:txBody><a:bodyPr/><a:p><a:r><a:t>最初に挨拶する。</a:t></a:r></a:p><a:p><a:r><a:t>Then the numbers.</a:t></a:r></a:p></p:txBody></p:sp>
+  <p:sp><p:nvSpPr><p:cNvPr id="4" name="Number"/><p:cNvSpPr/><p:nvPr><p:ph type="sldNum" idx="5"/></p:nvPr></p:nvSpPr><p:spPr/>
+    <p:txBody><a:bodyPr/><a:p><a:fld type="slidenum"><a:t>1</a:t></a:fld></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:notes>"#
+    );
+    let table_styles = r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"/>"#;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\npicture";
+    let slide_one_rels = rels(&[
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+        ("rId2", "image", "../media/image1.png"),
+        ("rId3", "notesSlide", "../notesSlides/notesSlide1.xml"),
+    ]);
+    let to_layout = rels(&[("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml")]);
+    let to_master = rels(&[("rId1", "slideMaster", "../slideMasters/slideMaster1.xml")]);
+    let to_theme = rels(&[("rId1", "theme", "../theme/theme1.xml")]);
+    package(&[
+        ("[Content_Types].xml", content_types().as_bytes()),
+        ("_rels/.rels", root_rels("ppt/presentation.xml").as_bytes()),
+        ("ppt/presentation.xml", presentation.as_bytes()),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            presentation_rels.as_bytes(),
+        ),
+        ("ppt/tableStyles.xml", table_styles.as_bytes()),
+        ("ppt/slides/slide1.xml", slide_one.as_bytes()),
+        (
+            "ppt/slides/_rels/slide1.xml.rels",
+            slide_one_rels.as_bytes(),
+        ),
+        ("ppt/slides/slide2.xml", slide_two.as_bytes()),
+        ("ppt/slides/_rels/slide2.xml.rels", to_layout.as_bytes()),
+        ("ppt/notesSlides/notesSlide1.xml", notes.as_bytes()),
+        ("ppt/slideLayouts/slideLayout1.xml", layout.as_bytes()),
+        (
+            "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+            to_master.as_bytes(),
+        ),
+        ("ppt/slideMasters/slideMaster1.xml", master.as_bytes()),
+        (
+            "ppt/slideMasters/_rels/slideMaster1.xml.rels",
+            to_theme.as_bytes(),
+        ),
+        ("ppt/theme/theme1.xml", theme.as_bytes()),
+        ("ppt/media/image1.png", png),
+    ])
+}
+
+#[test]
+fn colours_pictures_tables_and_notes() {
+    use aster_slides::Fill;
+
+    let presentation = Pptx.read(themed()).unwrap();
+    let slide = &presentation.slides[0];
+    // bg1 maps to dk1 on this master; background style 1002 is the second
+    // background fill, a gradient, drawn from its first stop.
+    match &slide.background {
+        Some(Fill::Gradient { stops, angle }) => {
+            assert_eq!(stops[0].1, [0x10, 0x10, 0x10, 0xff]);
+            assert_eq!(stops[1].1, [0x08, 0x08, 0x08, 0xff]);
+            assert_eq!(*angle, 90.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        slide.notes.as_deref(),
+        Some("最初に挨拶する。\nThen the numbers.")
+    );
+
+    let title = &slide.shapes[0];
+    let run = &title.text.as_ref().unwrap().paragraphs[0].runs[0];
+    // tx1 maps to lt1: light text on the dark background.
+    assert_eq!(run.color, Some([0xFA, 0xFA, 0xFA, 0xff]));
+    assert_eq!(run.size, 40.0);
+    assert_eq!(run.font.as_deref(), Some("Georgia"));
+
+    let card = &slide.shapes[1];
+    assert_eq!(card.fill, Some(Fill::Solid([0x33, 0x19, 0x85, 0xff])));
+    let line = card.line.unwrap();
+    assert_eq!((line.color, line.width), ([0, 0xFF, 0, 0xff], 38_100));
+    let run = &card.text.as_ref().unwrap().paragraphs[0].runs[0];
+    assert_eq!(run.color, Some([0xED, 0x7D, 0x31, 0xff]));
+    assert!(run.strike);
+    assert_eq!(run.font.as_deref(), Some("Verdana"));
+    // The theme's Japanese face, picked by the run's language.
+    assert_eq!(run.east_asian_font.as_deref(), Some("Hiragino Sans"));
+
+    // Fill, outline and text colour from the shape's theme style.
+    let styled = &slide.shapes[2];
+    assert_eq!(styled.fill, Some(Fill::Solid([0xBE, 0xAE, 0xF0, 0xff])));
+    let line = styled.line.unwrap();
+    assert_eq!((line.color, line.width), ([0xED, 0x7D, 0x31, 0xff], 25_400));
+    let run = &styled.text.as_ref().unwrap().paragraphs[0].runs[0];
+    // lt1 itself, not through the map.
+    assert_eq!(run.color, Some([0xFA, 0xFA, 0xFA, 0xff]));
+
+    let photo = &slide.shapes[3];
+    assert_eq!(photo.role, Role::Picture);
+    let picture = photo.picture.as_ref().unwrap();
+    assert_eq!(&picture.image[..4], b"\x89PNG");
+    assert_eq!(picture.crop, [0.1, 0.0, 0.25, 0.05]);
+    assert_eq!(photo.line, None);
+
+    let table = slide.shapes[4].table.as_ref().unwrap();
+    assert_eq!(table.columns, [2_000_000; 3]);
+    assert_eq!(table.rows.len(), 3);
+    let header = &table.rows[0].cells;
+    assert_eq!(header[0].span, (2, 1));
+    assert!(header[1].merged);
+    // The default style: header in accent 1 with bold light text.
+    assert_eq!(header[0].fill, Some(Fill::Solid([0x7C, 0x5C, 0xE0, 0xff])));
+    let run = &header[0].text.as_ref().unwrap().paragraphs[0].runs[0];
+    assert!(run.bold);
+    assert_eq!(run.color, Some([0xFA, 0xFA, 0xFA, 0xff]));
+    // A thick light line under the header row, thin ones between cells.
+    let bottom = header[0].borders[3].unwrap();
+    assert_eq!(
+        (bottom.color, bottom.width),
+        ([0xFA, 0xFA, 0xFA, 0xff], 38_100)
+    );
+    assert_eq!(header[2].borders[0].unwrap().width, 12_700);
+    // Banded rows: the first body row is tint 40%, the next tint 20%.
+    let body = &table.rows[1].cells;
+    assert_eq!(body[0].fill, Some(Fill::Solid([0xCB, 0xBE, 0xF3, 0xff])));
+    assert_eq!(
+        table.rows[2].cells[0].fill,
+        Some(Fill::Solid([0xE5, 0xDE, 0xF9, 0xff]))
+    );
+    // Text in body cells is dk1, which this master does not remap.
+    let run = &body[0].text.as_ref().unwrap().paragraphs[0].runs[0];
+    assert!(!run.bold);
+    assert_eq!(run.color, Some([0x10, 0x10, 0x10, 0xff]));
+    // A cell's own fill, border, colour, margin and anchor win.
+    assert_eq!(body[1].fill, Some(Fill::Solid([0xFF, 0xFF, 0, 0xff])));
+    assert_eq!(body[1].borders[3].unwrap().color, [0, 0, 0, 0xff]);
+    let text = body[1].text.as_ref().unwrap();
+    assert_eq!(text.paragraphs[0].runs[0].color, Some([0xFF, 0, 0, 0xff]));
+    assert_eq!(text.insets[0], 0);
+    assert_eq!(text.anchor, Anchor::Middle);
+    // A short row is filled up with empty cells.
+    assert_eq!(table.rows[2].cells.len(), 3);
+    assert!(table.rows[2].cells[2].text.is_none());
+
+    // The second slide's own background, and its override of the map.
+    let second = &presentation.slides[1];
+    match &second.background {
+        Some(Fill::Gradient { stops, angle }) => {
+            assert_eq!(stops[0].1, [0xFF, 0, 0, 0xff]);
+            assert_eq!(*angle, 0.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(second.notes, None);
 }

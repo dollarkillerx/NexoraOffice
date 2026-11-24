@@ -7,10 +7,13 @@
 //! and sizes are in EMU (English Metric Units, 914,400 per inch, 12,700 per
 //! point), the unit of the file format; text sizes are in points.
 //!
-//! This first version is read-only and models what is needed to show the
-//! text and the outlines of shapes. Fills, colours, pictures, charts and
-//! tables are recorded only as "something is here". Shape geometry is meant
-//! to move to `aster-drawing` once that crate exists (Phase 4 of the plan).
+//! This version is read-only. It models what is needed to show a slide as
+//! it looks: the background, shapes with their fills and outlines, text
+//! with its colours and fonts, pictures and tables, and the speaker notes.
+//! Colours are final: theme colours and their modifiers have been worked
+//! out by the reader. Charts, diagrams and other graphics are recorded only
+//! as "something is here". Shape geometry is meant to move to
+//! `aster-drawing` once that crate exists (Phase 4 of the plan).
 //!
 //! Nothing here reads files; `aster-ooxml` turns PPTX packages into this
 //! model. Nothing here knows about the GUI toolkit either.
@@ -23,6 +26,51 @@ pub const EMU_PER_INCH: f64 = 914_400.0;
 pub const DEFAULT_SIZE: (i64, i64) = (12_192_000, 6_858_000);
 /// Text size when nothing says otherwise.
 pub const DEFAULT_TEXT_POINTS: f32 = 18.0;
+
+/// Red, green, blue, alpha.
+pub type Rgba = [u8; 4];
+
+/// How an area is painted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fill {
+    Solid(Rgba),
+    /// Stops (position 0 to 1, colour) and the direction in degrees,
+    /// clockwise from left to right.
+    Gradient {
+        stops: Vec<(f32, Rgba)>,
+        angle: f64,
+    },
+    /// A picture stretched over the area.
+    Picture(Picture),
+}
+
+impl Fill {
+    /// The colour that best stands for the fill: a gradient's first stop.
+    pub fn main_color(&self) -> Option<Rgba> {
+        match self {
+            Fill::Solid(color) => Some(*color),
+            Fill::Gradient { stops, .. } => stops.first().map(|(_, color)| *color),
+            Fill::Picture(_) => None,
+        }
+    }
+}
+
+/// A picture: the file's own bytes (PNG, JPEG or another format), decoded
+/// when drawn, and how much is cropped off each side.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picture {
+    pub image: std::sync::Arc<[u8]>,
+    /// Shares of the picture cut off the left, top, right and bottom.
+    pub crop: [f64; 4],
+}
+
+/// A line around a shape or along a table cell's edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Outline {
+    pub color: Rgba,
+    /// EMU.
+    pub width: i64,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Presentation {
@@ -46,6 +94,10 @@ pub struct Slide {
     pub shapes: Vec<Shape>,
     /// Skipped in a slide show.
     pub hidden: bool,
+    /// Its own, its layout's or its master's; `None` for white.
+    pub background: Option<Fill>,
+    /// The speaker notes, one paragraph per line.
+    pub notes: Option<String>,
 }
 
 impl Slide {
@@ -139,10 +191,16 @@ pub struct Shape {
     pub flip_v: bool,
     pub geometry: Geometry,
     pub role: Role,
-    /// Whether its outline is drawn: not for text boxes and placeholders,
-    /// which have none unless the file gives them one.
-    pub outlined: bool,
+    /// What is inside its outline.
+    pub fill: Option<Fill>,
+    /// Its outline, if drawn: text boxes and placeholders have none unless
+    /// the file gives them one.
+    pub line: Option<Outline>,
     pub text: Option<TextBody>,
+    /// For pictures.
+    pub picture: Option<Picture>,
+    /// For tables.
+    pub table: Option<Table>,
     /// Comes from the layout or the master, not from the slide itself.
     pub inherited: bool,
 }
@@ -156,9 +214,52 @@ impl Shape {
             flip_v: false,
             geometry,
             role,
-            outlined: false,
+            fill: None,
+            line: None,
             text: None,
+            picture: None,
+            table: None,
             inherited: false,
+        }
+    }
+}
+
+/// A table: column widths, and rows of cells. Every row has one cell per
+/// column; cells covered by a merged neighbour are marked `merged`.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Table {
+    /// EMU.
+    pub columns: Vec<i64>,
+    pub rows: Vec<TableRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct TableRow {
+    /// EMU; the least height, rows grow to fit their text.
+    pub height: i64,
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCell {
+    pub text: Option<TextBody>,
+    pub fill: Option<Fill>,
+    /// Left, top, right, bottom.
+    pub borders: [Option<Outline>; 4],
+    /// Columns and rows this cell spans, at least 1.
+    pub span: (u32, u32),
+    /// Covered by a cell to its left or above that spans over it.
+    pub merged: bool,
+}
+
+impl Default for TableCell {
+    fn default() -> Self {
+        Self {
+            text: None,
+            fill: None,
+            borders: [None; 4],
+            span: (1, 1),
+            merged: false,
         }
     }
 }
@@ -264,6 +365,12 @@ pub struct Run {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub strike: bool,
+    /// `None` for the default, dark text.
+    pub color: Option<Rgba>,
+    /// Typefaces for Latin and for East Asian text, as the file names them.
+    pub font: Option<String>,
+    pub east_asian_font: Option<String>,
 }
 
 impl Run {
@@ -274,6 +381,10 @@ impl Run {
             bold: false,
             italic: false,
             underline: false,
+            strike: false,
+            color: None,
+            font: None,
+            east_asian_font: None,
         }
     }
 }

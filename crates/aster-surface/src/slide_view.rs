@@ -1,23 +1,26 @@
 //! A presentation on screen: a strip of slide thumbnails on the left and the
 //! current slide, fitted, on the right. Read-only.
 //!
-//! A slide is drawn as a white page whatever the theme, since its colours
-//! are not read yet: the text of its shapes, the outlines of autoshapes and
-//! connectors, and labelled boxes where pictures, tables and charts are.
-//! Laid-out slides are kept per size, so moving through the slides and
-//! scrolling the strip do not lay text out again.
+//! A slide is drawn in its own colours whatever the theme of the window:
+//! its background, the fills and outlines of its shapes, pictures, tables,
+//! and text in its colours and fonts. Charts, diagrams and pictures in
+//! formats we do not decode are labelled boxes. Laid-out slides are kept
+//! per size, so moving through the slides and scrolling the strip do not
+//! lay text out again; pictures are decoded once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use aster_slides::{
-    Align as SlideAlign, Anchor, EMU_PER_POINT, Geometry, Presentation, Role, Shape, Slide,
+    Align as SlideAlign, Anchor, EMU_PER_POINT, Fill, Geometry, Outline, Presentation, Role, Shape,
+    Slide, Table, TextBody,
 };
 use aster_text::{Align, Family, Paragraph, Rules, Shaper, Span, Spec, Style as TextStyle};
 use vello_cpu::kurbo::{Affine, BezPath, Ellipse, Line, Rect, RoundedRect, Shape as _, Stroke};
-use vello_cpu::peniko::{Color, Fill};
+use vello_cpu::peniko::{Color, Fill as FillRule};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
+use crate::picture::{ImageCache, draw_image};
 use crate::preview::draw_text;
 use crate::text_surface::{DEFAULT_LANGUAGE, HAN_FALLBACK_FAMILIES, Rgba8};
 
@@ -95,6 +98,18 @@ struct LaidShape {
     /// the shape's top-left) and the laid-out text.
     texts: Vec<(f64, f64, Paragraph)>,
     label: Option<Paragraph>,
+    /// A table's cells.
+    cells: Vec<LaidCell>,
+}
+
+/// A table cell placed in its table's frame.
+struct LaidCell {
+    /// Physical pixels from the frame's top-left.
+    rect: Rect,
+    fill: Option<Fill>,
+    borders: [Option<Outline>; 4],
+    /// Relative to the cell's top-left.
+    texts: Vec<(f64, f64, Paragraph)>,
 }
 
 pub struct SlideView {
@@ -116,6 +131,7 @@ pub struct SlideView {
     resources: Resources,
     glyphs: Vec<Glyph>,
     drawn: Option<Drawn>,
+    images: ImageCache,
 }
 
 impl SlideView {
@@ -139,6 +155,7 @@ impl SlideView {
             resources: Resources::new(),
             glyphs: Vec::new(),
             drawn: None,
+            images: ImageCache::default(),
         }
     }
 
@@ -339,7 +356,7 @@ impl SlideView {
         let s = self.s();
         let style = self.style.clone();
         self.ctx.reset();
-        self.ctx.set_fill_rule(Fill::NonZero);
+        self.ctx.set_fill_rule(FillRule::NonZero);
         self.ctx.set_transform(Affine::IDENTITY);
         self.ctx.set_paint(color(style.background));
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
@@ -441,13 +458,21 @@ impl SlideView {
         let slide = &presentation.slides[index];
         let mut shapes = Vec::new();
         for (i, shape) in slide.shapes.iter().enumerate() {
+            let (width, height) = (
+                shape.frame.width as f64 * px_per_emu,
+                shape.frame.height as f64 * px_per_emu,
+            );
             let texts = match &shape.text {
-                Some(_) => lay_out_text(&mut self.shaper, shape, px_per_emu),
+                Some(body) => lay_out_text(&mut self.shaper, body, width, height, px_per_emu),
+                None => Vec::new(),
+            };
+            let cells = match &shape.table {
+                Some(table) => lay_out_table(&mut self.shaper, table, px_per_emu),
                 None => Vec::new(),
             };
             let label = match shape.role {
                 Role::Picture => Some(self.style.picture.clone()),
-                Role::Table => Some(self.style.table.clone()),
+                Role::Table if shape.table.is_none() => Some(self.style.table.clone()),
                 Role::Chart => Some(self.style.chart.clone()),
                 Role::Graphic => Some(self.style.graphic.clone()),
                 _ => None,
@@ -464,18 +489,65 @@ impl SlideView {
                     Align::Start,
                 )
             });
-            if texts.is_empty() && label.is_none() && !shape.outlined {
+            let visible = !texts.is_empty()
+                || !cells.is_empty()
+                || label.is_some()
+                || shape.fill.is_some()
+                || shape.line.is_some()
+                || shape.picture.is_some();
+            if !visible {
                 continue;
             }
             shapes.push(LaidShape {
                 index: i,
                 texts,
                 label,
+                cells,
             });
         }
         let laid = Arc::new(LaidSlide { shapes });
         self.laid.insert(key, laid.clone());
         laid
+    }
+
+    /// Paint `fill` over `area` (a path in `frame`, before `transform`).
+    fn fill_area(&mut self, fill: &Fill, area: &BezPath, frame: Rect, transform: Affine) {
+        self.ctx.set_transform(transform);
+        match fill {
+            Fill::Solid(rgba) => {
+                self.ctx.set_paint(color(*rgba));
+                self.ctx.fill_path(area);
+            }
+            Fill::Gradient { stops, angle } => {
+                let stops: Vec<(f32, Color)> =
+                    stops.iter().map(|(at, rgba)| (*at, color(*rgba))).collect();
+                if stops.len() < 2 {
+                    if let Some((_, only)) = stops.first() {
+                        self.ctx.set_paint(*only);
+                        self.ctx.fill_path(area);
+                    }
+                } else {
+                    // Clockwise from left to right, across the whole frame.
+                    let (sin, cos) = angle.to_radians().sin_cos();
+                    let half = (frame.width() * cos.abs() + frame.height() * sin.abs()) / 2.0;
+                    let center = frame.center();
+                    let start = (center.x - cos * half, center.y - sin * half);
+                    let end = (center.x + cos * half, center.y + sin * half);
+                    self.ctx.set_paint(
+                        vello_cpu::peniko::Gradient::new_linear(start, end).with_stops(&stops[..]),
+                    );
+                    self.ctx.fill_path(area);
+                }
+            }
+            Fill::Picture(picture) => {
+                if let Some(image) = self.images.get(&picture.image) {
+                    self.ctx.push_clip_layer(area);
+                    draw_image(&mut self.ctx, &image, frame, Some(picture.crop), transform);
+                    self.ctx.pop_layer();
+                }
+            }
+        }
+        self.ctx.set_transform(Affine::IDENTITY);
     }
 
     fn draw_slide(&mut self, index: usize, page: Rect, main: bool) {
@@ -492,11 +564,11 @@ impl SlideView {
         self.ctx.set_paint(color(PAGE));
         self.ctx.fill_rect(&page);
         self.ctx.push_clip_layer(&page.to_path(0.1));
-        let line_width = if main {
-            (1.25 * s).max(1.0)
-        } else {
-            (px_per_emu * 9_525.0).max(0.5)
-        };
+        if let Some(background) = &slide.background {
+            self.fill_area(background, &page.to_path(0.1), page, Affine::IDENTITY);
+        }
+        // Hairlines stay visible however small the page.
+        let min_line = if main { s.max(1.0) * 0.75 } else { 0.5 };
         for laid_shape in &laid.shapes {
             let shape = &slide.shapes[laid_shape.index];
             let frame = Rect::new(
@@ -506,13 +578,32 @@ impl SlideView {
                 page.y0 + (shape.frame.y + shape.frame.height) as f64 * px_per_emu,
             );
             let transform = shape_transform(shape, frame);
-            // Placeholder boxes for what is not drawn yet.
-            if let Some(label) = &laid_shape.label {
+            let path = outline(&shape.geometry, frame, shape);
+            if let Some(fill) = &shape.fill
+                && shape.geometry != Geometry::Line
+            {
+                self.fill_area(fill, &path, frame, transform);
+            }
+            let mut boxed = laid_shape.label.is_some() && shape.role != Role::Picture;
+            if let Some(picture) = &shape.picture {
+                match self.images.get(&picture.image) {
+                    Some(image) => {
+                        draw_image(&mut self.ctx, &image, frame, Some(picture.crop), transform)
+                    }
+                    // A format we do not decode (EMF, TIFF ...): its box.
+                    None => boxed = true,
+                }
+            } else if shape.role == Role::Picture {
+                boxed = true;
+            }
+            // Boxes for what is not drawn: charts, diagrams, pictures that
+            // cannot be shown.
+            if boxed && let Some(label) = &laid_shape.label {
                 self.ctx.set_transform(transform);
                 self.ctx.set_paint(color(PAGE_BOX));
                 self.ctx.fill_rect(&frame);
                 self.ctx.set_paint(color(PAGE_LINE));
-                self.ctx.set_stroke(Stroke::new(line_width));
+                self.ctx.set_stroke(Stroke::new(min_line));
                 self.ctx.stroke_rect(&frame);
                 // A small picture, such as an icon in front of a line of
                 // text, is only a box: its name would spill over the text.
@@ -534,12 +625,15 @@ impl SlideView {
                     );
                 }
             }
-            if shape.outlined {
+            if !laid_shape.cells.is_empty() {
+                self.draw_table(&laid_shape.cells, frame, transform, px_per_emu, min_line);
+            }
+            if let Some(line) = shape.line {
                 self.ctx.set_transform(transform);
-                self.ctx.set_paint(color(PAGE_LINE));
-                self.ctx.set_stroke(Stroke::new(line_width));
+                self.ctx.set_paint(color(line.color));
                 self.ctx
-                    .stroke_path(&outline(&shape.geometry, frame, shape));
+                    .set_stroke(Stroke::new((line.width as f64 * px_per_emu).max(min_line)));
+                self.ctx.stroke_path(&path);
             }
             for (x, y, paragraph) in &laid_shape.texts {
                 self.ctx
@@ -557,6 +651,63 @@ impl SlideView {
         }
         self.ctx.set_transform(Affine::IDENTITY);
         self.ctx.pop_layer();
+    }
+
+    /// A table's cells: fills, then texts, then borders over both.
+    fn draw_table(
+        &mut self,
+        cells: &[LaidCell],
+        frame: Rect,
+        transform: Affine,
+        px_per_emu: f64,
+        min_line: f64,
+    ) {
+        let at = |cell: &LaidCell| cell.rect + frame.origin().to_vec2();
+        for cell in cells {
+            if let Some(fill) = &cell.fill {
+                let rect = at(cell);
+                self.fill_area(fill, &rect.to_path(0.1), rect, transform);
+            }
+        }
+        for cell in cells {
+            let rect = at(cell);
+            self.ctx.push_clip_layer(&transform_path(transform, rect));
+            for (x, y, paragraph) in &cell.texts {
+                self.ctx
+                    .set_transform(transform * Affine::translate((rect.x0 + x, rect.y0 + y)));
+                draw_text(
+                    &mut self.ctx,
+                    &mut self.resources,
+                    paragraph,
+                    f32::MIN,
+                    f32::MAX,
+                    self.scale,
+                    &mut self.glyphs,
+                );
+            }
+            self.ctx.set_transform(Affine::IDENTITY);
+            self.ctx.pop_layer();
+        }
+        self.ctx.set_transform(transform);
+        for cell in cells {
+            let rect = at(cell);
+            let edges = [
+                ((rect.x0, rect.y0), (rect.x0, rect.y1)),
+                ((rect.x0, rect.y0), (rect.x1, rect.y0)),
+                ((rect.x1, rect.y0), (rect.x1, rect.y1)),
+                ((rect.x0, rect.y1), (rect.x1, rect.y1)),
+            ];
+            for (border, (a, b)) in cell.borders.iter().zip(edges) {
+                if let Some(border) = border {
+                    self.ctx.set_paint(color(border.color));
+                    self.ctx.set_stroke(Stroke::new(
+                        (border.width as f64 * px_per_emu).max(min_line),
+                    ));
+                    self.ctx.stroke_path(&Line::new(a, b).to_path(0.1));
+                }
+            }
+        }
+        self.ctx.set_transform(Affine::IDENTITY);
     }
 
     fn paint(&mut self, paragraph: &Paragraph, x: f64, y: f64) {
@@ -618,15 +769,88 @@ fn outline(geometry: &Geometry, frame: Rect, _shape: &Shape) -> BezPath {
     }
 }
 
-/// Lay out a shape's paragraphs inside its frame: positions relative to the
-/// frame's top-left, physical pixels.
-fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64, f64, Paragraph)> {
-    let Some(body) = &shape.text else {
-        return Vec::new();
+/// Lay out a text body inside a frame `width` × `height` physical pixels:
+/// positions relative to the frame's top-left.
+fn lay_out_text(
+    shaper: &mut Shaper,
+    body: &TextBody,
+    width: f64,
+    height: f64,
+    px_per_emu: f64,
+) -> Vec<(f64, f64, Paragraph)> {
+    let (mut out, used) = lay_out_body(shaper, body, width, px_per_emu);
+    anchor(&mut out, body, height, used, px_per_emu);
+    out
+}
+
+/// Move laid-out paragraphs to the body's vertical anchor in a frame of
+/// `height`, `used` being the height of the text.
+fn anchor(
+    out: &mut [(f64, f64, Paragraph)],
+    body: &TextBody,
+    height: f64,
+    used: f64,
+    px_per_emu: f64,
+) {
+    let top = body.insets[1] as f64 * px_per_emu;
+    let bottom = body.insets[3] as f64 * px_per_emu;
+    let room = height - top - bottom;
+    let shift = match body.anchor {
+        Anchor::Top => 0.0,
+        Anchor::Middle => (room - used) / 2.0,
+        Anchor::Bottom => room - used,
     };
-    let [left, top, right, bottom] = body.insets.map(|inset| inset as f64 * px_per_emu);
-    let width = shape.frame.width as f64 * px_per_emu - left - right;
-    let height = shape.frame.height as f64 * px_per_emu - top - bottom;
+    if shift != 0.0 {
+        for (_, y, _) in out {
+            *y += shift;
+        }
+    }
+}
+
+/// The font a run asks for, then its East Asian font, then the system's.
+fn family(run: &aster_slides::Run) -> Family {
+    let names: Vec<String> = [run.font.as_deref(), run.east_asian_font.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|name| {
+            name.chars()
+                .filter(|c| !matches!(c, '"' | ',' | ';'))
+                .collect::<String>()
+        })
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("\"{}\"", name.trim()))
+        .collect();
+    if names.is_empty() {
+        Family::SystemUi
+    } else {
+        Family::List(format!("{}, system-ui", names.join(", ")).into())
+    }
+}
+
+fn run_style(run: &aster_slides::Run, size: f32) -> TextStyle {
+    TextStyle {
+        family: family(run),
+        size: size.max(0.5),
+        color: run.color.unwrap_or(PAGE_TEXT),
+        bold: run.bold,
+        italic: run.italic,
+        underline: run.underline,
+        strike: run.strike,
+        rise: 0.0,
+    }
+}
+
+/// Lay out a body's paragraphs from the top of its text area; returns them
+/// (relative to the frame's top-left, physical pixels) and the height the
+/// text takes.
+fn lay_out_body(
+    shaper: &mut Shaper,
+    body: &TextBody,
+    frame_width: f64,
+    px_per_emu: f64,
+) -> (Vec<(f64, f64, Paragraph)>, f64) {
+    let [left, top, right, _] = body.insets.map(|inset| inset as f64 * px_per_emu);
+    let width = frame_width - left - right;
     let points_to_px = EMU_PER_POINT * px_per_emu * f64::from(body.font_scale);
     let mut out: Vec<(f64, f64, Paragraph)> = Vec::new();
     let mut y = 0.0;
@@ -646,12 +870,7 @@ fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64
             let end = start + run.text.len();
             spans.push(Span {
                 range: start..end,
-                style: style(
-                    (f64::from(run.size) * points_to_px) as f32,
-                    run.bold,
-                    run.italic,
-                    run.underline,
-                ),
+                style: run_style(run, (f64::from(run.size) * points_to_px) as f32),
             });
             start = end;
         }
@@ -668,9 +887,13 @@ fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64
                 .runs
                 .first()
                 .map_or(size, |run| (f64::from(run.size) * points_to_px) as f32);
+            let mut mark_style = style(first_size, false, false, false);
+            if let Some(first) = paragraph.runs.first() {
+                mark_style.color = first.color.unwrap_or(PAGE_TEXT);
+            }
             let mark = shaper.lay_out(&Spec {
                 text: bullet,
-                base: style(first_size, false, false, false),
+                base: mark_style,
                 spans: &[],
                 language,
                 width: None,
@@ -707,18 +930,85 @@ fn lay_out_text(shaper: &mut Shaper, shape: &Shape, px_per_emu: f64) -> Vec<(f64
         out.push((x, top + y, laid));
         y += h;
     }
-    // Vertical anchoring of the whole block.
-    let shift = match body.anchor {
-        Anchor::Top => 0.0,
-        Anchor::Middle => ((height - y) / 2.0).max(f64::MIN),
-        Anchor::Bottom => height - y,
+    (out, y)
+}
+
+/// Paragraphs laid out from the top of a text area, and the height they
+/// take.
+type LaidBody = (Vec<(f64, f64, Paragraph)>, f64);
+
+/// A table's cells placed in its frame (physical pixels from the frame's
+/// top-left), rows grown to fit their text as PowerPoint does.
+fn lay_out_table(shaper: &mut Shaper, table: &Table, px_per_emu: f64) -> Vec<LaidCell> {
+    let mut xs = vec![0.0];
+    for width in &table.columns {
+        xs.push(xs.last().copied().unwrap_or(0.0) + *width as f64 * px_per_emu);
+    }
+    let cols = table.columns.len();
+    let width_of = |c: usize, span: u32| {
+        let end = (c + span.max(1) as usize).min(cols);
+        xs[end] - xs[c.min(cols)]
     };
-    if shift != 0.0 {
-        for (_, py, _) in &mut out {
-            *py += shift;
+    // Lay out every shown cell's text at its width first, to know how tall
+    // each row must be.
+    let mut texts: Vec<Vec<Option<LaidBody>>> = Vec::new();
+    let mut heights: Vec<f64> = Vec::new();
+    for row in &table.rows {
+        let mut row_texts = Vec::with_capacity(row.cells.len());
+        let mut height = row.height as f64 * px_per_emu;
+        for (c, cell) in row.cells.iter().enumerate().take(cols) {
+            let laid = match (&cell.text, cell.merged) {
+                (Some(body), false) => {
+                    let (out, used) =
+                        lay_out_body(shaper, body, width_of(c, cell.span.0), px_per_emu);
+                    if cell.span.1 <= 1 {
+                        let insets = (body.insets[1] + body.insets[3]) as f64 * px_per_emu;
+                        height = height.max(used + insets);
+                    }
+                    Some((out, used))
+                }
+                _ => None,
+            };
+            row_texts.push(laid);
+        }
+        texts.push(row_texts);
+        heights.push(height);
+    }
+    let mut ys = vec![0.0];
+    for height in &heights {
+        ys.push(ys.last().copied().unwrap_or(0.0) + height);
+    }
+    let rows = table.rows.len();
+    let mut out = Vec::new();
+    for (r, (row, row_texts)) in table.rows.iter().zip(texts).enumerate() {
+        for (c, (cell, laid)) in row.cells.iter().zip(row_texts).enumerate().take(cols) {
+            if cell.merged {
+                continue;
+            }
+            let x1 = xs[(c + cell.span.0.max(1) as usize).min(cols)];
+            let y1 = ys[(r + cell.span.1.max(1) as usize).min(rows)];
+            let rect = Rect::new(xs[c], ys[r], x1, y1);
+            let texts = match (laid, &cell.text) {
+                (Some((mut items, used)), Some(body)) => {
+                    anchor(&mut items, body, rect.height(), used, px_per_emu);
+                    items
+                }
+                _ => Vec::new(),
+            };
+            out.push(LaidCell {
+                rect,
+                fill: cell.fill.clone(),
+                borders: cell.borders,
+                texts,
+            });
         }
     }
     out
+}
+
+/// A rectangle through a transform, as a path for clipping.
+fn transform_path(transform: Affine, rect: Rect) -> BezPath {
+    transform * rect.to_path(0.1)
 }
 
 fn style(size: f32, bold: bool, italic: bool, underline: bool) -> TextStyle {
@@ -791,7 +1081,10 @@ mod tests {
                     Geometry::Ellipse,
                     Role::Shape,
                 );
-                ellipse.outlined = true;
+                ellipse.line = Some(Outline {
+                    color: [0x20, 0x20, 0x20, 0xff],
+                    width: 12_700,
+                });
                 ellipse.rotation = 30.0;
                 let picture = Shape::new(
                     Frame::new(500_000, 4_000_000, 1_000_000, 1_000_000),
@@ -810,6 +1103,7 @@ mod tests {
                         picture,
                     ],
                     hidden: n == 1,
+                    ..Slide::default()
                 }
             })
             .collect();
@@ -876,5 +1170,147 @@ mod tests {
         view.render();
         view.resize(1, 1, 3.0);
         view.render();
+    }
+
+    fn pixel(view: &mut SlideView, x: f64, y: f64) -> [u8; 4] {
+        let width = usize::from(view.size().0);
+        let pixmap = view.render();
+        let data = pixmap.data_as_u8_slice();
+        let at = (y as usize * width + x as usize) * 4;
+        [data[at], data[at + 1], data[at + 2], data[at + 3]]
+    }
+
+    fn png(rgba: [u8; 4], width: u16, height: u16) -> Arc<[u8]> {
+        let mut pixmap = Pixmap::new(width, height);
+        for pixel in pixmap.data_mut() {
+            *pixel = vello_cpu::peniko::color::PremulRgba8 {
+                r: rgba[0],
+                g: rgba[1],
+                b: rgba[2],
+                a: rgba[3],
+            };
+        }
+        Arc::from(pixmap.into_png().unwrap())
+    }
+
+    /// Where a point of the slide (EMU) is on screen.
+    fn on_page(view: &SlideView, x: i64, y: i64) -> (f64, f64) {
+        let page = view.page_rect();
+        let per = page.width() / view.presentation.size.0 as f64;
+        (page.x0 + x as f64 * per, page.y0 + y as f64 * per)
+    }
+
+    #[test]
+    fn backgrounds_fills_pictures_and_tables_are_drawn() {
+        use aster_slides::{Picture, TableCell, TableRow};
+
+        let mut card = Shape::new(
+            Frame::new(1_000_000, 1_000_000, 2_000_000, 1_000_000),
+            Geometry::Rect,
+            Role::Shape,
+        );
+        card.fill = Some(Fill::Solid([0x10, 0x80, 0x40, 0xff]));
+        let mut photo = Shape::new(
+            Frame::new(4_000_000, 1_000_000, 2_000_000, 1_000_000),
+            Geometry::Rect,
+            Role::Picture,
+        );
+        // A one-colour picture with its left quarter cropped off still
+        // fills the frame.
+        photo.picture = Some(Picture {
+            image: png([0, 0, 0xff, 0xff], 8, 4),
+            crop: [0.25, 0.0, 0.0, 0.0],
+        });
+        let mut broken = Shape::new(
+            Frame::new(7_000_000, 1_000_000, 2_000_000, 1_000_000),
+            Geometry::Rect,
+            Role::Picture,
+        );
+        broken.picture = Some(Picture {
+            image: Arc::from(&b"not a picture"[..]),
+            crop: [0.0; 4],
+        });
+        let mut table = Shape::new(
+            Frame::new(1_000_000, 3_000_000, 4_000_000, 1_000_000),
+            Geometry::Rect,
+            Role::Table,
+        );
+        let cell = |fill: [u8; 4], text: &str| TableCell {
+            fill: Some(Fill::Solid(fill)),
+            text: Some(TextBody {
+                paragraphs: vec![SlideParagraph {
+                    runs: vec![Run {
+                        color: Some([0xff, 0xff, 0xff, 0xff]),
+                        ..Run::new(text, 14.0)
+                    }],
+                    ..SlideParagraph::default()
+                }],
+                ..TextBody::default()
+            }),
+            borders: [Some(Outline {
+                color: [0, 0, 0, 0xff],
+                width: 12_700,
+            }); 4],
+            ..TableCell::default()
+        };
+        table.table = Some(Table {
+            columns: vec![2_000_000, 2_000_000],
+            rows: vec![TableRow {
+                height: 500_000,
+                cells: vec![
+                    cell([0xC0, 0x20, 0x20, 0xff], "表"),
+                    cell([0x20, 0x20, 0xC0, 0xff], "表"),
+                ],
+            }],
+        });
+        let slide = Slide {
+            shapes: vec![card, photo, broken, table],
+            background: Some(Fill::Solid([0x30, 0x30, 0x30, 0xff])),
+            notes: Some("メモ".into()),
+            ..Slide::default()
+        };
+        let mut view = SlideView::new(Arc::new(Presentation {
+            size: aster_slides::DEFAULT_SIZE,
+            slides: vec![slide],
+        }));
+        view.resize(1600, 1000, 1.0);
+        let (x, y) = on_page(&view, 100_000, 6_000_000);
+        assert_eq!(pixel(&mut view, x, y), [0x30, 0x30, 0x30, 0xff]);
+        let (x, y) = on_page(&view, 2_000_000, 1_500_000);
+        assert_eq!(pixel(&mut view, x, y), [0x10, 0x80, 0x40, 0xff]);
+        let (x, y) = on_page(&view, 4_200_000, 1_500_000);
+        assert_eq!(pixel(&mut view, x, y), [0, 0, 0xff, 0xff]);
+        // A picture that cannot be decoded is a light box.
+        let (x, y) = on_page(&view, 7_100_000, 1_100_000);
+        assert_eq!(pixel(&mut view, x, y), PAGE_BOX);
+        // Each table cell in its own fill, away from its text.
+        let (x, y) = on_page(&view, 1_050_000, 3_450_000);
+        assert_eq!(pixel(&mut view, x, y), [0xC0, 0x20, 0x20, 0xff]);
+        let (x, y) = on_page(&view, 3_050_000, 3_450_000);
+        assert_eq!(pixel(&mut view, x, y), [0x20, 0x20, 0xC0, 0xff]);
+        // The thumbnail is drawn the same way, smaller.
+        assert!(view.shows_strip());
+    }
+
+    #[test]
+    fn a_gradient_background_runs_from_its_first_colour_to_its_last() {
+        let slide = Slide {
+            background: Some(Fill::Gradient {
+                stops: vec![(0.0, [0xff, 0, 0, 0xff]), (1.0, [0, 0, 0xff, 0xff])],
+                angle: 0.0,
+            }),
+            ..Slide::default()
+        };
+        let mut view = SlideView::new(Arc::new(Presentation {
+            size: aster_slides::DEFAULT_SIZE,
+            slides: vec![slide],
+        }));
+        view.resize(1600, 1000, 1.0);
+        let (x, y) = on_page(&view, 50_000, 3_000_000);
+        let left = pixel(&mut view, x, y);
+        let (x, y) = on_page(&view, 12_100_000, 3_000_000);
+        let right = pixel(&mut view, x, y);
+        assert!(left[0] > 0xF0 && left[2] < 0x10, "{left:?}");
+        assert!(right[2] > 0xF0 && right[0] < 0x10, "{right:?}");
     }
 }

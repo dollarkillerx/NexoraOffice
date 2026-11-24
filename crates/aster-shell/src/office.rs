@@ -301,6 +301,9 @@ pub struct History {
     version: u64,
 }
 
+/// Frozen rows and columns of a sheet.
+type Frozen = (u32, u32);
+
 /// One entry, paste or clear: its cell changes, and the cell formats it
 /// added (a date format for a typed date), which go with it on undo.
 #[derive(Debug, Clone, Default)]
@@ -310,6 +313,8 @@ pub struct Step {
     merges: Vec<(usize, Vec<CellRange>, Vec<CellRange>)>,
     /// A column or row resized: sheet, which, size before and after.
     sizes: Vec<(usize, Resize, f64, f64)>,
+    /// Frozen rows and columns changed: sheet, before, after.
+    frozen: Vec<(usize, Frozen, Frozen)>,
     /// How many styles the workbook had before the step.
     styles_before: usize,
     /// The styles undo took away, put back by redo.
@@ -426,6 +431,7 @@ impl History {
             && step.lines.is_none()
             && step.sheets.is_none()
             && step.line_formats.is_empty()
+            && step.frozen.is_empty()
         {
             return;
         }
@@ -512,6 +518,8 @@ pub struct SheetTab {
     /// Whole rows and columns whose own format changed since then: sheet,
     /// columns (or rows), index.
     pub line_formats_changed: BTreeSet<(usize, bool, u32)>,
+    /// Sheets whose frozen rows and columns changed since then.
+    pub frozen_changed: BTreeSet<usize>,
     /// Rows and columns inserted and deleted since then, in order, by the
     /// file's sheet numbers.
     pub structure: Vec<(usize, Lines)>,
@@ -582,6 +590,7 @@ impl SheetTab {
             columns_changed: BTreeSet::new(),
             rows_changed: BTreeSet::new(),
             line_formats_changed: BTreeSet::new(),
+            frozen_changed: BTreeSet::new(),
             structure: Vec::new(),
             origins: (0..sheet_count).map(Some).collect(),
             file: 0,
@@ -1041,6 +1050,7 @@ impl SheetTab {
             lines: None,
             sheets: None,
             line_formats: Vec::new(),
+            frozen: Vec::new(),
         });
         changes
     }
@@ -1092,6 +1102,7 @@ impl SheetTab {
             columns: self.columns_changed.clone(),
             rows: self.rows_changed.clone(),
             line_styles: self.line_formats_changed.clone(),
+            frozen: self.frozen_changed.clone(),
             structure: self.structure.clone(),
             origins: self.origins.clone(),
         }
@@ -1184,6 +1195,7 @@ impl SheetTab {
             self.columns_changed.clear();
             self.rows_changed.clear();
             self.line_formats_changed.clear();
+            self.frozen_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -1219,6 +1231,9 @@ impl SheetTab {
             self.undo_sheets(step);
         }
         self.set_line_formats(&step, true);
+        for &(sheet, before, _) in &step.frozen {
+            self.set_frozen(sheet, before);
+        }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
         step.added = self.drop_styles(step.styles_before);
@@ -1262,6 +1277,9 @@ impl SheetTab {
             self.redo_sheets(step);
         }
         self.set_line_formats(&step, false);
+        for &(sheet, _, after) in &step.frozen {
+            self.set_frozen(sheet, after);
+        }
         self.note(&step.changes);
         self.show(&step.changes);
         let applied = step.changes.clone();
@@ -2036,6 +2054,7 @@ impl SheetTab {
             lines: None,
             sheets: None,
             line_formats: Vec::new(),
+            frozen: Vec::new(),
         });
         true
     }
@@ -2077,6 +2096,42 @@ impl SheetTab {
             ..Step::default()
         });
         changes
+    }
+
+    /// Freeze the rows above and the columns left of a point of the sheet
+    /// in front: `(1, 0)` the top row, `(0, 1)` the first column, `(0, 0)`
+    /// nothing. One undo step.
+    pub fn freeze(&mut self, rows: u32, cols: u32) -> bool {
+        let sheet = self.view.sheet_index();
+        let Some(current) = self.view.sheet() else {
+            return false;
+        };
+        let before = current.frozen;
+        let after = (rows, cols);
+        if before == after {
+            return false;
+        }
+        self.set_frozen(sheet, after);
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            frozen: vec![(sheet, before, after)],
+            ..Step::default()
+        });
+        true
+    }
+
+    /// Freeze at the active cell, as Excel's "Freeze Panes": the rows above
+    /// it and the columns left of it.
+    pub fn freeze_at_selection(&mut self) -> bool {
+        let at = self.view.selected();
+        self.freeze(at.row, at.col)
+    }
+
+    fn set_frozen(&mut self, sheet: usize, frozen: (u32, u32)) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            target.frozen = frozen;
+        }
+        self.frozen_changed.insert(sheet);
     }
 
     fn set_line_formats(&mut self, step: &Step, undo: bool) {
@@ -2185,6 +2240,7 @@ impl SheetTab {
             lines: None,
             sheets: None,
             line_formats: Vec::new(),
+            frozen: Vec::new(),
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -2918,6 +2974,58 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn frozen_panes_are_set_undone_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("固定.xlsx");
+        std::fs::write(&file, blank_workbook("ja")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let save = |tab: &mut SheetTab| {
+            let job = tab.begin_save().unwrap();
+            let written = job.write(&file).unwrap();
+            tab.finish_save(&job, &file, Some(written));
+            let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+            String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap()
+        };
+        let reopened = || {
+            let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+                panic!("the saved file loads");
+            };
+            again.sheets[0].frozen
+        };
+        assert!(tab.freeze(1, 0));
+        assert!(!tab.freeze(1, 0), "frozen already");
+        let xml = save(&mut tab);
+        assert!(
+            xml.contains(r#"<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A2" sqref="A2"/>"#),
+            "{xml}"
+        );
+        assert_eq!(reopened(), (1, 0));
+        // At the active cell: the rows above it, the columns left of it.
+        tab.view.select(at("C3"));
+        assert!(tab.freeze_at_selection());
+        let xml = save(&mut tab);
+        assert!(
+            xml.contains(r#"xSplit="2" ySplit="2" topLeftCell="C3" activePane="bottomRight""#),
+            "{xml}"
+        );
+        assert_eq!(xml.matches("<pane").count(), 1, "{xml}");
+        assert_eq!(reopened(), (2, 2));
+        // Unfrozen: no pane is left.
+        assert!(tab.freeze(0, 0));
+        let xml = save(&mut tab);
+        assert!(!xml.contains("<pane"), "{xml}");
+        assert_eq!(reopened(), (0, 0));
+        // Undo freezes it again.
+        tab.undo();
+        assert_eq!(tab.view.sheet().unwrap().frozen, (2, 2));
+        assert!(tab.is_modified());
     }
 
     #[test]

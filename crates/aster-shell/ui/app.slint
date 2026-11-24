@@ -295,6 +295,9 @@ export component AppWindow inherits Window {
     callback edit-select-all();
     // Insert (or delete) the columns (or rows) the selection spans.
     callback sheet-lines(/* columns */ bool, /* insert */ bool);
+    // Freeze panes: 0 the top row, 1 the first column, 2 at the active
+    // cell, 3 none.
+    callback sheet-freeze(int);
     // Hide (or show) the columns (or rows) the selection spans.
     callback sheet-hide(/* columns */ bool, /* hide */ bool);
     callback dialog-save();
@@ -729,6 +732,45 @@ export component AppWindow inherits Window {
                 enabled: root.editing;
                 activated => {
                     root.menu-go-to-line();
+                }
+            }
+        }
+
+        // How a workbook is seen: frozen rows and columns.
+        Menu {
+            title: Strings.menu-view;
+
+            MenuItem {
+                title: Strings.menu-freeze-panes;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-freeze(2);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-freeze-top-row;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-freeze(0);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-freeze-first-column;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-freeze(1);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-unfreeze;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-freeze(3);
                 }
             }
         }

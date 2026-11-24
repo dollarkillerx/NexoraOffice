@@ -64,6 +64,9 @@ pub struct Changes {
     /// Whole rows and columns whose own format changed: sheet, columns (or
     /// rows), index.
     pub line_styles: BTreeSet<(usize, bool, u32)>,
+    /// Sheets whose frozen rows and columns changed: their first
+    /// `<sheetView>` gets its `<pane>` and selection again.
+    pub frozen: BTreeSet<usize>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -199,7 +202,11 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                 &sizes,
                 &mut strings,
             )?;
-            let mut bytes = bytes;
+            let mut bytes = if sheet.frozen == (0, 0) {
+                bytes
+            } else {
+                sheets::frozen_xml(&bytes, sheet.frozen)
+            };
             bytes.splice(0..0, XML_DECLARATION.bytes());
             added.push((part.clone(), bytes));
             new_sheets.push((index, part));
@@ -247,7 +254,9 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             .filter_map(|(sheet, lines)| Some((plan.file_names.get(*sheet)?.as_str(), *lines)))
             .collect();
         let rules = !elsewhere.is_empty() || plan.changed();
-        let cells_changed = !(cells.is_empty() && merges.is_none() && sizes.is_empty());
+        let frozen = changes.frozen.contains(&index).then_some(sheet.frozen);
+        let cells_changed =
+            !(cells.is_empty() && merges.is_none() && sizes.is_empty() && frozen.is_none());
         if !cells_changed && !rules {
             continue;
         }
@@ -277,7 +286,11 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                 }
             }
         }
-        let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, merges, &sizes, &mut strings)?;
+        let mut rewritten =
+            rewrite_sheet(&bytes, &part, sheet, &cells, merges, &sizes, &mut strings)?;
+        if let Some(frozen) = frozen {
+            rewritten = sheets::frozen_xml(&rewritten, frozen);
+        }
         replaced.insert(key(&part), rewritten);
     }
 

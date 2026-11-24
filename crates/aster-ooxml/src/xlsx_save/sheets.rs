@@ -339,6 +339,104 @@ fn titles(text: &str, (old, new): &(Vec<String>, Vec<String>)) -> Option<String>
     Some(out)
 }
 
+/// A worksheet with its frozen rows and columns: the first `<sheetView>`
+/// loses its `<pane>` and selections and gets a frozen pane (if any) with
+/// one selection in the pane that scrolls. A sheet without `<sheetViews>`
+/// gets one where the schema puts it.
+pub(super) fn frozen_xml(bytes: &[u8], (rows, cols): (u32, u32)) -> Vec<u8> {
+    let (bom, xml) = split_bom(bytes);
+    let text = String::from_utf8_lossy(xml).into_owned();
+    let children = top_level(xml);
+    let root_prefix = children
+        .iter()
+        .find(|(name, ..)| name == "sheetData")
+        .map(|(_, start, _)| {
+            let (_, name) = start_tag(&text[*start..]);
+            name.rsplit_once(':')
+                .map_or(String::new(), |(p, _)| format!("{p}:"))
+        })
+        .unwrap_or_default();
+    let p = root_prefix.as_str();
+    let pane = if rows == 0 && cols == 0 {
+        String::new()
+    } else {
+        let active = match (rows > 0, cols > 0) {
+            (true, true) => "bottomRight",
+            (true, false) => "bottomLeft",
+            _ => "topRight",
+        };
+        let top_left = aster_sheets::CellRef::new(rows, cols).to_string();
+        let mut pane = format!("<{p}pane");
+        if cols > 0 {
+            pane.push_str(&format!(" xSplit=\"{cols}\""));
+        }
+        if rows > 0 {
+            pane.push_str(&format!(" ySplit=\"{rows}\""));
+        }
+        pane.push_str(&format!(
+            " topLeftCell=\"{top_left}\" activePane=\"{active}\" state=\"frozen\"/><{p}selection pane=\"{active}\" activeCell=\"{top_left}\" sqref=\"{top_left}\"/>"
+        ));
+        pane
+    };
+    let found = children.iter().find(|(name, ..)| name == "sheetViews");
+    let (start, end, new) = match found {
+        Some(&(_, start, end)) => {
+            let element = &text[start..end];
+            let views = children_of_views(element, &pane);
+            (start, end, views)
+        }
+        None => {
+            let at = children
+                .iter()
+                .find(|(name, ..)| !matches!(name.as_str(), "sheetPr" | "dimension"))
+                .map_or(xml.len(), |(_, start, _)| *start);
+            (
+                at,
+                at,
+                format!(
+                    "<{p}sheetViews><{p}sheetView workbookViewId=\"0\">{pane}</{p}sheetView></{p}sheetViews>"
+                ),
+            )
+        }
+    };
+    [bom, &xml[..start], new.as_bytes(), &xml[end..]].concat()
+}
+
+/// `<sheetViews>` with its first `<sheetView>`'s pane and selections
+/// replaced by `pane`.
+fn children_of_views(element: &str, pane: &str) -> String {
+    let (tag, name) = start_tag(element);
+    let mut out = String::from(tag);
+    let mut first = true;
+    for (child, raw) in children(element) {
+        if child != "sheetView" || !first {
+            out.push_str(&raw);
+            continue;
+        }
+        first = false;
+        let (open, view_name) = start_tag(&raw);
+        if open.ends_with("/>") {
+            out.push_str(open.trim_end_matches("/>").trim_end());
+            out.push('>');
+            out.push_str(pane);
+            out.push_str(&format!("</{view_name}>"));
+            continue;
+        }
+        out.push_str(open);
+        // The pane and selections go first in a sheetView; what else it
+        // holds (pivot selections) stays after them.
+        out.push_str(pane);
+        for (inner, inner_raw) in children(&raw) {
+            if inner != "pane" && inner != "selection" {
+                out.push_str(&inner_raw);
+            }
+        }
+        out.push_str(&format!("</{view_name}>"));
+    }
+    out.push_str(&format!("</{name}>"));
+    out
+}
+
 /// Text inserted before the closing tag of the root element.
 pub(super) fn append_to_root(bytes: &[u8], items: &str) -> Vec<u8> {
     let (bom, xml) = split_bom(bytes);

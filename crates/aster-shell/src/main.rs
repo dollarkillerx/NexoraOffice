@@ -1157,6 +1157,11 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_hide_columns(strings.menu_hide_columns.into());
     s.set_menu_unhide_rows(strings.menu_unhide_rows.into());
     s.set_menu_unhide_columns(strings.menu_unhide_columns.into());
+    s.set_menu_view(strings.menu_view.into());
+    s.set_menu_freeze_top_row(strings.menu_freeze_top_row.into());
+    s.set_menu_freeze_first_column(strings.menu_freeze_first_column.into());
+    s.set_menu_freeze_panes(strings.menu_freeze_panes.into());
+    s.set_menu_unfreeze(strings.menu_unfreeze.into());
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
@@ -5839,6 +5844,21 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             shell.sync_sheet_records();
         }),
     );
+    ui.on_sheet_freeze(handler!(|ui, shell, how| {
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        match how {
+            0 => tab.freeze(1, 0),
+            1 => tab.freeze(0, 1),
+            2 => tab.freeze_at_selection(),
+            _ => tab.freeze(0, 0),
+        };
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, Vec::new());
+    }));
     ui.on_sheet_hide(handler!(|ui, shell, columns, hide| {
         let language = shell.language.tag();
         let Some(tab) = shell.active_sheet() else {

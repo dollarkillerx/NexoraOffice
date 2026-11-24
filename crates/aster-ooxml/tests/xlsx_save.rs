@@ -523,3 +523,40 @@ fn formatting_and_merging_write_styles_and_merged_areas() {
     );
     assert_eq!(again.sheets[0].merges, [range("F9:G10")]);
 }
+
+#[test]
+fn resized_columns_and_rows_are_written_where_they_belong() {
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    // 等线 counts 8 pixels a digit: 100 pixels is 12.5.
+    book.sheets[0].columns.set(2, 3, 100.0);
+    book.sheets[0].row_sizes.set(2, 3, 30.0);
+    book.sheets[0].row_sizes.set(30, 31, 40.0);
+    book.sheets[0].columns.set(9, 10, 80.0);
+    let mut changes = Changes::default();
+    changes.columns.extend([(0, 2), (0, 9)]);
+    changes.rows.extend([(0, 2), (0, 30)]);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from(["xl/worksheets/sheet1.xml".to_owned()])
+    );
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    // The <col> for B:D is split around C, each part keeping its style.
+    assert!(sheet.contains(r#"<cols><col min="1" max="1" width="14.625" customWidth="1"/><col min="2" max="2" width="12.625" style="2" customWidth="1"/><col min="3" max="3" style="2" width="12.5" customWidth="1"/><col min="4" max="4" width="12.625" style="2" customWidth="1"/><col min="5" max="5" width="16.625" style="3" customWidth="1"/><col min="10" max="10" width="10" customWidth="1"/></cols>"#), "{sheet}");
+    assert!(
+        sheet.contains(
+            r#"<row r="3" spans="1:5" x14ac:dyDescent="0.2" ht="22.5" customHeight="1">"#
+        ),
+        "{sheet}"
+    );
+    assert!(sheet.contains(r#"<row r="31" ht="30" customHeight="1"/>"#));
+    let again = Xlsx.read(saved).unwrap();
+    let s = &again.sheets[0];
+    assert_eq!(s.columns.size(2), 100.0);
+    assert_eq!(s.columns.size(1), book.sheets[0].columns.size(1));
+    assert_eq!(s.columns.size(9), 80.0);
+    assert_eq!(s.row_sizes.size(2), 30.0);
+    assert_eq!(s.row_sizes.size(30), 40.0);
+    assert_eq!(s.cell(at("C3")), book.sheets[0].cell(at("C3")));
+}

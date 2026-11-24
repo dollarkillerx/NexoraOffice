@@ -19,7 +19,7 @@ use aster_sheets::{
     CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder, Edit, Workbook,
 };
 use aster_slides::Presentation;
-use aster_surface::sheet_view::{Direction, SheetKey, SheetStyle, SheetView};
+use aster_surface::sheet_view::{Direction, MIN_SIZE, Resize, SheetKey, SheetStyle, SheetView};
 use aster_surface::slide_view::{SlideStyle, SlideView};
 
 use crate::i18n::Strings;
@@ -269,6 +269,8 @@ pub struct Step {
     pub changes: Vec<Change>,
     /// Merged areas changed: sheet, before, after.
     merges: Vec<(usize, Vec<CellRange>, Vec<CellRange>)>,
+    /// A column or row resized: sheet, which, size before and after.
+    sizes: Vec<(usize, Resize, f64, f64)>,
     /// How many styles the workbook had before the step.
     styles_before: usize,
     /// The styles undo took away, put back by redo.
@@ -277,7 +279,7 @@ pub struct Step {
 
 impl History {
     fn push(&mut self, step: Step) {
-        if step.changes.is_empty() && step.merges.is_empty() {
+        if step.changes.is_empty() && step.merges.is_empty() && step.sizes.is_empty() {
             return;
         }
         if self.saved.is_some_and(|saved| saved > self.undo.len()) {
@@ -351,6 +353,12 @@ pub struct SheetTab {
     pub formulas_changed: bool,
     /// Sheets whose merged areas changed since then.
     pub merges_changed: BTreeSet<usize>,
+    /// Columns and rows resized since then: sheet and index.
+    pub columns_changed: BTreeSet<(usize, u32)>,
+    pub rows_changed: BTreeSet<(usize, u32)>,
+    /// A column or row being dragged, its size before, and how far the
+    /// pointer was from its edge when the drag started.
+    resizing: Option<(Resize, f64, f64)>,
     /// The file as last read or saved: saving starts from it.
     pub source: Arc<Vec<u8>>,
     /// How many cell formats that file has. Styles past these were added by
@@ -385,6 +393,9 @@ impl SheetTab {
             edited: BTreeSet::new(),
             formulas_changed: false,
             merges_changed: BTreeSet::new(),
+            columns_changed: BTreeSet::new(),
+            rows_changed: BTreeSet::new(),
+            resizing: None,
             file_styles: view_styles,
             source,
             saving: false,
@@ -660,6 +671,7 @@ impl SheetTab {
         self.history.push(Step {
             changes: changes.clone(),
             merges: Vec::new(),
+            sizes: Vec::new(),
             styles_before,
             added: Vec::new(),
         });
@@ -700,6 +712,8 @@ impl SheetTab {
                 edited: self.edited.clone(),
                 formulas_changed: self.formulas_changed,
                 merges: self.merges_changed.clone(),
+                columns: self.columns_changed.clone(),
+                rows: self.rows_changed.clone(),
             },
             depth: self.history.depth(),
         })
@@ -742,6 +756,8 @@ impl SheetTab {
         if unchanged_since {
             self.formulas_changed = false;
             self.merges_changed.clear();
+            self.columns_changed.clear();
+            self.rows_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -756,6 +772,9 @@ impl SheetTab {
         self.view.workbook_mut().apply(&inverse);
         for (sheet, before, _) in &step.merges {
             self.set_merges(*sheet, before.clone());
+        }
+        for &(sheet, resize, before, _) in &step.sizes {
+            self.set_size(sheet, resize, before);
         }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
@@ -783,11 +802,88 @@ impl SheetTab {
         for (sheet, _, after) in &step.merges {
             self.set_merges(*sheet, after.clone());
         }
+        for &(sheet, resize, _, after) in &step.sizes {
+            self.set_size(sheet, resize, after);
+        }
         self.note(&step.changes);
         self.show(&step.changes);
         let applied = step.changes.clone();
         self.history.undo.push(step);
         applied
+    }
+
+    fn set_size(&mut self, sheet: usize, resize: Resize, size: f64) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            match resize {
+                Resize::Column(col) => {
+                    target.columns.set(col, col + 1, size);
+                    self.columns_changed.insert((sheet, col));
+                }
+                Resize::Row(row) => {
+                    target.row_sizes.set(row, row + 1, size);
+                    self.rows_changed.insert((sheet, row));
+                }
+            }
+        }
+    }
+
+    fn size_of(&self, resize: Resize) -> f64 {
+        self.view.sheet().map_or(0.0, |sheet| match resize {
+            Resize::Column(col) => sheet.columns.size(col),
+            Resize::Row(row) => sheet.row_sizes.size(row),
+        })
+    }
+
+    /// Start dragging a column's or row's far edge, if one is under the
+    /// pointer (physical pixels). Returns whether a drag started.
+    pub fn begin_resize(&mut self, x: f64, y: f64) -> bool {
+        let Some(resize) = self.view.resize_hit(x, y) else {
+            return false;
+        };
+        self.view.cancel_edit();
+        let before = self.size_of(resize);
+        let grab = before - self.view.resized_size(resize, x, y);
+        self.resizing = Some((resize, before, grab));
+        true
+    }
+
+    pub fn is_resizing(&self) -> bool {
+        self.resizing.is_some()
+    }
+
+    /// The pointer moved during a drag: the size follows it.
+    pub fn drag_resize(&mut self, x: f64, y: f64) -> bool {
+        let Some((resize, _, grab)) = self.resizing else {
+            return false;
+        };
+        let size = (self.view.resized_size(resize, x, y) + grab).max(MIN_SIZE);
+        if size == self.size_of(resize) {
+            return false;
+        }
+        let sheet = self.view.sheet_index();
+        self.set_size(sheet, resize, size);
+        true
+    }
+
+    /// The drag ended: one undo step, if the size changed.
+    pub fn end_resize(&mut self) -> bool {
+        let Some((resize, before, _)) = self.resizing.take() else {
+            return false;
+        };
+        let after = self.size_of(resize);
+        if after == before {
+            return false;
+        }
+        let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
+        self.history.push(Step {
+            changes: Vec::new(),
+            merges: Vec::new(),
+            sizes: vec![(sheet, resize, before, after)],
+            styles_before,
+            added: Vec::new(),
+        });
+        true
     }
 
     fn set_merges(&mut self, sheet: usize, merges: Vec<CellRange>) {
@@ -897,6 +993,7 @@ impl SheetTab {
         self.history.push(Step {
             changes: changes.clone(),
             merges: vec![(sheet, before, after)],
+            sizes: Vec::new(),
             styles_before,
             added: Vec::new(),
         });
@@ -1695,5 +1792,55 @@ mod tests {
         tab.view.select(at("F9"));
         assert!(tab.auto_sum("en").is_empty());
         assert_eq!(tab.view.editor().unwrap().text(), "=SUM(");
+    }
+
+    #[test]
+    fn dragging_an_edge_resizes_one_step_at_a_time() {
+        let mut tab = tab();
+        tab.view.resize(800, 600, 1.0);
+        let width = |tab: &SheetTab| tab.view.sheet().unwrap().columns.size(0);
+        let height = |tab: &SheetTab| tab.view.sheet().unwrap().row_sizes.size(1);
+        let (w0, h0) = (width(&tab), height(&tab));
+        // Find the right edge of column A on the column letters.
+        let edge = (0..800)
+            .map(f64::from)
+            .find(|x| tab.view.resize_hit(*x, 10.0) == Some(Resize::Column(0)))
+            .unwrap();
+        assert!(
+            tab.view.resize_hit(edge, 300.0).is_none(),
+            "not over the cells"
+        );
+        assert!(tab.begin_resize(edge, 10.0));
+        assert!(tab.drag_resize(edge + 36.0, 10.0));
+        assert!(tab.drag_resize(edge + 40.0, 10.0));
+        assert!(tab.end_resize());
+        assert_eq!(width(&tab), (w0 + 40.0).round());
+        assert!(tab.is_modified());
+        assert!(tab.columns_changed.contains(&(0, 0)));
+        // Dragging far to the left stops at a few pixels.
+        assert!(tab.begin_resize(edge + 40.0, 10.0));
+        tab.drag_resize(0.0, 10.0);
+        tab.end_resize();
+        assert_eq!(width(&tab), 4.0);
+        tab.undo();
+        assert_eq!(width(&tab), (w0 + 40.0).round());
+        tab.undo();
+        assert_eq!(width(&tab), w0);
+        assert!(!tab.is_modified());
+        tab.redo();
+        assert_eq!(width(&tab), (w0 + 40.0).round());
+        // A row: the bottom edge of row 2 on the row numbers.
+        let edge = (0..600)
+            .map(f64::from)
+            .find(|y| tab.view.resize_hit(5.0, *y) == Some(Resize::Row(1)))
+            .unwrap();
+        assert!(tab.begin_resize(5.0, edge));
+        tab.drag_resize(5.0, edge + 10.0);
+        assert!(tab.end_resize());
+        assert_eq!(height(&tab), h0 + 10.0);
+        assert!(tab.rows_changed.contains(&(0, 1)));
+        // A press that does not move changes nothing.
+        assert!(tab.begin_resize(5.0, edge + 10.0));
+        assert!(!tab.end_resize());
     }
 }

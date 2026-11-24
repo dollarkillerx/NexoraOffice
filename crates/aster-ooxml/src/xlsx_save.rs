@@ -46,6 +46,29 @@ pub struct Changes {
     /// Sheets whose merged areas changed: their `<mergeCells>` is written
     /// again.
     pub merges: BTreeSet<usize>,
+    /// Columns and rows resized: sheet and index.
+    pub columns: BTreeSet<(usize, u32)>,
+    pub rows: BTreeSet<(usize, u32)>,
+}
+
+/// The widths and heights to write for sheet `index`, from the model's
+/// sizes in pixels.
+fn sizes_of(sheet: &aster_sheets::Sheet, index: usize, changes: &Changes, digit: f64) -> Sizes {
+    let in_sheet = |set: &BTreeSet<(usize, u32)>| -> Vec<u32> {
+        set.range((index, 0)..=(index, u32::MAX))
+            .map(|&(_, i)| i)
+            .collect()
+    };
+    Sizes {
+        widths: in_sheet(&changes.columns)
+            .into_iter()
+            .map(|col| (col, sheet.columns.size(col) / digit))
+            .collect(),
+        heights: in_sheet(&changes.rows)
+            .into_iter()
+            .map(|row| (row, sheet.row_sizes.size(row) * 0.75))
+            .collect(),
+    }
 }
 
 /// The package `source` (the file as read) with `workbook`'s changed cells
@@ -75,6 +98,13 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
 
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
     let mut removed: HashSet<String> = HashSet::new();
+    // Column widths count in the Normal font's digit width.
+    let normal = workbook
+        .styles
+        .first()
+        .map(|style| (*style.font).clone())
+        .unwrap_or_default();
+    let digit = crate::xlsx::digit_width(&normal);
     for (index, entry) in entries.sheets.iter().enumerate() {
         let Some(sheet) = workbook.sheets.get(index) else {
             continue;
@@ -98,14 +128,15 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             .merges
             .contains(&index)
             .then_some(sheet.merges.as_slice());
-        if cells.is_empty() && merges.is_none() {
+        let sizes = sizes_of(sheet, index, changes, digit);
+        if cells.is_empty() && merges.is_none() && sizes.is_empty() {
             continue;
         }
         let Some(part) = target(&entry.rel).filter(|part| package.has(part)) else {
             continue;
         };
         let bytes = package.read(&part)?;
-        let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, merges, &mut strings)?;
+        let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, merges, &sizes, &mut strings)?;
         replaced.insert(key(&part), rewritten);
     }
 
@@ -619,6 +650,7 @@ fn rewrite_sheet(
     sheet: &aster_sheets::Sheet,
     cells: &BTreeMap<CellRef, Mode>,
     merges: Option<&[aster_sheets::CellRange]>,
+    sizes: &Sizes,
     strings: &mut Strings,
 ) -> Result<Vec<u8>> {
     let (bom, xml) = split_bom(bytes);
@@ -675,6 +707,17 @@ fn rewrite_sheet(
     for (&at, &mode) in &cells {
         by_row.entry(at.row).or_default().push((at, mode));
     }
+    for row in sizes.heights.keys() {
+        by_row.entry(*row).or_default();
+    }
+    // A row's start tag, with its new height if it has one.
+    let row_tag = |tag: String, row: u32| match sizes.heights.get(&row) {
+        Some(points) => {
+            let tag = set_attribute(&tag, "ht", &number(*points));
+            set_attribute(&tag, "customHeight", "1")
+        }
+        None => tag,
+    };
     let mut new_rows: Vec<(u32, String)> = Vec::new();
     for (row_index, targets) in by_row {
         match rows.get(&row_index) {
@@ -705,21 +748,30 @@ fn rewrite_sheet(
                         }
                     }
                 }
-                if !appended.is_empty() {
-                    match row.close {
-                        Some(close) => push(&mut ops, close, close, appended),
-                        None => {
-                            // <row .../> becomes <row ...>cells</row>.
-                            let tag = String::from_utf8_lossy(&xml[row.start..row.open_end]);
-                            let open = tag.trim_end_matches('>').trim_end_matches('/').trim_end();
-                            push(
-                                &mut ops,
-                                row.start,
-                                row.end,
-                                format!("{open}>{appended}</{p}row>"),
-                            );
+                let tag = String::from_utf8_lossy(&xml[row.start..row.open_end]).into_owned();
+                let resized = sizes.heights.contains_key(&row_index);
+                let tag = row_tag(tag, row_index);
+                match (row.close, appended.is_empty()) {
+                    (Some(close), _) => {
+                        if resized {
+                            push(&mut ops, row.start, row.open_end, tag);
+                        }
+                        if !appended.is_empty() {
+                            push(&mut ops, close, close, appended);
                         }
                     }
+                    // <row .../> becomes <row ...>cells</row>.
+                    (None, false) => {
+                        let open = tag.trim_end_matches('>').trim_end_matches('/').trim_end();
+                        push(
+                            &mut ops,
+                            row.start,
+                            row.end,
+                            format!("{open}>{appended}</{p}row>"),
+                        );
+                    }
+                    (None, true) if resized => push(&mut ops, row.start, row.end, tag),
+                    (None, true) => {}
                 }
             }
             None => {
@@ -729,11 +781,12 @@ fn rewrite_sheet(
                         content.push_str(&cell_xml(&p, at, cell, strings));
                     }
                 }
+                let open = row_tag(format!("<{p}row r=\"{}\">", row_index + 1), row_index);
                 if !content.is_empty() {
-                    new_rows.push((
-                        row_index,
-                        format!("<{p}row r=\"{}\">{content}</{p}row>", row_index + 1),
-                    ));
+                    new_rows.push((row_index, format!("{open}{content}</{p}row>")));
+                } else if sizes.heights.contains_key(&row_index) {
+                    let open = open.trim_end_matches('>');
+                    new_rows.push((row_index, format!("{open}/>")));
                 }
             }
         }
@@ -767,6 +820,10 @@ fn rewrite_sheet(
         let (start, end, text) = merge_cells(xml, &p, merges);
         push(&mut ops, start, end, text);
     }
+    if !sizes.widths.is_empty() {
+        let (start, end, text) = columns_xml(xml, &p, &sizes.widths, data.start);
+        push(&mut ops, start, end, text);
+    }
     ops.sort_by_key(|(start, _, order, _)| (*start, *order));
     let mut out = Vec::with_capacity(bytes.len() + 256);
     out.extend_from_slice(bom);
@@ -781,6 +838,138 @@ fn rewrite_sheet(
     }
     out.extend_from_slice(&xml[at..]);
     Ok(out)
+}
+
+/// Column widths (in digits, as the file counts) and row heights (points)
+/// set here, by index.
+#[derive(Clone, Debug, Default)]
+pub struct Sizes {
+    pub widths: Vec<(u32, f64)>,
+    pub heights: BTreeMap<u32, f64>,
+}
+
+impl Sizes {
+    pub fn is_empty(&self) -> bool {
+        self.widths.is_empty() && self.heights.is_empty()
+    }
+}
+
+/// A `<col>` element: the columns it covers (from 1) and its other
+/// attributes as written.
+struct Col {
+    min: u32,
+    max: u32,
+    attributes: Vec<(String, String)>,
+}
+
+/// The sheet's `<cols>` with new widths: the `<col>` that covers a resized
+/// column is split around it, keeping its attributes on every part; a
+/// column no `<col>` covers gets one. A sheet without `<cols>` gets it
+/// right before `<sheetData>`.
+fn columns_xml(
+    xml: &[u8],
+    p: &str,
+    widths: &[(u32, f64)],
+    data_start: usize,
+) -> (usize, usize, String) {
+    let children_list = top_level(xml);
+    let found = children_list.iter().find(|(name, ..)| name == "cols");
+    let mut cols: Vec<Col> = Vec::new();
+    if let Some((_, start, end)) = found {
+        let element = String::from_utf8_lossy(&xml[*start..*end]).into_owned();
+        for (name, raw) in children(&element) {
+            if name != "col" {
+                continue;
+            }
+            let mut reader = Reader::from_reader(raw.as_bytes());
+            if let Ok(Event::Empty(e) | Event::Start(e)) = reader.read_event() {
+                let all = attributes(&e);
+                let min = find(&all, "min").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let max = find(&all, "max")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(min);
+                let attributes = all
+                    .into_iter()
+                    .filter(|(k, _)| k != "min" && k != "max")
+                    .collect();
+                cols.push(Col {
+                    min,
+                    max,
+                    attributes,
+                });
+            }
+        }
+    }
+    for &(index, width) in widths {
+        let column = index + 1;
+        let set = |attributes: &mut Vec<(String, String)>| {
+            attributes.retain(|(k, _)| k != "width" && k != "customWidth" && k != "hidden");
+            attributes.push(("width".into(), number(width)));
+            attributes.push(("customWidth".into(), "1".into()));
+        };
+        match cols.iter().position(|c| c.min <= column && column <= c.max) {
+            Some(i) => {
+                let old = cols.remove(i);
+                let mut parts = Vec::new();
+                if old.min < column {
+                    parts.push(Col {
+                        min: old.min,
+                        max: column - 1,
+                        attributes: old.attributes.clone(),
+                    });
+                }
+                let mut changed = old.attributes.clone();
+                set(&mut changed);
+                parts.push(Col {
+                    min: column,
+                    max: column,
+                    attributes: changed,
+                });
+                if old.max > column {
+                    parts.push(Col {
+                        min: column + 1,
+                        max: old.max,
+                        attributes: old.attributes,
+                    });
+                }
+                for (offset, part) in parts.into_iter().enumerate() {
+                    cols.insert(i + offset, part);
+                }
+            }
+            None => {
+                let mut fresh = Vec::new();
+                set(&mut fresh);
+                let at = cols
+                    .iter()
+                    .position(|c| c.min > column)
+                    .unwrap_or(cols.len());
+                cols.insert(
+                    at,
+                    Col {
+                        min: column,
+                        max: column,
+                        attributes: fresh,
+                    },
+                );
+            }
+        }
+    }
+    let items: String = cols
+        .iter()
+        .map(|c| {
+            let rest: String = c
+                .attributes
+                .iter()
+                .map(|(k, v)| format!(" {k}=\"{v}\""))
+                .collect();
+            format!("<{p}col min=\"{}\" max=\"{}\"{rest}/>", c.min, c.max)
+        })
+        .collect();
+    let text = format!("<{p}cols>{items}</{p}cols>");
+    match found {
+        Some((_, start, end)) => (*start, *end, text),
+        None => (data_start, data_start, text),
+    }
 }
 
 /// The worksheet's own children: local name and span.

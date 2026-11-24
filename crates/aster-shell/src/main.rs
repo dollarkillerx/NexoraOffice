@@ -4341,6 +4341,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
             Some(Content::Markdown(editor)) => editor.pointer_press(x, y, shift, clicks),
             Some(Content::Sheet(tab)) => {
+                if tab.begin_resize(x, y) {
+                    present(&ui, shell);
+                    return;
+                }
+                let Some(tab) = shell.active_sheet() else {
+                    return;
+                };
                 // A click elsewhere keeps what was being typed.
                 let changes = if tab.view.is_editing() {
                     tab.commit(language)
@@ -4373,6 +4380,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_drag(x, y),
             Some(Content::Markdown(editor)) => editor.pointer_drag(x, y),
+            Some(Content::Sheet(tab)) if tab.is_resizing() => {
+                if tab.drag_resize(x, y) {
+                    present(&ui, shell);
+                }
+                return;
+            }
             Some(Content::Sheet(tab)) => {
                 if !tab.view.is_editing() && tab.view.drag(x, y) {
                     refresh_viewer(&ui, shell);
@@ -4384,6 +4397,35 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         follow_selection(&ui, shell);
         present(&ui, shell);
+    }));
+
+    ui.on_pointer_up(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet()
+            && tab.end_resize()
+        {
+            after_sheet_change(&ui, shell, Vec::new());
+            if shell.sync_modified() {
+                refresh_tabs(&ui, shell);
+            }
+            refresh_toolbar(&ui, shell);
+        }
+    }));
+
+    ui.on_pointer_hover(handler!(|ui, shell, x, y| {
+        let scale = f64::from(ui.window().scale_factor());
+        let cursor = shell.active_sheet().map_or(0, |tab| {
+            match tab
+                .view
+                .resize_hit(f64::from(x) * scale, f64::from(y) * scale)
+            {
+                Some(aster_surface::sheet_view::Resize::Column(_)) => 1,
+                Some(aster_surface::sheet_view::Resize::Row(_)) => 2,
+                None => 0,
+            }
+        });
+        if cursor != ui.get_resize_cursor() {
+            ui.set_resize_cursor(cursor);
+        }
     }));
 
     ui.on_pointer_double(handler!(|ui, shell, x, y| {

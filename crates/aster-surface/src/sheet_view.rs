@@ -134,6 +134,16 @@ struct Drawn {
     caret_on: bool,
 }
 
+/// A column or row whose size is being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resize {
+    Column(u32),
+    Row(u32),
+}
+
+/// The smallest size a drag leaves, logical pixels.
+pub const MIN_SIZE: f64 = 4.0;
+
 /// What is under a point of the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -604,6 +614,77 @@ impl SheetView {
                 sheet.row_sizes.offset(sheet.frozen.0),
             )
         })
+    }
+
+    /// Where a column starts and ends on screen, logical pixels from the
+    /// window's left: frozen columns do not scroll.
+    fn column_span(&self, col: u32) -> (f64, f64) {
+        let Some(sheet) = self.sheet() else {
+            return (0.0, 0.0);
+        };
+        let scroll = if col < sheet.frozen.1 {
+            0.0
+        } else {
+            self.place().scroll_x
+        };
+        let left = self.header_width() + sheet.columns.offset(col) - scroll;
+        (left, left + sheet.columns.size(col))
+    }
+
+    /// Where a row starts and ends on screen, logical pixels from the top.
+    fn row_span(&self, row: u32) -> (f64, f64) {
+        let Some(sheet) = self.sheet() else {
+            return (0.0, 0.0);
+        };
+        let scroll = if row < sheet.frozen.0 {
+            0.0
+        } else {
+            self.place().scroll_y
+        };
+        let top = HEADER_HEIGHT + sheet.row_sizes.offset(row) - scroll;
+        (top, top + sheet.row_sizes.size(row))
+    }
+
+    /// The column or row whose far edge is under a point (physical pixels)
+    /// on the column letters or row numbers: what dragging there resizes.
+    pub fn resize_hit(&self, x: f64, y: f64) -> Option<Resize> {
+        const NEAR: f64 = 4.0;
+        let sheet = self.sheet()?;
+        let (x, y) = (x / self.s(), y / self.s());
+        let header = self.header_width();
+        if y < HEADER_HEIGHT && x >= header {
+            let col = self
+                .cell_at(x * self.s(), (HEADER_HEIGHT + 1.0) * self.s())?
+                .col;
+            let (left, right) = self.column_span(col);
+            if right - x <= NEAR {
+                return Some(Resize::Column(col));
+            }
+            if x - left <= NEAR {
+                return sheet.columns.previous_visible(col).map(Resize::Column);
+            }
+        } else if x < header && y >= HEADER_HEIGHT {
+            let row = self.cell_at((header + 1.0) * self.s(), y * self.s())?.row;
+            let (top, bottom) = self.row_span(row);
+            if bottom - y <= NEAR {
+                return Some(Resize::Row(row));
+            }
+            if y - top <= NEAR {
+                return sheet.row_sizes.previous_visible(row).map(Resize::Row);
+            }
+        }
+        None
+    }
+
+    /// The size a column or row gets when its far edge is dragged to a
+    /// point (physical pixels), logical pixels; it may be below
+    /// [`MIN_SIZE`] or negative, the caller clamps.
+    pub fn resized_size(&self, resize: Resize, x: f64, y: f64) -> f64 {
+        let size = match resize {
+            Resize::Column(col) => x / self.s() - self.column_span(col).0,
+            Resize::Row(row) => y / self.s() - self.row_span(row).0,
+        };
+        size.round()
     }
 
     /// The cell under a point (physical pixels), if it is in the cells area.

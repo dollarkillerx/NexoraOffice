@@ -298,6 +298,11 @@ export component AppWindow inherits Window {
     callback pointer-drag(length, length);
     // A double click on the surface; a click in the formula bar.
     callback pointer-double(length, length);
+    // The button went up; the pointer moved over the surface.
+    callback pointer-up();
+    callback pointer-hover(length, length);
+    // Over an edge that resizes: 1 a column, 2 a row.
+    in property <int> resize-cursor;
     callback formula-bar-clicked();
     // Wheel movement across and down, and where the pointer is across.
     callback scrolled(length, length, length);
@@ -1165,11 +1170,24 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.viewer > 0 ? default : text;
+                                    mouse-cursor: root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();
                                             root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
+                                        }
+                                        if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                            root.pointer-up();
+                                        }
+                                    }
+                                    changed mouse-x => {
+                                        if (!self.pressed && root.viewer == 1) {
+                                            root.pointer-hover(self.mouse-x, self.mouse-y);
+                                        }
+                                    }
+                                    changed mouse-y => {
+                                        if (!self.pressed && root.viewer == 1) {
+                                            root.pointer-hover(self.mouse-x, self.mouse-y);
                                         }
                                     }
                                     moved => {

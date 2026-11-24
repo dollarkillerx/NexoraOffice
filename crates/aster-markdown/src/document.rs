@@ -325,6 +325,50 @@ impl Document {
         (!range.is_empty() || !text.is_empty()).then(|| self.replace(Kind::Single, range, text))
     }
 
+    /// Make a further replacement that finishes the last edit, such as
+    /// putting list numbers right after an item was deleted: undo takes the
+    /// two back as one step. The selection becomes `selection`. `None` if it
+    /// changes nothing.
+    pub fn amend(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        selection: Selection,
+    ) -> Option<Change> {
+        let range = self.clamp(range.start)..self.clamp(range.end.max(range.start));
+        if range.is_empty() && text.is_empty() {
+            return None;
+        }
+        let before = self.selection;
+        let removed = slice(&self.text, range.clone());
+        let current = &self.text;
+        let joined = self.history.amend(
+            |span| slice(current, span),
+            range.start,
+            &removed,
+            text,
+            selection,
+        );
+        replace(&mut self.text, range.clone(), text);
+        if !joined {
+            self.history.record(
+                Kind::Single,
+                range.start,
+                removed.clone(),
+                text.to_owned(),
+                before,
+                selection,
+            );
+        }
+        self.selection = selection;
+        Some(Change {
+            range,
+            inserted: text.to_owned(),
+            removed,
+            selection,
+        })
+    }
+
     /// Take a replacement that was worked out on another thread: `new_text`
     /// is the whole text with `range` replaced by `inserted`, and `removed`
     /// is what `range` held. One undo step. Recorded exactly as
@@ -644,6 +688,45 @@ mod tests {
         assert_eq!(change.inserted, "llo");
         assert_eq!(document.text(), "hello");
         assert_eq!(document.selection(), Selection::caret(5));
+    }
+
+    #[test]
+    fn an_amendment_undoes_with_the_edit_before_it() {
+        let mut document = Document::new("1. a\n2. b\n3. c");
+        document.set_selection(Selection {
+            anchor: 5,
+            focus: 10,
+        });
+        document.apply(EditCommand::Backspace);
+        assert_eq!(document.text(), "1. a\n3. c");
+        let change = document
+            .amend(5..6, "2", Selection::caret(5))
+            .expect("a change");
+        assert_eq!(change.removed, "3");
+        assert_eq!(document.text(), "1. a\n2. c");
+        assert!(document.is_modified());
+        assert_eq!(document.history.depth(), 1);
+        document.undo();
+        assert_eq!(document.text(), "1. a\n2. b\n3. c");
+        assert_eq!(
+            document.selection(),
+            Selection {
+                anchor: 5,
+                focus: 10
+            }
+        );
+        document.redo();
+        assert_eq!(document.text(), "1. a\n2. c");
+        assert_eq!(document.selection(), Selection::caret(5));
+        // Typing afterwards is a step of its own.
+        document.apply(EditCommand::Type("x".to_owned()));
+        assert_eq!(document.history.depth(), 2);
+        // Before any edit, an amendment is a step of its own.
+        let mut fresh = Document::new("abc");
+        fresh.amend(0..1, "z", Selection::caret(1));
+        assert_eq!(fresh.text(), "zbc");
+        fresh.undo();
+        assert_eq!(fresh.text(), "abc");
     }
 
     #[test]

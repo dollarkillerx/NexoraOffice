@@ -148,6 +148,42 @@ impl History {
         self.sealed = kind == Kind::Single;
     }
 
+    /// Fold a further replacement into the newest entry, so that undo takes
+    /// both back at once. `between` gives the text as it is now (after the
+    /// newest entry, before this replacement) over a range. The entry takes
+    /// no more merges afterwards. `false` if there is no entry to fold into.
+    pub fn amend(
+        &mut self,
+        between: impl FnOnce(std::ops::Range<usize>) -> String,
+        start: usize,
+        removed: &str,
+        inserted: &str,
+        after: Selection,
+    ) -> bool {
+        let Some(top) = self.undo.last_mut() else {
+            return false;
+        };
+        let top_end = top.start + top.inserted.len();
+        let end = start + removed.len();
+        let low = top.start.min(start);
+        let high = top_end.max(end);
+        let span = between(low..high);
+        top.removed = format!(
+            "{}{}{}",
+            &span[..top.start - low],
+            top.removed,
+            &span[top_end - low..]
+        );
+        top.inserted = format!("{}{inserted}{}", &span[..start - low], &span[end - low..]);
+        top.start = low;
+        top.after = after;
+        self.next_id += 1;
+        top.id = self.next_id;
+        self.redo.clear();
+        self.sealed = true;
+        true
+    }
+
     /// Take the newest entry off for undoing.
     pub fn pop_undo(&mut self) -> Option<Entry> {
         let entry = self.undo.pop()?;

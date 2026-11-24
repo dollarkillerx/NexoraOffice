@@ -646,6 +646,312 @@ fn renumber(text: &Rope, from: usize, indent: usize, first: u64) -> Option<(Stri
     Some((out, until))
 }
 
+/// How far above an edit the lists around it are read, to know what the
+/// items below should be numbered.
+const LIST_CONTEXT_REACH: usize = 64 * 1024;
+
+/// The first bytes of the line starting at `start`, enough for its markers.
+fn head_at(text: &Rope, start: usize) -> String {
+    let end = line_span(text, &(start..start)).end;
+    slice(text, start..ceil(text, (start + PREFIX_REACH).min(end)))
+}
+
+/// Whether the line starting at `start`, `len` bytes of it read, is in a
+/// code block by the highlighting, if there is highlighting to go by.
+fn in_code_block(highlighter: Option<&Highlighter>, start: usize, len: usize) -> bool {
+    highlighter.is_some_and(|highlighter| {
+        highlighter
+            .spans(start..start + len.max(1))
+            .iter()
+            .any(|span| span.marks.contains(Marks::CODE_BLOCK))
+    })
+}
+
+/// A list item for numbering: how far it is indented, and for a numbered
+/// item its number, its delimiter (`.` or `)`) and how many digits it has.
+struct Numbering {
+    indent: usize,
+    number: Option<(u64, u8, usize)>,
+}
+
+impl Numbering {
+    fn of(line: &str) -> Option<Self> {
+        let (parsed, kind) = parse_block(line);
+        let number = match kind? {
+            Block::Quote => return None,
+            Block::Numbered => {
+                let digits = parsed.prefix.len() - 2;
+                let number = parsed.prefix[..digits].parse().ok()?;
+                Some((number, parsed.prefix.as_bytes()[digits], digits))
+            }
+            Block::Bullet | Block::Task => None,
+        };
+        Some(Self {
+            indent: parsed.indent.len(),
+            number,
+        })
+    }
+
+    /// Items with the same delimiter belong to one list; any bullet goes on
+    /// a bulleted list.
+    fn delimiter(&self) -> Option<u8> {
+        self.number.map(|(_, delimiter, _)| delimiter)
+    }
+}
+
+/// A list met while putting numbers right.
+#[derive(Clone, Copy, Debug)]
+struct Level {
+    indent: usize,
+    /// `None` for a bulleted list.
+    delimiter: Option<u8>,
+    /// The number of the last item seen.
+    last: u64,
+    /// Every item has the same number (`1.`, `1.`, `1.`): keep it so.
+    same: bool,
+}
+
+/// The lists that the line `line` could go on, outermost first: for each
+/// level, the nearest item above at that level.
+fn lists_above(text: &Rope, highlighter: Option<&Highlighter>, line: usize) -> Vec<Level> {
+    let origin = text.line_to_byte(line);
+    // Innermost first, each with the number of the item before its last.
+    let mut found: Vec<(Level, Option<u64>, bool)> = Vec::new();
+    // Items indented as far as this or further are cut off from below.
+    let mut threshold = usize::MAX;
+    let mut blank_below = false;
+    let mut line = line;
+    while line > 0 {
+        line -= 1;
+        let start = text.line_to_byte(line);
+        if origin - start > LIST_CONTEXT_REACH {
+            break;
+        }
+        let head = head_at(text, start);
+        if head.trim().is_empty() {
+            // Two blank lines end a list.
+            if blank_below {
+                break;
+            }
+            blank_below = true;
+            continue;
+        }
+        blank_below = false;
+        let own = head.len() - head.trim_start_matches([' ', '\t']).len();
+        if in_code_block(highlighter, start, head.len()) {
+            if own == 0 {
+                break;
+            }
+            continue;
+        }
+        let Some(item) = Numbering::of(&head) else {
+            // Text that is not part of a list ends it.
+            if own == 0 {
+                break;
+            }
+            threshold = threshold.min(own);
+            continue;
+        };
+        if item.indent < threshold {
+            let level = Level {
+                indent: item.indent,
+                delimiter: item.delimiter(),
+                last: item.number.map_or(0, |(number, ..)| number),
+                same: false,
+            };
+            found.push((level, None, true));
+            threshold = item.indent;
+        } else if item.indent == threshold
+            && let Some((level, before, open)) = found.last_mut()
+            && level.indent == threshold
+            && *open
+        {
+            // The item before the nearest one, unless it is another list.
+            if level.delimiter == item.delimiter() {
+                *before = item.number.map(|(number, ..)| number);
+            }
+            *open = false;
+        }
+        if found
+            .last()
+            .is_some_and(|(level, _, open)| level.indent == 0 && !open)
+        {
+            break;
+        }
+    }
+    found
+        .into_iter()
+        .rev()
+        .map(|(mut level, before, _)| {
+            level.same = level.delimiter.is_some() && before == Some(level.last);
+            level
+        })
+        .collect()
+}
+
+/// After an edit that took out, put in or moved list items (deleting an
+/// item, pasting items, Tab and Shift+Tab, making lines a list), put the
+/// numbers of the numbered lists from the edit down right: each item counts
+/// on from the item before it in its list. The first item of a list keeps
+/// its number, except where the edit deleted the list's first item from the
+/// start of its line: the item that is first now takes that number. A list
+/// whose items all have one number keeps it. `changed` is what the edit put
+/// in (offsets after the edit), `removed` what it took out, and `selection`
+/// the selection after it, moved along with the numbers. `None` if every
+/// number is already right, or the edit is too large to look through.
+pub fn renumber_lists(
+    text: &Rope,
+    highlighter: Option<&Highlighter>,
+    changed: Range<usize>,
+    removed: &str,
+    selection: Selection,
+) -> Option<Edit> {
+    if changed.len() > RENUMBER_REACH {
+        return None;
+    }
+    let first_line = text.byte_to_line(changed.start);
+    let mut levels = lists_above(text, highlighter, first_line);
+    // A deletion from the start of a line that took a numbered item with it.
+    let mut takes_over = None;
+    if changed.is_empty() && changed.start == text.line_to_byte(first_line) {
+        let end = removed.len().min(PREFIX_REACH);
+        let end = (0..=end)
+            .rev()
+            .find(|&at| removed.is_char_boundary(at))
+            .unwrap_or(0);
+        let line = removed[..end].split('\n').next().unwrap_or("");
+        takes_over = Numbering::of(line).filter(|item| item.number.is_some());
+    }
+
+    let mut changes: Vec<(Range<usize>, String)> = Vec::new();
+    let mut renumber = |start: usize, item: &Numbering, to: u64| {
+        if let Some((number, _, digits)) = item.number
+            && number != to
+        {
+            let at = start + item.indent;
+            changes.push((at..at + digits, to.to_string()));
+        }
+    };
+    let mut line = first_line;
+    let mut blank_before = false;
+    let mut first = true;
+    while line < text.len_lines() {
+        let start = text.line_to_byte(line);
+        line += 1;
+        if start > changed.end + RENUMBER_REACH {
+            break;
+        }
+        // Below the edit, the first item of the outermost list that needs
+        // nothing ends the work: what follows did not move.
+        let past = start > changed.end;
+        let head = head_at(text, start);
+        if head.trim().is_empty() {
+            if blank_before {
+                break;
+            }
+            blank_before = true;
+            continue;
+        }
+        blank_before = false;
+        let own = head.len() - head.trim_start_matches([' ', '\t']).len();
+        let was_first = std::mem::replace(&mut first, false);
+        if in_code_block(highlighter, start, head.len()) {
+            if own == 0 {
+                break;
+            }
+            continue;
+        }
+        let Some(item) = Numbering::of(&head) else {
+            if own == 0 {
+                break;
+            }
+            // Text inside an item ends the lists nested deeper.
+            levels.retain(|level| level.indent < own);
+            continue;
+        };
+        levels.retain(|level| level.indent <= item.indent);
+        let goes_on = levels.last().is_some_and(|level| {
+            level.indent == item.indent && level.delimiter == item.delimiter()
+        });
+        if goes_on {
+            let level = levels.last_mut().expect("a level");
+            let mut settled = true;
+            if item.number.is_some() {
+                let expected = if level.same {
+                    level.last
+                } else {
+                    level.last + 1
+                };
+                level.last = expected;
+                settled = item.number.is_some_and(|(number, ..)| number == expected);
+                renumber(start, &item, expected);
+            }
+            if past && settled && levels.len() == 1 {
+                break;
+            }
+        } else {
+            if levels
+                .last()
+                .is_some_and(|level| level.indent == item.indent)
+            {
+                levels.pop();
+            }
+            let mut last = item.number.map_or(0, |(number, ..)| number);
+            if was_first
+                && let Some(gone) = takes_over.take()
+                && gone.indent == item.indent
+                && gone.delimiter() == item.delimiter()
+                && let Some((number, ..)) = gone.number
+            {
+                renumber(start, &item, number);
+                last = number;
+            }
+            levels.push(Level {
+                indent: item.indent,
+                delimiter: item.delimiter(),
+                last,
+                same: false,
+            });
+            if past && levels.len() == 1 {
+                break;
+            }
+        }
+    }
+
+    let from = changes.first()?.0.start;
+    let until = changes.last()?.0.end;
+    let mut out = String::new();
+    let mut copied = from;
+    for (range, number) in &changes {
+        out.push_str(&slice(text, copied..range.start));
+        out.push_str(number);
+        copied = range.end;
+    }
+    // Offsets after a number that got longer or shorter move with it; inside
+    // one they stay within it.
+    let shift = |offset: usize| -> usize {
+        let mut moved = offset as isize;
+        for (range, number) in &changes {
+            let grown = number.len() as isize - range.len() as isize;
+            if range.end <= offset {
+                moved += grown;
+            } else if range.start < offset {
+                let within = (offset - range.start).min(number.len());
+                moved += within as isize - (offset - range.start) as isize;
+            }
+        }
+        moved as usize
+    };
+    Some(Edit {
+        range: from..until,
+        text: out,
+        selection: Selection {
+            anchor: shift(selection.anchor),
+            focus: shift(selection.focus),
+        },
+    })
+}
+
 /// How far up Tab looks for the item above, to line the new level up with
 /// it.
 const INDENT_REACH: usize = 64 * 1024;
@@ -1636,5 +1942,172 @@ mod tests {
         assert_eq!(tab("正文|", false), None);
         assert_eq!(tab("> - 引用里的项|", false), None);
         assert_eq!(tab("# 标题|", true), None);
+    }
+
+    /// Replace `range` of `before` with `inserted`, as an edit by hand, then
+    /// put the list numbers right as the editor does. The caret, after the
+    /// inserted text, is marked `|`.
+    fn renumbered(before: &str, range: Range<usize>, inserted: &str, highlight: bool) -> String {
+        let removed = &before[range.clone()];
+        let mut after = String::from(before);
+        after.replace_range(range.clone(), inserted);
+        let changed = range.start..range.start + inserted.len();
+        let rope = Rope::from_str(&after);
+        let highlighter = Highlighter::new(&rope);
+        let edit = renumber_lists(
+            &rope,
+            highlight.then_some(&highlighter),
+            changed.clone(),
+            removed,
+            Selection::caret(changed.end),
+        );
+        let caret = match edit {
+            Some(edit) => {
+                after.replace_range(edit.range, &edit.text);
+                edit.selection.focus
+            }
+            None => changed.end,
+        };
+        after.insert(caret, '|');
+        after
+    }
+
+    fn delete(before: &str, needle: &str) -> String {
+        renumbered(before, at(before, needle), "", true)
+    }
+
+    #[test]
+    fn deleting_an_item_renumbers_the_ones_below() {
+        assert_eq!(
+            delete("1. a\n2. b\n3. c\n4. d", "2. b\n"),
+            "1. a\n|2. c\n3. d"
+        );
+        // Joining two items with Backspace.
+        assert_eq!(delete("1. a\n2. b\n3. c", "\n2. b"), "1. a|\n2. c");
+        // The first item: the one after it takes its number.
+        assert_eq!(delete("1. a\n2. b\n3. c", "1. a\n"), "|1. b\n2. c");
+        assert_eq!(delete("5. a\n6. b", "5. a\n"), "|5. b");
+        // Items under one that went join the list above them.
+        assert_eq!(
+            delete("1. a\n   1. x\n2. b\n   1. y\n3. c", "2. b\n"),
+            "1. a\n   1. x\n|   2. y\n2. c"
+        );
+        // Other lists nested in the items stay as they are.
+        assert_eq!(
+            delete("1. a\n   1. x\n   2. y\n2. b\n3. c", "2. b\n"),
+            "1. a\n   1. x\n   2. y\n|2. c"
+        );
+        // `1)` items are a list of their own.
+        assert_eq!(
+            delete("1. a\n2. b\n1) c\n2) d", "2. b\n"),
+            "1. a\n|1) c\n2) d"
+        );
+    }
+
+    #[test]
+    fn pasting_items_renumbers_them_and_the_ones_below() {
+        let before = "1. a\n2. b";
+        assert_eq!(
+            renumbered(before, 5..5, "1. x\n2. y\n", true),
+            "1. a\n2. x\n3. y\n|4. b"
+        );
+        // The caret moves with numbers that grow.
+        let before = "9. a\n";
+        assert_eq!(
+            renumbered(before, 5..5, "1. x\n1. y", true),
+            "9. a\n10. x\n11. y|"
+        );
+    }
+
+    #[test]
+    fn numbers_the_edit_did_not_move_stay() {
+        // A list numbered 1, 1, 1 keeps that.
+        let before = "1. a\n1. b\n1. c\n1. d";
+        assert_eq!(delete(before, "1. c\n"), "1. a\n1. b\n|1. d");
+        // A blank line put between items moves no number; further down the
+        // numbers stay even if they were not in order.
+        let before = "1. a\n2. b\n9. c";
+        assert_eq!(renumbered(before, 4..4, "\n", true), "1. a\n|\n2. b\n9. c");
+        // Lines in a code block are not items.
+        let before = "```\n1. x\n2. y\n3. z\n```";
+        assert_eq!(delete(before, "2. y\n"), "```\n1. x\n|3. z\n```");
+        // Bulleted lists have nothing to renumber.
+        assert_eq!(delete("- a\n- b\n- c", "- b\n"), "- a\n|- c");
+        // Text that is not in the list ends it.
+        assert_eq!(
+            delete("1. a\n2. b\n\n正文\n3. c", "2. b\n"),
+            "1. a\n|\n正文\n3. c"
+        );
+    }
+
+    /// Tab or Shift+Tab, then the renumbering the editor does after it.
+    fn tab_renumbered(input: &str, outdent: bool) -> String {
+        let (text, range) = marked(input);
+        let rope = Rope::from_str(&text);
+        let selection = Selection {
+            anchor: range.start,
+            focus: range.end,
+        };
+        let edit = indent(&rope, selection, outdent).expect("a list item");
+        let mut after = text.clone();
+        after.replace_range(edit.range.clone(), &edit.text);
+        let removed = &text[edit.range.clone()];
+        let changed = edit.range.start..edit.range.start + edit.text.len();
+        let rope = Rope::from_str(&after);
+        let fixed = renumber_lists(&rope, None, changed, removed, edit.selection);
+        let caret = match fixed {
+            Some(fixed) => {
+                after.replace_range(fixed.range, &fixed.text);
+                fixed.selection.focus
+            }
+            None => edit.selection.focus,
+        };
+        after.insert(caret, '|');
+        after
+    }
+
+    #[test]
+    fn tab_and_shift_tab_keep_both_levels_in_order() {
+        assert_eq!(
+            tab_renumbered("1. a\n2. b|\n3. c\n4. d", false),
+            "1. a\n   1. b|\n2. c\n3. d"
+        );
+        assert_eq!(
+            tab_renumbered("1. a\n   1. b|\n2. c", true),
+            "1. a\n2. b|\n3. c"
+        );
+        // Going in after items already there continues their numbers.
+        assert_eq!(
+            tab_renumbered("1. a\n   1. x\n2. b|\n3. c", false),
+            "1. a\n   1. x\n   2. b|\n2. c"
+        );
+    }
+
+    #[test]
+    fn making_lines_a_list_after_a_list_continues_it() {
+        let text = "1. a\n2. b\nc\nd";
+        let rope = Rope::from_str(text);
+        let selection = Selection {
+            anchor: at(text, "c").start,
+            focus: text.len(),
+        };
+        let edit = toggle_block(&rope, selection, Block::Numbered);
+        let mut after = String::from(text);
+        after.replace_range(edit.range.clone(), &edit.text);
+        assert_eq!(after, "1. a\n2. b\n1. c\n2. d");
+        let changed = edit.range.start..edit.range.start + edit.text.len();
+        let rope = Rope::from_str(&after);
+        let fixed = renumber_lists(&rope, None, changed, &text[edit.range], edit.selection)
+            .expect("new numbers");
+        after.replace_range(fixed.range, &fixed.text);
+        assert_eq!(after, "1. a\n2. b\n3. c\n4. d");
+    }
+
+    #[test]
+    fn ending_a_list_in_the_middle_keeps_the_rest_in_order() {
+        // Enter on an empty item takes its marker away; one blank line does
+        // not end a list, so the item below counts on from the one above.
+        let before = "1. a\n2. \n3. b";
+        assert_eq!(delete(before, "2. "), "1. a\n|\n2. b");
     }
 }

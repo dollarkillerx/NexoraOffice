@@ -1297,7 +1297,34 @@ impl MarkdownEditor {
             return false;
         }
         let change = self.document.apply(command);
-        self.show(change)
+        // Joining or splitting lines can take items out of a list or put
+        // them in.
+        let moved_lines = change
+            .as_ref()
+            .filter(|change| change.inserted.contains('\n') || change.removed.contains('\n'))
+            .cloned();
+        let shown = self.show(change);
+        if let Some(change) = moved_lines {
+            self.renumber(&change);
+        }
+        shown
+    }
+
+    /// Put the numbers of the lists from `change` down right, in the same
+    /// undo step as `change`.
+    fn renumber(&mut self, change: &Change) {
+        let changed = change.range.start..change.range.start + change.inserted.len();
+        let Some(edit) = format::renumber_lists(
+            self.document.text(),
+            self.fresh_highlighter(),
+            changed,
+            &change.removed,
+            self.document.selection(),
+        ) else {
+            return;
+        };
+        let change = self.document.amend(edit.range, &edit.text, edit.selection);
+        self.show(change);
     }
 
     /// Format the selection: emphasis, a heading level, a list or quote, or
@@ -1316,7 +1343,10 @@ impl MarkdownEditor {
                 None => format::toggle_inline(text, selection, kind),
             },
             Format::Heading(level) => format::set_heading(text, selection, level),
-            Format::Block(kind) => format::toggle_block(text, selection, kind),
+            Format::Block(kind) => {
+                let edit = format::toggle_block(text, selection, kind);
+                return self.apply_renumbered(edit);
+            }
             Format::Link => format::insert_link(text, selection, false),
             Format::Image => format::insert_link(text, selection, true),
             Format::Table => format::insert_table(text, selection),
@@ -1334,6 +1364,19 @@ impl MarkdownEditor {
         self.show(Some(change))
     }
 
+    /// Make an edit that moves list items, then put the numbers of the lists
+    /// below right; one undo step.
+    fn apply_renumbered(&mut self, edit: format::Edit) -> bool {
+        let Some(mut change) = self.document.replace_range(edit.range, &edit.text) else {
+            return false;
+        };
+        self.document.set_selection(edit.selection);
+        change.selection = edit.selection;
+        let shown = self.show(Some(change.clone()));
+        self.renumber(&change);
+        shown
+    }
+
     /// Tab and Shift+Tab: list items move a level in or out; elsewhere Tab
     /// types a tab and Shift+Tab does nothing.
     fn indent(&mut self, outdent: bool) -> bool {
@@ -1341,7 +1384,7 @@ impl MarkdownEditor {
             return false;
         }
         match format::indent(self.document.text(), self.document.selection(), outdent) {
-            Some(edit) => self.apply(edit),
+            Some(edit) => self.apply_renumbered(edit),
             None if outdent => false,
             None => self.edit(EditCommand::Type("\t".to_owned())),
         }
@@ -1359,7 +1402,7 @@ impl MarkdownEditor {
             self.document.selection(),
         );
         match edit {
-            Some(edit) => self.apply(edit),
+            Some(edit) => self.apply_renumbered(edit),
             None => self.edit(EditCommand::LineBreak),
         }
     }
@@ -2174,10 +2217,13 @@ mod tests {
         assert_eq!(text_of(&e), "1. 买菜\n2. \n3. 做饭");
         assert_eq!(e.document.selection(), Selection::caret(end + 4));
         assert_in_step(&e);
-        // Enter again on the empty item ends the list there.
+        // Enter again on the empty item ends the list there; one blank line
+        // does not end a list, so the item below counts on from the first.
         assert!(e.key(Action::Newline));
-        assert_eq!(text_of(&e), "1. 买菜\n\n3. 做饭");
+        assert_eq!(text_of(&e), "1. 买菜\n\n2. 做饭");
+        assert_in_step(&e);
         e.undo();
+        assert_eq!(text_of(&e), "1. 买菜\n2. \n3. 做饭");
         e.undo();
         assert_eq!(text_of(&e), "1. 买菜\n2. 做饭");
         // Plain text gets a plain line break.
@@ -2185,6 +2231,42 @@ mod tests {
         plain.document.set_selection(Selection::caret(6));
         assert!(plain.key(Action::Newline));
         assert_eq!(text_of(&plain), "正文\n");
+    }
+
+    #[test]
+    fn deleting_an_item_renumbers_the_list_in_the_same_undo_step() {
+        let mut e = editor("1. 买菜\n2. 做饭\n3. 洗碗\n4. 睡觉");
+        let start = "1. 买菜\n".len();
+        let end = "1. 买菜\n2. 做饭\n".len();
+        e.document.set_selection(Selection {
+            anchor: start,
+            focus: end,
+        });
+        assert!(e.key(Action::Backspace));
+        assert_eq!(text_of(&e), "1. 买菜\n2. 洗碗\n3. 睡觉");
+        assert_eq!(e.document.selection(), Selection::caret(start));
+        assert_in_step(&e);
+        // One undo brings the item and the old numbers back.
+        e.undo();
+        assert_eq!(text_of(&e), "1. 买菜\n2. 做饭\n3. 洗碗\n4. 睡觉");
+        assert_in_step(&e);
+        e.redo();
+        assert_eq!(text_of(&e), "1. 买菜\n2. 洗碗\n3. 睡觉");
+
+        // Pasting items in numbers them and the ones below.
+        e.document.set_selection(Selection::caret(start));
+        assert!(e.paste("1. 买米\n"));
+        assert_eq!(text_of(&e), "1. 买菜\n2. 买米\n3. 洗碗\n4. 睡觉");
+        assert_in_step(&e);
+
+        // Typing never renumbers: a number typed by hand stays.
+        let mut typed = editor("1. a\n2. b");
+        typed
+            .document
+            .set_selection(Selection::caret("1. a\n".len()));
+        typed.key(Action::Delete);
+        typed.key(Action::Insert("7".to_owned()));
+        assert_eq!(text_of(&typed), "1. a\n7. b");
     }
 
     #[test]

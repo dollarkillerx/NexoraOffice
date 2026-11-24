@@ -9,8 +9,13 @@
 //! the page should not run its scripts, event handlers or load what its
 //! tags point at when it is opened. Links with `javascript:`, `vbscript:`
 //! or `data:` addresses lose them.
+//!
+//! Pictures on the web are not put on the page as pictures: opening the
+//! page would fetch them and tell their server it was opened. Each becomes
+//! a link to the picture, marked 🖼 and named by its description, which the
+//! reader can follow. Local pictures and `data:image/…` stay pictures.
 
-use pulldown_cmark::{CowStr, Event, Parser, Tag, html};
+use pulldown_cmark::{CowStr, Event, Parser, Tag, TagEnd, html};
 
 use crate::syntax;
 
@@ -32,7 +37,56 @@ code,pre{background:#2a2a2d}a{color:#a891f0}th,td,hr,blockquote{border-color:#3a
 /// The HTML of the document's body: what the Markdown renders to.
 pub fn body(source: &str) -> String {
     let mut out = String::with_capacity(source.len() * 3 / 2);
-    let events = Parser::new_ext(source, syntax::options()).map(|event| match event {
+    // Whether each picture being written is one from the web, turned into a
+    // link: its end must end the link.
+    let mut pictures: Vec<bool> = Vec::new();
+    let events = Parser::new_ext(source, syntax::options()).flat_map(move |event| {
+        let one = |event| vec![event];
+        match event {
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) if is_web(&dest_url) => {
+                pictures.push(true);
+                vec![
+                    Event::Start(Tag::Link {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }),
+                    Event::Text(CowStr::Borrowed("🖼 ")),
+                ]
+            }
+            Event::Start(Tag::Image { .. }) => {
+                pictures.push(false);
+                one(sanitize(event))
+            }
+            Event::End(TagEnd::Image) => {
+                if pictures.pop() == Some(true) {
+                    one(Event::End(TagEnd::Link))
+                } else {
+                    one(event)
+                }
+            }
+            other => one(sanitize(other)),
+        }
+    });
+    html::push_html(&mut out, events);
+    out
+}
+
+/// Whether an address is on the web.
+fn is_web(address: &str) -> bool {
+    let address = address.trim_start().to_ascii_lowercase();
+    address.starts_with("http://") || address.starts_with("https://") || address.starts_with("//")
+}
+
+/// Raw HTML as text, and addresses that could run code taken away.
+fn sanitize(event: Event<'_>) -> Event<'_> {
+    match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
         Event::Start(Tag::Link {
             link_type,
@@ -57,9 +111,7 @@ pub fn body(source: &str) -> String {
             id,
         }),
         other => other,
-    });
-    html::push_html(&mut out, events);
-    out
+    }
 }
 
 /// An address that cannot run code: `javascript:` and `vbscript:` go, and so
@@ -157,6 +209,27 @@ mod tests {
         assert!(
             page.contains("<a href=\"https://example.com\">正常</a>"),
             "{page}"
+        );
+    }
+
+    #[test]
+    fn pictures_on_the_web_become_links_and_local_ones_stay() {
+        let page = body(
+            "![白板](https://example.com/b.png) 与 ![本地](pic.png) 与 ![小](//cdn.example/x.png)",
+        );
+        assert!(!page.contains("<img src=\"https://"), "{page}");
+        assert!(!page.contains("<img src=\"//"), "{page}");
+        assert!(
+            page.contains("<a href=\"https://example.com/b.png\">🖼 白板</a>"),
+            "{page}"
+        );
+        assert!(page.contains("<img src=\"pic.png\" alt=\"本地\""), "{page}");
+        // A picture inside a link: the link still closes properly.
+        let linked = body("[![图](https://example.com/p.png)](https://example.com)");
+        assert_eq!(
+            linked.matches("<a ").count(),
+            linked.matches("</a>").count(),
+            "{linked}"
         );
     }
 }

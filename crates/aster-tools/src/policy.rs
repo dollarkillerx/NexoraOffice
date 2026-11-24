@@ -196,39 +196,42 @@ impl Policy {
     }
 }
 
-/// A path with `.` and `..` worked out and links resolved: the deepest
-/// part that exists is resolved on disk, the rest is appended as written.
-/// So a file that does not exist yet still lands in the folder its parent
-/// really is.
+/// A path as the file system sees it: the deepest part that exists, as
+/// written (`..` included), is resolved on disk first, so `link/..` is the
+/// folder above where the link points, not the folder holding the link.
+/// The rest, which does not exist yet, is worked out from its text.
 pub fn normalize(path: &Path) -> PathBuf {
-    let mut lexical = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                lexical.pop();
-            }
-            other => lexical.push(other),
+    let parts: Vec<std::path::Component<'_>> = path.components().collect();
+    for split in (0..=parts.len()).rev() {
+        let existing: PathBuf = parts[..split].iter().collect();
+        if existing.as_os_str().is_empty() {
+            continue;
         }
-    }
-    let mut existing = lexical.as_path();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = existing.canonicalize() {
-            let mut out = real;
-            for part in rest.iter().rev() {
-                out.push(part);
+        if let Ok(mut out) = existing.canonicalize() {
+            for part in &parts[split..] {
+                match part {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other),
+                }
             }
             return out;
         }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_owned());
-                existing = parent;
+    }
+    // Nothing of it exists: the text alone.
+    let mut out = PathBuf::new();
+    for part in parts {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
             }
-            _ => return lexical,
+            other => out.push(other),
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -334,5 +337,25 @@ mod tests {
         );
         // A path that does not exist yet is worked out from its text.
         assert_eq!(policy.level_of_path(&notes.join("x/../new.md")), Level::Ask);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_link_goes_up_from_where_it_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("open/inner")).unwrap();
+        std::fs::create_dir(root.join("closed")).unwrap();
+        // closed/door points into open/inner: closed/door/.. is open.
+        std::os::unix::fs::symlink(root.join("open/inner"), root.join("closed/door")).unwrap();
+        let mut policy = Policy::default();
+        policy.set_folder(root.join("open"), Level::Ask);
+        assert_eq!(normalize(&root.join("closed/door/..")), root.join("open"));
+        assert_eq!(
+            policy.level_of_path(&root.join("closed/door/../x.md")),
+            Level::Ask
+        );
+        // Read as text, it would have been closed/x.md.
+        assert_eq!(policy.level_of_path(&root.join("closed/x.md")), Level::Off);
     }
 }

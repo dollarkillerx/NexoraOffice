@@ -439,19 +439,20 @@ pub fn set_base_url(ui: &AppWindow, shell: &mut Shell, url: &str) {
             url.to_owned()
         };
         let changed = provider.base_url != url;
-        let old_host = aster_ai::url_host(&provider.base_url);
-        let moved = old_host != aster_ai::url_host(&url);
+        let old_origin = aster_ai::url_origin(&provider.base_url);
+        let moved = old_origin != aster_ai::url_origin(&url);
         provider.base_url = url;
         let id = provider.id.clone();
         if moved {
-            // A key belongs to the host it was saved for: one typed for one
-            // service must not go to another. It is deleted, and the user
-            // saves it again for the new host. Insecure http is allowed
-            // per address, so it goes too. A key that is still there
-            // (deleting it failed, or it was never recorded with a host)
-            // stays bound to the old host, so it cannot follow the address;
-            // saving a key again binds it to the new one.
-            provider.key_host = provider.key_host.take().or(old_host);
+            // A key belongs to the origin it was saved for (scheme, host
+            // and port): one typed for one service must not go to another,
+            // nor over plain http where it was saved for https. It is
+            // deleted, and the user saves it again for the new address.
+            // Insecure http is allowed per address, so that goes too. A key
+            // that is still there (deleting it failed, or it was never
+            // recorded with an origin) stays bound to the old origin, so it
+            // cannot follow the address; saving a key again binds it anew.
+            provider.key_host = provider.key_host.take().or(old_origin);
             provider.allow_insecure = false;
             if key_known(ai, &id) {
                 let _ = ai.keys.delete(&id);
@@ -491,7 +492,7 @@ pub fn save_key(ui: &AppWindow, shell: &mut Shell, key: &str) {
                 ai.keys_cleared.remove(&id);
                 // The key is for this host only.
                 if let Some(provider) = selected_mut(ai) {
-                    provider.key_host = aster_ai::url_host(&provider.base_url);
+                    provider.key_host = aster_ai::url_origin(&provider.base_url);
                 }
                 save_settings(ai);
                 // A new key may see other models.
@@ -1356,24 +1357,87 @@ impl Host for ShellHost {
                 Ok(json!({ "document": id.0.to_string() }).to_string())
             })
             .unwrap_or_else(|| Err(NO_ANSWER.to_owned())),
-            "save_document" => self.save(tab_id(document)?),
-            _ => {
-                let id = tab_id(document)?;
-                on_ui(&self.ui, UI_WAIT, move |ui, shell| {
-                    let Some(editor) = shell.markdown(id) else {
-                        return Err(
-                            "only Markdown documents can be read and changed for now".to_owned()
-                        );
-                    };
-                    let result = assistant::run(editor, name, &args);
-                    if result.is_ok() && !tool_reads_only(name) {
-                        after_edit(ui, shell, true);
-                    }
-                    result
-                })
-                .unwrap_or_else(|| Err(NO_ANSWER.to_owned()))
-            }
+            "save_document" => self.save(tab_id(document)?, None),
+            _ => self.on_document(tab_id(document)?, name, args, None),
         }
+    }
+
+    fn fingerprint(
+        &self,
+        tool: &ToolSpec,
+        document: Option<&DocumentInfo>,
+        _: &Value,
+    ) -> Option<String> {
+        let id = tab_id(document).ok()?;
+        let name = tool.name;
+        on_ui(&self.ui, UI_WAIT, move |_, shell| {
+            fingerprint_of(shell, id, name)
+        })
+        .flatten()
+    }
+
+    fn run_checked(
+        &self,
+        tool: &ToolSpec,
+        document: Option<&DocumentInfo>,
+        args: &Value,
+        expect: Option<&str>,
+    ) -> Result<String, String> {
+        let Some(expect) = expect.map(str::to_owned) else {
+            return self.run(tool, document, args);
+        };
+        match tool.name {
+            "save_document" => self.save(tab_id(document)?, Some(expect)),
+            name if tool.on_document => {
+                self.on_document(tab_id(document)?, name, args.clone(), Some(expect))
+            }
+            _ => self.run(tool, document, args),
+        }
+    }
+}
+
+/// What an approval card about `tool` on tab `id` was shown against: the
+/// document's text version, and for the tools that act at the selection,
+/// the selection too. An approved call runs only while this is unchanged.
+fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str) -> Option<String> {
+    let editor = shell.markdown(id)?;
+    let version = editor.text_version();
+    let selection = editor.document.selection().range();
+    Some(match tool {
+        "replace_selection" | "insert_text" => {
+            format!("v{version}:{}-{}", selection.start, selection.end)
+        }
+        _ => format!("v{version}"),
+    })
+}
+
+impl ShellHost {
+    /// Run a document tool on the interface thread. With `expect`, only if
+    /// the document is still as the user was shown it, checked in the same
+    /// step as the change so that nothing can come in between.
+    fn on_document(
+        &self,
+        id: TabId,
+        name: &'static str,
+        args: Value,
+        expect: Option<String>,
+    ) -> Result<String, String> {
+        on_ui(&self.ui, UI_WAIT, move |ui, shell| {
+            if let Some(expect) = &expect
+                && fingerprint_of(shell, id, name).as_ref() != Some(expect)
+            {
+                return Err(aster_tools::CHANGED_WHILE_ASKING.to_owned());
+            }
+            let Some(editor) = shell.markdown(id) else {
+                return Err("only Markdown documents can be read and changed for now".to_owned());
+            };
+            let result = assistant::run(editor, name, &args);
+            if result.is_ok() && !tool_reads_only(name) {
+                after_edit(ui, shell, true);
+            }
+            result
+        })
+        .unwrap_or_else(|| Err(NO_ANSWER.to_owned()))
     }
 }
 
@@ -1414,8 +1478,13 @@ impl ShellHost {
         Err("the file did not open in time".to_owned())
     }
 
-    fn save(&self, id: TabId) -> Result<String, String> {
+    fn save(&self, id: TabId, expect: Option<String>) -> Result<String, String> {
         let started = on_ui(&self.ui, UI_WAIT, move |ui, shell| {
+            if let Some(expect) = &expect
+                && fingerprint_of(shell, id, "save_document").as_ref() != Some(expect)
+            {
+                return Err(aster_tools::CHANGED_WHILE_ASKING);
+            }
             let editor = shell
                 .markdown(id)
                 .ok_or("only Markdown documents can be saved this way")?;

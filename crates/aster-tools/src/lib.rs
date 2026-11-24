@@ -22,6 +22,7 @@ pub mod schema;
 pub use audit::{Audit, AuditRecord};
 pub use catalogue::{Annotations, Capability, ToolSpec, find, tools};
 pub use invoke::{
-    Approval, ApprovalRequest, Approver, DocumentInfo, Host, Invoker, Origin, ToolError, ToolResult,
+    Approval, ApprovalRequest, Approver, CHANGED_WHILE_ASKING, DocumentInfo, Host, Invoker, Origin,
+    ToolError, ToolResult,
 };
 pub use policy::{Level, Policy, Reason, Verdict};

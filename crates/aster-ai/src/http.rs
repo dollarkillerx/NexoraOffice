@@ -64,6 +64,10 @@ pub(crate) fn agent() -> Agent {
         // hosts, not `x-api-key`). Provider APIs do not redirect, so a 3xx
         // is reported as the error it is.
         .max_redirects(0)
+        // No proxy from the environment (HTTPS_PROXY and the like): it would
+        // see where the requests go and, for http, the key and the text. A
+        // proxy, if one is ever needed, will be a setting the user makes.
+        .proxy(None)
         .user_agent(concat!("AsterOffice/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()

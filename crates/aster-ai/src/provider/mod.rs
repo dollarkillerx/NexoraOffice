@@ -141,10 +141,13 @@ pub struct ProviderConfig {
     /// computer. Off by default: on any other network, the API key and the
     /// whole conversation could be read on the way.
     pub allow_insecure: bool,
-    /// The host the API key was saved for, from [`url_host`]. The key is
-    /// sent only to that host, so changing the address cannot send a saved
-    /// key somewhere else. `None` for keys saved before hosts were kept;
-    /// those go to whatever the address is, as they always did.
+    /// Where the API key was saved for: the origin from [`url_origin`]
+    /// (scheme, host and port), so a key typed for `http://localhost:11434`
+    /// goes neither to another port nor, once the address turns to https or
+    /// back, over another scheme. Settings written before origins were kept
+    /// hold a bare host, compared as a host. `None` for keys saved before
+    /// either was kept; those go to whatever the address is, as they always
+    /// did.
     pub key_host: Option<String>,
 }
 
@@ -165,7 +168,10 @@ impl ProviderConfig {
     /// Whether the saved key may go to the current address: there is no
     /// recorded host, or it is the address's host.
     pub fn key_matches_host(&self) -> bool {
-        key_host_matches(self.key_host.as_deref(), url_host(&self.base_url))
+        match parse_url(&self.base_url) {
+            Some(uri) => key_matches(self.key_host.as_deref(), &uri),
+            None => self.key_host.is_none(),
+        }
     }
 
     /// Whether a request to `url` may go out, `with_key` saying whether it
@@ -194,7 +200,7 @@ impl ProviderConfig {
                 ));
             }
         }
-        if with_key && !key_host_matches(self.key_host.as_deref(), uri_host(&uri)) {
+        if with_key && !key_matches(self.key_host.as_deref(), &uri) {
             return Err(AiError::NotConfigured(
                 "the API key was saved for another address; save it again".into(),
             ));
@@ -269,15 +275,47 @@ fn is_loopback_uri(uri: &ureq::http::Uri) -> bool {
             .is_ok_and(|ip| ip == Ipv6Addr::LOCALHOST)
 }
 
-/// Whether a key saved for `saved` may go to `host`.
-fn key_host_matches(saved: Option<&str>, host: Option<String>) -> bool {
+/// The origin of `url`: lowercased scheme, host and port, the port written
+/// out even where it is the scheme's default (`https://API.example.com/v1`
+/// is `https://api.example.com:443`, `http://[::1]:11434` is
+/// `http://[::1]:11434`). `None` when the URL has no scheme or host.
+pub fn url_origin(url: &str) -> Option<String> {
+    uri_origin(&parse_url(url)?)
+}
+
+fn uri_origin(uri: &ureq::http::Uri) -> Option<String> {
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let host = uri_host(uri)?;
+    let port = match uri.port_u16() {
+        Some(port) => port,
+        None => match scheme.as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        },
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+/// Whether a key saved for `saved` may go to `uri`: the same origin, or for
+/// an older setting holding a bare host, the same host.
+fn key_matches(saved: Option<&str>, uri: &ureq::http::Uri) -> bool {
     let Some(saved) = saved else {
         return true;
     };
-    // Written by hand or by an older shell, the saved host may have its
-    // brackets or capitals; compare it as `url_host` would give it.
-    let saved = saved.trim().trim_start_matches('[').trim_end_matches(']');
-    host.is_some_and(|host| host.eq_ignore_ascii_case(saved))
+    let saved = saved.trim();
+    if saved.contains("://") {
+        // Written by hand, the origin may lack its port or have capitals:
+        // compare it as `url_origin` would give it.
+        return url_origin(saved).is_some_and(|saved| uri_origin(uri) == Some(saved));
+    }
+    let saved = saved.trim_start_matches('[').trim_end_matches(']');
+    uri_host(uri).is_some_and(|host| host.eq_ignore_ascii_case(saved))
 }
 
 /// A tool as the model sees it.
@@ -648,6 +686,74 @@ mod tests {
         assert!(allowed(&insecure, "http://192.168.1.5/v1/models").is_ok());
         // Allowing insecure connections does not allow other schemes.
         assert!(allowed(&insecure, "ftp://192.168.1.5/v1/models").is_err());
+    }
+
+    #[test]
+    fn origins_have_scheme_host_and_port() {
+        assert_eq!(
+            url_origin("https://API.Example.com/v1").as_deref(),
+            Some("https://api.example.com:443")
+        );
+        assert_eq!(
+            url_origin("http://localhost:11434/v1").as_deref(),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(
+            url_origin("http://[::1]/v1").as_deref(),
+            Some("http://[::1]:80")
+        );
+        assert_eq!(url_origin("localhost:11434"), None);
+    }
+
+    #[test]
+    fn a_key_saved_for_an_origin_keeps_to_its_port_and_scheme() {
+        let mut config = custom("http://localhost:11434/v1");
+        config.key_host = url_origin(&config.base_url);
+        assert!(
+            config
+                .check_request("http://localhost:11434/v1/models", true)
+                .is_ok()
+        );
+        // Another port on the same computer: another service.
+        assert!(
+            config
+                .check_request("http://localhost:8080/v1/models", true)
+                .is_err()
+        );
+        // The same host over another scheme.
+        let mut secure = custom("https://api.example.com/v1");
+        secure.key_host = url_origin(&secure.base_url);
+        secure.allow_insecure = true;
+        assert!(
+            secure
+                .check_request("https://api.example.com:443/v1/x", true)
+                .is_ok()
+        );
+        assert!(
+            secure
+                .check_request("http://api.example.com/v1/x", true)
+                .is_err()
+        );
+        // Without the key the request may go.
+        assert!(
+            config
+                .check_request("http://localhost:8080/v1/models", false)
+                .is_ok()
+        );
+        // An origin written by hand without its port means the default one.
+        secure.key_host = Some("HTTPS://api.example.com".into());
+        assert!(
+            secure
+                .check_request("https://api.example.com/v1/x", true)
+                .is_ok()
+        );
+        // An older setting with a bare host is compared as a host.
+        secure.key_host = Some("api.example.com".into());
+        assert!(
+            secure
+                .check_request("https://api.example.com:8443/v1/x", true)
+                .is_ok()
+        );
     }
 
     #[test]

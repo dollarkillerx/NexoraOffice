@@ -68,7 +68,44 @@ pub trait Host: Send + Sync {
         document: Option<&DocumentInfo>,
         args: &Value,
     ) -> Result<String, String>;
+
+    /// What the call would act on, as it is now: something that changes
+    /// whenever what the user is shown on an approval card would be out of
+    /// date (the document's text, the selection a tool replaces). Taken
+    /// before the user is asked. `None` for calls with nothing to compare.
+    fn fingerprint(
+        &self,
+        tool: &ToolSpec,
+        document: Option<&DocumentInfo>,
+        args: &Value,
+    ) -> Option<String> {
+        let _ = (tool, document, args);
+        None
+    }
+
+    /// Run a call the user approved, only if what it acts on is still what
+    /// it was when they were asked (`expect`, from [`Self::fingerprint`]).
+    /// The comparison and the change should happen in one step on the
+    /// application's side, so nothing can slip in between; this default
+    /// compares and then runs.
+    fn run_checked(
+        &self,
+        tool: &ToolSpec,
+        document: Option<&DocumentInfo>,
+        args: &Value,
+        expect: Option<&str>,
+    ) -> Result<String, String> {
+        if let Some(expect) = expect
+            && self.fingerprint(tool, document, args).as_deref() != Some(expect)
+        {
+            return Err(CHANGED_WHILE_ASKING.to_owned());
+        }
+        self.run(tool, document, args)
+    }
 }
+
+/// What a call gets when the document changed while the user was deciding.
+pub const CHANGED_WHILE_ASKING: &str = "the document changed while the user was deciding, so the approved change was not made; read it again and retry";
 
 /// A question for the user about one call.
 #[derive(Clone, Debug)]
@@ -285,6 +322,8 @@ impl Invoker {
         };
 
         let mut verdict = judge(level, tool.capability);
+        // What the call acts on, as the user will be shown it.
+        let mut expect: Option<String> = None;
         if verdict == Verdict::Hidden {
             record.verdict = "hidden";
             return ToolResult::error(match &target {
@@ -316,6 +355,7 @@ impl Invoker {
             Verdict::Hidden => unreachable!(),
             Verdict::Ask(reason) => {
                 record.verdict = "ask";
+                expect = self.host.fingerprint(tool, document.as_ref(), args);
                 let request = ApprovalRequest {
                     id: self.next_request.fetch_add(1, Ordering::Relaxed),
                     origin: origin.clone(),
@@ -349,7 +389,13 @@ impl Invoker {
         if let Target::Path(path) = &target {
             args["path"] = Value::String(path.display().to_string());
         }
-        match self.host.run(tool, document.as_ref(), &args) {
+        let ran = match expect.as_deref() {
+            Some(expect) => self
+                .host
+                .run_checked(tool, document.as_ref(), &args, Some(expect)),
+            None => self.host.run(tool, document.as_ref(), &args),
+        };
+        match ran {
             Ok(text) => {
                 // A document the caller made itself it may go on editing;
                 // only that caller, and only until the document is saved.
@@ -421,11 +467,23 @@ mod tests {
     struct FakeHost {
         documents: Vec<DocumentInfo>,
         runs: Mutex<Vec<(String, Value)>>,
+        /// The documents' text version; tests change it while asking.
+        version: Mutex<u64>,
     }
 
     impl Host for FakeHost {
         fn documents(&self) -> Vec<DocumentInfo> {
             self.documents.clone()
+        }
+
+        fn fingerprint(
+            &self,
+            tool: &ToolSpec,
+            _: Option<&DocumentInfo>,
+            _: &Value,
+        ) -> Option<String> {
+            tool.on_document
+                .then(|| format!("v{}", self.version.lock().unwrap()))
         }
 
         fn run(
@@ -478,6 +536,7 @@ mod tests {
                 },
             ],
             runs: Mutex::new(Vec::new()),
+            version: Mutex::new(1),
         });
         let approver = Arc::new(FakeApprover {
             answer,
@@ -701,5 +760,39 @@ mod tests {
         let record = invoker.audit().recent().pop().unwrap();
         assert_eq!(record.verdict, "deny");
         assert_eq!(record.arguments["title"]["chars"], 4);
+    }
+
+    /// Approves, but first changes the document, as the user typing (or
+    /// another call landing) while the card is open would.
+    struct ChangingApprover {
+        host: Arc<FakeHost>,
+    }
+
+    impl Approver for ChangingApprover {
+        fn ask(&self, _: ApprovalRequest, _: Duration) -> Approval {
+            *self.host.version.lock().unwrap() += 1;
+            Approval::Allow
+        }
+    }
+
+    #[test]
+    fn an_approved_change_is_not_made_on_a_document_that_changed_meanwhile() {
+        let (_, host, _) = setup(Approval::Allow);
+        let mut policy = Policy::default();
+        policy.set_folder("/notes".into(), Level::Ask);
+        let invoker = Invoker::new(
+            Arc::new(Mutex::new(policy)),
+            host.clone(),
+            Arc::new(ChangingApprover { host: host.clone() }),
+            Arc::new(Audit::in_memory()),
+        );
+        let args = json!({"document": "1", "start_line": 1, "end_line": 1, "text": ""});
+        let result = invoker.call(&ai(), "replace_lines", &args);
+        assert_eq!(result, ToolResult::error(CHANGED_WHILE_ASKING));
+        assert!(host.runs.lock().unwrap().is_empty());
+        // Unchanged while asking: it runs.
+        let (invoker, host, _) = setup(Approval::Allow);
+        assert!(!invoker.call(&ai(), "replace_lines", &args).is_error);
+        assert_eq!(host.runs.lock().unwrap().len(), 1);
     }
 }

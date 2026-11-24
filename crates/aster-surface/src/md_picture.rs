@@ -45,10 +45,6 @@ pub fn resolve(base: Option<&Path>, url: &str) -> Option<PathBuf> {
     if url.is_empty() {
         return None;
     }
-    // A network share by its UNC name, written either way round.
-    if url.starts_with("\\\\") || url.starts_with("//") {
-        return None;
-    }
     let path = if let Some(rest) = url.strip_prefix("file://") {
         // file:///abs/path; a host part other than localhost is not ours.
         let rest = rest.strip_prefix("localhost").unwrap_or(rest);
@@ -56,15 +52,18 @@ pub fn resolve(base: Option<&Path>, url: &str) -> Option<PathBuf> {
             return None;
         }
         let rest = decode(rest)?;
-        // file:////host/share is a network share too.
-        if rest.starts_with("//") || rest.starts_with("\\\\") {
+        if names_a_share(&rest) {
             return None;
         }
         PathBuf::from(rest)
     } else if has_scheme(url) {
         return None;
     } else {
-        let decoded = PathBuf::from(decode(url)?);
+        let decoded = decode(url)?;
+        if names_a_share(&decoded) {
+            return None;
+        }
+        let decoded = PathBuf::from(decoded);
         if decoded.is_absolute() {
             decoded
         } else {
@@ -72,6 +71,17 @@ pub fn resolve(base: Option<&Path>, url: &str) -> Option<PathBuf> {
         }
     };
     Some(path)
+}
+
+/// Whether a path names a network share: it starts with two slashes of
+/// either kind (`//host`, `\\\\host`, `/\\host`, `\\/host`), however they
+/// were escaped. Checked after decoding, so `%2F%2Fhost` is caught too.
+fn names_a_share(path: &str) -> bool {
+    let mut start = path.chars().take(2);
+    matches!(
+        (start.next(), start.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    )
 }
 
 /// Whether an address starts with a URL scheme (`https:`, `data:`, …). A
@@ -228,6 +238,9 @@ mod tests {
         assert_eq!(resolve(Some(base), "//server/share/a.png"), None);
         assert_eq!(resolve(Some(base), "file:////server/share/a.png"), None);
         assert_eq!(resolve(Some(base), "file://%2F%2Fserver/a.png"), None);
+        assert_eq!(resolve(Some(base), "%2F%2Fserver/share/a.png"), None);
+        assert_eq!(resolve(Some(base), "/\\server\\share\\a.png"), None);
+        assert_eq!(resolve(Some(base), "%5C%5Cserver%5Cshare%5Ca.png"), None);
         // A document never saved has no folder to start from.
         assert_eq!(resolve(None, "a.png"), None);
         assert_eq!(resolve(Some(base), ""), None);
@@ -266,6 +279,7 @@ mod tests {
     #[test]
     fn pictures_on_local_disks_are_read_and_network_mounts_are_not() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"").unwrap();
         assert!(aster_platform::volumes::on_local_disks(
             &dir.path().join("a.png")
         ));

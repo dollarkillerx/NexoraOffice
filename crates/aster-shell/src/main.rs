@@ -916,6 +916,7 @@ fn apply_tokens(ui: &AppWindow, tokens: &theme::Tokens) {
     t.set_accent(color(c.accent));
     t.set_on_accent(color(c.on_accent));
     t.set_accent_soft(color(c.accent_soft));
+    t.set_selection(color(c.selection));
     t.set_desk(color(c.desk));
     t.set_page(color(c.page));
     t.set_page_edge(color(c.page_edge));

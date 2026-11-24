@@ -40,7 +40,7 @@ component ReadText inherits TextInput {
     wrap: word-wrap;
     font-size: Tokens.font-md;
     color: Tokens.text;
-    selection-background-color: Tokens.accent-soft;
+    selection-background-color: Tokens.selection;
     selection-foreground-color: Tokens.text;
 }
 
@@ -332,7 +332,7 @@ component Field inherits VerticalLayout {
             font-size: Tokens.font-md;
             color: Tokens.text;
             text <=> root.text;
-            selection-background-color: Tokens.accent-soft;
+            selection-background-color: Tokens.selection;
             selection-foreground-color: Tokens.text;
             accepted => {
                 root.accepted(self.text);
@@ -752,7 +752,7 @@ export component AssistantPanel inherits Rectangle {
                             wrap: word-wrap;
                             font-size: Tokens.font-md;
                             color: Tokens.text;
-                            selection-background-color: Tokens.accent-soft;
+                            selection-background-color: Tokens.selection;
                             selection-foreground-color: Tokens.text;
                         }
                     }

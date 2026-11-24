@@ -721,6 +721,14 @@ impl SheetView {
         (x - right).abs() <= NEAR && (y - bottom).abs() <= NEAR
     }
 
+    /// Where the fill handle is, physical pixels from the view's top left.
+    pub fn fill_handle_point(&self) -> (f64, f64) {
+        let range = self.selection();
+        let (_, right) = self.column_span(range.last.col);
+        let (_, bottom) = self.row_span(range.last.row);
+        (right * self.s(), bottom * self.s())
+    }
+
     /// The range a fill handle dragged to a point (physical pixels) covers:
     /// the selection stretched down, up, right or left, whichever way the
     /// point is further out of it.

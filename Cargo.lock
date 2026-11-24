@@ -433,6 +433,7 @@ dependencies = [
  "aster-tools",
  "aster-workspace",
  "chrono",
+ "i-slint-backend-testing",
  "ropey",
  "serde_json",
  "slint",

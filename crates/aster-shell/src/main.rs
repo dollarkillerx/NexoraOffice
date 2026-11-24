@@ -4355,8 +4355,38 @@ fn select_backend() -> Result<(), slint::PlatformError> {
     selector.select()
 }
 
+/// The window with its shell and handlers, ready for the event loop; the
+/// timers that drive it live as long as this does.
+struct App {
+    ui: AppWindow,
+    shell: Rc<RefCell<Shell>>,
+    _timers: [Timer; 2],
+}
+
 fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     select_backend()?;
+    let App { ui, shell, _timers } = setup(options)?;
+    ui.run()?;
+    if let Ok(mut shell) = shell.try_borrow_mut() {
+        agent::shut_down(&mut shell);
+    }
+    // Carry out what the record writer still has queued (deleting the records
+    // of documents that were saved or discarded) before the process ends.
+    if let Ok(mut shell) = shell.try_borrow_mut() {
+        drop(shell.writer.take());
+        shell.candidates.clear();
+        // The same for the recent list and the sidebar state.
+        if let Some(store) = shell.store.take() {
+            store.finish();
+        }
+    }
+    SHELL.with(|cell| cell.borrow_mut().take());
+    Ok(())
+}
+
+/// Make the window and the shell, and connect every handler, on whatever
+/// backend is selected: the real one, or the testing one in UI tests.
+fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     // Following the system language is not built yet; without `--lang` the
     // shell starts in Simplified Chinese.
     let language = options.language.unwrap_or(Language::ZhHans);
@@ -6275,22 +6305,11 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         spawn_load(&ui, path);
     }
 
-    ui.run()?;
-    if let Ok(mut shell) = shell.try_borrow_mut() {
-        agent::shut_down(&mut shell);
-    }
-    // Carry out what the record writer still has queued (deleting the records
-    // of documents that were saved or discarded) before the process ends.
-    if let Ok(mut shell) = shell.try_borrow_mut() {
-        drop(shell.writer.take());
-        shell.candidates.clear();
-        // The same for the recent list and the sidebar state.
-        if let Some(store) = shell.store.take() {
-            store.finish();
-        }
-    }
-    SHELL.with(|cell| cell.borrow_mut().take());
-    Ok(())
+    Ok(App {
+        ui,
+        shell,
+        _timers: [record_tick, ticker],
+    })
 }
 
 fn main() -> ExitCode {
@@ -6828,5 +6847,286 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// The window driven as a user would, on Slint's headless backend: what the
+/// background tools on a real desktop cannot reach (a click in a list while
+/// a text field has the keyboard, shortcuts, drags).
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use i_slint_backend_testing::ElementHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use slint::{LogicalPosition, LogicalSize};
+
+    /// The app with a new workbook in front, its data kept out of the
+    /// user's folders.
+    fn app() -> App {
+        static DATA: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DATA.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // SAFETY: set once, before any test reads it, under the lock.
+            unsafe { std::env::set_var(aster_platform::paths::DATA_DIR_ENV, dir.path()) };
+            dir
+        });
+        i_slint_backend_testing::init_no_event_loop();
+        let app = setup(cli::Options {
+            open: vec![DocKind::Sheets],
+            ..cli::Options::default()
+        })
+        .expect("the window is made");
+        app.ui.window().set_size(LogicalSize::new(1200.0, 800.0));
+        app.ui.show().unwrap();
+        app
+    }
+
+    fn center(element: &ElementHandle) -> (f32, f32) {
+        let at = element.absolute_position();
+        let size = element.size();
+        (at.x + size.width / 2.0, at.y + size.height / 2.0)
+    }
+
+    /// A click on an element, sent to the window it is in (a list's
+    /// popup has its own).
+    fn click(element: &ElementHandle) {
+        element.mock_single_click(PointerEventButton::Left);
+    }
+
+    fn type_text(ui: &AppWindow, text: &str) {
+        for c in text.chars() {
+            let text = slint::SharedString::from(c.to_string());
+            ui.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            ui.window()
+                .dispatch_event(WindowEvent::KeyReleased { text });
+        }
+    }
+
+    /// A key with the platform's command key held (Cmd on a Mac).
+    fn command(ui: &AppWindow, key: &str) {
+        let control = slint::SharedString::from(Key::Control);
+        let window = ui.window();
+        window.dispatch_event(WindowEvent::KeyPressed {
+            text: control.clone(),
+        });
+        window.dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        window.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        window.dispatch_event(WindowEvent::KeyReleased { text: control });
+    }
+
+    /// The toolbar's control for a command.
+    fn tool(ui: &AppWindow, command: Command) -> ElementHandle {
+        let items = ui.get_toolbar_items();
+        let index = (0..items.row_count())
+            .position(|i| {
+                items
+                    .row_data(i)
+                    .is_some_and(|item| item.command == command.id())
+            })
+            .expect("the command is on the toolbar");
+        ElementHandle::find_by_element_type_name(ui, "ToolControl")
+            .nth(index)
+            .expect("a control for each item")
+    }
+
+    fn with_sheet<T>(app: &App, f: impl FnOnce(&mut SheetTab) -> T) -> T {
+        let mut shell = app.shell.borrow_mut();
+        let tab = shell.active_sheet().expect("a workbook in front");
+        f(tab)
+    }
+
+    fn cell_style(app: &App, cell: &str) -> aster_sheets::CellStyle {
+        with_sheet(app, |tab| {
+            let at = aster_sheets::CellRef::parse(cell).unwrap();
+            let sheet = tab.view.sheet().unwrap();
+            tab.view.workbook().style(sheet.style_at(at))
+        })
+    }
+
+    #[test]
+    fn command_b_i_and_u_format_the_selected_cell() {
+        let app = app();
+        let ui = &app.ui;
+        with_sheet(&app, |tab| {
+            let at = aster_sheets::CellRef::parse("B2").unwrap();
+            tab.type_cells(at, &[vec!["x".to_owned()]], "en");
+            tab.view.select(at);
+        });
+        ui.invoke_focus_document();
+        command(ui, "b");
+        command(ui, "i");
+        command(ui, "u");
+        let font = cell_style(&app, "B2").font;
+        assert!(font.bold && font.italic && font.underline, "{font:?}");
+        // The toolbar shows it, as after a click.
+        let items = ui.get_toolbar_items();
+        let bold = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .find(|item| item.command == Command::Bold.id())
+            .unwrap();
+        assert!(bold.active);
+        // And the Format menu's item takes it off again.
+        ui.invoke_sheet_format(0);
+        assert!(!cell_style(&app, "B2").font.bold);
+    }
+
+    #[test]
+    fn command_a_and_v_work_in_a_dialog() {
+        let app = app();
+        let ui = &app.ui;
+        // The rename dialog, its name selected.
+        ui.invoke_sheet_rename(0);
+        assert!(ui.get_prompt_open());
+        let before = with_sheet(&app, |tab| tab.view.workbook().sheets[0].name.clone());
+        command(ui, "a");
+        type_text(ui, "数据");
+        assert_eq!(
+            ui.get_prompt_text(),
+            "数据",
+            "Cmd+A selected the whole name"
+        );
+        // Copy it and paste it after itself, in the field.
+        command(ui, "a");
+        command(ui, "c");
+        type_text(ui, &char::from(Key::RightArrow).to_string());
+        command(ui, "v");
+        assert_eq!(ui.get_prompt_text(), "数据数据");
+        // The sheet behind it was not touched.
+        with_sheet(&app, |tab| {
+            assert_eq!(tab.view.workbook().sheets[0].name, before);
+            assert!(tab.view.sheet().unwrap().cell_count() == 0);
+        });
+        ui.invoke_prompt_accept();
+        assert_eq!(
+            with_sheet(&app, |tab| tab.view.workbook().sheets[0].name.clone()),
+            "数据数据"
+        );
+    }
+
+    /// A drag with the left button through `points` (window coordinates).
+    fn drag(ui: &AppWindow, points: &[(f32, f32)]) {
+        let window = ui.window();
+        let at = |(x, y): (f32, f32)| LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: at(points[0]),
+        });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: at(points[0]),
+            button: PointerEventButton::Left,
+        });
+        for &point in &points[1..] {
+            window.dispatch_event(WindowEvent::PointerMoved {
+                position: at(point),
+            });
+        }
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: at(*points.last().unwrap()),
+            button: PointerEventButton::Left,
+        });
+    }
+
+    #[test]
+    fn dragging_the_fill_handle_continues_a_series() {
+        let app = app();
+        let ui = &app.ui;
+        with_sheet(&app, |tab| {
+            let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+            tab.type_cells(
+                at("B2"),
+                &[vec!["1".to_owned()], vec!["2".to_owned()]],
+                "en",
+            );
+            tab.view.select(at("B2"));
+            tab.view.extend_to(at("B3"));
+        });
+        present(ui, &mut app.shell.borrow_mut());
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = ui.window().scale_factor();
+        let (hx, hy) = with_sheet(&app, |tab| tab.view.fill_handle_point());
+        let start = (
+            origin.x + hx as f32 / scale - 1.0,
+            origin.y + hy as f32 / scale - 1.0,
+        );
+        // Three rows further down.
+        let row = 20.0;
+        drag(
+            ui,
+            &[
+                start,
+                (start.0, start.1 + 10.0),
+                (start.0, start.1 + 2.0 * row),
+                (start.0, start.1 + 3.0 * row - 4.0),
+            ],
+        );
+        let value = |cell: &str| {
+            with_sheet(&app, |tab| {
+                tab.view
+                    .sheet()
+                    .and_then(|s| s.cell(aster_sheets::CellRef::parse(cell).unwrap()))
+                    .map(|c| c.value.clone())
+            })
+        };
+        assert_eq!(value("B4"), Some(aster_sheets::Value::Number(3.0)));
+        assert_eq!(value("B6"), Some(aster_sheets::Value::Number(5.0)));
+        assert_eq!(value("B7"), None);
+    }
+
+    #[test]
+    fn dragging_a_sheet_tab_moves_the_sheet() {
+        let app = app();
+        let ui = &app.ui;
+        {
+            let mut shell = app.shell.borrow_mut();
+            let tab = shell.active_sheet().unwrap();
+            tab.add_sheet("Sheet");
+            tab.add_sheet("Sheet");
+            after_sheet_change(ui, &mut shell, Vec::new());
+        }
+        let tabs: Vec<ElementHandle> =
+            ElementHandle::find_by_element_id(ui, "SheetBar::tab").collect();
+        assert_eq!(tabs.len(), 3);
+        let (x0, y) = center(&tabs[0]);
+        let (x2, _) = center(&tabs[2]);
+        let steps: Vec<(f32, f32)> = (0..=10)
+            .map(|i| (x0 + (x2 - x0) * i as f32 / 10.0, y))
+            .collect();
+        drag(ui, &steps);
+        let names = with_sheet(&app, |tab| {
+            tab.view
+                .workbook()
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(names, ["Sheet2", "Sheet3", "Sheet1"]);
+    }
+
+    #[test]
+    fn a_colour_from_the_palette_arrives_while_the_find_field_has_the_keyboard() {
+        let app = app();
+        let ui = &app.ui;
+        with_sheet(&app, |tab| {
+            let at = aster_sheets::CellRef::parse("A3").unwrap();
+            tab.type_cells(at, &[vec!["東京".to_owned()]], "zh-Hans");
+        });
+        ui.invoke_menu_find();
+        type_text(ui, "京");
+        assert_eq!(
+            with_sheet(&app, |tab| tab.view.selected()),
+            aster_sheets::CellRef::parse("A3").unwrap(),
+            "typing in the find field selects the match"
+        );
+        click(&tool(ui, Command::FillColor));
+        let swatches: Vec<ElementHandle> =
+            ElementHandle::find_by_element_id(ui, "ToolControl::swatch").collect();
+        assert_eq!(swatches.len(), 16, "the palette is open");
+        // Yellow, the twelfth colour.
+        click(&swatches[11]);
+        assert_eq!(cell_style(&app, "A3").fill, Some([0xFF, 0xFF, 0x00, 0xFF]));
     }
 }

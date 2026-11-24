@@ -28,6 +28,9 @@ slint = { workspace = true }
 [dev-dependencies]
 aster-text = { workspace = true }
 tempfile = { workspace = true }
+# Slint's headless backend for the UI tests. It follows no semver: its
+# version must be Slint's, exactly. Only for tests; not in the app.
+i-slint-backend-testing = "=1.19.0"
 
 [build-dependencies]
 slint-build = { workspace = true }

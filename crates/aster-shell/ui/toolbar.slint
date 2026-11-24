@@ -165,7 +165,7 @@ component ToolControl inherits Rectangle {
 
             Rectangle {
                 height: ceil(root.item.colours.length / 8) * 24px;
-                for colour[index] in root.item.colours: Rectangle {
+                for colour[index] in root.item.colours: swatch := Rectangle {
                     x: mod(index, 8) * 24px + 2px;
                     y: floor(index / 8) * 24px + 2px;
                     width: 20px;

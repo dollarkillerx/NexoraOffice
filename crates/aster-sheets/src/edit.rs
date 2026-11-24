@@ -310,6 +310,7 @@ mod tests {
             ],
             date1904: false,
             active_sheet: 0,
+            names: Vec::new(),
         }
     }
 

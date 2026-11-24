@@ -248,10 +248,22 @@ impl Workbook {
         if self.active_sheet > index || self.active_sheet >= self.sheets.len() {
             self.active_sheet = self.active_sheet.saturating_sub(1);
         }
+        // Its own names go with it; the others' sheet numbers move up.
+        self.names.retain(|name| name.local != Some(index));
+        for name in &mut self.names {
+            if let Some(local) = &mut name.local
+                && *local > index
+            {
+                *local -= 1;
+            }
+        }
         self.retarget_all(&sheet.name, None)
     }
 
     fn retarget_all(&mut self, from: &str, to: Option<&str>) -> Vec<(usize, CellRef)> {
+        for name in &mut self.names {
+            name.formula = retarget(&name.formula, from, to);
+        }
         let mut changed = Vec::new();
         for (index, sheet) in self.sheets.iter_mut().enumerate() {
             let mut touched = false;
@@ -292,6 +304,31 @@ mod tests {
             sheets: vec![first.finish(), second.finish()],
             ..Workbook::default()
         }
+    }
+
+    #[test]
+    fn defined_names_follow_renames_and_deletions() {
+        use crate::model::DefinedName;
+        let mut book = book();
+        book.names = vec![
+            DefinedName {
+                name: "Rate".into(),
+                local: None,
+                formula: "数据!$A$1".into(),
+            },
+            DefinedName {
+                name: "Mine".into(),
+                local: Some(1),
+                formula: "Sheet2!$A$1".into(),
+            },
+        ];
+        book.rename_sheet(0, "Data 1");
+        assert_eq!(book.names[0].formula, "'Data 1'!$A$1");
+        book.delete_sheet(0);
+        assert_eq!(book.names[0].formula, "#REF!");
+        assert_eq!(book.names[1].local, Some(0));
+        book.delete_sheet(0);
+        assert_eq!(book.names.len(), 1);
     }
 
     #[test]
@@ -351,6 +388,7 @@ mod tests {
             "#REF!*2+SUM(#REF!)+\"数据!A1\"+[1]数据!A1"
         );
         assert_eq!(book.sheets.len(), 1);
+        assert!(book.names.is_empty());
         let added = book.add_sheet("Sheet3");
         assert_eq!(added, 1);
         assert_eq!(

@@ -392,6 +392,19 @@ pub struct Workbook {
     pub date1904: bool,
     /// The sheet that was in front when the file was saved.
     pub active_sheet: usize,
+    /// Defined names formulas can use (`TaxRate`, `Prices`), in file order.
+    pub names: Vec<DefinedName>,
+}
+
+/// A defined name: a range, a constant or a formula, for the whole
+/// workbook or one sheet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefinedName {
+    pub name: String,
+    /// The sheet it belongs to (`localSheetId`); `None` for the workbook.
+    pub local: Option<usize>,
+    /// What it stands for, without `=`: `汇总!$B$1`, `0.08`.
+    pub formula: String,
 }
 
 /// How a cell's content is to be shown.
@@ -585,6 +598,7 @@ mod tests {
             ],
             date1904: false,
             active_sheet: 0,
+            names: Vec::new(),
         };
         let mut cell = Cell::new(0, Value::Number(1234.5));
         cell.style = 1;

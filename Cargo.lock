@@ -1713,6 +1713,7 @@ checksum = "e3881e0a9f535dac29caba52e5e6f975b17146207a0de43dd22eceacba98628b"
 dependencies = [
  "formualizer-common",
  "formualizer-eval",
+ "formualizer-parse",
  "formualizer-sheetport",
  "formualizer-workbook",
 ]

@@ -345,6 +345,14 @@ impl crate::model::Workbook {
             return Vec::new();
         };
         let mut others = Vec::new();
+        // Defined names follow too; one of a sheet reads like its formulas.
+        for name in &mut self.names {
+            let host = name
+                .local
+                .and_then(|i| self.sheets.get(i))
+                .map(|s| s.name.clone());
+            name.formula = adjust(&name.formula, host.as_deref(), &target, lines);
+        }
         for (index, host) in self.sheets.iter_mut().enumerate() {
             let name = host.name.clone();
             for row in host.rows_mut().iter_mut() {
@@ -566,6 +574,11 @@ mod tests {
         other.push(0, formula(0, "表!A5*2"));
         let mut book = Workbook {
             sheets: vec![sheet.finish(), other.finish()],
+            names: vec![crate::model::DefinedName {
+                name: "Total".into(),
+                local: None,
+                formula: "表!$A$6".into(),
+            }],
             ..Workbook::default()
         };
         let changed = book.restructure(
@@ -596,6 +609,7 @@ mod tests {
             Some("SUM(A1:A7)")
         );
         assert_eq!(s.merges[0].to_string(), "B4:C5");
+        assert_eq!(book.names[0].formula, "表!$A$8");
         assert_eq!(s.row_sizes.size(6), 40.0);
         assert_eq!(
             book.sheets[1]

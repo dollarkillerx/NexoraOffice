@@ -33,6 +33,91 @@ fn engine_error(error: impl std::fmt::Display) -> CalcError {
     CalcError::Engine(error.to_string())
 }
 
+/// The workbook's defined names, for formulas that use them: a range of
+/// cells as a range, a constant as a value, anything else as a formula. A
+/// name the engine does not take is left out: formulas that use it show
+/// `#NAME?`, as they did.
+fn define_names(engine: &mut Engine, workbook: &Workbook) {
+    use formualizer::eval::engine::named_range::{NameScope, NamedDefinition};
+    use formualizer::eval::reference::{CellRef as At, Coord, RangeRef};
+
+    for name in &workbook.names {
+        let scope = match name.local {
+            None => NameScope::Workbook,
+            Some(index) => {
+                let Some(id) = workbook
+                    .sheets
+                    .get(index)
+                    .and_then(|sheet| engine.engine().sheet_id(&sheet.name))
+                else {
+                    continue;
+                };
+                NameScope::Sheet(id)
+            }
+        };
+        let text = name.formula.trim();
+        let definition = if let Some((sheet, range)) = reference(text)
+            && let Some(id) = engine.engine().sheet_id(&sheet)
+        {
+            let at = |cell: aster_sheets::CellRef| {
+                At::new(id, Coord::new(cell.row, cell.col, true, true))
+            };
+            if range.first == range.last {
+                NamedDefinition::Cell(at(range.first))
+            } else {
+                NamedDefinition::Range(RangeRef::new(at(range.first), at(range.last)))
+            }
+        } else if let Ok(number) = text.parse::<f64>() {
+            NamedDefinition::Literal(LiteralValue::Number(number))
+        } else if text.eq_ignore_ascii_case("TRUE") || text.eq_ignore_ascii_case("FALSE") {
+            NamedDefinition::Literal(LiteralValue::Boolean(text.eq_ignore_ascii_case("TRUE")))
+        } else {
+            match formualizer::parse::parser::parse(format!("={text}")) {
+                Ok(ast) => NamedDefinition::Formula {
+                    ast,
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                Err(_) => continue,
+            }
+        };
+        let _ = engine
+            .engine_mut()
+            .define_name(&name.name, definition, scope);
+    }
+}
+
+/// `Sheet!$A$1` or `'My sheet'!$A$1:$B$9`: the sheet and the cells. Whole
+/// rows and columns, several areas and anything else are not one.
+fn reference(text: &str) -> Option<(String, aster_sheets::CellRange)> {
+    let (sheet, rest) = if let Some(quoted) = text.strip_prefix('\'') {
+        let mut name = String::new();
+        let mut chars = quoted.char_indices();
+        let mut end = None;
+        while let Some((i, c)) = chars.next() {
+            if c == '\'' {
+                if quoted[i + 1..].starts_with('\'') {
+                    name.push('\'');
+                    chars.next();
+                    continue;
+                }
+                end = Some(i + 1);
+                break;
+            }
+            name.push(c);
+        }
+        (name, quoted[end?..].strip_prefix('!')?)
+    } else {
+        let (sheet, rest) = text.split_once('!')?;
+        (sheet.to_owned(), rest)
+    };
+    let plain = rest.replace('$', "");
+    if plain.contains([',', ' ', '(']) {
+        return None;
+    }
+    Some((sheet, aster_sheets::CellRange::parse(&plain)?))
+}
+
 impl Formualizer {
     /// Copy the workbook's inputs into a new engine. Nothing is calculated
     /// until [`CalcEngine::apply`].
@@ -99,6 +184,7 @@ impl Formualizer {
                 flush(&mut engine, &mut run, run_start)?;
             }
         }
+        define_names(&mut engine, workbook);
         Ok(Self {
             engine,
             sheets,
@@ -268,6 +354,44 @@ mod tests {
             .find(|r| r.sheet == sheet && r.at == at)
             .map(|r| r.value.clone())
             .unwrap_or(Value::Empty)
+    }
+
+    #[test]
+    fn defined_names_are_used() {
+        use aster_sheets::model::DefinedName;
+        let mut summary = SheetBuilder::new("汇总", SheetKind::Worksheet);
+        summary.push(0, Cell::new(1, Value::Number(0.1)));
+        summary.push(1, Cell::new(1, Value::Number(200.0)));
+        summary.push(2, formula(1, "ROUND(B2*(1+TaxRate),2)", Value::Empty));
+        summary.push(3, formula(1, "SUM(Amounts)+Bonus", Value::Empty));
+        summary.push(4, formula(1, "Twice", Value::Empty));
+        summary.push(5, formula(1, "Here", Value::Empty));
+        let mut other = SheetBuilder::new("My sheet", SheetKind::Worksheet);
+        other.push(0, Cell::new(0, Value::Number(7.0)));
+        other.push(1, formula(0, "Here", Value::Empty));
+        let name = |name: &str, local: Option<usize>, formula: &str| DefinedName {
+            name: name.into(),
+            local,
+            formula: formula.into(),
+        };
+        let workbook = Workbook {
+            sheets: vec![summary.finish(), other.finish()],
+            names: vec![
+                name("TaxRate", None, "汇总!$B$1"),
+                name("Amounts", None, "汇总!$B$1:$B$2"),
+                name("Bonus", None, "5"),
+                name("Twice", None, "汇总!$B$2*2"),
+                name("Here", Some(1), "'My sheet'!$A$1"),
+            ],
+            ..Workbook::default()
+        };
+        let results = results(&workbook);
+        assert_eq!(at(&results, 0, "B3"), Value::Number(220.0));
+        assert_eq!(at(&results, 0, "B4"), Value::Number(205.1));
+        assert_eq!(at(&results, 0, "B5"), Value::Number(400.0));
+        // A name of one sheet is not seen from another.
+        assert!(matches!(at(&results, 0, "B6"), Value::Error(_)));
+        assert_eq!(at(&results, 1, "A2"), Value::Number(7.0));
     }
 
     #[test]

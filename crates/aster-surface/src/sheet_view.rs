@@ -2054,6 +2054,7 @@ mod tests {
             styles: vec![CellStyle::default()],
             date1904: false,
             active_sheet: 1,
+            names: Vec::new(),
         })
     }
 
@@ -2256,6 +2257,7 @@ mod tests {
             styles,
             date1904: false,
             active_sheet: 0,
+            names: Vec::new(),
         }));
         view.resize(800, 600, 1.0);
         view

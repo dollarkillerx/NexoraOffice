@@ -634,6 +634,12 @@ fn deleting_a_row_moves_cells_ranges_names_and_other_sheets_formulas() {
     let source = linked();
     let mut book = Xlsx.read(source.clone()).unwrap();
     assert_eq!(book.sheets[0].structure_blocker, None);
+    // The name for formulas is read; Excel's print area is not one.
+    assert_eq!(book.names.len(), 1);
+    assert_eq!(
+        (book.names[0].name.as_str(), book.names[0].formula.as_str()),
+        ("区域", "数据!$A$2:$A$4")
+    );
     let mut changes = Changes::default();
     let lines = Lines {
         columns: false,
@@ -692,6 +698,8 @@ fn deleting_a_row_moves_cells_ranges_names_and_other_sheets_formulas() {
     let again = Xlsx.read(saved).unwrap();
     assert_eq!(contents(&again), contents(&book));
     assert_eq!(again.sheets[0].merges, book.sheets[0].merges);
+    // The model's names moved as the file's did.
+    assert_eq!(again.names, book.names);
 }
 
 #[test]

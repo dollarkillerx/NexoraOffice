@@ -69,6 +69,7 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
         styles: Vec::new(),
         date1904: entries.date1904,
         active_sheet: 0,
+        names: Vec::new(),
     };
     let mut charts: Vec<String> = Vec::new();
     for entry in entries.sheets {
@@ -158,6 +159,7 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
         }
     }
     workbook.active_sheet = entries.active.min(workbook.sheets.len() - 1);
+    workbook.names = entries.names;
     workbook.styles = styles;
     Ok(workbook)
 }
@@ -172,6 +174,7 @@ pub(crate) struct Entries {
     pub(crate) sheets: Vec<Entry>,
     date1904: bool,
     active: usize,
+    names: Vec<aster_sheets::model::DefinedName>,
 }
 
 pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
@@ -180,9 +183,30 @@ pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
         sheets: Vec::new(),
         date1904: false,
         active: 0,
+        names: Vec::new(),
     };
     loop {
         match reader.next()? {
+            Ev::Open(tag) if tag.is("definedName") => {
+                let local = tag
+                    .attr_i64("localSheetId")
+                    .and_then(|i| usize::try_from(i).ok());
+                let name = tag.attr("name");
+                let formula = reader.text()?;
+                // Excel's own names (print areas, filters) and names other
+                // workbooks or lost cells are not for formulas here.
+                if let Some(name) = name
+                    && !name.starts_with("_xlnm.")
+                    && !formula.contains('[')
+                    && !formula.trim().is_empty()
+                {
+                    entries.names.push(aster_sheets::model::DefinedName {
+                        name,
+                        local,
+                        formula: formula.trim().trim_start_matches('=').to_owned(),
+                    });
+                }
+            }
             Ev::Open(tag) if tag.is("sheet") => {
                 let (Some(name), Some(rel)) = (tag.attr("name"), tag.attr("id")) else {
                     continue;

@@ -131,7 +131,7 @@ zune-jpeg = "~0.5.15"
 krilla = { version = "~0.8.2", default-features = false, features = ["raster-images"] }
 # The formula engine (ADR 0002), only through `aster-calc`. Exact version: an
 # upgrade means re-running G5's measurements and its 69-formula comparison.
-formualizer = { version = "=0.15.0", default-features = false, features = ["workbook", "eval", "common", "system-clock"] }
+formualizer = { version = "=0.15.0", default-features = false, features = ["workbook", "eval", "common", "parse", "system-clock"] }
 
 [profile.dev]
 opt-level = 1

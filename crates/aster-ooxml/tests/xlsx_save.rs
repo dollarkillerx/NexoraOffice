@@ -918,3 +918,35 @@ fn a_new_sheet_with_a_resized_column_saves() {
         Some(Value::Number(1.0))
     );
 }
+
+#[test]
+fn a_text_colour_is_written_only_where_it_changed() {
+    use aster_sheets::StyleEdit;
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    for (edit, cell) in [
+        (StyleEdit::FontColor(Some([0xC0, 0, 0, 0xFF])), "A2"),
+        (StyleEdit::Bold(true), "A3"),
+    ] {
+        let cells = book.restyle(0, aster_sheets::CellRange::single(at(cell)), &edit);
+        for change in book.set_cells(0, cells) {
+            changes.cells.insert((0, change.at));
+            changes.edited.insert((0, change.at));
+        }
+    }
+    let saved = save(source, &book, &changes).unwrap();
+    let styles = part(&saved, "xl/styles.xml");
+    // The red font has its colour; the bold one keeps the base's.
+    assert!(styles.contains(r#"<color rgb="FFC00000"/>"#), "{styles}");
+    let again = Xlsx.read(saved).unwrap();
+    let style = |cell: &str| again.style(again.sheets[0].cell(at(cell)).unwrap().style);
+    assert_eq!(style("A2").font.color, Some([0xC0, 0, 0, 0xFF]));
+    assert!(style("A3").font.bold);
+    assert_eq!(
+        style("A3").font.color,
+        book.style(book.sheets[0].cell(at("A3")).unwrap().style)
+            .font
+            .color
+    );
+}

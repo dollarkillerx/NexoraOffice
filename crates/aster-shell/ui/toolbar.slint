@@ -6,7 +6,7 @@ component ToolControl inherits Rectangle {
     callback activated;
     // An entry of a select field's list was chosen.
     callback chosen(int);
-    property <bool> is-button: item.control == 0 || item.control == 1;
+    property <bool> is-button: item.control == 0 || item.control == 1 || item.control == 6;
     property <bool> is-gap: item.control == 4 || item.control == 5;
     property <length> fixed-width: is-button ? Tokens.control-height : item.control == 4 ? 9px : item.control == 5 ? 0px : item.width;
     property <brush> ink: item.enabled ? Tokens.text : Tokens.text-disabled;
@@ -34,6 +34,35 @@ component ToolControl inherits Rectangle {
         color: root.ink;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+
+    // A colour button: its face, raised a little, over a bar of the colour.
+    if item.control == 6 && item.icon != "": Icon {
+        y: -2px;
+        data: root.item.icon;
+        tint: root.item.enabled ? Tokens.text-secondary : Tokens.text-disabled;
+    }
+
+    if item.control == 6 && item.icon == "": Text {
+        y: -2px;
+        height: parent.height;
+        text: root.item.text;
+        font-size: Tokens.font-lg - 1px;
+        font-weight: 500;
+        color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if item.control == 6: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 7px;
+        width: 14px;
+        height: 3px;
+        border-radius: 1px;
+        background: root.item.has-swatch ? root.item.swatch : transparent;
+        border-width: root.item.has-swatch ? 0px : 1px;
+        border-color: Tokens.hairline;
     }
 
     if item.control == 1 && item.underline: Rectangle {
@@ -96,7 +125,9 @@ component ToolControl inherits Rectangle {
     touch := TouchArea {
         enabled: root.item.enabled && !root.is-gap;
         clicked => {
-            if (root.item.options.length > 0) {
+            if (root.item.control == 6) {
+                palette.show();
+            } else if (root.item.options.length > 0) {
                 options.show();
             } else {
                 root.activated();
@@ -108,6 +139,46 @@ component ToolControl inherits Rectangle {
     // rather than as a native menu: a native menu opened from a click runs
     // its own event loop inside winit's handler, and winit panics on the
     // next event.
+    // A colour button's palette: "none" (or "automatic"), then the colours
+    // eight to a row.
+    palette := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: 8 * 24px + 2 * (Tokens.space-xs + 2px);
+        MenuFrame { }
+
+        VerticalLayout {
+            padding: Tokens.space-xs + 2px;
+            spacing: 4px;
+            for option[index] in root.item.options: MenuRow {
+                text: option;
+                checked: !root.item.has-swatch;
+                clicked => {
+                    root.chosen(0);
+                }
+            }
+
+            Rectangle {
+                height: ceil(root.item.colours.length / 8) * 24px;
+                for colour[index] in root.item.colours: Rectangle {
+                    x: mod(index, 8) * 24px + 2px;
+                    y: floor(index / 8) * 24px + 2px;
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 3px;
+                    background: colour;
+                    border-width: (root.item.has-swatch && root.item.swatch == colour) ? 2px : 1px;
+                    border-color: (root.item.has-swatch && root.item.swatch == colour) ? Tokens.accent : Tokens.hairline;
+                    TouchArea {
+                        clicked => {
+                            root.chosen(index + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     options := PopupWindow {
         x: 0;
         y: root.height + 4px;

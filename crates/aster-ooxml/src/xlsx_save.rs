@@ -1474,10 +1474,18 @@ fn start_tag(element: &str) -> (&str, &str) {
 
 /// A font element made from `base` with the style's bold, italic,
 /// underline, strikethrough and size; its colour, name and the rest stay.
-fn font_xml(base: &str, p: &str, font: &aster_sheets::Font) -> String {
+/// `color` is the new text colour when it changed from the base font's
+/// (`Some(None)` for automatic); otherwise the base's `<color>` stays.
+fn font_xml(
+    base: &str,
+    p: &str,
+    font: &aster_sheets::Font,
+    color: Option<Option<aster_sheets::Rgba>>,
+) -> String {
     let kept: String = children(base)
         .into_iter()
         .filter(|(name, _)| !matches!(name.as_str(), "b" | "i" | "u" | "strike" | "sz"))
+        .filter(|(name, _)| color.is_none() || name != "color")
         .map(|(_, raw)| raw)
         .collect();
     let mut out = format!("<{p}font>");
@@ -1497,6 +1505,9 @@ fn font_xml(base: &str, p: &str, font: &aster_sheets::Font) -> String {
         "<{p}sz val=\"{}\"/>",
         number(f64::from(font.size))
     ));
+    if let Some(color) = color {
+        out.push_str(&color_xml(p, color));
+    }
     out.push_str(&kept);
     out.push_str(&format!("</{p}font>"));
     out
@@ -1664,10 +1675,12 @@ fn append_formats(bytes: &[u8], part: &str, workbook: &Workbook) -> Result<Optio
                     .or(fonts.items.first())
                     .map(|&span| text(span))
                     .unwrap_or_else(|| format!("<{p}font/>"));
+                let base_color = workbook.styles.get(base).and_then(|s| s.font.color);
+                let color = (style.font.color != base_color).then_some(style.font.color);
                 add(
                     "fonts",
                     fonts.items.len(),
-                    font_xml(&base_font, &p, &style.font),
+                    font_xml(&base_font, &p, &style.font, color),
                 )
             }
         };

@@ -277,7 +277,8 @@ export struct TabItem {
 }
 
 export struct ToolItem {
-    // 0 icon button, 1 letter button, 2 select, 3 value, 4 separator, 5 spacer.
+    // 0 icon button, 1 letter button, 2 select, 3 value, 4 separator, 5 spacer,
+    // 6 colour button.
     control: int,
     icon: string,
     text: string,
@@ -292,6 +293,11 @@ export struct ToolItem {
     command: int,
     // A select field: what its list offers, in order.
     options: [string],
+    // A colour button: the colour in effect (if `has-swatch`), and the
+    // palette after the list's one text option.
+    swatch: color,
+    has-swatch: bool,
+    colours: [color],
 }
 
 export struct KindItem {

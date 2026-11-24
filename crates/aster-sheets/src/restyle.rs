@@ -27,6 +27,8 @@ pub enum StyleEdit {
     /// format.
     Format(u32, Arc<Format>),
     Fill(Option<Rgba>),
+    /// The text colour; `None` is automatic.
+    FontColor(Option<Rgba>),
     /// Thin lines on every side of every cell, or none.
     Borders(bool),
 }
@@ -56,6 +58,7 @@ impl StyleEdit {
                     out.format_id = *id;
                 }
             }
+            StyleEdit::FontColor(color) => font(&mut out, &|f| f.color = *color),
             StyleEdit::Fill(fill) => {
                 if *fill != out.fill {
                     out.fill = *fill;

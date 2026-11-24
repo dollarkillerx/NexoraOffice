@@ -1249,6 +1249,25 @@ fn tool_item(item: &toolbar::Item) -> ToolItem {
             out.text = text.into();
             out.width = *width;
         }
+        Control::Swatch {
+            icon,
+            letter,
+            color,
+        } => {
+            out.control = 6;
+            out.icon = icon.map_or(SharedString::new(), |icon| icon.path().into());
+            out.text = (*letter).into();
+            out.has_swatch = color.is_some();
+            if let Some([r, g, b, a]) = color {
+                out.swatch = slint::Color::from_argb_u8(*a, *r, *g, *b);
+            }
+            out.colours = model(
+                toolbar::PALETTE
+                    .iter()
+                    .map(|[r, g, b, a]| slint::Color::from_argb_u8(*a, *r, *g, *b))
+                    .collect(),
+            );
+        }
         Control::Separator => out.control = 4,
         Control::Spacer => out.control = 5,
     }
@@ -4925,6 +4944,27 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_toolbar_option(handler!(|ui, shell, id, index| {
+        // A colour from a colour button's palette.
+        if let Some(command @ (Command::FillColor | Command::TextColor)) = Command::from_id(id)
+            && let Some(color) = usize::try_from(index).ok().and_then(toolbar::palette_color)
+        {
+            let language = shell.language.tag();
+            if let Some(tab) = shell.active_sheet() {
+                let mut changes = if tab.view.is_editing() {
+                    tab.commit(language)
+                } else {
+                    Vec::new()
+                };
+                let edit = if command == Command::FillColor {
+                    aster_sheets::StyleEdit::Fill(color)
+                } else {
+                    aster_sheets::StyleEdit::FontColor(color)
+                };
+                changes.extend(tab.format(&edit));
+                after_sheet_change(&ui, shell, changes);
+            }
+            return;
+        }
         if Command::from_id(id) == Some(Command::NumberFormat)
             && let Ok(index) = usize::try_from(index)
         {

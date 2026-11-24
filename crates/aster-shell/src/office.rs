@@ -1995,6 +1995,8 @@ impl SheetTab {
                 .sheet()
                 .is_some_and(|sheet| sheet.merge_at(self.view.selected()).is_some()),
             filled: style.fill.is_some(),
+            fill: style.fill,
+            font_color: style.font.color,
             bordered: !style.borders.is_empty(),
             size: style.font.size,
             format,

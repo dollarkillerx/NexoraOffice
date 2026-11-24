@@ -194,6 +194,7 @@ impl Command {
                     | Command::Percent
                     | Command::NumberFormat
                     | Command::FillColor
+                    | Command::TextColor
                     | Command::Borders
                     | Command::MergeCells
                     | Command::AlignLeft
@@ -250,6 +251,14 @@ pub enum Control {
     /// A value shown between two stepper buttons, such as the font size.
     /// Activating it resets the value.
     Value { text: String, width: f32 },
+    /// A colour button: its face (a line icon, or a letter) over a bar of
+    /// the colour in effect, opening a palette. The list's first option is
+    /// "none" (or "automatic"), then [`PALETTE`] in order.
+    Swatch {
+        icon: Option<Icon>,
+        letter: &'static str,
+        color: Option<[u8; 4]>,
+    },
     /// A thin vertical rule between groups.
     Separator,
     /// Pushes what follows to the right-hand end.
@@ -341,6 +350,9 @@ pub struct CellLook {
     pub merged: bool,
     pub filled: bool,
     pub bordered: bool,
+    /// The fill and text colours, `None` for none and automatic.
+    pub fill: Option<[u8; 4]>,
+    pub font_color: Option<[u8; 4]>,
     /// Points.
     pub size: f32,
     /// Index into [`number_formats`], or `None` for another format.
@@ -359,9 +371,41 @@ impl Default for CellLook {
             merged: false,
             filled: false,
             bordered: false,
+            fill: None,
+            font_color: None,
             size: 11.0,
             format: Some(0),
         }
+    }
+}
+
+/// The colours a colour button offers, as Excel's palette has them: light
+/// tints for fills, then the standard colours.
+pub const PALETTE: [[u8; 4]; 16] = [
+    [0xFF, 0xFF, 0xFF, 0xFF],
+    [0xF2, 0xF2, 0xF2, 0xFF],
+    [0xD9, 0xD9, 0xD9, 0xFF],
+    [0xFC, 0xE4, 0xD6, 0xFF],
+    [0xFF, 0xF2, 0xCC, 0xFF],
+    [0xE2, 0xEF, 0xDA, 0xFF],
+    [0xDD, 0xEB, 0xF7, 0xFF],
+    [0x00, 0x00, 0x00, 0xFF],
+    [0xC0, 0x00, 0x00, 0xFF],
+    [0xFF, 0x00, 0x00, 0xFF],
+    [0xFF, 0xC0, 0x00, 0xFF],
+    [0xFF, 0xFF, 0x00, 0xFF],
+    [0x92, 0xD0, 0x50, 0xFF],
+    [0x00, 0xB0, 0x50, 0xFF],
+    [0x00, 0x70, 0xC0, 0xFF],
+    [0x70, 0x30, 0xA0, 0xFF],
+];
+
+/// The colour a palette entry stands for: `None` for the first ("none" or
+/// "automatic"), else the palette's.
+pub fn palette_color(index: usize) -> Option<Option<[u8; 4]>> {
+    match index {
+        0 => Some(None),
+        i => PALETTE.get(i - 1).map(|c| Some(*c)),
     }
 }
 
@@ -499,6 +543,23 @@ impl Builder {
     fn select(&mut self, value: &str, width: f32, command: Command) -> &mut Self {
         let value = value.to_owned();
         self.push(Control::Select { value, width }, command)
+    }
+
+    fn swatch(
+        &mut self,
+        icon: Option<Icon>,
+        letter: &'static str,
+        color: Option<[u8; 4]>,
+        command: Command,
+    ) -> &mut Self {
+        self.push(
+            Control::Swatch {
+                icon,
+                letter,
+                color,
+            },
+            command,
+        )
     }
 
     fn value(&mut self, text: String, width: f32, command: Command) -> &mut Self {
@@ -685,8 +746,19 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
                 .font(&size)
                 .sep()
                 .emphasis()
-                .icon(Icon::FillColor, Command::FillColor)
-                .icon(Icon::Borders, Command::Borders)
+                .swatch(
+                    Some(Icon::FillColor),
+                    "",
+                    view.cell.fill,
+                    Command::FillColor,
+                )
+                .swatch(None, "A", view.cell.font_color, Command::TextColor);
+            let fill_index = b.items.len() - 2;
+            b.items[fill_index].options = vec![strings.fill_none.to_owned()];
+            if let Some(item) = b.items.last_mut() {
+                item.options = vec![strings.font_auto.to_owned()];
+            }
+            b.icon(Icon::Borders, Command::Borders)
                 .icon(Icon::MergeCells, Command::MergeCells)
                 .sep()
                 .alignment()
@@ -921,6 +993,7 @@ mod tests {
                         Command::Underline,
                         Command::Strikethrough,
                         Command::FillColor,
+                        Command::TextColor,
                         Command::Borders,
                         Command::MergeCells,
                         Command::AlignLeft,

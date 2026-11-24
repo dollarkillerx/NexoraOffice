@@ -118,6 +118,11 @@ quick-xml = "~0.42.0"
 # (through Slint's image loading), so they add no new crates.
 png = "~0.18.1"
 zune-jpeg = "~0.5.15"
+# Exporting Markdown as PDF: embedded, subsetted fonts with ToUnicode maps,
+# links and pictures. Without its own shaping: text comes shaped by
+# `aster-text`. `raster-images` is what has images at all (and bitmap emoji);
+# its decoders were already in the tree through Slint, only `imagesize` is new.
+krilla = { version = "~0.8.2", default-features = false, features = ["raster-images"] }
 # The formula engine (ADR 0002), only through `aster-calc`. Exact version: an
 # upgrade means re-running G5's measurements and its 69-formula comparison.
 formualizer = { version = "=0.15.0", default-features = false, features = ["workbook", "eval", "common", "system-clock"] }

@@ -601,6 +601,38 @@ impl SheetTab {
         self.record(changes, styles_before)
     }
 
+    /// Type `rows` of entries into the sheet in front, starting at `start`,
+    /// as if each were typed into its cell (numbers, dates, `=formulas`,
+    /// text; an empty entry empties the cell). One undo step. Entries that
+    /// would fall outside the sheet are left out.
+    pub fn type_cells(
+        &mut self,
+        start: CellRef,
+        rows: &[Vec<String>],
+        language: &str,
+    ) -> Vec<Change> {
+        let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
+        let reading = self.reading(language);
+        let mut cells = Vec::new();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, field) in row.iter().enumerate() {
+                let (Ok(r), Ok(c)) = (u32::try_from(r), u32::try_from(c)) else {
+                    continue;
+                };
+                let at = CellRef::new(start.row.saturating_add(r), start.col.saturating_add(c));
+                if at.row >= aster_sheets::MAX_ROWS || at.col >= aster_sheets::MAX_COLUMNS {
+                    continue;
+                }
+                let (entry, look) = input::read(field, &reading);
+                let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
+                cells.push((at, cell));
+            }
+        }
+        let changes = self.view.workbook_mut().set_cells(sheet, cells);
+        self.record(changes, styles_before)
+    }
+
     /// Put cells in place on the current sheet as one undo step.
     pub fn put(&mut self, cells: Vec<(CellRef, Option<aster_sheets::Cell>)>) -> Vec<Change> {
         let sheet = self.view.sheet_index();

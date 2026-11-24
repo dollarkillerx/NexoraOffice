@@ -75,7 +75,7 @@ pub struct PreviewStyle {
 
 /// Something to draw, at a position in the whole document, in physical pixels.
 /// Text is drawn after everything else, over the selection.
-enum Piece {
+pub(crate) enum Piece {
     Rect {
         rect: Rect,
         color: Rgba8,
@@ -97,21 +97,21 @@ enum Piece {
     },
 }
 
-struct Painted {
-    shape: Piece,
+pub(crate) struct Painted {
+    pub(crate) shape: Piece,
     /// Vertical extent, for skipping what is outside the view.
-    top: f64,
-    bottom: f64,
+    pub(crate) top: f64,
+    pub(crate) bottom: f64,
 }
 
 /// A laid-out text at its place in the document. The index of one in
 /// [`PreviewLayout::texts`] is what a selection calls a block.
-struct TextBox {
-    x: f64,
-    y: f64,
-    paragraph: Paragraph,
+pub(crate) struct TextBox {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) paragraph: Paragraph,
     /// Takes part in selections; list markers and the like do not.
-    selectable: bool,
+    pub(crate) selectable: bool,
     /// What separates it from the text before it when copied.
     before: &'static str,
 }
@@ -125,10 +125,10 @@ impl TextBox {
 /// Where a block of the source ended up, for scrolling the editor and the
 /// preview to the same place.
 #[derive(Clone, Debug, PartialEq)]
-struct Anchor {
-    top: f64,
-    bottom: f64,
-    source: Range<usize>,
+pub(crate) struct Anchor {
+    pub(crate) top: f64,
+    pub(crate) bottom: f64,
+    pub(crate) source: Range<usize>,
 }
 
 /// A laid-out document, made on the worker thread.
@@ -155,6 +155,26 @@ impl PreviewLayout {
     /// Total height in physical pixels.
     pub fn height(&self) -> f64 {
         self.height
+    }
+
+    /// What is drawn under the text, in drawing order.
+    pub(crate) fn items(&self) -> &[Painted] {
+        &self.items
+    }
+
+    /// The laid-out texts, in reading order.
+    pub(crate) fn texts(&self) -> &[TextBox] {
+        &self.texts
+    }
+
+    /// Where links are, and where they go.
+    pub(crate) fn links(&self) -> &[(Rect, String)] {
+        &self.links
+    }
+
+    /// Where the blocks of the source ended up, in document order.
+    pub(crate) fn anchors(&self) -> &[Anchor] {
+        &self.anchors
     }
 
     /// The text position nearest to a point in document coordinates: in the
@@ -436,6 +456,12 @@ impl PreviewBuilder {
     /// document's own, or `None` for one that was never saved.
     pub fn set_base(&mut self, base: Option<std::path::PathBuf>) {
         self.pictures.set_base(base);
+    }
+
+    /// The shaper documents are laid out with, for other text in the same
+    /// fonts.
+    pub(crate) fn shaper(&mut self) -> &mut Shaper {
+        &mut self.shaper
     }
 
     /// Lay out `source` for a surface `width` physical pixels wide.

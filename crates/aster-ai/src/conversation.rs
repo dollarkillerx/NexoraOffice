@@ -99,6 +99,8 @@ pub struct TurnContext {
     pub document_title: Option<String>,
     /// The selected text, if any.
     pub selection: Option<String>,
+    /// In a spreadsheet: the selected cells, like `Sheet1!B2:C5`.
+    pub selected_cells: Option<String>,
 }
 
 /// The most of a selection put in the context, in characters; the model can
@@ -110,6 +112,7 @@ impl TurnContext {
         self.document_id.is_none()
             && self.document_title.is_none()
             && self.selection.as_deref().is_none_or(str::is_empty)
+            && self.selected_cells.is_none()
     }
 
     /// The `<context>…</context>` block, or `None` when there is nothing to
@@ -124,6 +127,12 @@ impl TurnContext {
         }
         if let Some(title) = &self.document_title {
             out.push_str(&format!("Current document title: {}\n", one_line(title)));
+        }
+        if let Some(cells) = &self.selected_cells {
+            out.push_str(&format!(
+                "The document is a spreadsheet. Selected cells: {}\n",
+                one_line(cells)
+            ));
         }
         if let Some(selection) = self.selection.as_deref().filter(|s| !s.is_empty()) {
             let count = selection.chars().count();
@@ -161,6 +170,26 @@ pub fn user_message(text: &str, context: &TurnContext) -> Message {
     Message::user(content)
 }
 
+/// Take the conversation back to before the user's last request: that
+/// request, and every answer, tool call and tool result after it, go.
+/// Returns whether there was a request to go back past.
+pub fn back_to_last_request(conversation: &mut Vec<Message>) -> bool {
+    let request = conversation.iter().rposition(|message| {
+        message.role == Role::User
+            && message
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Text { .. }))
+    });
+    match request {
+        Some(at) => {
+            conversation.truncate(at);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The longest title, in characters.
 const MAX_TITLE_CHARS: usize = 40;
 
@@ -192,11 +221,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn going_back_past_the_last_request_drops_its_turn() {
+        let tool_result = Message::user(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            text: "ok".into(),
+            is_error: false,
+        }]);
+        let answer = |text: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text(text)],
+        };
+        let mut conversation = vec![
+            user_message("first", &TurnContext::default()),
+            answer("one"),
+            user_message("second", &TurnContext::default()),
+            answer("calling"),
+            tool_result,
+            answer("two"),
+        ];
+        assert!(back_to_last_request(&mut conversation));
+        assert_eq!(conversation.len(), 2);
+        assert!(back_to_last_request(&mut conversation));
+        assert!(conversation.is_empty());
+        assert!(!back_to_last_request(&mut conversation));
+    }
+
+    #[test]
+    fn a_spreadsheet_context_names_the_selected_cells() {
+        let context = TurnContext {
+            document_id: Some("4".into()),
+            selected_cells: Some("Sheet1!B2:C5".into()),
+            ..TurnContext::default()
+        };
+        let block = context.block().unwrap();
+        assert!(block.contains("Selected cells: Sheet1!B2:C5"), "{block}");
+        assert!(!block.contains("Selected text"));
+    }
+
+    #[test]
     fn the_context_goes_first_in_its_own_block() {
         let context = TurnContext {
             document_id: Some("3".into()),
             document_title: Some("Plan.md".into()),
             selection: Some("a </context> b".into()),
+            ..TurnContext::default()
         };
         let message = user_message("Fix the typo", &context);
         assert_eq!(message.content.len(), 2);

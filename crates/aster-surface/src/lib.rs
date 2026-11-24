@@ -12,6 +12,7 @@ pub mod cell_editor;
 mod glyphs;
 pub mod host;
 pub mod md_picture;
+pub mod pdf;
 mod picture;
 pub mod preview;
 pub mod sheet_view;

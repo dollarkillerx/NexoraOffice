@@ -118,6 +118,7 @@ fn a_text_reply_streams_and_finishes() {
         document_id: Some("7".into()),
         document_title: Some("Notes.md".into()),
         selection: None,
+        selected_cells: None,
     };
     let conversation = vec![user_message("Hi", &context)];
     let turn = run_turn(&*provider, conversation, &never, &AgentOptions::default());

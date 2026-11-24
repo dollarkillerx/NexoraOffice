@@ -1,5 +1,5 @@
 import { Tokens, Icons, Strings, ChatItem, ApprovalItem } from "tokens.slint";
-import { Icon, IconButton, TextButton, VHairline, Hairline } from "widgets.slint";
+import { Icon, IconButton, TextButton, VHairline, Hairline, MenuFrame, MenuRow } from "widgets.slint";
 
 // Five access levels in a row: Off, Read, Ask, Trusted, Full.
 component LevelPicker inherits HorizontalLayout {
@@ -44,10 +44,31 @@ component ReadText inherits TextInput {
     selection-foreground-color: Tokens.text;
 }
 
+// A small text button under an answer.
+component ReplyLink inherits Text {
+    callback clicked;
+    font-size: Tokens.font-sm;
+    color: link-touch.has-hover ? Tokens.accent : Tokens.text-tertiary;
+    accessible-role: button;
+    accessible-label: self.text;
+    link-touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 // One entry of the conversation, as tall as what it shows.
 component ChatRow inherits VerticalLayout {
     in property <ChatItem> item;
     in property <length> available;
+    // The answer can go into the document in front.
+    in property <bool> can-insert;
+    // This is the last answer, which can be asked again.
+    in property <bool> last;
+    in property <bool> running;
+    // 0 copy, 1 insert at the caret, 2 replace the selection, 3 ask again.
+    callback act(int);
 
     // The user's message: on the right, tinted.
     if root.item.kind == 0: Rectangle {
@@ -68,10 +89,46 @@ component ChatRow inherits VerticalLayout {
         }
     }
 
-    // The assistant's answer: plain text across the panel.
-    if root.item.kind == 1: ReadText {
-        width: root.available;
-        text: root.item.text;
+    // The assistant's answer: plain text across the panel, and what can be
+    // done with it.
+    if root.item.kind == 1: VerticalLayout {
+        spacing: 2px;
+        ReadText {
+            width: root.available;
+            text: root.item.text;
+        }
+
+        if root.item.text != "": HorizontalLayout {
+            alignment: start;
+            spacing: Tokens.space-md;
+            ReplyLink {
+                text: Strings.ai-reply-copy;
+                clicked => {
+                    root.act(0);
+                }
+            }
+
+            if root.can-insert: ReplyLink {
+                text: Strings.ai-reply-insert;
+                clicked => {
+                    root.act(1);
+                }
+            }
+
+            if root.can-insert: ReplyLink {
+                text: Strings.ai-reply-replace;
+                clicked => {
+                    root.act(2);
+                }
+            }
+
+            if root.last && !root.running: ReplyLink {
+                text: Strings.ai-reply-retry;
+                clicked => {
+                    root.act(3);
+                }
+            }
+        }
     }
 
     // A tool call: one quiet line.
@@ -398,18 +455,28 @@ export component AssistantPanel inherits Rectangle {
     in property <bool> mcp-enabled;
     in property <string> mcp-status;
     in property <string> mcp-clients;
+    in property <[string]> mcp-client-names;
+    callback disconnect-client(int);
     in property <string> mcp-setup-cli;
     in property <string> mcp-setup-json;
     // The selected provider's models, and what listing them came to.
     in property <[string]> models;
     in property <string> models-state;
+    // Earlier conversations of this run, most recent first.
+    in property <[string]> chats;
+    in property <bool> can-insert;
+    // The row of the last answer, or -1.
+    in property <int> last-reply: -1;
+    callback switch-chat(int);
+    callback reply-action(int, int);
     // The endpoint is plain http to another computer, and whether the user
     // has allowed it anyway.
     in property <bool> insecure;
     in property <bool> allow-insecure;
 
     callback send(string);
-    // A quick action: 0 rewrite, 1 proofread, 2 summarise, 3 continue.
+    // A quick action: 0 rewrite, 1 proofread, 2 summarise, 3 continue,
+    // 4 translate.
     callback quick(int);
     callback stop();
     callback new-chat();
@@ -435,6 +502,30 @@ export component AssistantPanel inherits Rectangle {
 
     VHairline {
         x: 0;
+    }
+
+    // The earlier conversations, from the clock in the header.
+    chat-menu := PopupWindow {
+        x: root.panel-width - self.width - Tokens.space-md;
+        y: 44px;
+        width: 260px;
+        MenuFrame { }
+
+        VerticalLayout {
+            padding: Tokens.space-xs + 2px;
+            Text {
+                text: Strings.ai-chats;
+                font-size: Tokens.font-xs;
+                color: Tokens.text-tertiary;
+            }
+
+            for title[index] in root.chats: MenuRow {
+                text: title;
+                clicked => {
+                    root.switch-chat(index);
+                }
+            }
+        }
     }
 
     // Laid out at the full width even while the panel is sliding shut.
@@ -463,6 +554,15 @@ export component AssistantPanel inherits Rectangle {
                 vertical-alignment: center;
                 horizontal-stretch: 1;
                 overflow: elide;
+            }
+
+            if root.page == 0 && root.chats.length > 0: IconButton {
+                icon: Icons.clock;
+                accessible-role: button;
+                accessible-label: Strings.ai-chats;
+                clicked => {
+                    chat-menu.show();
+                }
             }
 
             if root.page == 0: IconButton {
@@ -513,9 +613,15 @@ export component AssistantPanel inherits Rectangle {
                         wrap: word-wrap;
                     }
 
-                    for item in root.items: ChatRow {
+                    for item[row] in root.items: ChatRow {
                         item: item;
                         available: root.panel-width - 1px - 2 * Tokens.space-lg;
+                        can-insert: root.can-insert;
+                        last: row == root.last-reply;
+                        running: root.running;
+                        act(action) => {
+                            root.reply-action(row, action);
+                        }
                     }
 
                     if root.running: Text {
@@ -575,7 +681,7 @@ export component AssistantPanel inherits Rectangle {
                 padding-left: Tokens.space-md;
                 padding-right: Tokens.space-md;
                 spacing: Tokens.space-xs;
-                for name[index] in [Strings.ai-quick-rewrite, Strings.ai-quick-proofread, Strings.ai-quick-summarize, Strings.ai-quick-continue]: Rectangle {
+                for name[index] in [Strings.ai-quick-rewrite, Strings.ai-quick-proofread, Strings.ai-quick-summarize, Strings.ai-quick-continue, Strings.ai-quick-translate]: Rectangle {
                     property <bool> usable: root.configured && !root.running && root.access-level > 0;
                     height: 24px;
                     horizontal-stretch: 1;
@@ -910,6 +1016,25 @@ export component AssistantPanel inherits Rectangle {
                     font-size: Tokens.font-sm;
                     color: Tokens.text-secondary;
                     wrap: word-wrap;
+                }
+
+                for name[index] in root.mcp-client-names: HorizontalLayout {
+                    spacing: Tokens.space-sm;
+                    Text {
+                        text: name;
+                        font-size: Tokens.font-sm;
+                        color: Tokens.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    TextButton {
+                        text: Strings.mcp-disconnect;
+                        clicked => {
+                            root.disconnect-client(index);
+                        }
+                    }
                 }
 
                 if root.mcp-setup-cli != "": Snippet {

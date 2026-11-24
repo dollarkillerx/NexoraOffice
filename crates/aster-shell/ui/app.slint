@@ -79,6 +79,10 @@ export component AppWindow inherits Window {
     in property <string> mcp-setup-cli;
     in property <string> mcp-setup-json;
     in property <[string]> ai-models;
+    in property <[string]> ai-chats;
+    in property <[string]> mcp-client-names;
+    in property <bool> ai-can-insert;
+    in property <int> ai-last-reply: -1;
     in property <string> ai-models-state;
     in property <bool> ai-insecure;
     in property <bool> ai-allow-insecure;
@@ -119,6 +123,9 @@ export component AppWindow inherits Window {
     callback outline-clicked(int);
     callback ai-send(string);
     callback ai-quick(int);
+    callback ai-switch-chat(int);
+    callback mcp-disconnect-client(int);
+    callback ai-reply-action(int, int);
     callback ai-stop();
     callback ai-new-chat();
     callback ai-set-access(int);
@@ -264,6 +271,7 @@ export component AppWindow inherits Window {
     callback file-save();
     callback file-save-as();
     callback file-export-html();
+    callback file-export-pdf();
     callback file-close();
     callback quit-requested();
     callback edit-undo();
@@ -459,6 +467,14 @@ export component AppWindow inherits Window {
                 enabled: root.editing;
                 activated => {
                     root.file-export-html();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-export-pdf;
+                enabled: root.editing;
+                activated => {
+                    root.file-export-pdf();
                 }
             }
 
@@ -1329,6 +1345,19 @@ export component AppWindow inherits Window {
                 mcp-setup-json: root.mcp-setup-json;
                 models: root.ai-models;
                 models-state: root.ai-models-state;
+                chats: root.ai-chats;
+                mcp-client-names: root.mcp-client-names;
+                disconnect-client(index) => {
+                    root.mcp-disconnect-client(index);
+                }
+                can-insert: root.ai-can-insert;
+                last-reply: root.ai-last-reply;
+                switch-chat(index) => {
+                    root.ai-switch-chat(index);
+                }
+                reply-action(row, action) => {
+                    root.ai-reply-action(row, action);
+                }
                 insecure: root.ai-insecure;
                 allow-insecure: root.ai-allow-insecure;
                 set-allow-insecure(on) => {

@@ -4,17 +4,28 @@
 //! - one accept thread, which wakes every 100 ms to see whether the server
 //!   is stopping;
 //! - one reader thread per connection, which reads messages one line at a
-//!   time and answers everything except tool calls itself;
-//! - one thread per tool call, because a call can wait up to two minutes
-//!   for the user and the connection must go on answering `ping` and
-//!   accepting other calls meanwhile. Writes to the socket are serialised
-//!   by a mutex, so replies may come back in any order but never mixed.
+//!   time and answers everything that does not go through the invoker
+//!   itself;
+//! - one thread per tool call (and per resource listing or read, which are
+//!   tool calls underneath), because a call can wait up to two minutes for
+//!   the user and the connection must go on answering `ping` and accepting
+//!   other calls meanwhile. Writes to the socket are serialised by a mutex,
+//!   so replies may come back in any order but never mixed.
+//!
+//! Cancelling: `notifications/cancelled` cancels the call with that request
+//! id through the invoker ([`aster_tools::Invoker::cancel`]). A call
+//! waiting for the user is refused and its question withdrawn
+//! ([`aster_tools::Approver::withdraw`]); one whose tool is already running
+//! finishes. Either way it gets no reply, as MCP asks. `disconnect` and
+//! `stop` cancel every call of the connections they close the same way.
+//! A client that only closes its writing side is not cancelled: its calls
+//! go on and their replies are still sent.
 //!
 //! A connection's session (its "allow for this session" answers) ends when
 //! its reader and all of its calls have finished. `stop` closes every
-//! connection at once but does not wait for calls still waiting on the
-//! user: they finish, or time out, on their own, and their replies go
-//! nowhere.
+//! connection at once and does not wait for the calls: they end once
+//! their questions are withdrawn (or time out, with an approver that does
+//! not withdraw), and their replies go nowhere.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -188,7 +199,22 @@ impl McpServer {
         Vec::new()
     }
 
+    /// Close one client's connection, as if it had gone: its calls are
+    /// cancelled and the questions they wait on withdrawn, it is no longer
+    /// in [`Self::clients`], and `client_disconnected` follows once its
+    /// reader has stopped (if it had introduced itself). Returns at once;
+    /// `false` if there is no such connection.
+    pub fn disconnect(&self, connection: u64) -> bool {
+        #[cfg(unix)]
+        if let Some(running) = &self.running {
+            return running.disconnect(connection);
+        }
+        let _ = connection;
+        false
+    }
+
     /// Stop accepting, close every connection and remove the socket file.
+    /// Calls still running are cancelled and their questions withdrawn.
     /// Returns within about two seconds, even with calls waiting for the
     /// user (those are left to end on their own). Doing it twice is fine.
     pub fn stop(&mut self) {
@@ -219,7 +245,7 @@ mod unix {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use aster_tools::{Invoker, Origin};
+    use aster_tools::{CallToken, Invoker, Origin, ToolResult};
     use serde_json::Value;
 
     use super::{
@@ -228,7 +254,8 @@ mod unix {
     use crate::endpoint;
     use crate::peer;
     use crate::protocol::{
-        INVALID_REQUEST, Outcome, Session, TOO_BUSY, call_result, error_reply, reply,
+        self, INVALID_REQUEST, Job, Outcome, Resource, Session, TOO_BUSY, call_result, error_reply,
+        reply,
     };
 
     /// How often the accept thread looks at the stop flag.
@@ -263,8 +290,19 @@ mod unix {
     /// A connection as the server keeps track of it, to close it on stop.
     struct Live {
         stream: UnixStream,
+        connection: Arc<Connection>,
         client: Option<McpClient>,
         reader: Option<JoinHandle<()>>,
+    }
+
+    impl Live {
+        /// Shutting a socket down wakes its reader and fails pending writes,
+        /// whichever descriptor of it they use; cancelling the calls ends
+        /// those waiting for the user.
+        fn close(&self) {
+            let _ = self.stream.shutdown(Shutdown::Both);
+            self.connection.cancel_all();
+        }
     }
 
     /// Poisoning only means another thread panicked mid-update; the maps
@@ -357,6 +395,19 @@ mod unix {
             clients
         }
 
+        pub(super) fn disconnect(&self, connection: u64) -> bool {
+            // Out of the map first, so `clients` no longer lists it; the
+            // reader's own removal then finds nothing.
+            let live = lock(&self.shared.connections).remove(&connection);
+            match live {
+                Some(live) => {
+                    live.close();
+                    true
+                }
+                None => false,
+            }
+        }
+
         pub(super) fn stop(mut self, path: &Path) {
             self.shared.stopping.store(true, Ordering::SeqCst);
             // The accept thread ends within one tick and drops the listener,
@@ -368,10 +419,8 @@ mod unix {
                 .drain()
                 .map(|(_, live)| live)
                 .collect();
-            // Shutting a socket down wakes its reader and fails pending
-            // writes, whichever descriptor of it they use.
             for connection in &live {
-                let _ = connection.stream.shutdown(Shutdown::Both);
+                connection.close();
             }
             let deadline = Instant::now() + STOP_WAIT;
             for reader in live.into_iter().filter_map(|live| live.reader) {
@@ -436,6 +485,14 @@ mod unix {
             return;
         };
         let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+        let connection = Arc::new(Connection {
+            id,
+            session: format!("mcp-{id}"),
+            writer: Mutex::new(writer),
+            invoker: Arc::clone(&shared.invoker),
+            events: Arc::clone(&shared.events),
+            calls: Mutex::new(HashMap::new()),
+        });
         {
             let mut connections = lock(&shared.connections);
             if connections.len() >= MAX_CONNECTIONS {
@@ -445,19 +502,12 @@ mod unix {
                 id,
                 Live {
                     stream: registered,
+                    connection: Arc::clone(&connection),
                     client: None,
                     reader: None,
                 },
             );
         }
-        let connection = Arc::new(Connection {
-            id,
-            session: format!("mcp-{id}"),
-            writer: Mutex::new(writer),
-            invoker: Arc::clone(&shared.invoker),
-            events: Arc::clone(&shared.events),
-            calls: Mutex::new(HashMap::new()),
-        });
         let reading = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name(format!("aster-mcp-{id}"))
@@ -485,9 +535,8 @@ mod unix {
         writer: Mutex<UnixStream>,
         invoker: Arc<Invoker>,
         events: Arc<dyn McpEvents>,
-        /// Calls running, by request id as JSON text; `true` once the client
-        /// has cancelled one.
-        calls: Mutex<HashMap<String, bool>>,
+        /// Calls running, by request id as JSON text.
+        calls: Mutex<HashMap<String, CallToken>>,
     }
 
     impl Drop for Connection {
@@ -515,21 +564,26 @@ mod unix {
             let _ = lock(&self.writer).shutdown(Shutdown::Both);
         }
 
-        /// The call goes on (the user may be looking at its question), but
-        /// its reply is not sent, as MCP asks of a cancelled request.
+        /// Cancel the call with request id `id`, if it is still running: its
+        /// question is withdrawn, and its reply is not sent, as MCP asks of
+        /// a cancelled request.
         fn cancel(&self, id: &Value) {
-            if let Some(cancelled) = lock(&self.calls).get_mut(&id.to_string()) {
-                *cancelled = true;
+            let token = lock(&self.calls).get(&id.to_string()).cloned();
+            if let Some(token) = token {
+                self.invoker.cancel(&token);
             }
         }
 
-        fn start_call(
-            self: &Arc<Self>,
-            id: Value,
-            client: String,
-            name: String,
-            args: Value,
-        ) -> bool {
+        /// Cancel every call still running. The lock is not held while the
+        /// approver hears of it.
+        fn cancel_all(&self) {
+            let tokens: Vec<CallToken> = lock(&self.calls).values().cloned().collect();
+            for token in &tokens {
+                self.invoker.cancel(token);
+            }
+        }
+
+        fn start_call(self: &Arc<Self>, id: Value, client: String, job: Job) -> bool {
             let key = id.to_string();
             {
                 let mut calls = lock(&self.calls);
@@ -549,13 +603,13 @@ mod unix {
                         "too many tool calls at once on this connection; wait for one to finish",
                     ));
                 }
-                calls.insert(key.clone(), false);
+                calls.insert(key.clone(), CallToken::new());
             }
             let connection = Arc::clone(self);
             let (call_key, call_id) = (key.clone(), id.clone());
             let spawned = thread::Builder::new()
                 .name(format!("aster-mcp-{}-call", self.id))
-                .spawn(move || connection.run_call(&call_key, call_id, &client, &name, &args));
+                .spawn(move || connection.run_call(&call_key, call_id, &client, job));
             if spawned.is_err() {
                 lock(&self.calls).remove(&key);
                 return self.send(&error_reply(id, TOO_BUSY, "cannot start the call now"));
@@ -563,14 +617,44 @@ mod unix {
             true
         }
 
-        fn run_call(&self, key: &str, id: Value, client: &str, name: &str, args: &Value) {
+        fn run_call(&self, key: &str, id: Value, client: &str, job: Job) {
+            let Some(token) = lock(&self.calls).get(key).cloned() else {
+                return;
+            };
             let origin = Origin::new(format!("mcp:{client}"), self.session.clone());
-            let result = self.invoker.call(&origin, name, args);
-            self.events.tool_called(self.id, name, &result);
-            let cancelled = lock(&self.calls).remove(key).unwrap_or(false);
-            if !cancelled {
-                self.send(&reply(id, call_result(&result)));
+            let invoke = |name: &str, args: &Value| -> ToolResult {
+                let result = self.invoker.call_with(&origin, name, args, &token);
+                self.events.tool_called(self.id, name, &result);
+                result
+            };
+            let answer = match job {
+                Job::Tool { name, arguments } => Ok(call_result(&invoke(&name, &arguments))),
+                Job::ListResources => {
+                    protocol::resource_list(&invoke("list_documents", &protocol::list_arguments()))
+                }
+                Job::ReadResource(resource) => {
+                    let result = match &resource {
+                        Resource::Documents => {
+                            invoke("list_documents", &protocol::list_arguments())
+                        }
+                        Resource::Document(document) => {
+                            invoke("read_document", &protocol::read_arguments(document))
+                        }
+                        Resource::Sheet(document) => {
+                            invoke("read_sheet", &protocol::sheet_arguments(document))
+                        }
+                    };
+                    protocol::read_result(&resource, &result)
+                }
+            };
+            lock(&self.calls).remove(key);
+            if token.is_cancelled() {
+                return;
             }
+            self.send(&match answer {
+                Ok(result) => reply(id, result),
+                Err((code, message)) => error_reply(id, code, &message),
+            });
         }
     }
 
@@ -625,12 +709,7 @@ mod unix {
                     connected = true;
                     sent
                 }
-                Outcome::Call {
-                    id,
-                    client,
-                    name,
-                    arguments,
-                } => connection.start_call(id, client, name, arguments),
+                Outcome::Call { id, client, job } => connection.start_call(id, client, job),
             };
             if !sent {
                 break;

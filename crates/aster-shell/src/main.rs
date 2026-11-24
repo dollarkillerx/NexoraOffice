@@ -983,6 +983,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_save(strings.menu_save.into());
     s.set_menu_save_as(strings.menu_save_as.into());
     s.set_menu_export_html(strings.menu_export_html.into());
+    s.set_menu_export_pdf(strings.menu_export_pdf.into());
     s.set_menu_close_tab(strings.menu_close_tab.into());
     s.set_menu_quit(strings.menu_quit.into());
     s.set_menu_undo(strings.menu_undo.into());
@@ -1072,6 +1073,13 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_ai_quick_proofread(strings.ai_quick_proofread.into());
     s.set_ai_quick_summarize(strings.ai_quick_summarize.into());
     s.set_ai_quick_continue(strings.ai_quick_continue.into());
+    s.set_ai_quick_translate(strings.ai_quick_translate.into());
+    s.set_ai_reply_copy(strings.ai_reply_copy.into());
+    s.set_ai_reply_insert(strings.ai_reply_insert.into());
+    s.set_ai_reply_replace(strings.ai_reply_replace.into());
+    s.set_ai_reply_retry(strings.ai_reply_retry.into());
+    s.set_ai_chats(strings.ai_chats.into());
+    s.set_mcp_disconnect(strings.mcp_disconnect.into());
     s.set_ai_stop(strings.ai_stop.into());
     s.set_ai_input_hint(strings.ai_input_hint.into());
     s.set_ai_empty(strings.ai_empty.into());
@@ -1760,6 +1768,9 @@ fn undo_state(shell: &mut Shell) -> (bool, bool) {
         _ => (false, false),
     }
 }
+
+/// Body text size of an exported PDF, in points.
+const PDF_FONT_SIZE: f32 = 10.5;
 
 /// Documents up to this size get their outline worked out at once, as they
 /// are typed; larger ones once typing pauses.
@@ -4759,6 +4770,15 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     ui.on_ai_stop(handler!(|ui, shell| {
         agent::stop(&ui, shell);
     }));
+    ui.on_mcp_disconnect_client(handler!(|ui, shell, index| {
+        agent::disconnect_client(&ui, shell, index);
+    }));
+    ui.on_ai_switch_chat(handler!(|ui, shell, index| {
+        agent::switch_chat(&ui, shell, index);
+    }));
+    ui.on_ai_reply_action(handler!(|ui, shell, row, action| {
+        agent::reply_action(&ui, shell, row, action);
+    }));
     ui.on_ai_new_chat(handler!(|ui, shell| {
         agent::new_chat(&ui, shell);
     }));
@@ -4933,6 +4953,84 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         i18n::fill(strings.export_failed, "name", &files::display_name(&path));
                     show_dialog(&ui, &mut shell, 2, title, err.to_string());
                 }
+            });
+        });
+    }
+
+    {
+        let shell = shell.clone();
+        let weak = ui.as_weak();
+        ui.on_file_export_pdf(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Ok(mut borrowed) = shell.try_borrow_mut() else {
+                return;
+            };
+            let strings = borrowed.language.strings();
+            let Some(id) = borrowed.tabs.active_id() else {
+                return;
+            };
+            let Some((existing, suggested)) = borrowed.save_target(id) else {
+                return;
+            };
+            let Some(editor) = borrowed.markdown(id) else {
+                return;
+            };
+            let source = editor.document.text().to_string();
+            let base = editor
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_owned);
+            // On paper: the light colours, whatever the window shows, and
+            // body text at a size for print.
+            let style = aster_surface::preview::PreviewStyle {
+                font_size: PDF_FONT_SIZE,
+                ..content::preview_style(&theme::Tokens::of(ThemeMode::Light), strings)
+            };
+            drop(borrowed);
+            let suggested = existing.unwrap_or(suggested).with_extension("pdf");
+            let weak = ui.as_weak();
+            let _ = slint::spawn_local(async move {
+                let types = [FileType {
+                    name: strings.file_type_pdf,
+                    extensions: &["pdf"],
+                }];
+                let Some(path) =
+                    dialogs::pick_file_to_save(strings.menu_export_pdf, &suggested, &types).await
+                else {
+                    return;
+                };
+                // Laying out and writing a long document takes a moment.
+                std::thread::spawn(move || {
+                    let written = aster_surface::pdf::export_pdf(
+                        &source,
+                        base.as_deref(),
+                        &style,
+                        aster_surface::pdf::PdfPage::A4,
+                    )
+                    .and_then(|bytes| {
+                        aster_storage::write_atomically(&path, &bytes)
+                            .map_err(|err| err.to_string())
+                    });
+                    if let Err(err) = written {
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            deliver(
+                                ui,
+                                Box::new(move |ui, shell| {
+                                    let strings = shell.language.strings();
+                                    let title = i18n::fill(
+                                        strings.export_failed,
+                                        "name",
+                                        &files::display_name(&path),
+                                    );
+                                    show_dialog(ui, shell, 2, title, err);
+                                }),
+                            );
+                        });
+                    }
+                });
             });
         });
     }

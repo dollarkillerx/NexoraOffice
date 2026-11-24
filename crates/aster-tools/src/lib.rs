@@ -22,7 +22,8 @@ pub mod schema;
 pub use audit::{Audit, AuditRecord};
 pub use catalogue::{Annotations, Capability, ToolSpec, find, tools};
 pub use invoke::{
-    Approval, ApprovalRequest, Approver, CHANGED_WHILE_ASKING, DocumentInfo, Host, Invoker, Origin,
-    ToolError, ToolResult, UNCHECKABLE,
+    Approval, ApprovalRequest, Approver, CANCELLED_BY_CALLER, CANCELLED_BY_CLIENT,
+    CHANGED_WHILE_ASKING, CallToken, DocumentInfo, Host, Invoker, Origin, ToolError, ToolResult,
+    UNCHECKABLE,
 };
 pub use policy::{Level, Policy, Reason, Verdict};

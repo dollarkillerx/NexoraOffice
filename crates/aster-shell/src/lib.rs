@@ -14,6 +14,7 @@ pub mod i18n;
 pub mod icons;
 pub mod office;
 pub mod recovery;
+pub mod sheet_tools;
 pub mod sidebar;
 pub mod stats;
 pub mod tabs;

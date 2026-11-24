@@ -29,6 +29,7 @@ use aster_markdown::Selection;
 use aster_mcp::{McpClient, McpConfig, McpEvents, McpServer};
 use aster_shell::assistant;
 use aster_shell::i18n;
+use aster_shell::sheet_tools;
 use aster_shell::tabs::{DocKind, TabId};
 use aster_tools::{
     Approval, ApprovalRequest, Approver, Audit, DocumentInfo, Host, Invoker, Level, Policy, Reason,
@@ -38,8 +39,8 @@ use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::{
-    AfterSave, AppWindow, ApprovalItem, ChatItem, Shell, after_edit, after_tab_change, deliver,
-    spawn_save, start_load,
+    AfterSave, AppWindow, ApprovalItem, ChatItem, Content, Shell, after_edit, after_sheet_change,
+    after_tab_change, deliver, refresh_tabs, spawn_save, start_load,
 };
 
 /// How long a tool waits for the interface thread before giving up.
@@ -108,7 +109,27 @@ pub struct Assistant {
     /// Why the last attempt to save a key was refused, shown where the key
     /// state is until the next attempt.
     key_note: Option<&'static str>,
+    /// The other conversations of this run, most recent first. Kept in
+    /// memory only, like the one on screen.
+    chats: Vec<Chat>,
+    /// The conversation the running turn belongs to. Its events and result
+    /// go to that conversation only, even after another was put on screen.
+    turn_chat: Option<u64>,
+    /// The connections of the MCP clients the settings page lists, in its
+    /// order, for its "Disconnect" buttons.
+    mcp_connections: Vec<u64>,
 }
+
+/// A conversation put aside while another is on screen.
+struct Chat {
+    id: u64,
+    title: String,
+    conversation: Vec<aster_ai::Message>,
+    items: Vec<ChatItem>,
+}
+
+/// At most this many conversations are kept aside; older ones are let go.
+const MAX_CHATS: usize = 20;
 
 /// What listing a provider's models came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +192,9 @@ impl Assistant {
             models: HashMap::new(),
             keys_cleared: Default::default(),
             key_note: None,
+            chats: Vec::new(),
+            turn_chat: None,
+            mcp_connections: Vec::new(),
         });
         if mcp_enabled {
             set_mcp(ui, shell, true);
@@ -256,13 +280,16 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
     let folder = shell.tree.as_ref().map(|tree| tree.root().to_owned());
     let path = active
         .as_ref()
-        .and_then(|(id, _, _)| shell.markdown(*id).and_then(|e| e.path.clone()));
+        .and_then(|(id, _, _)| document_path(shell, *id));
+    let can_insert = shell
+        .active_markdown()
+        .is_some_and(|editor| editor.view_mode.shows_source() && !editor.locked());
     let Some(ai) = &mut shell.ai else {
         return;
     };
     let policy = ai.policy.lock().map(|p| p.clone()).unwrap_or_default();
     match active {
-        Some((id, DocKind::Markdown, title)) => {
+        Some((id, DocKind::Markdown | DocKind::Sheets, title)) => {
             let level = policy.level_of(&id.0.to_string(), path.as_deref());
             ui.set_ai_access_level(level_index(level));
             ui.set_ai_access_label(i18n::fill(strings.ai_access_label, "name", &title).into());
@@ -281,6 +308,24 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
         None => ui.set_ai_folder_label(SharedString::new()),
     }
     ui.set_ai_untitled_level(level_index(policy.untitled));
+    ui.set_ai_chats(crate::model(
+        ai.chats
+            .iter()
+            .map(|chat| SharedString::from(chat.title.as_str()))
+            .collect(),
+    ));
+    ui.set_ai_can_insert(can_insert);
+    // The last answer, if nothing was asked after it: only it can be asked
+    // again.
+    let rows = ai.items.row_count();
+    let last_request = (0..rows)
+        .rev()
+        .find(|&row| ai.items.row_data(row).is_some_and(|i| i.kind == 0));
+    let last_reply = (0..rows)
+        .rev()
+        .find(|&row| ai.items.row_data(row).is_some_and(|i| i.kind == 1))
+        .filter(|&row| last_request.is_none_or(|request| row > request));
+    ui.set_ai_last_reply(last_reply.map_or(-1, |row| row as i32));
 
     let provider = ai.settings.selected_provider().cloned();
     ui.set_ai_provider(provider.as_ref().map_or(0, |p| {
@@ -360,7 +405,15 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
             String::new(),
         ),
         (Some(server), None) => {
-            let names: Vec<String> = server.clients().into_iter().map(|c| c.name).collect();
+            let clients = server.clients();
+            ai.mcp_connections = clients.iter().map(|c| c.connection).collect();
+            let names: Vec<String> = clients.into_iter().map(|c| c.name).collect();
+            ui.set_mcp_client_names(crate::model(
+                names
+                    .iter()
+                    .map(|name| SharedString::from(name.as_str()))
+                    .collect(),
+            ));
             (
                 i18n::fill(
                     strings.mcp_on_note,
@@ -376,6 +429,10 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
         }
         (None, None) => (String::new(), String::new()),
     };
+    if ai.mcp.is_none() {
+        ai.mcp_connections.clear();
+        ui.set_mcp_client_names(crate::model(Vec::new()));
+    }
     ui.set_mcp_status(status.into());
     ui.set_mcp_clients(clients.into());
     match aster_mcp::bridge_path() {
@@ -686,11 +743,12 @@ fn context(shell: &mut Shell) -> TurnContext {
     let Some((id, title)) = shell
         .tabs
         .active()
-        .filter(|tab| tab.kind == DocKind::Markdown)
+        .filter(|tab| matches!(tab.kind, DocKind::Markdown | DocKind::Sheets))
         .map(|tab| (tab.id, tab.title.clone()))
     else {
         return context;
     };
+    let path = document_path(shell, id);
     let Some(policy) = shell
         .ai
         .as_ref()
@@ -698,14 +756,21 @@ fn context(shell: &mut Shell) -> TurnContext {
     else {
         return context;
     };
-    let Some(editor) = shell.markdown(id) else {
-        return context;
-    };
-    if policy.level_of(&id.0.to_string(), editor.path.as_deref()) == Level::Off {
+    if policy.level_of(&id.0.to_string(), path.as_deref()) == Level::Off {
         return context;
     }
     context.document_id = Some(id.0.to_string());
     context.document_title = Some(title);
+    if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
+        // Where the user is in the workbook; the cells themselves are read
+        // with read_sheet.
+        let sheet = tab.view.sheet().map_or("", |sheet| sheet.name.as_str());
+        context.selected_cells = Some(format!("{sheet}!{}", tab.view.selection()));
+        return context;
+    }
+    let Some(editor) = shell.markdown(id) else {
+        return context;
+    };
     let range = editor.document.selection().range();
     if !range.is_empty() {
         context.selection = Some(editor.document.text().byte_slice(range).to_string());
@@ -735,6 +800,8 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
     ai.streaming = None;
     let cancel = Arc::new(AtomicBool::new(false));
     ai.cancel = Some(cancel.clone());
+    let chat = ai.conversation_id;
+    ai.turn_chat = Some(chat);
     let mut conversation = ai.conversation.clone();
     let invoker = ai.invoker.clone();
     let options = ai.settings.agent_options();
@@ -774,11 +841,19 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
                         drain(ui, shell);
                         if let Some(ai) = &mut shell.ai {
                             // A stopped or failed turn leaves the conversation
-                            // as it was before it.
+                            // as it was before it. One put aside meanwhile
+                            // gets its result where it is kept.
                             if result.is_ok() {
-                                ai.conversation = conversation;
+                                if ai.conversation_id == chat {
+                                    ai.conversation = conversation;
+                                } else if let Some(kept) =
+                                    ai.chats.iter_mut().find(|kept| kept.id == chat)
+                                {
+                                    kept.conversation = conversation;
+                                }
                             }
                             ai.cancel = None;
+                            ai.turn_chat = None;
                             ai.streaming = None;
                         }
                         refresh(ui, shell);
@@ -791,6 +866,7 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
         let strings = shell.language.strings();
         if let Some(ai) = &mut shell.ai {
             ai.cancel = None;
+            ai.turn_chat = None;
             ai.conversation.pop();
             ai.push(
                 3,
@@ -833,6 +909,11 @@ fn drain(ui: &AppWindow, shell: &mut Shell) {
         .lock()
         .map(|mut inbox| std::mem::take(&mut *inbox))
         .unwrap_or_default();
+    // What a turn of a conversation no longer on screen still says (it was
+    // stopped when another was started) does not belong to this one.
+    if ai.turn_chat.is_some_and(|chat| chat != ai.conversation_id) {
+        return;
+    }
     for event in events {
         if !matches!(event, AgentEvent::TextDelta(_)) {
             flush_stream(ai);
@@ -892,14 +973,15 @@ fn drain(ui: &AppWindow, shell: &mut Shell) {
 
 /// A quick action from the panel: a request ready-made in the interface
 /// language, sent like one the user typed (0 rewrite, 1 proofread, 2
-/// summarise, 3 continue writing at the caret).
+/// summarise, 3 continue writing at the caret, 4 translate).
 pub fn quick(ui: &AppWindow, shell: &mut Shell, action: i32) {
     let strings = shell.language.strings();
     let prompt = match action {
         0 => strings.ai_prompt_rewrite,
         1 => strings.ai_prompt_proofread,
         2 => strings.ai_prompt_summarize,
-        _ => strings.ai_prompt_continue,
+        3 => strings.ai_prompt_continue,
+        _ => strings.ai_prompt_translate,
     };
     send(ui, shell, prompt);
 }
@@ -913,21 +995,140 @@ pub fn stop(ui: &AppWindow, shell: &mut Shell) {
     refresh(ui, shell);
 }
 
-/// Start over: the conversation and its "allow for this chat" answers go.
+impl Assistant {
+    /// The title of the conversation on screen: its first request.
+    fn current_title(&self) -> Option<String> {
+        self.items
+            .iter()
+            .find(|item| item.kind == 0)
+            .map(|item| aster_ai::title(&item.text))
+    }
+
+    /// Put the conversation on screen aside, if it has anything in it, and
+    /// clear the screen. Its "allow for this chat" answers stay with it.
+    fn stash_current(&mut self) {
+        if let Some(title) = self.current_title() {
+            let chat = Chat {
+                id: self.conversation_id,
+                title,
+                conversation: std::mem::take(&mut self.conversation),
+                items: self.items.iter().collect(),
+            };
+            self.chats.retain(|kept| kept.id != chat.id);
+            self.chats.insert(0, chat);
+            for dropped in self.chats.drain(MAX_CHATS.min(self.chats.len())..) {
+                self.invoker.end_session(&format!("chat-{}", dropped.id));
+            }
+        } else {
+            self.invoker
+                .end_session(&format!("chat-{}", self.conversation_id));
+        }
+        self.conversation.clear();
+        self.items.clear();
+        self.tool_rows.clear();
+        self.streaming = None;
+    }
+
+    /// A number for a conversation never used before.
+    fn fresh_id(&self) -> u64 {
+        let kept = self.chats.iter().map(|chat| chat.id).max().unwrap_or(0);
+        self.conversation_id.max(kept) + 1
+    }
+}
+
+/// Start a new conversation. The one on screen is kept aside, with its
+/// "allow for this chat" answers, and can be gone back to.
 pub fn new_chat(ui: &AppWindow, shell: &mut Shell) {
     if let Some(ai) = &mut shell.ai {
         if let Some(cancel) = &ai.cancel {
             cancel.store(true, Ordering::Relaxed);
         }
-        ai.invoker
-            .end_session(&format!("chat-{}", ai.conversation_id));
-        ai.conversation_id += 1;
-        ai.conversation.clear();
-        ai.items.clear();
-        ai.tool_rows.clear();
-        ai.streaming = None;
+        ai.stash_current();
+        ai.conversation_id = ai.fresh_id();
     }
     refresh(ui, shell);
+}
+
+/// Go back to a conversation put aside (`index` into the list the panel
+/// shows). Not while a turn runs.
+pub fn switch_chat(ui: &AppWindow, shell: &mut Shell, index: i32) {
+    if let Some(ai) = &mut shell.ai
+        && ai.cancel.is_none()
+        && let Ok(index) = usize::try_from(index)
+        && index < ai.chats.len()
+    {
+        let chat = ai.chats.remove(index);
+        ai.stash_current();
+        ai.conversation_id = chat.id;
+        ai.conversation = chat.conversation;
+        ai.items.set_vec(chat.items);
+    }
+    refresh(ui, shell);
+}
+
+/// What a reply's buttons do: 0 copy it, 1 insert it at the caret of the
+/// document in front, 2 put it in place of the selection there, 3 ask
+/// again (the last reply only).
+pub fn reply_action(ui: &AppWindow, shell: &mut Shell, row: i32, action: i32) {
+    let Some(text) = shell.ai.as_ref().and_then(|ai| {
+        let item = ai.items.row_data(usize::try_from(row).ok()?)?;
+        (item.kind == 1).then(|| item.text.to_string())
+    }) else {
+        return;
+    };
+    match action {
+        0 => ui.invoke_copy_to_clipboard(text.into()),
+        1 | 2 => {
+            let Some(editor) = shell.active_markdown() else {
+                return;
+            };
+            if !editor.view_mode.shows_source() {
+                return;
+            }
+            let selection = editor.document.selection().range();
+            let range = if action == 1 {
+                selection.end..selection.end
+            } else {
+                selection
+            };
+            let end = range.start + text.len();
+            if editor
+                .apply_external(range, &text, Selection::caret(end))
+                .is_ok()
+            {
+                after_edit(ui, shell, true);
+                ui.invoke_focus_document();
+            }
+        }
+        _ => retry(ui, shell),
+    }
+}
+
+/// Ask the last request again: the last answer and everything after the
+/// request go, and the request is sent as it was.
+fn retry(ui: &AppWindow, shell: &mut Shell) {
+    let Some(ai) = &mut shell.ai else {
+        return;
+    };
+    if ai.cancel.is_some() {
+        return;
+    }
+    let Some(row) = (0..ai.items.row_count())
+        .rev()
+        .find(|&row| ai.items.row_data(row).is_some_and(|item| item.kind == 0))
+    else {
+        return;
+    };
+    let Some(request) = ai.items.row_data(row).map(|item| item.text.to_string()) else {
+        return;
+    };
+    while ai.items.row_count() > row {
+        ai.items.remove(ai.items.row_count() - 1);
+    }
+    aster_ai::back_to_last_request(&mut ai.conversation);
+    ai.tool_rows.clear();
+    ai.streaming = None;
+    send(ui, shell, &request);
 }
 
 // --- Access ----------------------------------------------------------------
@@ -1029,6 +1230,20 @@ pub fn set_mcp(ui: &AppWindow, shell: &mut Shell, on: bool) {
 }
 
 /// Stop the MCP server before the program ends, so the socket goes.
+/// Close one MCP client's connection, from the settings page. Its
+/// questions on screen are withdrawn.
+pub fn disconnect_client(ui: &AppWindow, shell: &mut Shell, index: i32) {
+    if let Some(ai) = &shell.ai
+        && let Some(server) = &ai.mcp
+        && let Some(&connection) = usize::try_from(index)
+            .ok()
+            .and_then(|index| ai.mcp_connections.get(index))
+    {
+        server.disconnect(connection);
+    }
+    refresh(ui, shell);
+}
+
 pub fn shut_down(shell: &mut Shell) {
     if let Some(ai) = &mut shell.ai {
         if let Some(cancel) = &ai.cancel {
@@ -1069,6 +1284,23 @@ impl Approver for Cards {
             }
         }
     }
+
+    /// The caller gave up on the question (an MCP client cancelled or was
+    /// disconnected): the card goes and the wait ends as a refusal. Posted,
+    /// never waited for: this can be called on the interface thread itself.
+    fn withdraw(&self, id: u64) {
+        let id = id as i32;
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    if let Some(answer) = take_card(ui, shell, id) {
+                        let _ = answer.send(Approval::Deny);
+                    }
+                }),
+            );
+        });
+    }
 }
 
 /// Text for a card, at most `limit` characters, saying how long it was.
@@ -1104,6 +1336,27 @@ fn effect(shell: &mut Shell, request: &ApprovalRequest) -> (String, String, Stri
         .as_ref()
         .and_then(|d| d.id.parse().ok())
         .map(TabId);
+    if request.tool.name == "write_cells" {
+        let Some(Content::Sheet(tab)) = id.and_then(|id| shell.contents.get(&id)) else {
+            return (String::new(), String::new(), String::new());
+        };
+        let entries = sheet_tools::entries(args).unwrap_or_default();
+        let new = written(sheet_tools::as_rows(&entries));
+        let Some((sheet, range, now)) = sheet_tools::before_write(tab, args) else {
+            return (String::new(), String::new(), new);
+        };
+        let count = u64::from(range.rows()) * u64::from(range.cols());
+        let facts = i18n::fill(
+            &i18n::fill(
+                &i18n::fill(strings.approval_cells, "sheet", &sheet),
+                "range",
+                &range.to_string(),
+            ),
+            "count",
+            &count.to_string(),
+        );
+        return (facts, shortened(&now, SHOWN, strings), new);
+    }
     let editor = id.and_then(|id| shell.markdown(id));
     match request.tool.name {
         "replace_lines" => {
@@ -1242,6 +1495,10 @@ fn show_card(
     request: ApprovalRequest,
     answer: mpsc::Sender<Approval>,
 ) -> bool {
+    // Withdrawn before it could be shown.
+    if request.token.is_cancelled() {
+        return false;
+    }
     let strings = shell.language.strings();
     let (facts, removed, written) = effect(shell, &request);
     let Some(ai) = &mut shell.ai else {
@@ -1334,11 +1591,20 @@ fn documents(shell: &mut Shell) -> Vec<DocumentInfo> {
         .map(|(id, kind, title, modified)| DocumentInfo {
             id: id.0.to_string(),
             title,
-            path: shell.markdown(id).and_then(|editor| editor.path.clone()),
+            path: document_path(shell, id),
             kind: kind_name(kind).to_owned(),
             modified,
         })
         .collect()
+}
+
+/// The file a document is kept in, which folder rules apply to.
+fn document_path(shell: &mut Shell, id: TabId) -> Option<PathBuf> {
+    match shell.contents.get(&id)? {
+        Content::Markdown(editor) => editor.path.clone(),
+        Content::Sheet(tab) => tab.path.clone(),
+        _ => None,
+    }
 }
 
 fn tab_id(document: Option<&DocumentInfo>) -> Result<TabId, String> {
@@ -1388,12 +1654,13 @@ impl Host for ShellHost {
         &self,
         tool: &ToolSpec,
         document: Option<&DocumentInfo>,
-        _: &Value,
+        args: &Value,
     ) -> Option<String> {
         let id = tab_id(document).ok()?;
         let name = tool.name;
+        let args = args.clone();
         on_ui(&self.ui, UI_WAIT, move |_, shell| {
-            fingerprint_of(shell, id, name)
+            fingerprint_of(shell, id, name, &args)
         })
         .flatten()
     }
@@ -1421,7 +1688,13 @@ impl Host for ShellHost {
 /// What an approval card about `tool` on tab `id` was shown against: the
 /// document's text version, and for the tools that act at the selection,
 /// the selection too. An approved call runs only while this is unchanged.
-fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str) -> Option<String> {
+fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str, args: &Value) -> Option<String> {
+    if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
+        return Some(match tool {
+            "write_cells" => sheet_tools::fingerprint(tab, args),
+            _ => format!("d{}:{}", tab.history.depth(), tab.edited.len()),
+        });
+    }
     let editor = shell.markdown(id)?;
     let version = editor.text_version();
     let selection = editor.document.selection().range();
@@ -1455,9 +1728,24 @@ impl ShellHost {
     ) -> Result<String, String> {
         on_ui(&self.ui, UI_WAIT, move |ui, shell| {
             if let Some(expect) = &expect
-                && fingerprint_of(shell, id, name).as_ref() != Some(expect)
+                && fingerprint_of(shell, id, name, &args).as_ref() != Some(expect)
             {
                 return Err(aster_tools::CHANGED_WHILE_ASKING.to_owned());
+            }
+            let language = shell.language.tag();
+            if let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) {
+                let (result, changes) = sheet_tools::run(tab, name, &args, language)?;
+                if !changes.is_empty() {
+                    if shell.tabs.active_id() == Some(id) {
+                        after_sheet_change(ui, shell, changes);
+                    } else {
+                        tab.recalc(&changes);
+                        if shell.sync_modified() {
+                            refresh_tabs(ui, shell);
+                        }
+                    }
+                }
+                return Ok(result);
             }
             let Some(editor) = shell.markdown(id) else {
                 return Err("only Markdown documents can be read and changed for now".to_owned());
@@ -1512,7 +1800,7 @@ impl ShellHost {
     fn save(&self, id: TabId, expect: Option<String>) -> Result<String, String> {
         let started = on_ui(&self.ui, UI_WAIT, move |ui, shell| {
             if let Some(expect) = &expect
-                && fingerprint_of(shell, id, "save_document").as_ref() != Some(expect)
+                && fingerprint_of(shell, id, "save_document", &Value::Null).as_ref() != Some(expect)
             {
                 return Err(aster_tools::CHANGED_WHILE_ASKING);
             }
@@ -1596,17 +1884,20 @@ mod tests {
         let mut shell = Shell::new(ThemeMode::Light, Language::ZhHans);
         let id = shell.open_untitled(DocKind::Markdown);
         shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/a.md"));
-        let before = fingerprint_of(&mut shell, id, "save_document").unwrap();
+        let before = fingerprint_of(&mut shell, id, "save_document", &Value::Null).unwrap();
         // The same text, saved meanwhile under another name.
         shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/b.md"));
         assert_ne!(
-            fingerprint_of(&mut shell, id, "save_document"),
+            fingerprint_of(&mut shell, id, "save_document", &Value::Null),
             Some(before)
         );
         // Other tools look at the text only.
-        let edit = fingerprint_of(&mut shell, id, "replace_lines").unwrap();
+        let edit = fingerprint_of(&mut shell, id, "replace_lines", &Value::Null).unwrap();
         shell.markdown(id).unwrap().path = Some(PathBuf::from("/notes/c.md"));
-        assert_eq!(fingerprint_of(&mut shell, id, "replace_lines"), Some(edit));
+        assert_eq!(
+            fingerprint_of(&mut shell, id, "replace_lines", &Value::Null),
+            Some(edit)
+        );
     }
 
     #[test]

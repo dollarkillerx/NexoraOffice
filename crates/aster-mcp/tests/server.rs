@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aster_mcp::protocol::{
-    INVALID_REQUEST, METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR, PROTOCOL_VERSIONS, TOO_BUSY,
+    INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR,
+    PROTOCOL_VERSIONS, RESOURCE_NOT_FOUND, TOO_BUSY,
 };
 use aster_mcp::{
     EndpointError, MAX_CALLS_PER_CONNECTION, MAX_LINE_BYTES, McpClient, McpConfig, McpEvents,
     McpServer, StartError,
 };
 use aster_tools::{
-    Approval, ApprovalRequest, Approver, Audit, DocumentInfo, Host, Invoker, Level, Policy,
-    ToolResult, ToolSpec,
+    Approval, ApprovalRequest, Approver, Audit, CANCELLED_BY_CLIENT, DocumentInfo, Host, Invoker,
+    Level, Policy, ToolResult, ToolSpec,
 };
 use serde_json::{Value, json};
 
@@ -54,9 +55,13 @@ impl Host for FakeHost {
 }
 
 /// Tells the test when the user is asked, and answers when the test says.
+/// A withdrawn question is answered "deny" at once, the way the shell takes
+/// its card down.
 struct GateApprover {
     entered: Mutex<Sender<u64>>,
     release: Mutex<Receiver<Approval>>,
+    answer: Mutex<Sender<Approval>>,
+    withdrawn: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Approver for GateApprover {
@@ -67,6 +72,11 @@ impl Approver for GateApprover {
             .unwrap()
             .recv_timeout(timeout)
             .unwrap_or(Approval::TimedOut)
+    }
+
+    fn withdraw(&self, id: u64) {
+        self.withdrawn.lock().unwrap().push(id);
+        let _ = self.answer.lock().unwrap().send(Approval::Deny);
     }
 }
 
@@ -140,15 +150,30 @@ struct Fixture {
     invoker: Arc<Invoker>,
     entered: Receiver<u64>,
     release: Sender<Approval>,
+    withdrawn: Arc<Mutex<Vec<u64>>>,
     events: Arc<Recorder>,
 }
 
 fn invoker() -> (Arc<Invoker>, Receiver<u64>, Sender<Approval>) {
+    let (invoker, entered, release, _) = gated_invoker();
+    (invoker, entered, release)
+}
+
+#[allow(clippy::type_complexity)]
+fn gated_invoker() -> (
+    Arc<Invoker>,
+    Receiver<u64>,
+    Sender<Approval>,
+    Arc<Mutex<Vec<u64>>>,
+) {
     let (entered_tx, entered) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
+    let withdrawn = Arc::new(Mutex::new(Vec::new()));
     let approver = Arc::new(GateApprover {
         entered: Mutex::new(entered_tx),
         release: Mutex::new(release_rx),
+        answer: Mutex::new(release.clone()),
+        withdrawn: withdrawn.clone(),
     });
     let mut policy = Policy::default();
     policy.set_folder("/notes".into(), Level::Ask);
@@ -159,13 +184,13 @@ fn invoker() -> (Arc<Invoker>, Receiver<u64>, Sender<Approval>) {
         Arc::new(Audit::in_memory()),
     )
     .with_timeout(Duration::from_secs(30));
-    (Arc::new(invoker), entered, release)
+    (Arc::new(invoker), entered, release, withdrawn)
 }
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("run/mcp.sock");
-    let (invoker, entered, release) = invoker();
+    let (invoker, entered, release, withdrawn) = gated_invoker();
     let events = Arc::new(Recorder::default());
     let server = McpServer::start(
         McpConfig {
@@ -182,6 +207,7 @@ fn fixture() -> Fixture {
         invoker,
         entered,
         release,
+        withdrawn,
         events,
     }
 }
@@ -265,7 +291,9 @@ fn the_handshake_negotiates_the_version() {
     assert_eq!(result["protocolVersion"], "2025-03-26");
     assert_eq!(
         result["capabilities"],
-        json!({"tools": {"listChanged": false}})
+        json!({"tools": {"listChanged": false},
+               "resources": {"subscribe": false, "listChanged": false},
+               "prompts": {"listChanged": false}})
     );
     assert_eq!(result["serverInfo"]["name"], "aster-office");
     assert_eq!(result["serverInfo"]["title"], "Aster Office");
@@ -365,7 +393,7 @@ fn bad_messages_get_json_rpc_errors() {
     assert_eq!(parse["id"], Value::Null);
     client.send_raw(b"[{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"ping\"}]\n");
     assert_eq!(client.recv()["error"]["code"], INVALID_REQUEST);
-    let unknown = client.request(4, "resources/list", json!({}));
+    let unknown = client.request(4, "sampling/createMessage", json!({}));
     assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
     // Notifications, known or not, and blank lines get no answer: the next
     // message is the ping's.
@@ -459,25 +487,190 @@ fn a_call_waiting_for_the_user_does_not_block_the_connection() {
 }
 
 #[test]
-fn a_cancelled_call_gets_no_reply() {
+fn a_cancelled_call_is_withdrawn_and_gets_no_reply() {
     let fixture = fixture();
     let mut client = Client::connect(&fixture.path);
     client.initialize("t");
     client.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": "insert_text", "arguments": {"document": "1", "text": "x"}}}));
-    fixture
+    let asked = fixture
         .entered
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
+    // A cancellation for some other id changes nothing.
+    client.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": "1"}}),
+    );
+    client.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": 1, "reason": "user stopped"}}),
+    );
+    // The question is withdrawn without the user, and the call ends.
+    fixture.events.wait_for("called 1 insert_text true");
+    assert_eq!(*fixture.withdrawn.lock().unwrap(), [asked]);
+    // No reply for it: the next message is the ping's.
+    assert_eq!(client.request(2, "ping", json!({}))["id"], 2);
+    let record = fixture.invoker.audit().recent().pop().unwrap();
+    assert_eq!(record.tool, "insert_text");
+    assert_eq!(record.approval, Some("cancelled"));
+    assert_eq!(record.error.as_deref(), Some(CANCELLED_BY_CLIENT));
+    // The id is free again, and a cancellation that comes too late is
+    // ignored.
+    assert_eq!(
+        client.call(1, "read_document", json!({"document": "1"}))["isError"],
+        false
+    );
     client.send(
         json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
                        "params": {"requestId": 1}}),
     );
-    // Make sure the cancellation has been read before the call ends.
-    assert_eq!(client.request(2, "ping", json!({}))["id"], 2);
-    fixture.release.send(Approval::Allow).unwrap();
-    fixture.events.wait_for("called 1 insert_text false");
     assert_eq!(client.request(3, "ping", json!({}))["id"], 3);
+    assert_eq!(fixture.withdrawn.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn resources_are_read_through_the_invoker() {
+    let fixture = fixture();
+    let mut client = Client::connect(&fixture.path);
+    client.initialize("t");
+    let list = client.request(1, "resources/list", json!({}));
+    let resources = list["result"]["resources"].as_array().unwrap();
+    let uris: Vec<&str> = resources
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    // The document outside the policy is not there.
+    assert_eq!(uris, ["aster://documents", "aster://document/1"]);
+    assert_eq!(resources[1]["name"], "notes.md");
+    assert_eq!(resources[1]["mimeType"], "text/markdown");
+
+    let templates = client.request(2, "resources/templates/list", json!({}));
+    assert_eq!(
+        templates["result"]["resourceTemplates"][0]["uriTemplate"],
+        "aster://document/{id}"
+    );
+
+    let read = client.request(3, "resources/read", json!({"uri": "aster://document/1"}));
+    assert_eq!(
+        read["result"],
+        json!({"contents": [{"uri": "aster://document/1", "mimeType": "text/plain",
+                              "text": "1: hello"}]})
+    );
+    let documents = client.request(4, "resources/read", json!({"uri": "aster://documents"}));
+    let text = documents["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(text.contains("notes.md") && !text.contains("secret"));
+    // Hidden and missing documents are both not found.
+    for (id, uri) in [
+        (5, "aster://document/2"),
+        (6, "aster://document/99"),
+        (7, "file:///notes/notes.md"),
+    ] {
+        let missing = client.request(id, "resources/read", json!({"uri": uri}));
+        assert_eq!(missing["error"]["code"], RESOURCE_NOT_FOUND, "{uri}");
+        assert!(
+            !missing["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("secret")
+        );
+    }
+    let bad = client.request(8, "resources/read", json!({}));
+    assert_eq!(bad["error"]["code"], INVALID_PARAMS);
+
+    // Every listing and read is a tool call in the audit log; the foreign
+    // URI never reached the invoker.
+    let records = fixture.invoker.audit().recent();
+    let tools: Vec<(&str, &str)> = records
+        .iter()
+        .map(|r| (r.tool.as_str(), r.verdict))
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            ("list_documents", "allow"),
+            ("read_document", "allow"),
+            ("list_documents", "allow"),
+            ("read_document", "hidden"),
+            ("read_document", "hidden"),
+        ]
+    );
+    assert!(records.iter().all(|r| r.caller == "mcp:t"));
+    assert_eq!(records[1].arguments["max_lines"], 2000);
+    fixture.events.wait_for("called 1 read_document true");
+}
+
+#[test]
+fn prompts_are_listed_and_filled_in() {
+    let fixture = fixture();
+    let mut client = Client::connect(&fixture.path);
+    client.initialize("t");
+    let list = client.request(1, "prompts/list", json!({}));
+    let names: Vec<&str> = list["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["summarize_document", "proofread_document"]);
+    let prompt = client.request(
+        2,
+        "prompts/get",
+        json!({"name": "proofread_document", "arguments": {"document_id": "2"}}),
+    );
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("replace_lines"));
+    // A prompt names a document but reads nothing: no tool call, and no
+    // hint of what is in it.
+    assert!(!text.contains("secret"));
+    assert!(fixture.invoker.audit().recent().is_empty());
+    let missing = client.request(3, "prompts/get", json!({"name": "summarize_document"}));
+    assert_eq!(missing["error"]["code"], INVALID_PARAMS);
+}
+
+#[test]
+fn disconnecting_a_client_withdraws_its_questions() {
+    let fixture = fixture();
+    let mut client = Client::connect(&fixture.path);
+    let mut other = Client::connect(&fixture.path);
+    client.initialize("gone");
+    other.initialize("stays");
+    fixture.events.wait_for("connected 2 stays");
+    client.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "insert_text", "arguments": {"document": "1", "text": "x"}}}));
+    let asked = fixture
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let clients = fixture.server.clients();
+    let gone = clients
+        .iter()
+        .find(|c| c.name == "gone")
+        .unwrap()
+        .connection;
+    assert!(fixture.server.disconnect(gone));
+    // Listed no more, at once.
+    let names: Vec<String> = fixture
+        .server
+        .clients()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["stays"]);
+    // The socket is closed without a reply, and the question withdrawn.
+    assert!(client.try_recv().is_none());
+    fixture.events.wait_for("disconnected 1");
+    fixture.events.wait_for("called 1 insert_text true");
+    assert_eq!(*fixture.withdrawn.lock().unwrap(), [asked]);
+    let record = fixture.invoker.audit().recent().pop().unwrap();
+    assert_eq!(record.approval, Some("cancelled"));
+    assert!(!fixture.server.disconnect(gone));
+    assert!(!fixture.server.disconnect(u64::MAX));
+    // The other client goes on.
+    assert_eq!(other.request(2, "ping", json!({}))["id"], 2);
+    assert_eq!(fixture.server.clients().len(), 1);
 }
 
 #[test]
@@ -537,6 +730,9 @@ fn stopping_is_quick_even_with_a_call_waiting() {
     assert!(client.try_recv().is_none());
     assert!(UnixStream::connect(&fixture.path).is_err());
     fixture.events.wait_for("disconnected 1");
+    // The question it was waiting on is withdrawn.
+    fixture.events.wait_for("called 1 insert_text true");
+    assert_eq!(fixture.withdrawn.lock().unwrap().len(), 1);
     // Stopping again, and dropping, are harmless.
     fixture.server.stop();
 }

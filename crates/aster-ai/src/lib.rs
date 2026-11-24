@@ -30,7 +30,9 @@ mod sse;
 pub use agent::{
     AgentEvent, AgentOptions, DEFAULT_MAX_STEPS, InvokerExecutor, ToolExecutor, TurnEnd, run,
 };
-pub use conversation::{ContentBlock, Message, Role, TurnContext, title, user_message};
+pub use conversation::{
+    ContentBlock, Message, Role, TurnContext, back_to_last_request, title, user_message,
+};
 pub use error::AiError;
 pub use prompt::SYSTEM_PROMPT;
 pub use provider::{

@@ -140,7 +140,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_selection",
         title: "Get selection",
-        description: "The text the user has selected in a document, and the line and column range of the selection. Empty text means only a caret.",
+        description: "The text the user has selected in a document, and the line and column range of the selection. Empty text means only a caret. In a spreadsheet: the sheet, the selected range and the active cell.",
         capability: Capability::Read,
         annotations: READ,
         on_document: true,
@@ -225,6 +225,24 @@ const TOOLS: &[ToolSpec] = &[
         },
     },
     ToolSpec {
+        name: "read_sheet",
+        title: "Read sheet",
+        description: "Cells of a spreadsheet document as JSON: the values as the grid shows them, row by row from first_row, with formulas listed apart by cell. Without a range, the used part of the sheet (at most 200 rows and 26 columns). Also gives the names of all sheets.",
+        capability: Capability::Read,
+        annotations: READ,
+        on_document: true,
+        schema: || {
+            object(
+                json!({
+                    "document": document(),
+                    "sheet": { "type": "string", "description": "The sheet's name. Default: the sheet in front." },
+                    "range": { "type": "string", "description": "A cell range like A1:D20, or one cell like B3." }
+                }),
+                &["document"],
+            )
+        },
+    },
+    ToolSpec {
         name: "replace_lines",
         title: "Replace lines",
         description: "Replace lines start_line to end_line (1-based, inclusive) of a document with new text. An empty text deletes them. One undo step in the editor.",
@@ -290,6 +308,29 @@ const TOOLS: &[ToolSpec] = &[
                     "case_sensitive": { "type": "boolean", "description": "Default false." }
                 }),
                 &["document", "query"],
+            )
+        },
+    },
+    ToolSpec {
+        name: "write_cells",
+        title: "Write cells",
+        description: "Type entries into the cells of a spreadsheet document, starting at a cell and going right and down, as a person typing them would: numbers, dates, percentages, TRUE/FALSE, formulas starting with = and text. An empty entry empties its cell. One undo step in the editor.",
+        capability: Capability::Edit,
+        annotations: REPLACE,
+        on_document: true,
+        schema: || {
+            object(
+                json!({
+                    "document": document(),
+                    "sheet": { "type": "string", "description": "The sheet's name. Default: the sheet in front." },
+                    "start": { "type": "string", "description": "The top left cell, like B2." },
+                    "rows": {
+                        "type": "array",
+                        "description": "Rows of entries, each an array of strings.",
+                        "items": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } }
+                    }
+                }),
+                &["document", "start", "rows"],
             )
         },
     },

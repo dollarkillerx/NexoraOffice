@@ -1,10 +1,16 @@
 //! The call pipeline both callers share: look up, check, find the target,
 //! judge, ask, run, cut down, audit.
+//!
+//! A call can be cancelled while it runs (an MCP client sends
+//! `notifications/cancelled`, or goes away): see [`CallToken`]. Up to the
+//! moment the tool runs, a cancelled call stops and is refused; a question
+//! waiting for the user is withdrawn through [`Approver::withdraw`]. Once
+//! the tool runs it is not stopped.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -110,6 +116,40 @@ pub trait Host: Send + Sync {
 /// What a call gets when the document changed while the user was deciding.
 pub const CHANGED_WHILE_ASKING: &str = "the document changed while the user was deciding, so the approved change was not made; read it again and retry";
 
+/// What a cancelled call's audit record says went wrong. The caller does
+/// not hear it: a cancelled MCP request gets no response at all.
+pub const CANCELLED_BY_CLIENT: &str = "cancelled by the client";
+/// The same for the built-in assistant.
+pub const CANCELLED_BY_CALLER: &str = "cancelled by the caller";
+
+/// The cancel switch of one call, shared by whoever started it (which keeps
+/// a clone) and the invoker. Cancel it with [`Invoker::cancel`].
+#[derive(Clone, Debug, Default)]
+pub struct CallToken(Arc<TokenState>);
+
+#[derive(Debug, Default)]
+struct TokenState {
+    cancelled: AtomicBool,
+    /// The approval request the call is waiting on, if any. Its lock also
+    /// orders cancelling against starting to ask.
+    asking: Mutex<Option<u64>>,
+}
+
+impl CallToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the call has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn asking(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        self.0.asking.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// A question for the user about one call.
 #[derive(Clone, Debug)]
 pub struct ApprovalRequest {
@@ -120,6 +160,10 @@ pub struct ApprovalRequest {
     pub document: Option<DocumentInfo>,
     pub reason: Reason,
     pub args: Value,
+    /// The call's token. It is cancelled before [`Approver::withdraw`] is
+    /// called, so an approver that looks at it where it shows the question
+    /// (on the interface thread) never shows a question already withdrawn.
+    pub token: CallToken,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +190,21 @@ impl Approval {
 /// Asks the user. Blocks the calling thread until an answer or `timeout`.
 pub trait Approver: Send + Sync {
     fn ask(&self, request: ApprovalRequest, timeout: Duration) -> Approval;
+
+    /// The caller has given up on the call behind request `id` (an MCP
+    /// client cancelled it, or was disconnected). Take the question down
+    /// and let the `ask` waiting for it return now; whatever it returns,
+    /// the call is refused as cancelled. Called from the cancelling thread,
+    /// so it should hand the work over and return.
+    ///
+    /// It can come while `ask` has not shown the question yet (then
+    /// `request.token` is already cancelled: do not show it), or just after
+    /// the user answered (then there is nothing to do). An approver that
+    /// does nothing here leaves the question up until the user answers or
+    /// it times out; the call is refused as cancelled either way.
+    fn withdraw(&self, id: u64) {
+        let _ = id;
+    }
 }
 
 /// What the caller gets back. A failed call is a result too (`is_error`),
@@ -256,6 +315,19 @@ impl Invoker {
 
     /// Make a tool call. Exactly one audit record is written.
     pub fn call(&self, origin: &Origin, name: &str, args: &Value) -> ToolResult {
+        self.call_with(origin, name, args, &CallToken::new())
+    }
+
+    /// [`Self::call`], which another thread can cancel through `token`
+    /// (see [`Self::cancel`]). A cancelled call comes back as an error
+    /// result, and its audit record says it was cancelled.
+    pub fn call_with(
+        &self,
+        origin: &Origin,
+        name: &str,
+        args: &Value,
+        token: &CallToken,
+    ) -> ToolResult {
         let mut record = AuditRecord {
             time: now_ms(),
             caller: origin.caller.clone(),
@@ -267,7 +339,7 @@ impl Invoker {
             error: None,
             arguments: summarise(args),
         };
-        let result = self.call_inner(origin, name, args, &mut record);
+        let result = self.call_inner(origin, name, args, token, &mut record);
         record.ok = !result.is_error;
         // The pipeline's own messages are fixed text; a tool's may repeat
         // what the user looked for, so it is not copied (see `call_inner`).
@@ -278,13 +350,30 @@ impl Invoker {
         result
     }
 
+    /// Cancel the call running with `token`: it stops before its tool runs,
+    /// and a question it is waiting on is withdrawn. A call already running
+    /// its tool finishes. Cancelling twice, or a call that has ended, does
+    /// nothing more.
+    pub fn cancel(&self, token: &CallToken) {
+        let (already, asking) = {
+            let asking = token.asking();
+            (token.0.cancelled.swap(true, Ordering::SeqCst), *asking)
+        };
+        if let (false, Some(id)) = (already, asking) {
+            self.approver.withdraw(id);
+        }
+    }
+
     fn call_inner(
         &self,
         origin: &Origin,
         name: &str,
         args: &Value,
+        token: &CallToken,
         record: &mut AuditRecord,
     ) -> ToolResult {
+        // Cancellation is looked at once the verdict is known (so that the
+        // audit record has it): before asking, after asking, before running.
         let Some(tool) = find(name) else {
             return ToolResult::error(format!("unknown tool `{name}`"));
         };
@@ -365,15 +454,33 @@ impl Invoker {
                     // has changed since.
                     return ToolResult::error(UNCHECKABLE);
                 }
+                let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+                {
+                    // Under the token's lock: a cancel either comes before
+                    // this, or finds the id to withdraw.
+                    let mut asking = token.asking();
+                    if token.is_cancelled() {
+                        return cancelled(origin, record);
+                    }
+                    *asking = Some(id);
+                }
                 let request = ApprovalRequest {
-                    id: self.next_request.fetch_add(1, Ordering::Relaxed),
+                    id,
                     origin: origin.clone(),
                     tool,
                     document: document.clone(),
                     reason,
                     args: args.clone(),
+                    token: token.clone(),
                 };
                 let answer = self.approver.ask(request, self.timeout);
+                *token.asking() = None;
+                // Whatever the answer, a call cancelled meanwhile is not
+                // made: nobody is waiting for its result.
+                if token.is_cancelled() {
+                    record.approval = Some("cancelled");
+                    return cancelled(origin, record);
+                }
                 record.approval = Some(answer.key());
                 match answer {
                     Approval::Allow => {}
@@ -394,6 +501,9 @@ impl Invoker {
             }
         }
 
+        if token.is_cancelled() {
+            return cancelled(origin, record);
+        }
         let mut args = args.clone();
         if let Target::Path(path) = &target {
             args["path"] = Value::String(path.display().to_string());
@@ -451,8 +561,20 @@ impl Invoker {
 /// approval could not be checked against it.
 pub const UNCHECKABLE: &str = "Aster Office could not tell what the document holds now, so the action was not taken; try again";
 
-fn unknown_document(id: &str) -> String {
+/// The error for a document that is not open, or that the caller may not
+/// see: the two read the same, so a hidden document does not exist.
+pub fn unknown_document(id: &str) -> String {
     format!("no open document `{id}` that you may see; call list_documents")
+}
+
+fn cancelled(origin: &Origin, record: &mut AuditRecord) -> ToolResult {
+    let text = if origin.is_mcp() {
+        CANCELLED_BY_CLIENT
+    } else {
+        CANCELLED_BY_CALLER
+    };
+    record.error = Some(text.to_owned());
+    ToolResult::error(text)
 }
 
 fn refusal(reason: Reason) -> String {
@@ -795,6 +917,123 @@ mod tests {
             *self.host.version.lock().unwrap() += 1;
             Approval::Allow
         }
+    }
+
+    /// Says when it is asked, then waits until the question is withdrawn
+    /// and answers "allow" anyway: the invoker must not run the call.
+    struct WithdrawnApprover {
+        asked: Mutex<std::sync::mpsc::Sender<(u64, CallToken)>>,
+        withdrawn_tx: Mutex<std::sync::mpsc::Sender<u64>>,
+        withdrawn_rx: Mutex<std::sync::mpsc::Receiver<u64>>,
+        withdrawn: Mutex<Vec<u64>>,
+    }
+
+    impl Approver for WithdrawnApprover {
+        fn ask(&self, request: ApprovalRequest, timeout: Duration) -> Approval {
+            let _ = self
+                .asked
+                .lock()
+                .unwrap()
+                .send((request.id, request.token.clone()));
+            match self.withdrawn_rx.lock().unwrap().recv_timeout(timeout) {
+                Ok(id) => {
+                    assert_eq!(id, request.id);
+                    assert!(request.token.is_cancelled());
+                    Approval::Allow
+                }
+                Err(_) => Approval::TimedOut,
+            }
+        }
+
+        fn withdraw(&self, id: u64) {
+            self.withdrawn.lock().unwrap().push(id);
+            let _ = self.withdrawn_tx.lock().unwrap().send(id);
+        }
+    }
+
+    #[test]
+    fn cancelling_withdraws_the_question_and_refuses_the_call() {
+        let (_, host, _) = setup(Approval::Allow);
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+        let approver = Arc::new(WithdrawnApprover {
+            asked: Mutex::new(asked_tx),
+            withdrawn_tx: Mutex::new(withdrawn_tx),
+            withdrawn_rx: Mutex::new(withdrawn_rx),
+            withdrawn: Mutex::new(Vec::new()),
+        });
+        let mut policy = Policy::default();
+        policy.set_folder("/notes".into(), Level::Ask);
+        let invoker = Arc::new(
+            Invoker::new(
+                Arc::new(Mutex::new(policy)),
+                host.clone(),
+                approver.clone(),
+                Arc::new(Audit::in_memory()),
+            )
+            .with_timeout(Duration::from_secs(30)),
+        );
+        let token = CallToken::new();
+        let calling = {
+            let (invoker, token) = (invoker.clone(), token.clone());
+            std::thread::spawn(move || {
+                invoker.call_with(
+                    &Origin::new("mcp:client", "connection-1"),
+                    "insert_text",
+                    &json!({"document": "1", "text": "x"}),
+                    &token,
+                )
+            })
+        };
+        let (id, seen) = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!seen.is_cancelled());
+        invoker.cancel(&token);
+        // A second cancel does not withdraw again.
+        invoker.cancel(&token);
+        let result = calling.join().unwrap();
+        assert_eq!(result, ToolResult::error(CANCELLED_BY_CLIENT));
+        assert_eq!(*approver.withdrawn.lock().unwrap(), [id]);
+        assert!(host.runs.lock().unwrap().is_empty());
+        let record = invoker.audit().recent().pop().unwrap();
+        assert_eq!(record.verdict, "ask");
+        assert_eq!(record.approval, Some("cancelled"));
+        assert_eq!(record.error.as_deref(), Some(CANCELLED_BY_CLIENT));
+        assert!(!record.ok);
+        // Cancelling a call that has ended does nothing.
+        invoker.cancel(&token);
+        assert_eq!(approver.withdrawn.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_call_cancelled_before_it_starts_is_not_asked_about_or_run() {
+        let (invoker, host, approver) = setup(Approval::Allow);
+        let token = CallToken::new();
+        invoker.cancel(&token);
+        let changed = invoker.call_with(
+            &ai(),
+            "insert_text",
+            &json!({"document": "1", "text": "x"}),
+            &token,
+        );
+        assert_eq!(changed, ToolResult::error(CANCELLED_BY_CALLER));
+        assert!(approver.asked.lock().unwrap().is_empty());
+        // A read is not asked about; it is stopped before it runs.
+        let read = invoker.call_with(&ai(), "read_document", &json!({"document": "1"}), &token);
+        assert!(read.is_error);
+        assert!(host.runs.lock().unwrap().is_empty());
+        let records = invoker.audit().recent();
+        assert_eq!(records[0].verdict, "ask");
+        assert_eq!(records[0].approval, None);
+        assert_eq!(records[1].verdict, "allow");
+        assert_eq!(records[1].error.as_deref(), Some(CANCELLED_BY_CALLER));
+        // A token nobody cancelled changes nothing.
+        let read = invoker.call_with(
+            &ai(),
+            "read_document",
+            &json!({"document": "1"}),
+            &CallToken::new(),
+        );
+        assert_eq!(read.text, "1: 你好");
     }
 
     #[test]

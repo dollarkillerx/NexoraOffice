@@ -19,6 +19,7 @@ slint = { workspace = true }
 parley = { workspace = true }
 vello_cpu = { workspace = true }
 bytemuck = { workspace = true }
+krilla = { workspace = true }
 
 [dev-dependencies]
 png = { workspace = true }

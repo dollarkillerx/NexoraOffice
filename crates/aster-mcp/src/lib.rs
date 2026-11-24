@@ -1,7 +1,9 @@
 //! The MCP server inside Aster Office. MCP clients (Claude Code, Claude
 //! Desktop and the like) reach the same tools as the built-in assistant,
 //! through the same [`aster_tools::Invoker`]: one policy, one approval flow,
-//! one audit log.
+//! one audit log. Resources (the open documents) are read through that
+//! invoker too, and the prompts carry no document text, so neither gets
+//! round the policy (see [`protocol`]).
 //!
 //! The server runs in the application's process, on threads of its own,
 //! and listens on a local socket only (see [`endpoint`]). Each connection

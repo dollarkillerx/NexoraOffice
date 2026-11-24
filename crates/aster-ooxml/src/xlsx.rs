@@ -907,8 +907,15 @@ fn read_cell(
 
 /// What a worksheet may be linked to and still have rows and columns
 /// inserted and deleted: its drawing's anchors are moved, hyperlinks are
-/// cell references in the sheet itself.
-const RESTRUCTURABLE: [&str; 4] = ["drawing", "printerSettings", "hyperlink", "image"];
+/// cell references in the sheet itself, printer settings, a background
+/// picture and custom properties name no cells.
+const RESTRUCTURABLE: [&str; 5] = [
+    "drawing",
+    "printerSettings",
+    "hyperlink",
+    "image",
+    "customProperty",
+];
 
 /// The chart parts a drawing (or a chart sheet's drawing) shows.
 fn linked_charts(package: &mut Package, drawing: &str) -> Result<Vec<String>> {

@@ -17,7 +17,7 @@ use crate::error::Result;
 
 /// The worksheet children whose references are moved here, or that hold
 /// none.
-const HANDLED: [&str; 26] = [
+const HANDLED: [&str; 27] = [
     "sheetPr",
     "dimension",
     "sheetViews",
@@ -35,6 +35,7 @@ const HANDLED: [&str; 26] = [
     "pageMargins",
     "pageSetup",
     "headerFooter",
+    "customProperties",
     "rowBreaks",
     "colBreaks",
     "ignoredErrors",

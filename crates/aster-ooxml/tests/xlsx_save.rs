@@ -451,3 +451,75 @@ fn typed_amounts_add_a_currency_format_once() {
         "$2.50"
     );
 }
+
+#[test]
+fn formatting_and_merging_write_styles_and_merged_areas() {
+    use aster_sheets::restyle::{StyleEdit, YELLOW};
+    use aster_sheets::{CellRange, HAlign};
+
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    let range = |text: &str| CellRange::parse(text).unwrap();
+    for (cells, change) in [
+        ("A2:A3", StyleEdit::Bold(true)),
+        ("A2", StyleEdit::Size(14.0)),
+        ("C2", StyleEdit::Fill(Some(YELLOW))),
+        ("G9:H9", StyleEdit::Borders(true)),
+        ("C3", StyleEdit::Align(Some(HAlign::Center))),
+    ] {
+        let cells = book.restyle(0, range(cells), &change);
+        let cells = cells
+            .into_iter()
+            .map(|(at, cell)| (at.to_string(), cell))
+            .collect::<Vec<_>>();
+        edit(
+            &mut book,
+            &mut changes,
+            cells.iter().map(|(a, c)| (a.as_str(), c.clone())).collect(),
+        );
+    }
+    book.sheets[0].merges = vec![range("F9:G10")];
+    book.sheets[0].refresh();
+    changes.merges.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from([
+            "xl/styles.xml".to_owned(),
+            "xl/worksheets/sheet1.xml".to_owned()
+        ])
+    );
+    let styles = part(&saved, "xl/styles.xml");
+    // A bold copy of font 0, then a 14-point one; a yellow fill; thin borders.
+    assert!(styles.contains(r#"<fonts count="5" x14ac:knownFonts="1">"#));
+    assert!(styles.contains(r#"<font><b/><sz val="11"/><color theme="1"/><name val="等线"/><family val="2"/><charset val="134"/><scheme val="minor"/></font><font><b/><sz val="14"/><color theme="1"/>"#));
+    assert!(styles.contains(r#"<fills count="4">"#));
+    assert!(styles.contains(r#"<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills>"#));
+    assert!(styles.contains(r#"<borders count="3">"#));
+    assert!(
+        styles.contains(
+            r#"applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>"#
+        )
+    );
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(r#"<mergeCells count="1"><mergeCell ref="F9:G10"/></mergeCells>"#));
+
+    let again = Xlsx.read(saved).unwrap();
+    let style = |c: &str| again.style(again.sheets[0].style_at(at(c)));
+    assert!(style("A2").font.bold && style("A3").font.bold);
+    assert_eq!(style("A2").font.size, 14.0);
+    assert_eq!(style("A3").font.size, 11.0);
+    assert_eq!(style("C2").fill, Some(YELLOW));
+    assert!(style("G9").borders.left.is_some() && style("H9").borders.right.is_some());
+    assert_eq!(style("C3").align, Some(HAlign::Center));
+    // Values stay.
+    assert_eq!(
+        again.sheets[0].cell(at("A2")).unwrap().value,
+        Xlsx.read(g4()).unwrap().sheets[0]
+            .cell(at("A2"))
+            .unwrap()
+            .value
+    );
+    assert_eq!(again.sheets[0].merges, [range("F9:G10")]);
+}

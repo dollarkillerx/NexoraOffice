@@ -179,7 +179,29 @@ impl Command {
                         | Command::ZoomReset
                 ) || self.formats_markdown()
             }
-            DocKind::Sheets => matches!(self, Command::Undo | Command::Redo),
+            DocKind::Sheets => matches!(
+                self,
+                Command::Undo
+                    | Command::Redo
+                    | Command::Bold
+                    | Command::Italic
+                    | Command::Underline
+                    | Command::Strikethrough
+                    | Command::FontSizeDown
+                    | Command::FontSize
+                    | Command::FontSizeUp
+                    | Command::Currency
+                    | Command::Percent
+                    | Command::NumberFormat
+                    | Command::FillColor
+                    | Command::Borders
+                    | Command::MergeCells
+                    | Command::AlignLeft
+                    | Command::AlignCenter
+                    | Command::AlignRight
+                    | Command::WrapText
+                    | Command::AutoSum
+            ),
             DocKind::Slides | DocKind::Pdf => false,
         }
     }
@@ -302,6 +324,80 @@ pub struct ViewState {
     /// Markdown tabs: the styles the selection has, whose buttons show
     /// pressed.
     pub styles: Styles,
+    /// Sheets tabs: how the active cell looks.
+    pub cell: CellLook,
+}
+
+/// How the active cell of a workbook looks, for the toolbar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellLook {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// 0 by value, 1 left, 2 centre, 3 right.
+    pub align: u8,
+    pub wrap: bool,
+    pub merged: bool,
+    pub filled: bool,
+    pub bordered: bool,
+    /// Points.
+    pub size: f32,
+    /// Index into [`number_formats`], or `None` for another format.
+    pub format: Option<usize>,
+}
+
+impl Default for CellLook {
+    fn default() -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: false,
+            align: 0,
+            wrap: false,
+            merged: false,
+            filled: false,
+            bordered: false,
+            size: 11.0,
+            format: Some(0),
+        }
+    }
+}
+
+/// The number formats the field of a Sheets tab lists, in order: General,
+/// Number, Currency, Percent, Date, Time, Text.
+pub fn number_formats(strings: &Strings) -> Vec<String> {
+    [
+        strings.number_general,
+        strings.number_number,
+        strings.number_currency,
+        strings.number_percent,
+        strings.number_date,
+        strings.number_time,
+        strings.number_text,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Font sizes the size buttons step through, points.
+pub const FONT_SIZES: [f32; 16] = [
+    8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 28.0, 36.0, 48.0, 72.0, 96.0,
+];
+
+/// The next size up or down from `size`.
+pub fn font_size_step(size: f32, up: bool) -> f32 {
+    if up {
+        FONT_SIZES.into_iter().find(|s| *s > size).unwrap_or(size)
+    } else {
+        FONT_SIZES
+            .into_iter()
+            .rev()
+            .find(|s| *s < size)
+            .unwrap_or(size)
+    }
 }
 
 impl Default for ViewState {
@@ -313,11 +409,31 @@ impl Default for ViewState {
             view_mode: ViewMode::Edit,
             heading: 0,
             styles: Styles::default(),
+            cell: CellLook::default(),
         }
     }
 }
 
 impl ViewState {
+    /// Whether the active cell has what a formatting command writes.
+    fn cell_has(&self, command: Command) -> bool {
+        let cell = &self.cell;
+        match command {
+            Command::Bold => cell.bold,
+            Command::Italic => cell.italic,
+            Command::Underline => cell.underline,
+            Command::Strikethrough => cell.strike,
+            Command::AlignLeft => cell.align == 1,
+            Command::AlignCenter => cell.align == 2,
+            Command::AlignRight => cell.align == 3,
+            Command::WrapText => cell.wrap,
+            Command::MergeCells => cell.merged,
+            Command::FillColor => cell.filled,
+            Command::Borders => cell.bordered,
+            _ => false,
+        }
+    }
+
     /// Whether the selection already has what a formatting command writes.
     fn has(&self, command: Command) -> bool {
         let styles = &self.styles;
@@ -365,7 +481,8 @@ impl Builder {
             enabled,
             active: enabled
                 && (ViewMode::of(command) == Some(self.view.view_mode)
-                    || (self.kind == DocKind::Markdown && self.view.has(command))),
+                    || (self.kind == DocKind::Markdown && self.view.has(command))
+                    || (self.kind == DocKind::Sheets && self.view.cell_has(command))),
             options: Vec::new(),
         });
         self
@@ -547,10 +664,25 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
                 .zoom(view)
                 .sep()
                 .letter("¥", plain, Command::Currency)
-                .letter("%", plain, Command::Percent)
-                .select(strings.number_general, 76.0, Command::NumberFormat)
-                .sep()
-                .font("11")
+                .letter("%", plain, Command::Percent);
+            let formats = number_formats(strings);
+            let shown = view
+                .cell
+                .format
+                .and_then(|i| formats.get(i).cloned())
+                .unwrap_or_else(|| strings.number_other.to_owned());
+            b.select(&shown, 76.0, Command::NumberFormat);
+            if let Some(item) = b.items.last_mut() {
+                item.options = formats;
+            }
+            let size = view.cell.size;
+            let size = if size.fract() == 0.0 {
+                format!("{size:.0}")
+            } else {
+                format!("{size}")
+            };
+            b.sep()
+                .font(&size)
                 .sep()
                 .emphasis()
                 .icon(Icon::FillColor, Command::FillColor)
@@ -773,7 +905,31 @@ mod tests {
                         Command::ViewPreview
                     ]
                 ),
-                DocKind::Sheets => assert_eq!(enabled, [Command::Undo, Command::Redo]),
+                DocKind::Sheets => assert_eq!(
+                    enabled,
+                    [
+                        Command::Undo,
+                        Command::Redo,
+                        Command::Currency,
+                        Command::Percent,
+                        Command::NumberFormat,
+                        Command::FontSizeDown,
+                        Command::FontSize,
+                        Command::FontSizeUp,
+                        Command::Bold,
+                        Command::Italic,
+                        Command::Underline,
+                        Command::Strikethrough,
+                        Command::FillColor,
+                        Command::Borders,
+                        Command::MergeCells,
+                        Command::AlignLeft,
+                        Command::AlignCenter,
+                        Command::AlignRight,
+                        Command::WrapText,
+                        Command::AutoSum
+                    ]
+                ),
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }

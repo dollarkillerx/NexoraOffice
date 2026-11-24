@@ -170,6 +170,11 @@ pub struct CellStyle {
     /// added for a typed date or percentage copies the one it was made
     /// from, with its own number format.
     pub xf: Option<u32>,
+    /// The file's font, fill and border this style uses; `None` for one
+    /// changed here, which saving writes as a new one.
+    pub font_id: Option<u32>,
+    pub fill_id: Option<u32>,
+    pub border_id: Option<u32>,
 }
 
 impl Default for CellStyle {
@@ -185,11 +190,26 @@ impl Default for CellStyle {
             borders: Arc::new(Borders::default()),
             format_id: 0,
             xf: None,
+            font_id: None,
+            fill_id: None,
+            border_id: None,
         }
     }
 }
 
 impl CellStyle {
+    /// Whether two styles show cells the same way, wherever they come from.
+    pub fn looks_like(&self, other: &CellStyle) -> bool {
+        self.format.code() == other.format.code()
+            && self.align == other.align
+            && self.valign == other.valign
+            && self.wrap == other.wrap
+            && self.indent == other.indent
+            && self.font == other.font
+            && self.fill == other.fill
+            && self.borders == other.borders
+    }
+
     /// Whether an empty cell with this style shows anything: a fill or a
     /// border.
     pub fn is_visible_when_empty(&self) -> bool {

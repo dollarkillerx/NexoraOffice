@@ -43,6 +43,9 @@ pub struct Changes {
     /// A formula appeared or went: Excel's calculation chain no longer
     /// matches and is removed.
     pub formulas_changed: bool,
+    /// Sheets whose merged areas changed: their `<mergeCells>` is written
+    /// again.
+    pub merges: BTreeSet<usize>,
 }
 
 /// The package `source` (the file as read) with `workbook`'s changed cells
@@ -91,14 +94,18 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                 (at, mode)
             })
             .collect();
-        if cells.is_empty() {
+        let merges = changes
+            .merges
+            .contains(&index)
+            .then_some(sheet.merges.as_slice());
+        if cells.is_empty() && merges.is_none() {
             continue;
         }
         let Some(part) = target(&entry.rel).filter(|part| package.has(part)) else {
             continue;
         };
         let bytes = package.read(&part)?;
-        let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, &mut strings)?;
+        let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, merges, &mut strings)?;
         replaced.insert(key(&part), rewritten);
     }
 
@@ -611,6 +618,7 @@ fn rewrite_sheet(
     part: &str,
     sheet: &aster_sheets::Sheet,
     cells: &BTreeMap<CellRef, Mode>,
+    merges: Option<&[aster_sheets::CellRange]>,
     strings: &mut Strings,
 ) -> Result<Vec<u8>> {
     let (bom, xml) = split_bom(bytes);
@@ -755,6 +763,10 @@ fn rewrite_sheet(
             }
         }
     }
+    if let Some(merges) = merges {
+        let (start, end, text) = merge_cells(xml, &p, merges);
+        push(&mut ops, start, end, text);
+    }
     ops.sort_by_key(|(start, _, order, _)| (*start, *order));
     let mut out = Vec::with_capacity(bytes.len() + 256);
     out.extend_from_slice(bom);
@@ -771,179 +783,589 @@ fn rewrite_sheet(
     Ok(out)
 }
 
-// --- Cell formats ---
-
-/// `styles.xml` with an `<xf>` for every style of `workbook` past the ones
-/// it has: a copy of the format the style was made from, with the style's
-/// number format. A number format of the workbook's own (a currency) is
-/// added to `<numFmts>` unless one with the same code is there. `None` when
-/// there is nothing to add.
-fn append_formats(bytes: &[u8], part: &str, workbook: &Workbook) -> Result<Option<Vec<u8>>> {
-    let (bom, xml) = split_bom(bytes);
+/// The worksheet's own children: local name and span.
+fn top_level(xml: &[u8]) -> Vec<(String, usize, usize)> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().check_end_names = false;
-    let mut sheet_open: Option<(usize, String)> = None;
-    let mut formats_open: Option<(usize, usize, bool)> = None;
-    let mut formats_close: Option<usize> = None;
-    let mut formats: Vec<(u32, String)> = Vec::new();
-    let mut open: Option<(usize, usize)> = None;
-    let mut close: Option<usize> = None;
-    let mut xfs: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::new();
     let mut depth = 0usize;
-    let mut xf_start = 0usize;
+    let mut start = 0usize;
+    let mut name = String::new();
     loop {
         let before = reader.buffer_position() as usize;
-        let event = reader.read_event().map_err(|e| Error::broken(part, e))?;
+        let Ok(event) = reader.read_event() else {
+            break;
+        };
         let after = reader.buffer_position() as usize;
-        let in_xfs = open.is_some() && close.is_none();
         match event {
-            Event::Start(e) if sheet_open.is_none() && local(&e) == "styleSheet" => {
-                sheet_open = Some((after, prefix(&e)));
-            }
-            Event::Start(e) if formats_open.is_none() && local(&e) == "numFmts" => {
-                formats_open = Some((before, after, false));
-            }
-            Event::Empty(e) if formats_open.is_none() && local(&e) == "numFmts" => {
-                formats_open = Some((before, after, true));
-            }
-            Event::End(e)
-                if formats_open.is_some()
-                    && formats_close.is_none()
-                    && e.local_name().as_ref() == "numFmts" =>
-            {
-                formats_close = Some(before);
-            }
-            Event::Start(e) | Event::Empty(e) if !in_xfs && local(&e) == "numFmt" => {
-                let attrs = attributes(&e);
-                if let (Some(id), Some(code)) = (
-                    find(&attrs, "numFmtId").and_then(|id| id.parse::<u32>().ok()),
-                    find(&attrs, "formatCode"),
-                ) {
-                    formats.push((id, unescape(code)));
-                }
-            }
-            Event::Start(e) if open.is_none() && local(&e) == "cellXfs" => {
-                open = Some((before, after));
-                depth = 0;
-            }
-            Event::Empty(e) if open.is_none() && local(&e) == "cellXfs" => {
-                open = Some((before, after));
-                break;
-            }
-            Event::Start(e) if in_xfs => {
-                if depth == 0 && local(&e) == "xf" {
-                    xf_start = before;
+            Event::Start(e) => {
+                if depth == 1 {
+                    start = before;
+                    name = local(&e).to_owned();
                 }
                 depth += 1;
             }
-            Event::Empty(e) if in_xfs => {
-                if depth == 0 && local(&e) == "xf" {
-                    xfs.push((before, after));
-                }
-            }
-            Event::End(e) if in_xfs => {
-                if depth == 0 && e.local_name().as_ref() == "cellXfs" {
-                    close = Some(before);
-                    break;
-                }
+            Event::Empty(e) if depth == 1 => out.push((local(&e).to_owned(), before, after)),
+            Event::End(_) => {
                 depth = depth.saturating_sub(1);
-                if depth == 0 && e.local_name().as_ref() == "xf" {
-                    xfs.push((xf_start, after));
+                if depth == 1 {
+                    out.push((name.clone(), start, after));
+                }
+                if depth == 0 {
+                    // Where </worksheet> starts.
+                    out.push((String::new(), before, before));
                 }
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    let (Some((start, open_end)), Some(close), Some((sheet_end, p))) = (open, close, sheet_open)
-    else {
+    out
+}
+
+/// The replacement for a sheet's `<mergeCells>`: where it goes and what.
+/// A sheet without one gets it where the schema puts it: after the
+/// elements that come before it, before those that come after.
+fn merge_cells(xml: &[u8], p: &str, merges: &[aster_sheets::CellRange]) -> (usize, usize, String) {
+    const AFTER: [&str; 23] = [
+        "phoneticPr",
+        "conditionalFormatting",
+        "dataValidations",
+        "hyperlinks",
+        "printOptions",
+        "pageMargins",
+        "pageSetup",
+        "headerFooter",
+        "rowBreaks",
+        "colBreaks",
+        "customProperties",
+        "cellWatches",
+        "ignoredErrors",
+        "smartTags",
+        "drawing",
+        "legacyDrawing",
+        "legacyDrawingHF",
+        "drawingHF",
+        "picture",
+        "oleObjects",
+        "controls",
+        "webPublishItems",
+        "tableParts",
+    ];
+    let text = if merges.is_empty() {
+        String::new()
+    } else {
+        let items: String = merges
+            .iter()
+            .map(|range| format!("<{p}mergeCell ref=\"{range}\"/>"))
+            .collect();
+        format!(
+            "<{p}mergeCells count=\"{}\">{items}</{p}mergeCells>",
+            merges.len()
+        )
+    };
+    let children = top_level(xml);
+    if let Some((_, start, end)) = children.iter().find(|(name, ..)| name == "mergeCells") {
+        return (*start, *end, text);
+    }
+    let at = children
+        .iter()
+        .find(|(name, ..)| AFTER.contains(&name.as_str()) || name == "extLst" || name.is_empty())
+        .map_or(xml.len(), |(_, start, _)| *start);
+    (at, at, text)
+}
+
+// --- Cell formats ---
+
+/// A list element of `styles.xml` (`numFmts`, `fonts`, `cellXfs` ...): where
+/// its start tag is, where its end tag starts (`None` for `<x/>`), and the
+/// spans of its items.
+#[derive(Default)]
+struct List {
+    open: Option<(usize, usize)>,
+    close: Option<usize>,
+    items: Vec<(usize, usize)>,
+}
+
+/// Find the lists of `styles.xml` and their items.
+/// Where `<styleSheet>`'s start tag ends and its prefix, and the lists.
+type StyleLists = (Option<(usize, String)>, HashMap<String, List>);
+
+fn style_lists(xml: &[u8], part: &str) -> Result<StyleLists> {
+    const LISTS: [(&str, &str); 5] = [
+        ("numFmts", "numFmt"),
+        ("fonts", "font"),
+        ("fills", "fill"),
+        ("borders", "border"),
+        ("cellXfs", "xf"),
+    ];
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().check_end_names = false;
+    let mut sheet: Option<(usize, String)> = None;
+    let mut lists: HashMap<String, List> = HashMap::new();
+    // The list being read, how deep inside it, and where its item started.
+    let mut current: Option<(&str, &str)> = None;
+    let mut depth = 0usize;
+    let mut item_start = 0usize;
+    let mut skip_depth = 0usize;
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader.read_event().map_err(|e| Error::broken(part, e))?;
+        let after = reader.buffer_position() as usize;
+        match event {
+            Event::Start(e) if sheet.is_none() && local(&e) == "styleSheet" => {
+                sheet = Some((after, prefix(&e)));
+            }
+            Event::Start(e) if current.is_none() => {
+                let name = local(&e).to_owned();
+                if let Some(&(list, item)) = LISTS.iter().find(|(l, _)| *l == name)
+                    && skip_depth == 0
+                    && !lists.contains_key(list)
+                {
+                    lists.insert(
+                        list.to_owned(),
+                        List {
+                            open: Some((before, after)),
+                            ..List::default()
+                        },
+                    );
+                    current = Some((list, item));
+                    depth = 0;
+                } else if sheet.is_some() {
+                    // Lists inside other elements (dxfs, cellStyleXfs) are
+                    // not the ones wanted.
+                    skip_depth += 1;
+                }
+            }
+            Event::Empty(e) if current.is_none() && skip_depth == 0 => {
+                let name = local(&e).to_owned();
+                if let Some(&(list, _)) = LISTS.iter().find(|(l, _)| *l == name)
+                    && !lists.contains_key(list)
+                {
+                    lists.insert(
+                        list.to_owned(),
+                        List {
+                            open: Some((before, after)),
+                            ..List::default()
+                        },
+                    );
+                }
+            }
+            Event::End(_) if current.is_none() && skip_depth > 0 => skip_depth -= 1,
+            Event::Start(e) if current.is_some() => {
+                if depth == 0 && local(&e) == current.map_or("", |c| c.1) {
+                    item_start = before;
+                }
+                depth += 1;
+            }
+            Event::Empty(e) if current.is_some() => {
+                if depth == 0
+                    && local(&e) == current.map_or("", |c| c.1)
+                    && let Some(list) = lists.get_mut(current.map_or("", |c| c.0))
+                {
+                    list.items.push((before, after));
+                }
+            }
+            Event::End(e) if current.is_some() => {
+                let (list_name, item) = current.unwrap_or(("", ""));
+                if depth == 0 && e.local_name().as_ref() == list_name {
+                    if let Some(list) = lists.get_mut(list_name) {
+                        list.close = Some(before);
+                    }
+                    current = None;
+                    continue;
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && e.local_name().as_ref() == item
+                    && let Some(list) = lists.get_mut(list_name)
+                {
+                    list.items.push((item_start, after));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok((sheet, lists))
+}
+
+/// The children of an element as raw text, with their local names.
+fn children(element: &str) -> Vec<(String, String)> {
+    let mut reader = Reader::from_reader(element.as_bytes());
+    reader.config_mut().check_end_names = false;
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut name = String::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        let Ok(event) = reader.read_event() else {
+            break;
+        };
+        let after = reader.buffer_position() as usize;
+        match event {
+            Event::Start(e) => {
+                if depth == 1 {
+                    start = before;
+                    name = local(&e).to_owned();
+                }
+                depth += 1;
+            }
+            Event::Empty(e) if depth == 1 => {
+                out.push((local(&e).to_owned(), element[before..after].to_owned()));
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    out.push((name.clone(), element[start..after].to_owned()));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The start tag of an element and its name with prefix.
+fn start_tag(element: &str) -> (&str, &str) {
+    let end = element.find('>').map_or(element.len(), |i| i + 1);
+    let tag = &element[..end];
+    let name = tag[1..]
+        .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .next()
+        .unwrap_or("");
+    (tag, name)
+}
+
+/// A font element made from `base` with the style's bold, italic,
+/// underline, strikethrough and size; its colour, name and the rest stay.
+fn font_xml(base: &str, p: &str, font: &aster_sheets::Font) -> String {
+    let kept: String = children(base)
+        .into_iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "b" | "i" | "u" | "strike" | "sz"))
+        .map(|(_, raw)| raw)
+        .collect();
+    let mut out = format!("<{p}font>");
+    if font.bold {
+        out.push_str(&format!("<{p}b/>"));
+    }
+    if font.italic {
+        out.push_str(&format!("<{p}i/>"));
+    }
+    if font.strike {
+        out.push_str(&format!("<{p}strike/>"));
+    }
+    if font.underline {
+        out.push_str(&format!("<{p}u/>"));
+    }
+    out.push_str(&format!(
+        "<{p}sz val=\"{}\"/>",
+        number(f64::from(font.size))
+    ));
+    out.push_str(&kept);
+    out.push_str(&format!("</{p}font>"));
+    out
+}
+
+fn color_xml(p: &str, color: Option<aster_sheets::Rgba>) -> String {
+    match color {
+        Some([r, g, b, _]) => format!("<{p}color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"),
+        None => format!("<{p}color auto=\"1\"/>"),
+    }
+}
+
+fn fill_xml(p: &str, fill: Option<aster_sheets::Rgba>) -> String {
+    match fill {
+        Some([r, g, b, _]) => format!(
+            "<{p}fill><{p}patternFill patternType=\"solid\"><{p}fgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/><{p}bgColor indexed=\"64\"/></{p}patternFill></{p}fill>"
+        ),
+        None => format!("<{p}fill><{p}patternFill patternType=\"none\"/></{p}fill>"),
+    }
+}
+
+fn border_xml(p: &str, borders: &aster_sheets::Borders) -> String {
+    let side = |name: &str, line: &Option<aster_sheets::Line>| match line {
+        Some(line) => format!(
+            "<{p}{name} style=\"{}\">{}</{p}{name}>",
+            line_style(line.style),
+            color_xml(p, line.color)
+        ),
+        None => format!("<{p}{name}/>"),
+    };
+    format!(
+        "<{p}border>{}{}{}{}<{p}diagonal/></{p}border>",
+        side("left", &borders.left),
+        side("right", &borders.right),
+        side("top", &borders.top),
+        side("bottom", &borders.bottom)
+    )
+}
+
+fn line_style(style: aster_sheets::LineStyle) -> &'static str {
+    use aster_sheets::LineStyle as L;
+    match style {
+        L::Hair => "hair",
+        L::Thin => "thin",
+        L::Medium => "medium",
+        L::Thick => "thick",
+        L::Double => "double",
+        L::Dotted => "dotted",
+        L::Dashed => "dashed",
+        L::DashDot => "dashDot",
+        L::DashDotDot => "dashDotDot",
+        L::MediumDashed => "mediumDashed",
+        L::MediumDashDot => "mediumDashDot",
+        L::MediumDashDotDot => "mediumDashDotDot",
+        L::SlantDashDot => "slantDashDot",
+    }
+}
+
+/// An `<alignment>` for a style, `None` when everything is the default.
+fn alignment_xml(p: &str, style: &aster_sheets::CellStyle) -> Option<String> {
+    let mut attrs = String::new();
+    if let Some(align) = style.align {
+        let name = match align {
+            aster_sheets::HAlign::Left => "left",
+            aster_sheets::HAlign::Center => "center",
+            aster_sheets::HAlign::Right => "right",
+        };
+        attrs.push_str(&format!(" horizontal=\"{name}\""));
+    }
+    match style.valign {
+        aster_sheets::VAlign::Top => attrs.push_str(" vertical=\"top\""),
+        aster_sheets::VAlign::Center => attrs.push_str(" vertical=\"center\""),
+        aster_sheets::VAlign::Bottom => {}
+    }
+    if style.wrap {
+        attrs.push_str(" wrapText=\"1\"");
+    }
+    if style.indent > 0 {
+        attrs.push_str(&format!(" indent=\"{}\"", style.indent));
+    }
+    (!attrs.is_empty()).then(|| format!("<{p}alignment{attrs}/>"))
+}
+
+/// `styles.xml` with what the styles of `workbook` past the file's own
+/// need: number formats in `<numFmts>`, fonts, fills and borders changed
+/// here in their lists, and an `<xf>` for each at the end of `cellXfs`,
+/// counts updated. Nothing is added twice; nothing else changes. `None`
+/// when there is nothing to add.
+fn append_formats(bytes: &[u8], part: &str, workbook: &Workbook) -> Result<Option<Vec<u8>>> {
+    let (bom, xml) = split_bom(bytes);
+    let (sheet, lists) = style_lists(xml, part)?;
+    let Some((sheet_end, p)) = sheet else {
         return Ok(None);
     };
-    if workbook.styles.len() <= xfs.len() || xfs.is_empty() {
+    let empty = List::default();
+    let list = |name: &str| lists.get(name).unwrap_or(&empty);
+    let xfs = list("cellXfs");
+    if workbook.styles.len() <= xfs.items.len() || xfs.items.is_empty() || xfs.close.is_none() {
         return Ok(None);
     }
-    let mut next_id = formats
+    let text = |(from, to): (usize, usize)| String::from_utf8_lossy(&xml[from..to]).into_owned();
+
+    // Existing number formats, and what is added to each list.
+    let mut formats: Vec<(u32, String)> = list("numFmts")
+        .items
         .iter()
-        .map(|(id, _)| *id + 1)
+        .filter_map(|&span| {
+            let element = text(span);
+            let (tag, _) = start_tag(&element);
+            let id = attribute(tag.as_bytes(), "numFmtId")?.parse().ok()?;
+            Some((id, unescape(&attribute(tag.as_bytes(), "formatCode")?)))
+        })
+        .collect();
+    let mut next_format = formats
+        .iter()
+        .map(|(id, _)| id + 1)
         .max()
         .unwrap_or(164)
         .max(164);
-    let mut new_formats: Vec<(u32, String)> = Vec::new();
-    let mut added = String::new();
-    for style in &workbook.styles[xfs.len()..] {
-        let id = if style.format_id == aster_sheets::style::UNNUMBERED_FORMAT {
+    let mut new_formats: Vec<String> = Vec::new();
+    let mut added: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut add = |list_name: &'static str, existing: usize, element: String| -> u32 {
+        let items = added.entry(list_name).or_default();
+        let at = items.iter().position(|e| *e == element).unwrap_or_else(|| {
+            items.push(element);
+            items.len() - 1
+        });
+        (existing + at) as u32
+    };
+    let mut new_xfs = String::new();
+    for style in &workbook.styles[xfs.items.len()..] {
+        let base = style.xf.map_or(0, |i| i as usize).min(xfs.items.len() - 1);
+        let base_xf = text(xfs.items[base]);
+        let (base_tag, xf_name) = start_tag(&base_xf);
+        let base_id = |name: &str| {
+            attribute(base_tag.as_bytes(), name)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let format_id = if style.format_id == aster_sheets::style::UNNUMBERED_FORMAT {
             let code = style.format.code().to_owned();
-            match formats.iter().chain(&new_formats).find(|(_, c)| *c == code) {
+            match formats.iter().find(|(_, c)| *c == code) {
                 Some((id, _)) => *id,
                 None => {
-                    let id = next_id;
-                    next_id += 1;
-                    new_formats.push((id, code));
+                    let id = next_format;
+                    next_format += 1;
+                    new_formats.push(format!(
+                        "<{p}numFmt numFmtId=\"{id}\" formatCode=\"{}\"/>",
+                        escape(&code)
+                    ));
+                    formats.push((id, code));
                     id
                 }
             }
         } else {
             style.format_id
         };
-        let base = style.xf.map_or(0, |i| i as usize).min(xfs.len() - 1);
-        let (from, to) = xfs[base];
-        let element = String::from_utf8_lossy(&xml[from..to]).into_owned();
-        // The start tag ends at the first '>': attribute values do not hold
-        // one unescaped.
-        let tag_end = element.find('>').map_or(element.len(), |i| i + 1);
-        let tag = set_attribute(&element[..tag_end], "numFmtId", &id.to_string());
-        let tag = set_attribute(&tag, "applyNumberFormat", "1");
-        added.push_str(&tag);
-        added.push_str(&element[tag_end..]);
-    }
-    // Edits in file order: the number formats come before the cell formats.
-    let mut ops: Vec<(usize, usize, String)> = Vec::new();
-    if !new_formats.is_empty() {
-        let items: String = new_formats
-            .iter()
-            .map(|(id, code)| {
-                format!(
-                    "<{p}numFmt numFmtId=\"{id}\" formatCode=\"{}\"/>",
-                    escape(code)
+        let fonts = list("fonts");
+        let font_id = match style.font_id {
+            Some(id) => id,
+            None => {
+                let base_font = fonts
+                    .items
+                    .get(base_id("fontId"))
+                    .or(fonts.items.first())
+                    .map(|&span| text(span))
+                    .unwrap_or_else(|| format!("<{p}font/>"));
+                add(
+                    "fonts",
+                    fonts.items.len(),
+                    font_xml(&base_font, &p, &style.font),
                 )
-            })
-            .collect();
-        let total = formats.len() + new_formats.len();
-        match (formats_open, formats_close) {
-            (Some((f_start, f_end, false)), Some(f_close)) => {
-                let tag = String::from_utf8_lossy(&xml[f_start..f_end]).into_owned();
-                ops.push((
-                    f_start,
-                    f_end,
-                    set_attribute(&tag, "count", &total.to_string()),
-                ));
-                ops.push((f_close, f_close, items));
             }
-            (Some((f_start, f_end, true)), _) => {
-                let tag = String::from_utf8_lossy(&xml[f_start..f_end]).into_owned();
-                let tag = set_attribute(&tag, "count", &total.to_string());
-                let open_tag = tag.trim_end_matches('>').trim_end_matches('/').trim_end();
-                ops.push((f_start, f_end, format!("{open_tag}>{items}</{p}numFmts>")));
+        };
+        let fills = list("fills");
+        let fill_id = match (style.fill_id, style.fill) {
+            (Some(id), _) => id,
+            // Every file's first fill is "none".
+            (None, None) => 0,
+            (None, fill) => add("fills", fills.items.len(), fill_xml(&p, fill)),
+        };
+        let borders = list("borders");
+        let border_id = match style.border_id {
+            Some(id) => id,
+            None if style.borders.is_empty() => 0,
+            None => add(
+                "borders",
+                borders.items.len(),
+                border_xml(&p, &style.borders),
+            ),
+        };
+        let mut tag = base_tag.to_owned();
+        for (name, value) in [
+            ("numFmtId", format_id),
+            ("fontId", font_id),
+            ("fillId", fill_id),
+            ("borderId", border_id),
+        ] {
+            tag = set_attribute(&tag, name, &value.to_string());
+        }
+        for (name, on) in [
+            ("applyNumberFormat", format_id != 0),
+            ("applyFont", style.font_id.is_none()),
+            ("applyFill", style.fill_id.is_none()),
+            ("applyBorder", style.border_id.is_none()),
+        ] {
+            if on {
+                tag = set_attribute(&tag, name, "1");
             }
-            _ => ops.push((
-                sheet_end,
-                sheet_end,
-                format!("<{p}numFmts count=\"{total}\">{items}</{p}numFmts>"),
-            )),
+        }
+        // A changed alignment is the style's own; otherwise, and for the
+        // other children (protection), the base's stay as they were.
+        let aligned_alike = workbook.styles.get(base).is_some_and(|b| {
+            (b.align, b.valign, b.wrap, b.indent)
+                == (style.align, style.valign, style.wrap, style.indent)
+        });
+        let inner: String = if aligned_alike {
+            children(&base_xf).into_iter().map(|(_, raw)| raw).collect()
+        } else {
+            tag = set_attribute(&tag, "applyAlignment", "1");
+            let others: String = children(&base_xf)
+                .into_iter()
+                .filter(|(name, _)| name != "alignment")
+                .map(|(_, raw)| raw)
+                .collect();
+            format!("{}{others}", alignment_xml(&p, style).unwrap_or_default())
+        };
+        let open = tag
+            .trim_end_matches('>')
+            .trim_end_matches('/')
+            .trim_end()
+            .to_owned();
+        if inner.is_empty() {
+            new_xfs.push_str(&format!("{open}/>"));
+        } else {
+            new_xfs.push_str(&format!("{open}>{inner}</{xf_name}>"));
         }
     }
-    let tag = String::from_utf8_lossy(&xml[start..open_end]).into_owned();
-    ops.push((
-        start,
-        open_end,
-        set_attribute(&tag, "count", &workbook.styles.len().to_string()),
-    ));
-    ops.push((close, close, added));
+
+    // Edits, in the order of the file.
+    let mut ops: Vec<(usize, usize, String)> = Vec::new();
+    let extend = |ops: &mut Vec<(usize, usize, String)>,
+                  name: &str,
+                  list: &List,
+                  items: &[String],
+                  fallback: usize| {
+        if items.is_empty() {
+            return;
+        }
+        let total = list.items.len() + items.len();
+        let joined: String = items.concat();
+        match (list.open, list.close) {
+            (Some((start, end)), Some(close)) => {
+                let tag = text((start, end));
+                ops.push((start, end, set_attribute(&tag, "count", &total.to_string())));
+                ops.push((close, close, joined));
+            }
+            (Some((start, end)), None) => {
+                let tag = set_attribute(&text((start, end)), "count", &total.to_string());
+                let open = tag
+                    .trim_end_matches('>')
+                    .trim_end_matches('/')
+                    .trim_end()
+                    .to_owned();
+                ops.push((start, end, format!("{open}>{joined}</{p}{name}>")));
+            }
+            (None, _) => ops.push((
+                fallback,
+                fallback,
+                format!("<{p}{name} count=\"{total}\">{joined}</{p}{name}>"),
+            )),
+        }
+    };
+    extend(
+        &mut ops,
+        "numFmts",
+        list("numFmts"),
+        &new_formats,
+        sheet_end,
+    );
+    for name in ["fonts", "fills", "borders"] {
+        let items = added.get(name).cloned().unwrap_or_default();
+        let fallback = list("cellXfs").open.map_or(sheet_end, |(start, _)| start);
+        extend(&mut ops, name, list(name), &items, fallback);
+    }
+    if let (Some((start, end)), Some(close)) = (xfs.open, xfs.close) {
+        let tag = text((start, end));
+        ops.push((
+            start,
+            end,
+            set_attribute(&tag, "count", &workbook.styles.len().to_string()),
+        ));
+        ops.push((close, close, new_xfs));
+    }
     ops.sort_by_key(|(start, ..)| *start);
     let mut out = Vec::with_capacity(bytes.len() + 512);
     out.extend_from_slice(bom);
     let mut at = 0;
     for (start, end, text) in ops {
+        if start < at {
+            return Err(Error::broken(part, "overlapping changes"));
+        }
         out.extend_from_slice(&xml[at..start]);
         out.extend_from_slice(text.as_bytes());
         at = end;

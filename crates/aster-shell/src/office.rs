@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use aster_ooxml::{ErrorKind, FormatCodec, Pptx, Xlsx};
 use aster_sheets::input::{self, Reading};
+use aster_sheets::{HAlign, StyleEdit};
+use aster_surface::cell_editor::EditMode;
+
+use crate::toolbar::{CellLook, Command, font_size_step};
 use aster_sheets::{
     CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder, Edit, Workbook,
 };
@@ -263,6 +267,8 @@ pub struct History {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub changes: Vec<Change>,
+    /// Merged areas changed: sheet, before, after.
+    merges: Vec<(usize, Vec<CellRange>, Vec<CellRange>)>,
     /// How many styles the workbook had before the step.
     styles_before: usize,
     /// The styles undo took away, put back by redo.
@@ -271,7 +277,7 @@ pub struct Step {
 
 impl History {
     fn push(&mut self, step: Step) {
-        if step.changes.is_empty() {
+        if step.changes.is_empty() && step.merges.is_empty() {
             return;
         }
         if self.saved.is_some_and(|saved| saved > self.undo.len()) {
@@ -343,6 +349,8 @@ pub struct SheetTab {
     pub edited: BTreeSet<(usize, CellRef)>,
     /// A formula appeared or went since the file was read or saved.
     pub formulas_changed: bool,
+    /// Sheets whose merged areas changed since then.
+    pub merges_changed: BTreeSet<usize>,
     /// The file as last read or saved: saving starts from it.
     pub source: Arc<Vec<u8>>,
     /// How many cell formats that file has. Styles past these were added by
@@ -376,6 +384,7 @@ impl SheetTab {
             dirty: BTreeSet::new(),
             edited: BTreeSet::new(),
             formulas_changed: false,
+            merges_changed: BTreeSet::new(),
             file_styles: view_styles,
             source,
             saving: false,
@@ -650,6 +659,7 @@ impl SheetTab {
         self.note(&changes);
         self.history.push(Step {
             changes: changes.clone(),
+            merges: Vec::new(),
             styles_before,
             added: Vec::new(),
         });
@@ -689,6 +699,7 @@ impl SheetTab {
                 cells: self.dirty.clone(),
                 edited: self.edited.clone(),
                 formulas_changed: self.formulas_changed,
+                merges: self.merges_changed.clone(),
             },
             depth: self.history.depth(),
         })
@@ -730,6 +741,7 @@ impl SheetTab {
         }
         if unchanged_since {
             self.formulas_changed = false;
+            self.merges_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -742,6 +754,9 @@ impl SheetTab {
         };
         let inverse: Vec<Change> = step.changes.iter().rev().map(Change::inverse).collect();
         self.view.workbook_mut().apply(&inverse);
+        for (sheet, before, _) in &step.merges {
+            self.set_merges(*sheet, before.clone());
+        }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
         step.added = self.drop_styles(step.styles_before);
@@ -765,11 +780,214 @@ impl SheetTab {
             }
         }
         self.view.workbook_mut().apply(&step.changes);
+        for (sheet, _, after) in &step.merges {
+            self.set_merges(*sheet, after.clone());
+        }
         self.note(&step.changes);
         self.show(&step.changes);
         let applied = step.changes.clone();
         self.history.undo.push(step);
         applied
+    }
+
+    fn set_merges(&mut self, sheet: usize, merges: Vec<CellRange>) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            target.merges = merges;
+            target.refresh();
+        }
+        self.merges_changed.insert(sheet);
+    }
+
+    /// Apply a formatting change to the selection. One undo step.
+    pub fn format(&mut self, edit: &StyleEdit) -> Vec<Change> {
+        let sheet = self.view.sheet_index();
+        let range = self.view.selection();
+        let styles_before = self.view.workbook().styles.len();
+        let cells = self.view.workbook_mut().restyle(sheet, range, edit);
+        let changes = self.view.workbook_mut().set_cells(sheet, cells);
+        self.record(changes, styles_before)
+    }
+
+    /// The style of the active cell.
+    pub fn active_style(&self) -> aster_sheets::CellStyle {
+        let workbook = self.view.workbook();
+        self.view
+            .sheet()
+            .map(|sheet| workbook.style(sheet.style_at(self.view.selected())))
+            .unwrap_or_default()
+    }
+
+    /// What a formatting command does here: turn bold on or off as the
+    /// active cell has it, step the size, and so on.
+    pub fn edit_for(&self, command: Command, language: &str) -> Option<StyleEdit> {
+        let style = self.active_style();
+        let font = &style.font;
+        let toggle_align =
+            |align: HAlign| StyleEdit::Align((style.align != Some(align)).then_some(align));
+        Some(match command {
+            Command::Bold => StyleEdit::Bold(!font.bold),
+            Command::Italic => StyleEdit::Italic(!font.italic),
+            Command::Underline => StyleEdit::Underline(!font.underline),
+            Command::Strikethrough => StyleEdit::Strike(!font.strike),
+            Command::FontSizeUp => StyleEdit::Size(font_size_step(font.size, true)),
+            Command::FontSizeDown => StyleEdit::Size(font_size_step(font.size, false)),
+            Command::FontSize => StyleEdit::Size(11.0),
+            Command::AlignLeft => toggle_align(HAlign::Left),
+            Command::AlignCenter => toggle_align(HAlign::Center),
+            Command::AlignRight => toggle_align(HAlign::Right),
+            Command::WrapText => StyleEdit::Wrap(!style.wrap),
+            Command::FillColor => StyleEdit::Fill(match style.fill {
+                Some(_) => None,
+                None => Some(aster_sheets::restyle::YELLOW),
+            }),
+            Command::Borders => StyleEdit::Borders(style.borders.is_empty()),
+            Command::Currency => number_format(2, language),
+            Command::Percent => StyleEdit::Format(9, Arc::new(aster_sheets::Format::builtin(9))),
+            _ => return None,
+        })
+    }
+
+    /// Merge the selected cells and centre what the first holds, as Excel's
+    /// "merge and centre" does; on a merged area, split it again. The
+    /// other cells' contents go. One undo step.
+    pub fn merge(&mut self) -> Vec<Change> {
+        let sheet = self.view.sheet_index();
+        let range = self.view.selection();
+        let Some(current) = self.view.sheet() else {
+            return Vec::new();
+        };
+        let before = current.merges.clone();
+        let styles_before = self.view.workbook().styles.len();
+        let mut changes = Vec::new();
+        let after: Vec<CellRange> = if before.contains(&range) {
+            before.iter().filter(|m| **m != range).copied().collect()
+        } else {
+            if range.first == range.last || aster_sheets::restyle::is_whole(&range) {
+                return Vec::new();
+            }
+            let emptied: Vec<(CellRef, Option<aster_sheets::Cell>)> = current
+                .cells_in(range)
+                .filter(|(at, cell)| *at != range.first && !cell.is_blank())
+                .map(|(at, cell)| {
+                    let kept = (cell.style != 0).then(|| aster_sheets::Cell {
+                        style: cell.style,
+                        ..aster_sheets::Cell::new(at.col, aster_sheets::Value::Empty)
+                    });
+                    (at, kept)
+                })
+                .collect();
+            changes.extend(self.view.workbook_mut().set_cells(sheet, emptied));
+            // Centre the first cell, which shows for the whole area.
+            let centred = self.view.workbook_mut().restyle(
+                sheet,
+                CellRange::single(range.first),
+                &StyleEdit::Align(Some(HAlign::Center)),
+            );
+            changes.extend(self.view.workbook_mut().set_cells(sheet, centred));
+            let mut list: Vec<CellRange> = before
+                .iter()
+                .filter(|m| !m.intersects(&range))
+                .copied()
+                .collect();
+            list.push(range);
+            list
+        };
+        self.set_merges(sheet, after.clone());
+        self.note(&changes);
+        self.history.push(Step {
+            changes: changes.clone(),
+            merges: vec![(sheet, before, after)],
+            styles_before,
+            added: Vec::new(),
+        });
+        self.view.select(range.first);
+        self.view.extend_to(range.last);
+        changes
+    }
+
+    /// Sum the numbers right above the active cell (or, if none, to its
+    /// left) into it, as Excel's AutoSum does. With no numbers next to it,
+    /// start typing `=SUM(` there.
+    pub fn auto_sum(&mut self, language: &str) -> Vec<Change> {
+        let at = self.view.selected();
+        let Some(sheet) = self.view.sheet() else {
+            return Vec::new();
+        };
+        let is_number = |cell: CellRef| {
+            sheet
+                .cell(cell)
+                .is_some_and(|c| matches!(c.value, aster_sheets::Value::Number(_)))
+        };
+        let run = |step: &dyn Fn(CellRef) -> Option<CellRef>| {
+            let mut first = None;
+            let mut cell = step(at);
+            while let Some(here) = cell.filter(|c| is_number(*c)) {
+                first = Some(here);
+                cell = step(here);
+            }
+            first
+        };
+        let up = |c: CellRef| c.row.checked_sub(1).map(|r| CellRef::new(r, c.col));
+        let left = |c: CellRef| c.col.checked_sub(1).map(|col| CellRef::new(c.row, col));
+        let range = run(&up)
+            .map(|first| CellRange::new(first, up(at).unwrap_or(first)))
+            .or_else(|| run(&left).map(|first| CellRange::new(first, left(at).unwrap_or(first))));
+        match range {
+            Some(range) => {
+                self.view
+                    .begin_edit(EditMode::Enter, Some(format!("=SUM({range})")));
+                self.commit(language)
+            }
+            None => {
+                self.view
+                    .begin_edit(EditMode::Enter, Some("=SUM(".to_owned()));
+                Vec::new()
+            }
+        }
+    }
+
+    /// How the active cell looks, for the toolbar.
+    pub fn cell_look(&self) -> CellLook {
+        let style = self.active_style();
+        let code = style.format.code();
+        let format = if code == "General" || code.is_empty() {
+            Some(0)
+        } else if code.contains(['$', '¥', '￥', '€', '£', '₩']) {
+            Some(2)
+        } else if code.contains('%') {
+            Some(3)
+        } else if style.format.is_date() && style.format.date_order().is_some() {
+            Some(4)
+        } else if style.format.is_date() {
+            Some(5)
+        } else if code == "@" {
+            Some(6)
+        } else if code.contains('0') {
+            Some(1)
+        } else {
+            None
+        };
+        CellLook {
+            bold: style.font.bold,
+            italic: style.font.italic,
+            underline: style.font.underline,
+            strike: style.font.strike,
+            align: match style.align {
+                None => 0,
+                Some(HAlign::Left) => 1,
+                Some(HAlign::Center) => 2,
+                Some(HAlign::Right) => 3,
+            },
+            wrap: style.wrap,
+            merged: self
+                .view
+                .sheet()
+                .is_some_and(|sheet| sheet.merge_at(self.view.selected()).is_some()),
+            filled: style.fill.is_some(),
+            bordered: !style.borders.is_empty(),
+            size: style.font.size,
+            format,
+        }
     }
 
     /// Bring the cells a step changed into view, selected.
@@ -786,6 +1004,35 @@ impl SheetTab {
         }
         self.view.select(range.first);
         self.view.extend_to(range.last);
+    }
+}
+
+/// The number format at `index` of the toolbar's list (General, Number,
+/// Currency, Percent, Date, Time, Text). The currency is the one of the
+/// interface language.
+pub fn number_format(index: usize, language: &str) -> StyleEdit {
+    use aster_sheets::Format;
+    let builtin = |id: u32| StyleEdit::Format(id, Arc::new(Format::builtin(id)));
+    match index {
+        1 => builtin(4),
+        2 => {
+            let code = match language {
+                "zh-Hans" | "zh-Hant" => "\"¥\"#,##0.00",
+                "ja" => "\"¥\"#,##0",
+                "ko" => "\"₩\"#,##0",
+                "fr" | "de" | "es" => "#,##0.00\" €\"",
+                _ => "\"$\"#,##0.00",
+            };
+            StyleEdit::Format(
+                aster_sheets::style::UNNUMBERED_FORMAT,
+                Arc::new(Format::parse(code)),
+            )
+        }
+        3 => builtin(10),
+        4 => builtin(14),
+        5 => builtin(21),
+        6 => builtin(49),
+        _ => builtin(0),
     }
 }
 
@@ -1380,5 +1627,73 @@ mod tests {
         let a1 = again.sheets[0].cell(at("A1")).unwrap();
         assert_eq!(again.display(a1).unwrap().text, "$2.50");
         assert_eq!(again.styles.len(), before + 2);
+    }
+
+    #[test]
+    fn toolbar_formatting_merging_and_autosum() {
+        let mut tab = tab();
+        tab.view.select(at("A1"));
+        tab.view.extend_to(at("B2"));
+        // Bold on: the active cell is not bold, so the command turns it on.
+        let bold = tab.edit_for(Command::Bold, "en").unwrap();
+        assert_eq!(bold, StyleEdit::Bold(true));
+        assert_eq!(tab.format(&bold).len(), 4);
+        assert!(tab.cell_look().bold);
+        // Again: off.
+        let again = tab.edit_for(Command::Bold, "en").unwrap();
+        assert_eq!(again, StyleEdit::Bold(false));
+        tab.format(&tab.edit_for(Command::FontSizeUp, "en").unwrap());
+        assert_eq!(tab.cell_look().size, 12.0);
+        tab.format(&tab.edit_for(Command::AlignCenter, "en").unwrap());
+        assert_eq!(tab.cell_look().align, 2);
+        // Centred again: back to by value.
+        tab.format(&tab.edit_for(Command::AlignCenter, "en").unwrap());
+        assert_eq!(tab.cell_look().align, 0);
+        tab.format(&tab.edit_for(Command::FillColor, "en").unwrap());
+        assert!(tab.cell_look().filled);
+        tab.format(&number_format(3, "en"));
+        assert_eq!(tab.cell_look().format, Some(3));
+        assert_eq!(value(&tab, "A1"), Some(aster_sheets::Value::Number(1.0)));
+        let a1 = tab.view.sheet().unwrap().cell(at("A1")).unwrap().clone();
+        assert_eq!(tab.view.workbook().display(&a1).unwrap().text, "100.00%");
+        tab.format(&number_format(2, "ja"));
+        assert_eq!(tab.cell_look().format, Some(2));
+
+        // Merge and centre: B2's... A2's value goes, A1 is centred.
+        tab.view.select(at("A1"));
+        tab.view.extend_to(at("A2"));
+        let changes = tab.merge();
+        assert!(!changes.is_empty());
+        assert_eq!(tab.view.sheet().unwrap().merges.len(), 1);
+        assert!(tab.cell_look().merged);
+        assert_eq!(tab.cell_look().align, 2);
+        assert_eq!(value(&tab, "A2"), Some(aster_sheets::Value::Empty));
+        assert!(tab.merges_changed.contains(&0));
+        // On the merged area: split again.
+        tab.merge();
+        assert!(tab.view.sheet().unwrap().merges.is_empty());
+        // Undo the split and the merge.
+        tab.undo();
+        assert_eq!(tab.view.sheet().unwrap().merges.len(), 1);
+        tab.undo();
+        assert!(tab.view.sheet().unwrap().merges.is_empty());
+        assert_eq!(value(&tab, "A2"), Some(aster_sheets::Value::Number(2.0)));
+
+        // AutoSum under the numbers in column A.
+        tab.view.select(at("A3"));
+        tab.auto_sum("en");
+        let sum = tab
+            .view
+            .sheet()
+            .unwrap()
+            .cell(at("A3"))
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(sum.as_deref(), Some("SUM(A1:A2)"));
+        // With nothing to sum: an entry is started.
+        tab.view.select(at("F9"));
+        assert!(tab.auto_sum("en").is_empty());
+        assert_eq!(tab.view.editor().unwrap().text(), "=SUM(");
     }
 }

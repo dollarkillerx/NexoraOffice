@@ -40,7 +40,7 @@ use aster_shell::sidebar::{self, Look, SIDEBAR_RECENT};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
-use aster_shell::toolbar::{self, Command, Control, ViewMode, ViewState, zoom_step};
+use aster_shell::toolbar::{self, CellLook, Command, Control, ViewMode, ViewState, zoom_step};
 use aster_storage::{
     Contents, Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot,
 };
@@ -210,6 +210,8 @@ struct Shell {
     shown_heading: u8,
     /// The styles the toolbar shows pressed.
     shown_styles: Styles,
+    /// How the toolbar shows the active cell of a workbook.
+    shown_cell: CellLook,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -278,6 +280,7 @@ impl Shell {
             preview_builder: None,
             shown_heading: 0,
             shown_styles: Styles::default(),
+            shown_cell: CellLook::default(),
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -695,6 +698,36 @@ impl Shell {
             }
             (Some(Content::Markdown(editor)), Command::Undo) => editor.undo(),
             (Some(Content::Markdown(editor)), Command::Redo) => editor.redo(),
+            (Some(Content::Sheet(_)), command) if sheet_formats(command) => {
+                let language = self.language.tag();
+                let Some(tab) = self.active_sheet() else {
+                    return false;
+                };
+                let mut changes = if tab.view.is_editing() {
+                    tab.commit(language)
+                } else {
+                    Vec::new()
+                };
+                let started = match command {
+                    Command::MergeCells => {
+                        changes.extend(tab.merge());
+                        true
+                    }
+                    Command::AutoSum => {
+                        changes.extend(tab.auto_sum(language));
+                        true
+                    }
+                    _ => match tab.edit_for(command, language) {
+                        Some(edit) => {
+                            changes.extend(tab.format(&edit));
+                            false
+                        }
+                        None => false,
+                    },
+                };
+                tab.recalc(&changes);
+                started || !changes.is_empty()
+            }
             (Some(Content::Sheet(tab)), Command::Undo | Command::Redo) => {
                 let changes = if command == Command::Undo {
                     tab.undo()
@@ -1277,7 +1310,11 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         styles: shell
             .active_markdown()
             .map_or_else(Styles::default, |editor| editor.styles()),
+        cell: shell
+            .active_sheet()
+            .map_or_else(CellLook::default, |tab| tab.cell_look()),
     };
+    shell.shown_cell = view.cell;
     shell.shown_heading = view.heading;
     shell.shown_styles = view.styles;
     ui.set_in_table(view.styles.table);
@@ -3603,17 +3640,26 @@ fn after_sheet_change(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_shee
     if let Some(tab) = shell.active_sheet() {
         tab.recalc(&changes);
     }
-    if !changes.is_empty() {
-        if shell.sync_modified() {
-            refresh_tabs(ui, shell);
-        }
-        if undo_state(shell) != (ui.get_can_undo(), ui.get_can_redo()) {
-            refresh_toolbar(ui, shell);
-        }
+    if !changes.is_empty() && shell.sync_modified() {
+        refresh_tabs(ui, shell);
+    }
+    let look = shell.active_sheet().map(|tab| tab.cell_look());
+    if undo_state(shell) != (ui.get_can_undo(), ui.get_can_redo())
+        || look.is_some_and(|look| look != shell.shown_cell)
+    {
+        refresh_toolbar(ui, shell);
     }
     refresh_viewer(ui, shell);
     refresh_status(ui, shell);
     present(ui, shell);
+}
+
+/// The toolbar commands that act on a workbook's cells.
+fn sheet_formats(command: Command) -> bool {
+    command != Command::Undo
+        && command != Command::Redo
+        && command != Command::NumberFormat
+        && command.is_available(DocKind::Sheets)
 }
 
 /// Whether a key's text is something to type rather than a control key.
@@ -3697,6 +3743,23 @@ fn sheet_key_pressed(
         }
         return true;
     }
+    if primary && !tab.view.is_editing() {
+        let command = match text {
+            "b" | "B" => Some(Command::Bold),
+            "i" | "I" => Some(Command::Italic),
+            "u" | "U" => Some(Command::Underline),
+            _ => None,
+        };
+        if let Some(command) = command {
+            if shell.run(command) {
+                after_edit(ui, shell, true);
+            }
+            return true;
+        }
+    }
+    let Some(tab) = shell.active_sheet() else {
+        return false;
+    };
     if is(Key::F2) {
         tab.view.begin_edit(EditMode::Edit, None);
     } else if is(Key::Return) || tab_key {
@@ -4676,6 +4739,21 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_toolbar_option(handler!(|ui, shell, id, index| {
+        if Command::from_id(id) == Some(Command::NumberFormat)
+            && let Ok(index) = usize::try_from(index)
+        {
+            let language = shell.language.tag();
+            if let Some(tab) = shell.active_sheet() {
+                let mut changes = if tab.view.is_editing() {
+                    tab.commit(language)
+                } else {
+                    Vec::new()
+                };
+                changes.extend(tab.format(&office::number_format(index, language)));
+                after_sheet_change(&ui, shell, changes);
+            }
+            return;
+        }
         if Command::from_id(id) == Some(Command::Heading)
             && let Ok(level) = u8::try_from(index)
         {

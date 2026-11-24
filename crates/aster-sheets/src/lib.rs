@@ -24,6 +24,7 @@ pub mod format;
 pub mod formula;
 pub mod input;
 pub mod model;
+pub mod restyle;
 pub mod style;
 
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};
@@ -36,4 +37,5 @@ pub use model::{
     Anchor, Cell, Display, DisplayKind, Picture, Placement, Row, Sheet, SheetBuilder, SheetKind,
     Value, Workbook,
 };
+pub use restyle::StyleEdit;
 pub use style::{Borders, CellStyle, Font, HAlign, Line, LineStyle, Rgba, VAlign};

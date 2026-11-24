@@ -44,15 +44,19 @@ component ReadText inherits TextInput {
     selection-foreground-color: Tokens.text;
 }
 
-component ChatRow inherits Rectangle {
+// One entry of the conversation, as tall as what it shows.
+component ChatRow inherits VerticalLayout {
     in property <ChatItem> item;
     in property <length> available;
 
     // The user's message: on the right, tinted.
-    if root.item.kind == 0: HorizontalLayout {
-        alignment: end;
-        Rectangle {
-            width: min(root.available * 0.85, user-text.preferred-width + 2 * Tokens.space-md);
+    if root.item.kind == 0: Rectangle {
+        height: bubble.height;
+        bubble := Rectangle {
+            // A little slack: the last glyph must not touch the edge.
+            width: min(root.available * 0.85, user-text.preferred-width + 2 * Tokens.space-md + 4px);
+            x: root.available - self.width;
+            height: user-text.preferred-height + 2 * Tokens.space-sm;
             border-radius: Tokens.radius-lg;
             background: Tokens.accent-soft;
             user-text := ReadText {
@@ -61,8 +65,6 @@ component ChatRow inherits Rectangle {
                 width: parent.width - 2 * Tokens.space-md;
                 text: root.item.text;
             }
-
-            height: user-text.preferred-height + 2 * Tokens.space-sm;
         }
     }
 
@@ -445,9 +447,11 @@ export component AssistantPanel inherits Rectangle {
                 vertical-stretch: 1;
                 content-height: max(self.height, messages.preferred-height + 2 * Tokens.space-lg);
                 messages := VerticalLayout {
+                    alignment: start;
+                    height: self.preferred-height;
                     x: Tokens.space-lg;
                     y: Tokens.space-lg;
-                    width: chat.width - 2 * Tokens.space-lg;
+                    width: root.panel-width - 1px - 2 * Tokens.space-lg;
                     spacing: Tokens.space-md;
                     if root.items.length == 0: Text {
                         text: root.configured ? Strings.ai-empty : Strings.ai-not-configured;
@@ -458,7 +462,7 @@ export component AssistantPanel inherits Rectangle {
 
                     for item in root.items: ChatRow {
                         item: item;
-                        available: chat.width - 2 * Tokens.space-lg;
+                        available: root.panel-width - 1px - 2 * Tokens.space-lg;
                     }
 
                     if root.running: Text {

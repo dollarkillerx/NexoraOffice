@@ -21,12 +21,14 @@ pub mod calc;
 pub mod format;
 pub mod formula;
 pub mod model;
+pub mod style;
 
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};
 pub use axis::Axis;
 pub use calc::{CalcEngine, CalcError, Cancel, Computed, Edit, Mismatch};
 pub use format::{Format, date_parts};
 pub use model::{
-    Cell, CellStyle, Display, DisplayKind, HAlign, Row, Sheet, SheetBuilder, SheetKind, Value,
-    Workbook,
+    Anchor, Cell, Display, DisplayKind, Picture, Placement, Row, Sheet, SheetBuilder, SheetKind,
+    Value, Workbook,
 };
+pub use style::{Borders, CellStyle, Font, HAlign, Line, LineStyle, Rgba, VAlign};

@@ -345,3 +345,202 @@ fn parts_that_inflate_too_far_are_refused() {
     // Part names compare without case.
     assert!(package.has("BIG.XML"));
 }
+
+/// Fonts, fills, borders and alignment with theme, tinted and indexed
+/// colours; a frozen pane; whole-row and whole-column formats; a picture
+/// and a chart on a drawing; the Chinese default font.
+fn styled() -> Vec<u8> {
+    let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="样式" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+    let workbook_rels = rels(&[
+        ("rId1", "worksheet", "worksheets/sheet1.xml"),
+        ("rId2", "styles", "styles.xml"),
+        ("rId3", "theme", "theme/theme1.xml"),
+    ]);
+    let theme = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+  <a:clrScheme name="x"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+  <a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:accent1><a:srgbClr val="4472C4"/></a:accent1></a:clrScheme>
+</a:themeElements></a:theme>"#;
+    let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="3">
+    <font><sz val="11"/><color theme="1"/><name val="等线"/></font>
+    <font><b/><i val="0"/><u/><strike/><sz val="14"/><color theme="0"/><name val="Arial"/></font>
+    <font><sz val="9"/><color indexed="10"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="6">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor theme="4" tint="0.79998168889431442"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor indexed="13"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF7C5CE0"/></patternFill></fill>
+    <fill><gradientFill degree="90"><stop position="0"><color rgb="FF00B050"/></stop><stop position="1"><color theme="4"/></stop></gradientFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color auto="1"/></left><right style="dashed"><color rgb="FFFF0000"/></right><top/><bottom style="double"><color theme="4" tint="-0.249977111117893"/></bottom><diagonal style="thin"/></border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="6">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="2" fillId="3" borderId="0"><alignment horizontal="left" vertical="center" indent="2"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="0"/>
+    <xf numFmtId="0" fontId="0" fillId="5" borderId="0"/>
+    <xf numFmtId="0" fontId="9" fillId="99" borderId="99"/>
+  </cellXfs>
+  <colors><indexedColors>
+    <rgbColor rgb="00000000"/><rgbColor rgb="00FFFFFF"/><rgbColor rgb="00FF0000"/><rgbColor rgb="0000FF00"/>
+    <rgbColor rgb="000000FF"/><rgbColor rgb="00FFFF00"/><rgbColor rgb="00FF00FF"/><rgbColor rgb="0000FFFF"/>
+    <rgbColor rgb="00000000"/><rgbColor rgb="00FFFFFF"/><rgbColor rgb="00123456"/>
+  </indexedColors></colors>
+</styleSheet>"#;
+    let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetViews><sheetView showGridLines="0" workbookViewId="0"><pane xSplit="1" ySplit="2" topLeftCell="B3" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>
+  <sheetFormatPr defaultRowHeight="14.25"/>
+  <cols><col min="1" max="1" width="16.625" customWidth="1"/><col min="3" max="4" width="9" style="3" customWidth="1"/></cols>
+  <sheetData>
+    <row r="1"><c r="A1" s="1" t="inlineStr"><is><t>标题</t></is></c><c r="B1" s="1"/><c r="E1" s="2"><v>5</v></c><c r="F1" s="5"><v>1</v></c></row>
+    <row r="2"><c r="A2" s="4"/><c r="B2" s="0"/></row>
+    <row r="5" s="4" customFormat="1"><c r="A5"><v>1</v></c></row>
+  </sheetData>
+  <drawing r:id="rId1"/>
+</worksheet>"#;
+    let sheet_rels = rels(&[("rId1", "drawing", "../drawings/drawing1.xml")]);
+    let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+  <xdr:twoCellAnchor editAs="oneCell">
+    <xdr:from><xdr:col>2</xdr:col><xdr:colOff>95250</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>190500</xdr:rowOff></xdr:to>
+    <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="图片 1"/><xdr:cNvPicPr/></xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr/></xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+  <mc:AlternateContent><mc:Choice Requires="a14"><xdr:oneCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>20</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:ext cx="952500" cy="476250"/>
+    <xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="グラフ 2"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>
+      <xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"/></a:graphic></xdr:graphicFrame>
+    <xdr:clientData/></xdr:oneCellAnchor></mc:Choice></mc:AlternateContent>
+  <xdr:absoluteAnchor><xdr:pos x="0" y="0"/><xdr:ext cx="9525" cy="9525"/>
+    <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="4" name="lost"/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId9"/></xdr:blipFill></xdr:pic><xdr:clientData/></xdr:absoluteAnchor>
+</xdr:wsDr>"#;
+    let drawing_rels = rels(&[("rId1", "image", "../media/image1.png")]);
+    let png: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
+    package(&[
+        ("[Content_Types].xml", content_types(1).as_bytes()),
+        ("_rels/.rels", root_rels("xl/workbook.xml").as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", workbook_rels.as_bytes()),
+        ("xl/styles.xml", styles.as_bytes()),
+        ("xl/theme/theme1.xml", theme.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels.as_bytes()),
+        ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels",
+            drawing_rels.as_bytes(),
+        ),
+        ("xl/media/image1.png", png),
+    ])
+}
+
+#[test]
+fn styles_colours_panes_and_pictures() {
+    use aster_sheets::{LineStyle, Placement, VAlign};
+
+    let workbook = Xlsx.read(styled()).unwrap();
+    let sheet = &workbook.sheets[0];
+    let style_of = |cell: &str| workbook.style(sheet.style_at(at(cell)));
+
+    let title = style_of("A1");
+    assert!(title.font.bold && !title.font.italic && title.font.underline && title.font.strike);
+    assert_eq!(title.font.size, 14.0);
+    assert_eq!(title.font.name.as_deref(), Some("Arial"));
+    // Theme 0 is lt1 (white), not dk1.
+    assert_eq!(title.font.color, Some([0xFF, 0xFF, 0xFF, 0xFF]));
+    // Accent 1, lighter 80%.
+    assert_eq!(title.fill, Some([0xDA, 0xE3, 0xF3, 0xFF]));
+    assert_eq!(
+        (title.align, title.valign, title.wrap),
+        (Some(HAlign::Center), VAlign::Top, true)
+    );
+    let left = title.borders.left.unwrap();
+    assert_eq!((left.style, left.color), (LineStyle::Thin, None));
+    assert_eq!(title.borders.right.unwrap().color, Some([0xFF, 0, 0, 0xFF]));
+    let bottom = title.borders.bottom.unwrap();
+    assert_eq!(bottom.style, LineStyle::Double);
+    assert_eq!(bottom.color, Some([0x2F, 0x55, 0x97, 0xFF]));
+    assert_eq!(title.borders.top, None);
+
+    // The file's own palette replaces index 10; 13 is past it, so the
+    // default palette's yellow.
+    let indexed = style_of("E1");
+    assert_eq!(indexed.font.color, Some([0x12, 0x34, 0x56, 0xFF]));
+    assert_eq!(indexed.fill, Some([0xFF, 0xFF, 0x00, 0xFF]));
+    assert_eq!((indexed.indent, indexed.valign), (2, VAlign::Center));
+    // A gradient shows its first colour; indices past the lists fall back.
+    assert_eq!(style_of("F2").fill, None);
+    assert_eq!(workbook.style(4).fill, Some([0x00, 0xB0, 0x50, 0xFF]));
+    assert_eq!(style_of("F1").font.size, 11.0);
+    assert_eq!(style_of("F1").fill, None);
+
+    // An empty cell with a fill or border is kept, one without is not.
+    assert!(sheet.cell(at("B1")).is_some_and(|c| c.is_blank()));
+    assert!(sheet.cell(at("A2")).is_some());
+    assert!(sheet.cell(at("B2")).is_none());
+    assert_eq!(sheet.cell_count(), 4);
+    // Whole-column and whole-row formats.
+    assert_eq!(style_of("D40").fill, Some([0x7C, 0x5C, 0xE0, 0xFF]));
+    assert_eq!(style_of("B40").fill, None);
+    assert_eq!(style_of("D5").fill, Some([0x00, 0xB0, 0x50, 0xFF]));
+
+    assert_eq!(sheet.frozen, (2, 1));
+    assert!(!sheet.show_grid);
+    // 等线 counts columns in 8-pixel digits: 16.625 → 133 pixels.
+    assert_eq!(sheet.columns.size(0), 133.0);
+    assert_eq!(sheet.columns.size(2), 72.0);
+
+    assert_eq!(sheet.pictures.len(), 3);
+    let picture = &sheet.pictures[0];
+    assert_eq!(picture.name, "图片 1");
+    assert_eq!(&picture.image.as_deref().unwrap()[..4], b"\x89PNG");
+    let Placement::TwoCell { from, to } = picture.placement else {
+        panic!("{:?}", picture.placement);
+    };
+    assert_eq!((from.cell, from.dx, from.dy), (at("C4"), 10.0, 0.0));
+    assert_eq!((to.cell, to.dy), (at("F11"), 20.0));
+    let chart = &sheet.pictures[1];
+    assert_eq!(
+        (chart.name.as_str(), chart.image.is_none()),
+        ("グラフ 2", true)
+    );
+    assert!(matches!(
+        chart.placement,
+        Placement::OneCell {
+            width: 100.0,
+            height: 50.0,
+            ..
+        }
+    ));
+    // A picture whose image part is missing keeps its frame.
+    assert!(sheet.pictures[2].image.is_none());
+}
+
+#[test]
+fn the_digit_width_follows_the_normal_font() {
+    use aster_sheets::Font;
+    use std::sync::Arc;
+
+    let font = |name: &str, size: f32| Font {
+        name: Some(Arc::from(name)),
+        size,
+        ..Font::default()
+    };
+    assert_eq!(xlsx::digit_width(&Font::default()), 7.0);
+    assert_eq!(xlsx::digit_width(&font("Calibri", 11.0)), 7.0);
+    assert_eq!(xlsx::digit_width(&font("等线", 11.0)), 8.0);
+    assert_eq!(xlsx::digit_width(&font("Yu Gothic", 11.0)), 8.0);
+    assert_eq!(xlsx::digit_width(&font("ＭＳ Ｐゴシック", 11.0)), 8.0);
+    assert_eq!(xlsx::digit_width(&font("Arial", 10.0)), 7.0);
+    assert_eq!(xlsx::digit_width(&font("Calibri", 22.0)), 15.0);
+}

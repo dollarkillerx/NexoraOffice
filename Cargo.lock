@@ -336,6 +336,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-image"
+version = "0.0.1"
+dependencies = [
+ "png",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "aster-markdown"
 version = "0.0.1"
 dependencies = [
@@ -404,6 +412,7 @@ dependencies = [
 name = "aster-surface"
 version = "0.0.1"
 dependencies = [
+ "aster-image",
  "aster-markdown",
  "aster-ooxml",
  "aster-sheets",

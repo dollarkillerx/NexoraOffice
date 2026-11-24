@@ -12,19 +12,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aster_sheets::{
-    Cell, CellRange, CellRef, DisplayKind, HAlign, MAX_COLUMNS, MAX_ROWS, Sheet, Workbook,
-    column_name,
+    Anchor, Cell, CellRange, CellRef, DisplayKind, HAlign, Line, LineStyle, MAX_COLUMNS, MAX_ROWS,
+    Picture, Placement, Rgba, Sheet, VAlign, Workbook, column_name,
 };
 use aster_text::{Align, Family, Paragraph, Rules, Shaper, Spec, Style as TextStyle};
 use vello_cpu::kurbo::{Affine, Rect, Shape, Stroke};
 use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
+use crate::picture::{ImageCache, draw_image};
 use crate::preview::draw_text;
 use crate::text_surface::{DEFAULT_LANGUAGE, HAN_FALLBACK_FAMILIES, Rgba8};
 
-/// Text size in cells and headers, logical pixels.
+/// Text size in headers and picture labels, logical pixels.
 const TEXT_SIZE: f32 = 13.0;
+/// Logical pixels per point.
+const PX_PER_POINT: f32 = 96.0 / 72.0;
+/// Cell text is drawn a little smaller than its point size: the fonts
+/// standing in for Calibri and 等线 on this system are wider than them, and
+/// column widths were set for those.
+const TEXT_FIT: f32 = 0.9;
+/// One indent level: three spaces of the default font.
+const INDENT: f64 = 9.0;
 const HEADER_HEIGHT: f64 = 22.0;
 /// Space between a cell's edge and its text.
 const PAD: f64 = 4.0;
@@ -133,13 +142,64 @@ pub struct SheetView {
     resources: Resources,
     glyphs: Vec<Glyph>,
     drawn: Option<Drawn>,
+    /// Which styles have a fill or borders, by index.
+    decorated: Vec<bool>,
+    any_decorated: bool,
+    images: ImageCache,
 }
 
 /// A cell's text, laid out.
 struct Laid {
     paragraph: Paragraph,
     align: HAlign,
+    valign: VAlign,
     kind: DisplayKind,
+    /// Logical pixels.
+    indent: f64,
+    wrap: bool,
+}
+
+/// A part of the window that scrolls as one: the frozen corner, the frozen
+/// rows, the frozen columns or the rest.
+struct Pane {
+    first: CellRef,
+    last: CellRef,
+    /// Logical pixels this pane is scrolled by.
+    scroll_x: f64,
+    scroll_y: f64,
+    header_w: f64,
+    /// Physical pixels.
+    clip: Rect,
+    frozen_rows: bool,
+    frozen_cols: bool,
+}
+
+impl Pane {
+    /// Left edge of a column in this pane, physical pixels.
+    fn x(&self, sheet: &Sheet, col: u32, s: f64) -> f64 {
+        (self.header_w + sheet.columns.offset(col) - self.scroll_x) * s
+    }
+
+    /// Top edge of a row in this pane, physical pixels.
+    fn y(&self, sheet: &Sheet, row: u32, s: f64) -> f64 {
+        (HEADER_HEIGHT + sheet.row_sizes.offset(row) - self.scroll_y) * s
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn decorations(workbook: &Workbook) -> Vec<bool> {
+    workbook
+        .styles
+        .iter()
+        .map(|style| style.is_visible_when_empty())
+        .collect()
 }
 
 impl SheetView {
@@ -165,7 +225,12 @@ impl SheetView {
             resources: Resources::new(),
             glyphs: Vec::new(),
             drawn: None,
+            decorated: Vec::new(),
+            any_decorated: false,
+            images: ImageCache::default(),
         };
+        view.decorated = decorations(&view.workbook);
+        view.any_decorated = view.decorated.contains(&true);
         // A hidden sheet is not where a file opens.
         let start = if view.is_visible(first) {
             first
@@ -188,6 +253,8 @@ impl SheetView {
             self.sheet = self.sheet.min(workbook.sheets.len().saturating_sub(1));
         }
         self.workbook = workbook;
+        self.decorated = decorations(&self.workbook);
+        self.any_decorated = self.decorated.contains(&true);
         self.cells.clear();
         self.drawn = None;
     }
@@ -373,22 +440,55 @@ impl SheetView {
         (self.place().scroll_x * self.s(), max_x * self.s())
     }
 
+    /// Where the frozen rows and columns end, logical pixels from the top
+    /// left of the cells area.
+    fn frozen_size(&self) -> (f64, f64) {
+        self.sheet().map_or((0.0, 0.0), |sheet| {
+            (
+                sheet.columns.offset(sheet.frozen.1),
+                sheet.row_sizes.offset(sheet.frozen.0),
+            )
+        })
+    }
+
     /// The cell under a point (physical pixels), if it is in the cells area.
     pub fn cell_at(&self, x: f64, y: f64) -> Option<CellRef> {
         let sheet = self.sheet()?;
         let (x, y) = (x / self.s(), y / self.s());
         let header_width = self.header_width();
         let place = self.place();
-        let row = (y >= HEADER_HEIGHT)
-            .then(|| sheet.row_sizes.index_at(y - HEADER_HEIGHT + place.scroll_y));
-        let col =
-            (x >= header_width).then(|| sheet.columns.index_at(x - header_width + place.scroll_x));
+        let (frozen_w, frozen_h) = self.frozen_size();
+        // Frozen rows and columns do not scroll.
+        let row_at = |y: f64| {
+            let scroll = if y < frozen_h { 0.0 } else { place.scroll_y };
+            sheet.row_sizes.index_at(y + scroll)
+        };
+        let col_at = |x: f64| {
+            let scroll = if x < frozen_w { 0.0 } else { place.scroll_x };
+            sheet.columns.index_at(x + scroll)
+        };
+        let row = (y >= HEADER_HEIGHT).then(|| row_at(y - HEADER_HEIGHT));
+        let col = (x >= header_width).then(|| col_at(x - header_width));
+        let first_col = || {
+            if sheet.frozen.1 > 0 {
+                sheet.columns.index_at(0.0)
+            } else {
+                col_at(frozen_w)
+            }
+        };
+        let first_row = || {
+            if sheet.frozen.0 > 0 {
+                sheet.row_sizes.index_at(0.0)
+            } else {
+                row_at(frozen_h)
+            }
+        };
         match (row, col) {
             (Some(row), Some(col)) => Some(CellRef::new(row, col)),
             // A row number: the first cell of that row on screen.
-            (Some(row), None) => Some(CellRef::new(row, sheet.columns.index_at(place.scroll_x))),
+            (Some(row), None) => Some(CellRef::new(row, first_col())),
             // A column letter: that column's cell in the top row on screen.
-            (None, Some(col)) => Some(CellRef::new(sheet.row_sizes.index_at(place.scroll_y), col)),
+            (None, Some(col)) => Some(CellRef::new(first_row(), col)),
             (None, None) => None,
         }
     }
@@ -421,6 +521,7 @@ impl SheetView {
             return;
         };
         let at = self.place().selected;
+        let (frozen_rows, frozen_cols) = sheet.frozen;
         let range = sheet
             .merge_at(at)
             .copied()
@@ -429,19 +530,26 @@ impl SheetView {
         let right = sheet.columns.offset(range.last.col + 1);
         let top = sheet.row_sizes.offset(range.first.row);
         let bottom = sheet.row_sizes.offset(range.last.row + 1);
+        let (frozen_w, frozen_h) = self.frozen_size();
         let (area_w, area_h) = self.area();
         let place = self.place_mut();
-        if right > place.scroll_x + area_w {
-            place.scroll_x = right - area_w;
+        // Frozen cells are always in view; the others scroll into the part
+        // of the window the frozen ones leave.
+        if range.first.col >= frozen_cols {
+            if right > place.scroll_x + area_w {
+                place.scroll_x = right - area_w;
+            }
+            if left - frozen_w < place.scroll_x {
+                place.scroll_x = left - frozen_w;
+            }
         }
-        if left < place.scroll_x {
-            place.scroll_x = left;
-        }
-        if bottom > place.scroll_y + area_h {
-            place.scroll_y = bottom - area_h;
-        }
-        if top < place.scroll_y {
-            place.scroll_y = top;
+        if range.first.row >= frozen_rows {
+            if bottom > place.scroll_y + area_h {
+                place.scroll_y = bottom - area_h;
+            }
+            if top - frozen_h < place.scroll_y {
+                place.scroll_y = top - frozen_h;
+            }
         }
         self.clamp();
     }
@@ -482,7 +590,7 @@ impl SheetView {
                 at.row,
                 sheet
                     .row(at.row)
-                    .and_then(|row| row.cells.last())
+                    .and_then(|row| row.cells.iter().rev().find(|cell| !cell.is_blank()))
                     .map_or(at.col, |cell| cell.col),
             ),
             SheetKey::Start => CellRef::default(),
@@ -497,7 +605,9 @@ impl SheetView {
         self.selection_text().1
     }
 
-    fn laid(&mut self, at: CellRef, cell: &Cell) -> Option<Arc<Laid>> {
+    /// A cell's text laid out in its style. `width` is the cell's (or its
+    /// merged area's) width, physical pixels, which wrapped text fills.
+    fn laid(&mut self, at: CellRef, cell: &Cell, width: f64) -> Option<Arc<Laid>> {
         let key = (self.sheet, at);
         if let Some(found) = self.cells.get(&key) {
             return found.clone();
@@ -506,16 +616,51 @@ impl SheetView {
             self.cells.clear();
         }
         let laid = self.workbook.display(cell).map(|display| {
-            // Without "wrap text" (not read yet) a cell is one line.
-            let text = display.text.replace(['\r', '\n'], " ");
+            let style = self.workbook.style(cell.style);
+            let font = &style.font;
             let color = match display.kind {
                 DisplayKind::Uncomputed => self.style.secondary,
-                _ => self.style.text,
+                _ => readable(font.color, style.fill, &self.style),
+            };
+            let indent = f64::from(style.indent) * INDENT;
+            let s = f64::from(self.scale);
+            let wrap = style.wrap;
+            let text = if wrap {
+                display.text.replace("\r\n", "\n").replace('\r', "\n")
+            } else {
+                // Without "wrap text" a cell is one line.
+                display.text.replace(['\r', '\n'], " ")
+            };
+            let text_style = TextStyle {
+                family: family(font.name.as_deref()),
+                size: font.size * PX_PER_POINT * TEXT_FIT,
+                color,
+                bold: font.bold,
+                italic: font.italic,
+                underline: font.underline,
+                strike: font.strike,
+                rise: 0.0,
+            };
+            let wrap_width = wrap.then(|| ((width - (2.0 * PAD + indent) * s).max(s)) as f32);
+            let align = match display.align {
+                HAlign::Left => Align::Start,
+                HAlign::Center => Align::Center,
+                HAlign::Right => Align::End,
             };
             Arc::new(Laid {
-                paragraph: lay_out(&mut self.shaper, &text, color, self.scale, Align::Start),
+                paragraph: lay_out(
+                    &mut self.shaper,
+                    &text,
+                    text_style,
+                    self.scale,
+                    align,
+                    wrap_width,
+                ),
                 align: display.align,
+                valign: style.valign,
                 kind: display.kind,
+                indent,
+                wrap,
             })
         });
         self.cells.insert(key, laid.clone());
@@ -532,9 +677,10 @@ impl SheetView {
         let paragraph = Arc::new(lay_out(
             &mut self.shaper,
             text,
-            self.style.header_text,
+            ui_text(self.style.header_text, TEXT_SIZE),
             self.scale,
             Align::Start,
+            None,
         ));
         self.headers.insert(text.to_owned(), paragraph.clone());
         paragraph
@@ -547,12 +693,31 @@ impl SheetView {
         let hashes = Arc::new(lay_out(
             &mut self.shaper,
             "#",
-            self.style.text,
+            ui_text(self.style.text, TEXT_SIZE),
             self.scale,
             Align::Start,
+            None,
         ));
         self.hashes = Some(hashes.clone());
         hashes
+    }
+
+    /// A picture's name, for its frame.
+    fn label(&mut self, text: &str) -> Arc<Paragraph> {
+        let key = format!("\u{1}{text}");
+        if let Some(found) = self.headers.get(&key) {
+            return found.clone();
+        }
+        let paragraph = Arc::new(lay_out(
+            &mut self.shaper,
+            text,
+            ui_text(self.style.secondary, TEXT_SIZE),
+            self.scale,
+            Align::Start,
+            None,
+        ));
+        self.headers.insert(key, paragraph.clone());
+        paragraph
     }
 
     pub fn needs_render(&self) -> bool {
@@ -590,63 +755,280 @@ impl SheetView {
         let place = self.place();
         let header_w = self.header_width();
         let (area_w, area_h) = self.area();
-        let first_row = sheet.row_sizes.index_at(place.scroll_y);
-        let last_row = sheet.row_sizes.index_at(place.scroll_y + area_h);
-        let first_col = sheet.columns.index_at(place.scroll_x);
-        let last_col = sheet.columns.index_at(place.scroll_x + area_w);
-        let view = CellRange::new(
-            CellRef::new(first_row, first_col),
-            CellRef::new(last_row, last_col),
-        );
-        // Logical sheet position to physical window position.
-        let x_of = |col: u32| (header_w + sheet.columns.offset(col) - place.scroll_x) * s;
-        let y_of = |row: u32| (HEADER_HEIGHT + sheet.row_sizes.offset(row) - place.scroll_y) * s;
+        let (frozen_rows, frozen_cols) = sheet.frozen;
+        let (frozen_w, frozen_h) = self.frozen_size();
         let line = (s.round()).max(1.0);
         let (left, top) = (header_w * s, HEADER_HEIGHT * s);
+        let split_x = (left + frozen_w * s).min(w);
+        let split_y = (top + frozen_h * s).min(h);
 
-        // Grid lines.
+        // Columns and rows on screen: the frozen ones, then the scrolled ones
+        // (first, last, scroll offset, screen span).
+        let mut columns: Vec<(u32, u32, f64, f64, f64)> = Vec::new();
+        if frozen_cols > 0 && split_x > left {
+            let last = sheet.columns.index_at(area_w).min(frozen_cols - 1);
+            columns.push((0, last, 0.0, left, split_x));
+        }
+        if split_x < w {
+            let first = sheet
+                .columns
+                .index_at(frozen_w + place.scroll_x)
+                .max(frozen_cols);
+            let last = sheet.columns.index_at(place.scroll_x + area_w).max(first);
+            columns.push((first, last, place.scroll_x, split_x, w));
+        }
+        let mut rows: Vec<(u32, u32, f64, f64, f64)> = Vec::new();
+        if frozen_rows > 0 && split_y > top {
+            let last = sheet.row_sizes.index_at(area_h).min(frozen_rows - 1);
+            rows.push((0, last, 0.0, top, split_y));
+        }
+        if split_y < h {
+            let first = sheet
+                .row_sizes
+                .index_at(frozen_h + place.scroll_y)
+                .max(frozen_rows);
+            let last = sheet.row_sizes.index_at(place.scroll_y + area_h).max(first);
+            rows.push((first, last, place.scroll_y, split_y, h));
+        }
+        let pane_of = |row_span: &(u32, u32, f64, f64, f64),
+                       col_span: &(u32, u32, f64, f64, f64)| Pane {
+            first: CellRef::new(row_span.0, col_span.0),
+            last: CellRef::new(row_span.1, col_span.1),
+            scroll_x: col_span.2,
+            scroll_y: row_span.2,
+            header_w,
+            clip: Rect::new(col_span.3, row_span.3, col_span.4, row_span.4),
+            frozen_rows: row_span.0 < frozen_rows,
+            frozen_cols: col_span.0 < frozen_cols,
+        };
+        for row_span in &rows {
+            for col_span in &columns {
+                self.draw_pane(&workbook, sheet, &pane_of(row_span, col_span));
+            }
+        }
+
+        // The selected cell, in the pane it is in.
+        let selected = place.selected;
+        let span = sheet
+            .merge_at(selected)
+            .copied()
+            .unwrap_or_else(|| CellRange::single(selected));
+        let row_span = rows
+            .iter()
+            .find(|r| (selected.row < frozen_rows) == (r.0 < frozen_rows));
+        let col_span = columns
+            .iter()
+            .find(|c| (selected.col < frozen_cols) == (c.0 < frozen_cols));
+        if let (Some(row_span), Some(col_span)) = (row_span, col_span) {
+            let pane = pane_of(row_span, col_span);
+            let border = (2.0 * s).round();
+            let outline = Rect::new(
+                pane.x(sheet, span.first.col, s).round() - line,
+                pane.y(sheet, span.first.row, s).round() - line,
+                pane.x(sheet, span.last.col + 1, s).round(),
+                pane.y(sheet, span.last.row + 1, s).round(),
+            );
+            self.ctx.push_clip_layer(&pane.clip.to_path(0.1));
+            self.ctx.set_paint(color(style.accent));
+            self.ctx.set_stroke(Stroke::new(border));
+            self.ctx
+                .stroke_rect(&outline.inset(-border / 2.0 + line / 2.0));
+            self.ctx.pop_layer();
+        }
+
+        // Where the frozen part ends.
+        self.ctx.set_paint(color(style.header_text));
+        if frozen_cols > 0 && split_x < w {
+            self.ctx
+                .fill_rect(&Rect::new(split_x.round() - line, top, split_x.round(), h));
+        }
+        if frozen_rows > 0 && split_y < h {
+            self.ctx
+                .fill_rect(&Rect::new(left, split_y.round() - line, w, split_y.round()));
+        }
+
+        // Headers over everything else.
+        self.ctx.set_paint(color(style.header));
+        self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, top));
+        self.ctx.fill_rect(&Rect::new(0.0, 0.0, left, h));
+        for &(first, last, scroll, x0, x1) in &columns {
+            self.ctx
+                .push_clip_layer(&Rect::new(x0, 0.0, x1, top).to_path(0.1));
+            let x_of = |col: u32| (header_w + sheet.columns.offset(col) - scroll) * s;
+            for col in first..=last {
+                if sheet.columns.size(col) == 0.0 {
+                    continue;
+                }
+                let (x0, x1) = (x_of(col), x_of(col + 1));
+                if (span.first.col..=span.last.col).contains(&col) {
+                    self.ctx.set_paint(color(style.header_active));
+                    self.ctx.fill_rect(&Rect::new(x0, 0.0, x1, top));
+                }
+                let label = self.header_text(&column_name(col));
+                self.draw_centered(&label, Rect::new(x0, 0.0, x1, top));
+                self.ctx.set_paint(color(style.grid));
+                self.ctx
+                    .fill_rect(&Rect::new(x1.round() - line, 0.0, x1.round(), top));
+            }
+            self.ctx.pop_layer();
+        }
+        for &(first, last, scroll, y0, y1) in &rows {
+            self.ctx
+                .push_clip_layer(&Rect::new(0.0, y0, left, y1).to_path(0.1));
+            let y_of = |row: u32| (HEADER_HEIGHT + sheet.row_sizes.offset(row) - scroll) * s;
+            for row in first..=last {
+                if sheet.row_sizes.size(row) == 0.0 {
+                    continue;
+                }
+                let (y0, y1) = (y_of(row), y_of(row + 1));
+                if (span.first.row..=span.last.row).contains(&row) {
+                    self.ctx.set_paint(color(style.header_active));
+                    self.ctx.fill_rect(&Rect::new(0.0, y0, left, y1));
+                }
+                let label = self.header_text(&(row + 1).to_string());
+                self.draw_centered(&label, Rect::new(0.0, y0, left, y1));
+                self.ctx.set_paint(color(style.grid));
+                self.ctx
+                    .fill_rect(&Rect::new(0.0, y1.round() - line, left, y1.round()));
+            }
+            self.ctx.pop_layer();
+        }
         self.ctx.set_paint(color(style.grid));
-        for col in first_col..=last_col + 1 {
-            if col > first_col && sheet.columns.size(col - 1) == 0.0 {
-                continue;
+        self.ctx.fill_rect(&Rect::new(left - line, 0.0, left, h));
+        self.ctx.fill_rect(&Rect::new(0.0, top - line, w, top));
+        self.finish()
+    }
+
+    /// One pane of the sheet: grid, fills, borders, texts and pictures.
+    fn draw_pane(&mut self, workbook: &Workbook, sheet: &Sheet, pane: &Pane) {
+        let s = self.s();
+        let style = self.style;
+        let line = (s.round()).max(1.0);
+        let clip = pane.clip;
+        let x_of = |col: u32| pane.x(sheet, col, s);
+        let y_of = |row: u32| pane.y(sheet, row, s);
+        let (first_row, last_row) = (pane.first.row, pane.last.row);
+        let (first_col, last_col) = (pane.first.col, pane.last.col);
+        let view = CellRange::new(pane.first, pane.last);
+        self.ctx.push_clip_layer(&clip.to_path(0.1));
+
+        if sheet.show_grid {
+            self.ctx.set_paint(color(style.grid));
+            for col in first_col..=last_col + 1 {
+                if col > first_col && sheet.columns.size(col - 1) == 0.0 {
+                    continue;
+                }
+                let x = x_of(col).round() - line;
+                if x >= clip.x0 - line {
+                    self.ctx
+                        .fill_rect(&Rect::new(x, clip.y0, x + line, clip.y1));
+                }
             }
-            let x = x_of(col).round() - line;
-            if x >= left - line {
-                self.ctx.fill_rect(&Rect::new(x, top, x + line, h));
-            }
-        }
-        for row in first_row..=last_row + 1 {
-            if row > first_row && sheet.row_sizes.size(row - 1) == 0.0 {
-                continue;
-            }
-            let y = y_of(row).round() - line;
-            if y >= top - line {
-                self.ctx.fill_rect(&Rect::new(left, y, w, y + line));
+            for row in first_row..=last_row + 1 {
+                if row > first_row && sheet.row_sizes.size(row - 1) == 0.0 {
+                    continue;
+                }
+                let y = y_of(row).round() - line;
+                if y >= clip.y0 - line {
+                    self.ctx
+                        .fill_rect(&Rect::new(clip.x0, y, clip.x1, y + line));
+                }
             }
         }
 
-        // Merged areas on screen: cover the lines inside them.
         let merges: Vec<CellRange> = sheet
             .merges
             .iter()
             .filter(|merge| merge.intersects(&view))
             .copied()
             .collect();
-        let clip_cells = Rect::new(left, top, w, h);
-        self.ctx.push_clip_layer(&clip_cells.to_path(0.1));
-        self.ctx.set_paint(color(style.background));
+        let snapped = |range: CellRange| {
+            Rect::new(
+                x_of(range.first.col).round(),
+                y_of(range.first.row).round(),
+                x_of(range.last.col + 1).round(),
+                y_of(range.last.row + 1).round(),
+            )
+        };
+
+        // Cells with a fill or borders, found once.
+        let mut decorated: Vec<(CellRef, u32)> = Vec::new();
+        if self.any_decorated {
+            for row in first_row..=last_row {
+                if sheet.row_sizes.size(row) == 0.0 {
+                    continue;
+                }
+                for col in first_col..=last_col {
+                    if sheet.columns.size(col) == 0.0 {
+                        continue;
+                    }
+                    let at = CellRef::new(row, col);
+                    let index = sheet.style_at(at);
+                    if self.decorated.get(index as usize).copied().unwrap_or(false) {
+                        decorated.push((at, index));
+                    }
+                }
+            }
+        }
+
+        // Merged areas cover the lines inside them, with their first cell's
+        // fill.
         for merge in &merges {
-            let x0 = x_of(merge.first.col).round();
-            let y0 = y_of(merge.first.row).round();
-            let x1 = x_of(merge.last.col + 1).round() - line;
-            let y1 = y_of(merge.last.row + 1).round() - line;
-            self.ctx.fill_rect(&Rect::new(x0, y0, x1, y1));
+            let fill = workbook.style(sheet.style_at(merge.first)).fill;
+            self.ctx.set_paint(color(fill.unwrap_or(style.background)));
+            let rect = snapped(*merge);
+            self.ctx.fill_rect(&Rect::new(
+                rect.x0,
+                rect.y0,
+                rect.x1 - if fill.is_some() { 0.0 } else { line },
+                rect.y1 - if fill.is_some() { 0.0 } else { line },
+            ));
+        }
+        for &(at, index) in &decorated {
+            if merges.iter().any(|merge| merge.contains(at)) {
+                continue;
+            }
+            if let Some(fill) = workbook.styles.get(index as usize).and_then(|st| st.fill) {
+                self.ctx.set_paint(color(fill));
+                self.ctx.fill_rect(&snapped(CellRange::single(at)));
+            }
+        }
+        for &(at, index) in &decorated {
+            let Some(cell_style) = workbook.styles.get(index as usize) else {
+                continue;
+            };
+            let borders = &cell_style.borders;
+            if borders.is_empty() {
+                continue;
+            }
+            let merge = merges.iter().find(|merge| merge.contains(at));
+            let rect = snapped(CellRange::single(at));
+            let inner = |side: Side| {
+                merge.is_some_and(|m| match side {
+                    Side::Left => at.col > m.first.col,
+                    Side::Right => at.col < m.last.col,
+                    Side::Top => at.row > m.first.row,
+                    Side::Bottom => at.row < m.last.row,
+                })
+            };
+            for (side, border) in [
+                (Side::Top, borders.top),
+                (Side::Bottom, borders.bottom),
+                (Side::Left, borders.left),
+                (Side::Right, borders.right),
+            ] {
+                if let Some(border) = border
+                    && !inner(side)
+                {
+                    self.draw_border(border, side, rect, line);
+                }
+            }
         }
 
         // Cell texts: merged areas show their top-left cell.
         let mut texts: Vec<(CellRef, Rect)> = Vec::new();
-        for (at, _) in sheet.cells_in(view) {
-            if merges.iter().any(|merge| merge.contains(at)) {
+        for (at, cell) in sheet.cells_in(view) {
+            if cell.is_blank() || merges.iter().any(|merge| merge.contains(at)) {
                 continue;
             }
             if sheet.columns.size(at.col) == 0.0 || sheet.row_sizes.size(at.row) == 0.0 {
@@ -663,7 +1045,7 @@ impl SheetView {
             ));
         }
         for merge in &merges {
-            if sheet.cell(merge.first).is_some() {
+            if sheet.is_filled(merge.first) {
                 texts.push((
                     merge.first,
                     Rect::new(
@@ -679,87 +1061,157 @@ impl SheetView {
             let Some(cell) = sheet.cell(at) else {
                 continue;
             };
-            let Some(laid) = self.laid(at, cell) else {
+            let Some(laid) = self.laid(at, cell, rect.width()) else {
                 continue;
             };
             let merged = merges.iter().any(|merge| merge.first == at);
-            // Left-aligned text runs on over empty cells to its right, as in
-            // Excel.
+            // Unwrapped text runs on over empty cells beside it, as in Excel:
+            // to the right when left-aligned, to the left when right-aligned.
             let mut room = rect;
-            if !merged && laid.kind == DisplayKind::Text && laid.align == HAlign::Left {
-                let stop = sheet
-                    .next_in_row(at)
-                    .map_or(last_col + 1, |next| next.col.min(last_col + 1));
-                room.x1 = x_of(stop).max(rect.x1);
+            if !merged && !laid.wrap && laid.kind == DisplayKind::Text {
+                match laid.align {
+                    HAlign::Left => {
+                        let stop = sheet
+                            .next_in_row(at)
+                            .map_or(last_col + 1, |next| next.col.min(last_col + 1));
+                        room.x1 = x_of(stop).max(rect.x1);
+                    }
+                    HAlign::Right => {
+                        let stop = sheet
+                            .previous_in_row(at)
+                            .map_or(first_col, |previous| (previous.col + 1).max(first_col));
+                        room.x0 = x_of(stop).min(rect.x0);
+                    }
+                    HAlign::Center => {}
+                }
             }
             self.draw_cell(&laid, rect, room, s);
         }
-        self.ctx.pop_layer();
 
-        // The selected cell.
-        let selected = place.selected;
-        let span = sheet
-            .merge_at(selected)
-            .copied()
-            .unwrap_or_else(|| CellRange::single(selected));
-        let border = (2.0 * s).round();
-        let outline = Rect::new(
-            x_of(span.first.col).round() - line,
-            y_of(span.first.row).round() - line,
-            x_of(span.last.col + 1).round(),
-            y_of(span.last.row + 1).round(),
-        );
-        self.ctx.push_clip_layer(&clip_cells.to_path(0.1));
-        self.ctx.set_paint(color(style.accent));
-        self.ctx.set_stroke(Stroke::new(border));
-        self.ctx
-            .stroke_rect(&outline.inset(-border / 2.0 + line / 2.0));
+        // Pictures float over the cells; each is drawn in the pane its top
+        // left corner is fastened in.
+        for picture in &sheet.pictures {
+            let anchor = match picture.placement {
+                Placement::TwoCell { from, .. } | Placement::OneCell { from, .. } => from.cell,
+                Placement::Absolute { .. } => CellRef::new(u32::MAX, u32::MAX),
+            };
+            let frozen_rows = anchor.row < sheet.frozen.0;
+            let frozen_cols = anchor.col < sheet.frozen.1;
+            if frozen_rows != pane.frozen_rows || frozen_cols != pane.frozen_cols {
+                continue;
+            }
+            let at = |a: &Anchor| (x_of(a.cell.col) + a.dx * s, y_of(a.cell.row) + a.dy * s);
+            let rect = match picture.placement {
+                Placement::TwoCell { from, to } => {
+                    let (x0, y0) = at(&from);
+                    let (x1, y1) = at(&to);
+                    Rect::new(x0, y0, x1.max(x0), y1.max(y0))
+                }
+                Placement::OneCell {
+                    from,
+                    width,
+                    height,
+                } => {
+                    let (x0, y0) = at(&from);
+                    Rect::new(x0, y0, x0 + width * s, y0 + height * s)
+                }
+                Placement::Absolute {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    let x0 = (pane.header_w + x - pane.scroll_x) * s;
+                    let y0 = (HEADER_HEIGHT + y - pane.scroll_y) * s;
+                    Rect::new(x0, y0, x0 + width * s, y0 + height * s)
+                }
+            };
+            if rect.width() < 1.0 || rect.height() < 1.0 || rect.intersect(clip).is_zero_area() {
+                continue;
+            }
+            self.draw_picture(picture, rect);
+        }
         self.ctx.pop_layer();
+    }
 
-        // Headers over everything else.
+    /// A picture, or for one that cannot be shown (a chart, a format not
+    /// read) a frame with its name.
+    fn draw_picture(&mut self, picture: &Picture, rect: Rect) {
+        let s = self.s();
+        let style = self.style;
+        if let Some(image) = picture
+            .image
+            .as_ref()
+            .and_then(|bytes| self.images.get(bytes))
+        {
+            draw_image(&mut self.ctx, &image, rect, None, Affine::IDENTITY);
+            return;
+        }
         self.ctx.set_paint(color(style.header));
-        self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, top));
-        self.ctx.fill_rect(&Rect::new(0.0, 0.0, left, h));
-        self.ctx
-            .push_clip_layer(&Rect::new(left, 0.0, w, top).to_path(0.1));
-        for col in first_col..=last_col {
-            if sheet.columns.size(col) == 0.0 {
-                continue;
-            }
-            let (x0, x1) = (x_of(col), x_of(col + 1));
-            if (span.first.col..=span.last.col).contains(&col) {
-                self.ctx.set_paint(color(style.header_active));
-                self.ctx.fill_rect(&Rect::new(x0, 0.0, x1, top));
-            }
-            let label = self.header_text(&column_name(col));
-            self.draw_centered(&label, Rect::new(x0, 0.0, x1, top));
-            self.ctx.set_paint(color(style.grid));
-            self.ctx
-                .fill_rect(&Rect::new(x1.round() - line, 0.0, x1.round(), top));
-        }
-        self.ctx.pop_layer();
-        self.ctx
-            .push_clip_layer(&Rect::new(0.0, top, left, h).to_path(0.1));
-        for row in first_row..=last_row {
-            if sheet.row_sizes.size(row) == 0.0 {
-                continue;
-            }
-            let (y0, y1) = (y_of(row), y_of(row + 1));
-            if (span.first.row..=span.last.row).contains(&row) {
-                self.ctx.set_paint(color(style.header_active));
-                self.ctx.fill_rect(&Rect::new(0.0, y0, left, y1));
-            }
-            let label = self.header_text(&(row + 1).to_string());
-            self.draw_centered(&label, Rect::new(0.0, y0, left, y1));
-            self.ctx.set_paint(color(style.grid));
-            self.ctx
-                .fill_rect(&Rect::new(0.0, y1.round() - line, left, y1.round()));
-        }
-        self.ctx.pop_layer();
+        self.ctx.fill_rect(&rect);
         self.ctx.set_paint(color(style.grid));
-        self.ctx.fill_rect(&Rect::new(left - line, 0.0, left, h));
-        self.ctx.fill_rect(&Rect::new(0.0, top - line, w, top));
-        self.finish()
+        self.ctx.set_stroke(Stroke::new(s.max(1.0)));
+        self.ctx.stroke_rect(&rect.inset(-s / 2.0));
+        let label = self.label(&picture.name);
+        if f64::from(label.width()) + 8.0 * s <= rect.width()
+            && f64::from(label.height()) + 4.0 * s <= rect.height()
+        {
+            self.draw_centered(&label, rect);
+        }
+    }
+
+    /// One side of a cell's border, centred on the grid line.
+    fn draw_border(&mut self, border: Line, side: Side, rect: Rect, line: f64) {
+        let s = self.s();
+        let paint = readable_line(border.color, &self.style);
+        self.ctx.set_paint(color(paint));
+        let width = (border.style.width() * s).round().max(1.0);
+        let horizontal = matches!(side, Side::Top | Side::Bottom);
+        // The grid line this side sits on: the one left of and above a cell
+        // belong to its neighbours.
+        let at = match side {
+            Side::Top => rect.y0 - line,
+            Side::Bottom => rect.y1 - line,
+            Side::Left => rect.x0 - line,
+            Side::Right => rect.x1 - line,
+        };
+        let start = (at + line / 2.0 - width / 2.0).round();
+        let (from, to) = if horizontal {
+            (rect.x0 - line, rect.x1)
+        } else {
+            (rect.y0 - line, rect.y1)
+        };
+        let bands: Vec<(f64, f64)> = if border.style == LineStyle::Double {
+            let thin = s.round().max(1.0);
+            vec![(start, start + thin), (start + width - thin, start + width)]
+        } else {
+            vec![(start, start + width)]
+        };
+        let dashes = border.style.dashes();
+        for (a, b) in bands {
+            let mut segment = |p: f64, q: f64| {
+                let rect = if horizontal {
+                    Rect::new(p, a, q, b)
+                } else {
+                    Rect::new(a, p, b, q)
+                };
+                self.ctx.fill_rect(&rect);
+            };
+            if dashes.is_empty() {
+                segment(from, to);
+                continue;
+            }
+            let mut p = from;
+            let mut i = 0;
+            while p < to {
+                let length = dashes[i % dashes.len()] * s;
+                if i % 2 == 0 {
+                    segment(p, (p + length).min(to));
+                }
+                p += length.max(1.0);
+                i += 1;
+            }
+        }
     }
 
     fn finish(&mut self) -> &Pixmap {
@@ -771,15 +1223,28 @@ impl SheetView {
     /// One cell's text in `rect`, allowed to spread over `room`.
     fn draw_cell(&mut self, laid: &Laid, rect: Rect, room: Rect, s: f64) {
         let pad = PAD * s;
+        let indent = laid.indent * s;
         let paragraph = &laid.paragraph;
         let width = f64::from(paragraph.width());
         let height = f64::from(paragraph.height());
+        let y = match laid.valign {
+            VAlign::Top => rect.y0 + s,
+            VAlign::Center => (rect.y0 + rect.y1 - height) / 2.0,
+            VAlign::Bottom => (rect.y1 - height - s).max(rect.y0),
+        };
         // Numbers that do not fit show as ### in Excel.
-        if laid.kind == DisplayKind::Number && width > rect.width() - 2.0 * pad {
+        if laid.kind == DisplayKind::Number
+            && !laid.wrap
+            && width > rect.width() - 2.0 * pad - indent
+        {
             let hash = self.hashes();
             let each = f64::from(hash.width()).max(1.0);
             let count = ((rect.width() - 2.0 * pad) / each).floor().max(1.0) as usize;
-            let y = (rect.y1 - height - s).max(rect.y0);
+            let y = match laid.valign {
+                VAlign::Top => rect.y0 + s,
+                VAlign::Center => (rect.y0 + rect.y1 - f64::from(hash.height())) / 2.0,
+                VAlign::Bottom => (rect.y1 - f64::from(hash.height()) - s).max(rect.y0),
+            };
             let x0 = rect.x1 - pad - each * count as f64;
             self.ctx.push_clip_layer(&rect.to_path(0.1));
             for i in 0..count {
@@ -788,20 +1253,34 @@ impl SheetView {
             self.ctx.pop_layer();
             return;
         }
-        let x = match laid.align {
-            HAlign::Left => rect.x0 + pad,
-            HAlign::Right => rect.x1 - pad - width,
-            HAlign::Center => (rect.x0 + rect.x1 - width) / 2.0,
+        let x = if laid.wrap {
+            // Wrapped lines are aligned by the layout across this width.
+            match laid.align {
+                HAlign::Right => rect.x0 + pad,
+                _ => rect.x0 + pad + indent,
+            }
+        } else {
+            match laid.align {
+                HAlign::Left => rect.x0 + pad + indent,
+                HAlign::Right => rect.x1 - pad - indent - width,
+                HAlign::Center => (rect.x0 + rect.x1 - width) / 2.0,
+            }
         };
-        // Excel puts text at the bottom of a cell.
-        let y = (rect.y1 - height - s).max(rect.y0);
-        let fits = x >= room.x0 && x + width <= room.x1 - pad / 2.0 && height <= rect.height();
+        let fits = x >= room.x0
+            && x + width <= room.x1 - pad / 2.0
+            && y >= rect.y0 - 0.5
+            && y + height <= rect.y1 + 0.5;
         if fits {
             self.paint(paragraph, x, y);
         } else {
             let clip = Rect::new(room.x0, rect.y0, room.x1 - s, rect.y1);
             self.ctx.push_clip_layer(&clip.to_path(0.1));
-            self.paint(paragraph, x.max(room.x0 + pad).min(x), y);
+            let x = if laid.align == HAlign::Left || laid.wrap {
+                x
+            } else {
+                x.max(room.x0 + pad).min(x)
+            };
+            self.paint(paragraph, x, y);
             self.ctx.pop_layer();
         }
     }
@@ -840,7 +1319,7 @@ impl SheetView {
 /// Ctrl+arrow: to the edge of the block of filled cells, or to the next
 /// filled cell, or to the sheet's edge.
 fn jump(sheet: &Sheet, at: CellRef, direction: Direction) -> CellRef {
-    let filled = |cell: CellRef| sheet.cell(cell).is_some();
+    let filled = |cell: CellRef| sheet.is_filled(cell);
     let step = |cell: CellRef| -> Option<CellRef> {
         match direction {
             Direction::Up => cell.row.checked_sub(1).map(|r| CellRef::new(r, cell.col)),
@@ -879,14 +1358,14 @@ fn jump(sheet: &Sheet, at: CellRef, direction: Direction) -> CellRef {
             .rows()
             .iter()
             .filter(|row| row.index > at.row)
-            .find(|row| row.cells.binary_search_by_key(&at.col, |c| c.col).is_ok())
+            .find(|row| sheet.is_filled(CellRef::new(row.index, at.col)))
             .map(|row| CellRef::new(row.index, at.col)),
         Direction::Up => sheet
             .rows()
             .iter()
             .rev()
             .filter(|row| row.index < at.row)
-            .find(|row| row.cells.binary_search_by_key(&at.col, |c| c.col).is_ok())
+            .find(|row| sheet.is_filled(CellRef::new(row.index, at.col)))
             .map(|row| CellRef::new(row.index, at.col)),
         Direction::Right => sheet
             .next_in_row(at)
@@ -898,24 +1377,94 @@ fn jump(sheet: &Sheet, at: CellRef, direction: Direction) -> CellRef {
     found.unwrap_or(edge)
 }
 
-fn lay_out(shaper: &mut Shaper, text: &str, color: Rgba8, scale: f32, align: Align) -> Paragraph {
-    let language = aster_text::segment::guess_language(text, DEFAULT_LANGUAGE);
-    let base = TextStyle {
+/// The font a cell asks for, then the system's.
+fn family(name: Option<&str>) -> Family {
+    match name {
+        Some(name) if !name.trim().is_empty() => {
+            let name: String = name
+                .chars()
+                .filter(|c| !matches!(c, '"' | ',' | ';'))
+                .collect();
+            Family::List(format!("\"{}\", system-ui", name.trim()).into())
+        }
+        _ => Family::SystemUi,
+    }
+}
+
+fn ui_text(color: Rgba8, size: f32) -> TextStyle {
+    TextStyle {
         family: Family::SystemUi,
-        size: TEXT_SIZE,
+        size,
         color,
         bold: false,
         italic: false,
         underline: false,
         strike: false,
         rise: 0.0,
+    }
+}
+
+/// Relative luminance, 0 to 1.
+fn luminance(color: [u8; 4]) -> f64 {
+    let channel = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
     };
+    0.2126 * channel(color[0]) + 0.7152 * channel(color[1]) + 0.0722 * channel(color[2])
+}
+
+/// WCAG contrast ratio of two colours.
+fn contrast(a: [u8; 4], b: [u8; 4]) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The colour a cell's text is drawn in. Automatic text is the window's
+/// text colour, or black or white on a fill. Text on no fill that would
+/// vanish into the window (black text of a light-made sheet in the dark
+/// theme) takes the window's text colour instead.
+fn readable(font: Option<Rgba>, fill: Option<Rgba>, style: &SheetStyle) -> Rgba8 {
+    match (font, fill) {
+        (Some(font), Some(_)) => font,
+        (None, Some(fill)) => {
+            if luminance(fill) > 0.4 {
+                [0x1f, 0x1f, 0x1f, 0xff]
+            } else {
+                [0xff, 0xff, 0xff, 0xff]
+            }
+        }
+        (Some(font), None) if contrast(font, style.background) >= 1.6 => font,
+        _ => style.text,
+    }
+}
+
+/// A border's colour, kept visible against the window the same way.
+fn readable_line(line: Option<Rgba>, style: &SheetStyle) -> Rgba8 {
+    match line {
+        Some(line) if contrast(line, style.background) >= 1.3 => line,
+        _ => style.text,
+    }
+}
+
+fn lay_out(
+    shaper: &mut Shaper,
+    text: &str,
+    base: TextStyle,
+    scale: f32,
+    align: Align,
+    width: Option<f32>,
+) -> Paragraph {
+    let language = aster_text::segment::guess_language(text, DEFAULT_LANGUAGE);
     shaper.lay_out(&Spec {
         text,
         base,
         spans: &[],
         language,
-        width: None,
+        width,
         scale,
         line_height: 1.25,
         align,
@@ -926,7 +1475,7 @@ fn lay_out(shaper: &mut Shaper, text: &str, color: Rgba8, scale: f32, align: Ali
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_sheets::{CellStyle, SheetBuilder, SheetKind, Value};
+    use aster_sheets::{Borders, CellStyle, Font, SheetBuilder, SheetKind, Value};
 
     fn workbook() -> Arc<Workbook> {
         let mut first = SheetBuilder::new("数据", SheetKind::Worksheet);
@@ -1055,5 +1604,189 @@ mod tests {
         // A column letter selects that column in the top row on screen.
         view.press(header + 5.0, 20.0);
         assert_eq!(view.selected().to_string(), "A1");
+    }
+
+    fn pixel(view: &mut SheetView, x: f64, y: f64) -> [u8; 4] {
+        let width = usize::from(view.size().0);
+        let pixmap = view.render();
+        let data = pixmap.data_as_u8_slice();
+        let at = (y as usize * width + x as usize) * 4;
+        [data[at], data[at + 1], data[at + 2], data[at + 3]]
+    }
+
+    /// Styled cells, a frozen row and column, and a picture.
+    fn styled() -> SheetView {
+        let red = [0xC0, 0x10, 0x10, 0xff];
+        let thick = Line {
+            style: LineStyle::Thick,
+            color: Some([0x10, 0x20, 0xC0, 0xff]),
+        };
+        let styles = vec![
+            CellStyle::default(),
+            CellStyle {
+                fill: Some(red),
+                font: Arc::new(Font {
+                    bold: true,
+                    size: 14.0,
+                    ..Font::default()
+                }),
+                ..CellStyle::default()
+            },
+            CellStyle {
+                borders: Arc::new(Borders {
+                    bottom: Some(thick),
+                    right: Some(Line {
+                        style: LineStyle::Dashed,
+                        color: None,
+                    }),
+                    ..Borders::default()
+                }),
+                wrap: true,
+                valign: VAlign::Top,
+                ..CellStyle::default()
+            },
+        ];
+        let mut sheet = SheetBuilder::new("样式", SheetKind::Worksheet);
+        let mut title = Cell::new(0, Value::Text("标题".into()));
+        title.style = 1;
+        sheet.push(0, title);
+        let mut boxed = Cell::new(1, Value::Text("折り返し のある 長い テキスト".into()));
+        boxed.style = 2;
+        sheet.push(1, boxed);
+        for row in 0..200 {
+            sheet.push(row, Cell::new(3, Value::Number(f64::from(row))));
+        }
+        sheet.frozen = (1, 1);
+        sheet.show_grid = false;
+        sheet.column_styles = vec![(5, 5, 1)];
+        // A blue 4 × 4 picture over C10:D12.
+        let mut blue = Pixmap::new(4, 4);
+        for pixel in blue.data_mut() {
+            *pixel = vello_cpu::peniko::color::PremulRgba8 {
+                r: 0,
+                g: 0,
+                b: 0xff,
+                a: 0xff,
+            };
+        }
+        let png = blue.into_png().unwrap();
+        sheet.pictures.push(Picture {
+            placement: Placement::TwoCell {
+                from: Anchor {
+                    cell: CellRef::new(9, 2),
+                    dx: 0.0,
+                    dy: 0.0,
+                },
+                to: Anchor {
+                    cell: CellRef::new(12, 4),
+                    dx: 0.0,
+                    dy: 0.0,
+                },
+            },
+            image: Some(Arc::from(png)),
+            name: "图片 1".into(),
+        });
+        sheet.pictures.push(Picture {
+            placement: Placement::OneCell {
+                from: Anchor {
+                    cell: CellRef::new(14, 2),
+                    dx: 0.0,
+                    dy: 0.0,
+                },
+                width: 120.0,
+                height: 60.0,
+            },
+            image: None,
+            name: "グラフ".into(),
+        });
+        let mut view = SheetView::new(Arc::new(Workbook {
+            sheets: vec![sheet.finish()],
+            styles,
+            date1904: false,
+            active_sheet: 0,
+        }));
+        view.resize(800, 600, 1.0);
+        view
+    }
+
+    #[test]
+    fn fills_borders_and_pictures_are_drawn() {
+        let mut view = styled();
+        let header = view.header_width();
+        // A1 is red (away from its text), with no grid lines anywhere.
+        let red = pixel(&mut view, header + 60.0, 22.0 + 3.0);
+        assert_eq!(red, [0xC0, 0x10, 0x10, 0xff]);
+        // The whole of column F takes the column's red fill.
+        let f = header + 64.0 * 5.0 + 30.0;
+        assert_eq!(
+            pixel(&mut view, f, 22.0 + 20.0 * 20.0 + 10.0),
+            [0xC0, 0x10, 0x10, 0xff]
+        );
+        // B2's thick blue bottom border sits on the line between rows 2
+        // and 3, three pixels thick.
+        let x = header + 64.0 + 30.0;
+        let line = 22.0 + 40.0 - 1.0;
+        assert_eq!(pixel(&mut view, x, line), [0x10, 0x20, 0xC0, 0xff]);
+        assert_eq!(pixel(&mut view, x, line - 1.0), [0x10, 0x20, 0xC0, 0xff]);
+        assert_ne!(pixel(&mut view, x, line - 3.0), [0x10, 0x20, 0xC0, 0xff]);
+        // No grid: an empty cell's edge is background.
+        assert_eq!(
+            pixel(
+                &mut view,
+                header + 64.0 * 7.0 - 1.0,
+                22.0 + 20.0 * 20.0 + 5.0
+            ),
+            [0xff; 4]
+        );
+        // The picture fills C10:E13 in blue.
+        let inside = (header + 64.0 * 3.0, 22.0 + 20.0 * 11.0);
+        assert_eq!(pixel(&mut view, inside.0, inside.1), [0, 0, 0xff, 0xff]);
+        // A chart is a grey frame.
+        let chart = pixel(
+            &mut view,
+            header + 64.0 * 2.0 + 5.0,
+            22.0 + 20.0 * 14.0 + 5.0,
+        );
+        assert_eq!(chart, color_bytes(SheetStyle::default().header));
+    }
+
+    fn color_bytes(rgba: Rgba8) -> [u8; 4] {
+        rgba
+    }
+
+    #[test]
+    fn frozen_rows_and_columns_stay_while_the_rest_scrolls() {
+        let mut view = styled();
+        let header = view.header_width();
+        assert!(view.scroll_by(0.0, 20.0 * 50.0));
+        // Row 1 is still at the top: A1's red is where it was.
+        assert_eq!(
+            pixel(&mut view, header + 60.0, 22.0 + 3.0),
+            [0xC0, 0x10, 0x10, 0xff]
+        );
+        // Below it, the first scrolled row is row 52.
+        assert_eq!(
+            view.cell_at(header + 100.0, 22.0 + 20.0 + 5.0),
+            Some(CellRef::new(51, 1))
+        );
+        // The frozen column answers clicks without the scroll.
+        assert_eq!(
+            view.cell_at(header + 10.0, 22.0 + 5.0),
+            Some(CellRef::new(0, 0))
+        );
+        assert_eq!(
+            view.cell_at(header + 10.0, 22.0 + 25.0),
+            Some(CellRef::new(51, 0))
+        );
+        // Selecting a cell above the scrolled part brings it back into view
+        // below the frozen row, not under it.
+        view.select(CellRef::new(10, 3));
+        let (offset, _) = view.scroll_range();
+        assert_eq!(offset, 20.0 * 9.0);
+        // Frozen cells never scroll the view.
+        view.scroll_by(0.0, 20.0 * 40.0);
+        let before = view.scroll_range();
+        view.select(CellRef::new(0, 0));
+        assert_eq!(view.scroll_range(), before);
     }
 }

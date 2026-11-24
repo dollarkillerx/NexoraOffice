@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS};
 use crate::axis::Axis;
 use crate::format::Format;
+use crate::style::{CellStyle, HAlign};
 
 /// Default column width and row height of a new Excel sheet, logical pixels.
 pub const DEFAULT_COLUMN_WIDTH: f64 = 64.0;
@@ -20,31 +21,6 @@ pub enum Value {
     Bool(bool),
     /// `#DIV/0!`, `#N/A` and so on, as written.
     Error(Arc<str>),
-}
-
-/// Horizontal alignment set on a cell. `None` in a style means "by value":
-/// numbers to the right, text to the left, the rest centred.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HAlign {
-    Left,
-    Center,
-    Right,
-}
-
-/// The parts of a cell format this version uses.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CellStyle {
-    pub format: Arc<Format>,
-    pub align: Option<HAlign>,
-}
-
-impl Default for CellStyle {
-    fn default() -> Self {
-        Self {
-            format: Arc::new(Format::general()),
-            align: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +43,50 @@ impl Cell {
             formula: None,
         }
     }
+
+    /// No value and no formula: a cell kept only for its fill or borders.
+    pub fn is_blank(&self) -> bool {
+        self.value == Value::Empty && self.formula.is_none()
+    }
+}
+
+/// Where a picture is fastened to the sheet: a cell and an offset into it,
+/// logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Anchor {
+    pub cell: CellRef,
+    pub dx: f64,
+    pub dy: f64,
+}
+
+/// How a picture is placed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Placement {
+    /// Stretches between two cell positions as columns and rows change.
+    TwoCell { from: Anchor, to: Anchor },
+    /// Starts at a cell position and keeps its size, logical pixels.
+    OneCell {
+        from: Anchor,
+        width: f64,
+        height: f64,
+    },
+    /// At a fixed position on the sheet, logical pixels.
+    Absolute {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+}
+
+/// A picture on a sheet. The image is the file's own bytes (PNG, JPEG or
+/// something else), decoded when it is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picture {
+    pub placement: Placement,
+    pub image: Option<Arc<[u8]>>,
+    /// The name the file gives it, such as `Picture 1`.
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,6 +117,18 @@ pub struct Sheet {
     pub merges: Vec<CellRange>,
     used: Option<CellRange>,
     cell_count: usize,
+    /// Rows and columns frozen at the top and left: they stay put while the
+    /// rest scrolls.
+    pub frozen: (u32, u32),
+    /// Grid lines are drawn (Excel's "View > Gridlines").
+    pub show_grid: bool,
+    /// Styles of whole columns, sorted runs of `first..=last`, for cells
+    /// that are not in the file.
+    pub column_styles: Vec<(u32, u32, u32)>,
+    /// Styles of whole rows, sorted by row; they win over column styles.
+    pub row_styles: Vec<(u32, u32)>,
+    /// In drawing order.
+    pub pictures: Vec<Picture>,
 }
 
 impl Sheet {
@@ -170,14 +202,40 @@ impl Sheet {
     pub fn previous_in_row(&self, at: CellRef) -> Option<&Cell> {
         let row = self.row(at.row)?;
         let i = row.cells.partition_point(|cell| cell.col < at.col);
-        i.checked_sub(1).map(|i| &row.cells[i])
+        row.cells[..i].iter().rev().find(|cell| !cell.is_blank())
     }
 
     /// The next cell with something in it to the right of `at` in its row.
     pub fn next_in_row(&self, at: CellRef) -> Option<&Cell> {
         let row = self.row(at.row)?;
         let i = row.cells.partition_point(|cell| cell.col <= at.col);
-        row.cells.get(i)
+        row.cells[i..].iter().find(|cell| !cell.is_blank())
+    }
+
+    /// Whether the cell has a value or a formula.
+    pub fn is_filled(&self, at: CellRef) -> bool {
+        self.cell(at).is_some_and(|cell| !cell.is_blank())
+    }
+
+    /// The style a cell is drawn with: its own if it is in the file, else
+    /// its row's, else its column's, else the default (0).
+    pub fn style_at(&self, at: CellRef) -> u32 {
+        if let Some(cell) = self.cell(at) {
+            return cell.style;
+        }
+        if let Ok(i) = self
+            .row_styles
+            .binary_search_by_key(&at.row, |(row, _)| *row)
+        {
+            return self.row_styles[i].1;
+        }
+        let i = self
+            .column_styles
+            .partition_point(|(_, last, _)| *last < at.col);
+        match self.column_styles.get(i) {
+            Some(&(first, _, style)) if first <= at.col => style,
+            _ => 0,
+        }
     }
 }
 
@@ -191,6 +249,11 @@ pub struct SheetBuilder {
     pub columns: Axis,
     pub row_sizes: Axis,
     merges: Vec<CellRange>,
+    pub frozen: (u32, u32),
+    pub show_grid: bool,
+    pub column_styles: Vec<(u32, u32, u32)>,
+    pub row_styles: Vec<(u32, u32)>,
+    pub pictures: Vec<Picture>,
 }
 
 impl SheetBuilder {
@@ -203,6 +266,11 @@ impl SheetBuilder {
             columns: Axis::new(DEFAULT_COLUMN_WIDTH, MAX_COLUMNS),
             row_sizes: Axis::new(DEFAULT_ROW_HEIGHT, MAX_ROWS),
             merges: Vec::new(),
+            frozen: (0, 0),
+            show_grid: true,
+            column_styles: Vec::new(),
+            row_styles: Vec::new(),
+            pictures: Vec::new(),
         }
     }
 
@@ -246,13 +314,18 @@ impl SheetBuilder {
                     cells: vec![cell],
                 }),
             }
-            cell_count += 1;
             let single = CellRange::single(at);
             used = Some(used.map_or(single, |u| u.union(&single)));
         }
         for merge in &self.merges {
             used = Some(used.map_or(*merge, |u| u.union(merge)));
         }
+        for row in &rows {
+            cell_count += row.cells.iter().filter(|cell| !cell.is_blank()).count();
+        }
+        self.column_styles.sort_by_key(|(first, _, _)| *first);
+        self.row_styles.sort_by_key(|(row, _)| *row);
+        self.row_styles.dedup_by_key(|(row, _)| *row);
         Sheet {
             name: self.name,
             kind: self.kind,
@@ -263,6 +336,14 @@ impl SheetBuilder {
             merges: self.merges,
             used,
             cell_count,
+            frozen: (
+                self.frozen.0.min(MAX_ROWS - 1),
+                self.frozen.1.min(MAX_COLUMNS - 1),
+            ),
+            show_grid: self.show_grid,
+            column_styles: self.column_styles,
+            row_styles: self.row_styles,
+            pictures: self.pictures,
         }
     }
 }
@@ -410,6 +491,34 @@ mod tests {
     }
 
     #[test]
+    fn blank_styled_cells_draw_but_do_not_count() {
+        let mut builder = SheetBuilder::new("表", SheetKind::Worksheet);
+        builder.push(0, Cell::new(0, text("左")));
+        let mut blank = Cell::new(1, Value::Empty);
+        blank.style = 3;
+        builder.push(0, blank);
+        builder.push(0, Cell::new(4, text("右")));
+        builder.column_styles = vec![(10, 12, 7), (2, 3, 5)];
+        builder.row_styles = vec![(9, 6)];
+        let sheet = builder.finish();
+        assert_eq!(sheet.cell_count(), 2);
+        assert_eq!(sheet.used_range().unwrap().to_string(), "A1:E1");
+        // Overflow and Ctrl+arrow look past the blank cell.
+        assert_eq!(sheet.next_in_row(CellRef::new(0, 0)).unwrap().col, 4);
+        assert_eq!(sheet.previous_in_row(CellRef::new(0, 4)).unwrap().col, 0);
+        assert!(!sheet.is_filled(CellRef::new(0, 1)));
+        assert!(sheet.is_filled(CellRef::new(0, 0)));
+        // Own style, then the row's, then the column's.
+        assert_eq!(sheet.style_at(CellRef::new(0, 1)), 3);
+        assert_eq!(sheet.style_at(CellRef::new(9, 2)), 6);
+        assert_eq!(sheet.style_at(CellRef::new(5, 2)), 5);
+        assert_eq!(sheet.style_at(CellRef::new(5, 3)), 5);
+        assert_eq!(sheet.style_at(CellRef::new(5, 4)), 0);
+        assert_eq!(sheet.style_at(CellRef::new(5, 12)), 7);
+        assert_eq!(sheet.style_at(CellRef::new(5, 13)), 0);
+    }
+
+    #[test]
     fn an_empty_sheet() {
         let sheet = Sheet::empty("Sheet1", SheetKind::Worksheet);
         assert_eq!(sheet.used_range(), None);
@@ -430,11 +539,12 @@ mod tests {
                 CellStyle::default(),
                 CellStyle {
                     format: Arc::new(Format::parse("#,##0.00")),
-                    align: None,
+                    ..CellStyle::default()
                 },
                 CellStyle {
                     format: Arc::new(Format::builtin(14)),
                     align: Some(HAlign::Center),
+                    ..CellStyle::default()
                 },
             ],
             date1904: false,

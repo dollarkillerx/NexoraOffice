@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/aster-calc",
+    "crates/aster-image",
     "crates/aster-markdown",
     "crates/aster-platform",
     "crates/aster-ooxml",
@@ -36,6 +37,7 @@ publish = false
 [workspace.dependencies]
 aster-calc = { path = "crates/aster-calc" }
 aster-markdown = { path = "crates/aster-markdown" }
+aster-image = { path = "crates/aster-image" }
 aster-ooxml = { path = "crates/aster-ooxml" }
 aster-platform = { path = "crates/aster-platform" }
 aster-sheets = { path = "crates/aster-sheets" }
@@ -89,6 +91,10 @@ regex-syntax = "~0.8.12"
 # the G4 gate measured. Only reading and inflating; nothing is written yet.
 zip = { version = "~8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 quick-xml = "~0.42.0"
+# Pictures in workbooks and presentations. Both were already in the tree
+# (through Slint's image loading), so they add no new crates.
+png = "~0.18.1"
+zune-jpeg = "~0.5.15"
 # The formula engine (ADR 0002), only through `aster-calc`. Exact version: an
 # upgrade means re-running G5's measurements and its 69-formula comparison.
 formualizer = { version = "=0.15.0", default-features = false, features = ["workbook", "eval", "common", "system-clock"] }

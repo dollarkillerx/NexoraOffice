@@ -1,0 +1,12 @@
+[package]
+name = "aster-image"
+version.workspace = true
+license.workspace = true
+description = "Decoding PNG and JPEG pictures from documents, within size limits"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+png = { workspace = true }
+zune-jpeg = { workspace = true }

@@ -88,6 +88,8 @@ impl AiSettings {
                     "name": provider.name,
                     "base_url": provider.base_url,
                     "model": provider.model,
+                    "allow_insecure": provider.allow_insecure,
+                    "key_host": provider.key_host,
                 })
             })
             .collect();
@@ -174,6 +176,15 @@ fn provider_from(entry: &Map<String, Value>) -> Option<ProviderConfig> {
     if let Some(model) = text("model") {
         provider.model = model.trim().to_string();
     }
+    // Only a real `true` turns insecure connections on; anything else, a
+    // missing field included, leaves them off.
+    provider.allow_insecure = entry
+        .get("allow_insecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    provider.key_host = text("key_host")
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty());
     Some(provider)
 }
 
@@ -284,13 +295,72 @@ mod tests {
         local.name = "Ollama".into();
         local.model = "qwen3:8b".into();
         settings.providers.push(local);
+        let mut lan = ProviderConfig::from_preset("lan", Preset::Custom);
+        lan.base_url = "http://192.168.1.5:8080/v1".into();
+        lan.allow_insecure = true;
+        lan.key_host = Some("192.168.1.5".into());
+        settings.providers.push(lan);
         settings.selected = Some("local".into());
         settings.redact = false;
         settings.max_steps = 10;
         settings.save(&path).unwrap();
         assert_eq!(AiSettings::load(&path), settings);
         let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("key"), "no keys in the settings file");
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        for provider in saved["providers"].as_array().unwrap() {
+            let fields: Vec<&str> = provider
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            for field in &fields {
+                assert!(
+                    [
+                        "id",
+                        "kind",
+                        "preset",
+                        "name",
+                        "base_url",
+                        "model",
+                        "allow_insecure",
+                        "key_host"
+                    ]
+                    .contains(field),
+                    "no keys in the settings file: {field}"
+                );
+            }
+        }
+        assert_eq!(saved["providers"][4]["allow_insecure"], true);
+        assert_eq!(saved["providers"][4]["key_host"], "192.168.1.5");
+        assert_eq!(saved["providers"][0]["allow_insecure"], false);
+        assert_eq!(saved["providers"][0]["key_host"], Value::Null);
+    }
+
+    #[test]
+    fn insecure_and_key_host_default_to_off_and_none() {
+        let value = json!({
+            "providers": [
+                {"id": "old", "kind": "openai_compatible", "base_url": "http://10.0.0.2/v1"},
+                {"id": "odd", "kind": "openai_compatible", "allow_insecure": "true", "key_host": 5},
+                {"id": "blank", "kind": "openai_compatible", "allow_insecure": 1, "key_host": "  "},
+                {"id": "set", "kind": "openai_compatible", "allow_insecure": true, "key_host": " API.Example.com "}
+            ]
+        });
+        let settings = AiSettings::from_json(&value);
+        for id in ["old", "odd", "blank"] {
+            let provider = settings.provider(id).unwrap();
+            assert!(!provider.allow_insecure, "{id}");
+            assert_eq!(provider.key_host, None, "{id}");
+        }
+        let set = settings.provider("set").unwrap();
+        assert!(set.allow_insecure);
+        assert_eq!(set.key_host.as_deref(), Some("api.example.com"));
+        // Defaults have neither.
+        for provider in AiSettings::default().providers {
+            assert!(!provider.allow_insecure);
+            assert_eq!(provider.key_host, None);
+        }
     }
 
     #[test]

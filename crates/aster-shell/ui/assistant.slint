@@ -115,6 +115,42 @@ component ChatRow inherits VerticalLayout {
     }
 }
 
+// A labelled block of text on an approval card, with a coloured edge.
+component TextBlock inherits VerticalLayout {
+    in property <string> label;
+    in property <string> text;
+    in property <brush> tint;
+    spacing: 4px;
+    Text {
+        text: root.label;
+        font-size: Tokens.font-xs;
+        color: Tokens.text-tertiary;
+    }
+
+    Rectangle {
+        border-radius: Tokens.radius-sm;
+        background: Tokens.fill;
+        height: min(block.preferred-height, 120px) + 2 * Tokens.space-sm;
+        clip: true;
+        Rectangle {
+            x: 0;
+            width: 3px;
+            background: root.tint;
+        }
+
+        block := Text {
+            x: Tokens.space-sm + 3px;
+            y: Tokens.space-sm;
+            width: parent.width - 2 * Tokens.space-sm - 3px;
+            text: root.text;
+            font-size: Tokens.font-sm;
+            font-family: "Menlo";
+            color: Tokens.text-secondary;
+            wrap: word-wrap;
+        }
+    }
+}
+
 component ApprovalCard inherits Rectangle {
     in property <ApprovalItem> item;
     callback answer(int, int);
@@ -142,21 +178,24 @@ component ApprovalCard inherits Rectangle {
             wrap: word-wrap;
         }
 
-        if root.item.preview != "": Rectangle {
-            border-radius: Tokens.radius-sm;
-            background: Tokens.fill;
-            height: min(preview.preferred-height, 120px) + 2 * Tokens.space-sm;
-            clip: true;
-            preview := Text {
-                x: Tokens.space-sm;
-                y: Tokens.space-sm;
-                width: parent.width - 2 * Tokens.space-sm;
-                text: root.item.preview;
-                font-size: Tokens.font-sm;
-                font-family: "Menlo";
-                color: Tokens.text-secondary;
-                wrap: word-wrap;
-            }
+        if root.item.facts != "": Text {
+            text: root.item.facts;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-secondary;
+            wrap: word-wrap;
+        }
+
+        // What goes: the original text, so a deletion is seen for what it is.
+        if root.item.removed != "": TextBlock {
+            label: Strings.approval-removed-label;
+            text: root.item.removed;
+            tint: #d1242f;
+        }
+
+        if root.item.preview != "": TextBlock {
+            label: Strings.approval-inserted-label;
+            text: root.item.preview;
+            tint: Tokens.accent;
         }
 
         HorizontalLayout {
@@ -364,6 +403,10 @@ export component AssistantPanel inherits Rectangle {
     // The selected provider's models, and what listing them came to.
     in property <[string]> models;
     in property <string> models-state;
+    // The endpoint is plain http to another computer, and whether the user
+    // has allowed it anyway.
+    in property <bool> insecure;
+    in property <bool> allow-insecure;
 
     callback send(string);
     callback stop();
@@ -383,6 +426,7 @@ export component AssistantPanel inherits Rectangle {
     callback pick-model(string);
     callback refresh-models();
     callback settings-opened();
+    callback set-allow-insecure(bool);
 
     background: Tokens.panel;
     clip: true;
@@ -739,6 +783,21 @@ export component AssistantPanel inherits Rectangle {
                     text <=> root.base-url;
                     accepted(text) => {
                         root.set-base-url(text);
+                    }
+                }
+
+                if root.insecure: Text {
+                    text: Strings.ai-insecure;
+                    font-size: Tokens.font-sm;
+                    color: #d1242f;
+                    wrap: word-wrap;
+                }
+
+                if root.insecure: Switch {
+                    label: Strings.ai-allow-insecure;
+                    checked: root.allow-insecure;
+                    toggled(on) => {
+                        root.set-allow-insecure(on);
                     }
                 }
 

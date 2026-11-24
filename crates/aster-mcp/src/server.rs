@@ -246,12 +246,17 @@ mod unix {
         identity: (u64, u64),
     }
 
+    /// Connection ids, unique for the whole process: a server started again
+    /// after a stop never reuses one, so nothing tied to an old connection
+    /// (an "allow for this session" answer, a waiting approval) can pass to
+    /// a new client.
+    static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
     /// What the accept thread and the readers share.
     struct Shared {
         invoker: Arc<Invoker>,
         events: Arc<dyn McpEvents>,
         stopping: AtomicBool,
-        next_id: AtomicU64,
         connections: Mutex<HashMap<u64, Live>>,
     }
 
@@ -322,7 +327,6 @@ mod unix {
             invoker,
             events,
             stopping: AtomicBool::new(false),
-            next_id: AtomicU64::new(1),
             connections: Mutex::new(HashMap::new()),
         });
         let accepting = Arc::clone(&shared);
@@ -431,7 +435,7 @@ mod unix {
         let (Ok(writer), Ok(registered)) = (stream.try_clone(), stream.try_clone()) else {
             return;
         };
-        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
         {
             let mut connections = lock(&shared.connections);
             if connections.len() >= MAX_CONNECTIONS {

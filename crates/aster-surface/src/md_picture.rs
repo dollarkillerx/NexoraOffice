@@ -3,7 +3,13 @@
 //!
 //! Nothing is fetched from the network. A web address in a document would
 //! tell its server that the document was opened, and where; so web images
-//! stay boxes with their description. Paths are taken relative to the
+//! stay boxes with their description. The same goes for files on network
+//! shares: `\\host\share` and `//host/share` paths are refused, and so is
+//! any path that passes through a folder that is not on a local disk (an
+//! NFS or SMB mount, macOS's `/net` automounts), checked before that folder
+//! is entered so that not even the mount is triggered. This holds for
+//! addresses an assistant or MCP client writes into a document too: they
+//! go through the same check. Paths are taken relative to the
 //! document's folder, the way other Markdown tools read them; absolute paths
 //! and `file:` URLs work too.
 //!
@@ -39,13 +45,22 @@ pub fn resolve(base: Option<&Path>, url: &str) -> Option<PathBuf> {
     if url.is_empty() {
         return None;
     }
+    // A network share by its UNC name, written either way round.
+    if url.starts_with("\\\\") || url.starts_with("//") {
+        return None;
+    }
     let path = if let Some(rest) = url.strip_prefix("file://") {
         // file:///abs/path; a host part other than localhost is not ours.
         let rest = rest.strip_prefix("localhost").unwrap_or(rest);
         if !rest.starts_with('/') {
             return None;
         }
-        PathBuf::from(decode(rest)?)
+        let rest = decode(rest)?;
+        // file:////host/share is a network share too.
+        if rest.starts_with("//") || rest.starts_with("\\\\") {
+            return None;
+        }
+        PathBuf::from(rest)
     } else if has_scheme(url) {
         return None;
     } else {
@@ -129,6 +144,9 @@ impl Pictures {
     /// read.
     pub fn get(&mut self, url: &str) -> Option<Arc<Pixmap>> {
         let path = resolve(self.base.as_deref(), url)?;
+        if !aster_platform::volumes::on_local_disks(&path) {
+            return None;
+        }
         let meta = std::fs::metadata(&path).ok()?;
         if !meta.is_file() || meta.len() > MAX_FILE {
             return None;
@@ -205,6 +223,11 @@ mod tests {
         assert_eq!(resolve(Some(base), "https://example.com/a.png"), None);
         assert_eq!(resolve(Some(base), "data:image/png;base64,AAAA"), None);
         assert_eq!(resolve(Some(base), "file://server/share/a.png"), None);
+        // Network shares by name, however they are written.
+        assert_eq!(resolve(Some(base), "\\\\server\\share\\a.png"), None);
+        assert_eq!(resolve(Some(base), "//server/share/a.png"), None);
+        assert_eq!(resolve(Some(base), "file:////server/share/a.png"), None);
+        assert_eq!(resolve(Some(base), "file://%2F%2Fserver/a.png"), None);
         // A document never saved has no folder to start from.
         assert_eq!(resolve(None, "a.png"), None);
         assert_eq!(resolve(Some(base), ""), None);
@@ -238,5 +261,24 @@ mod tests {
         assert_eq!(changed.width(), 8);
         assert!(pictures.get("broken.png").is_none());
         assert!(pictures.get("missing.png").is_none());
+    }
+
+    #[test]
+    fn pictures_on_local_disks_are_read_and_network_mounts_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(aster_platform::volumes::on_local_disks(
+            &dir.path().join("a.png")
+        ));
+        // macOS mounts home folders on demand through autofs, which is not
+        // a local file system: refused before anything inside is touched.
+        #[cfg(target_os = "macos")]
+        {
+            let automount = Path::new("/System/Volumes/Data/home");
+            if automount.exists() {
+                assert!(!aster_platform::volumes::on_local_disks(
+                    &automount.join("someone/pic.png")
+                ));
+            }
+        }
     }
 }

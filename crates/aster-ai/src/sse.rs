@@ -3,6 +3,13 @@
 //! whatever pieces the network makes, so a line, or a character of it, can
 //! be split across chunks; the parser keeps the unfinished line until the
 //! rest comes.
+//!
+//! The unfinished line and the event's data never grow past
+//! [`MAX_EVENT_BYTES`]: a server that sends more without ending them ends
+//! the stream with [`AiError::TooLarge`] instead of filling the memory.
+
+use crate::error::AiError;
+use crate::limits::MAX_EVENT_BYTES;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Event {
@@ -23,7 +30,7 @@ pub(crate) struct Parser {
 
 impl Parser {
     /// Feed the next chunk; returns the events it completed.
-    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Event>, AiError> {
         let mut events = Vec::new();
         for &byte in bytes {
             if byte == b'\n' {
@@ -31,32 +38,37 @@ impl Parser {
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                if let Some(event) = self.line_done(&String::from_utf8_lossy(&line)) {
+                if let Some(event) = self.line_done(&String::from_utf8_lossy(&line))? {
                     events.push(event);
                 }
             } else {
+                // Checked before the push, so the buffer never holds more
+                // than the limit.
+                if self.line.len() >= MAX_EVENT_BYTES {
+                    return Err(too_long());
+                }
                 self.line.push(byte);
             }
         }
-        events
+        Ok(events)
     }
 
     /// The event still open when the stream ended without its empty line.
-    pub(crate) fn finish(&mut self) -> Option<Event> {
+    pub(crate) fn finish(&mut self) -> Result<Option<Event>, AiError> {
         if !self.line.is_empty() {
             let line = std::mem::take(&mut self.line);
-            let _ = self.line_done(&String::from_utf8_lossy(&line));
+            let _ = self.line_done(&String::from_utf8_lossy(&line))?;
         }
-        self.dispatch()
+        Ok(self.dispatch())
     }
 
-    fn line_done(&mut self, line: &str) -> Option<Event> {
+    fn line_done(&mut self, line: &str) -> Result<Option<Event>, AiError> {
         if line.is_empty() {
-            return self.dispatch();
+            return Ok(self.dispatch());
         }
         if line.starts_with(':') {
             // A comment, used as a keep-alive.
-            return None;
+            return Ok(None);
         }
         let (field, value) = match line.split_once(':') {
             Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
@@ -65,6 +77,11 @@ impl Parser {
         match field {
             "event" => self.name = value.to_string(),
             "data" => {
+                // Many short `data:` lines add up to one event's data, so
+                // the line limit alone does not bound it.
+                if self.data.len() + 1 + value.len() > MAX_EVENT_BYTES {
+                    return Err(too_long());
+                }
                 if self.has_data {
                     self.data.push('\n');
                 }
@@ -73,7 +90,7 @@ impl Parser {
             }
             _ => {}
         }
-        None
+        Ok(None)
     }
 
     fn dispatch(&mut self) -> Option<Event> {
@@ -86,6 +103,13 @@ impl Parser {
     }
 }
 
+fn too_long() -> AiError {
+    AiError::TooLarge(format!(
+        "an event of the stream is longer than {} MiB",
+        MAX_EVENT_BYTES / (1024 * 1024)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,9 +118,9 @@ mod tests {
         let mut parser = Parser::default();
         let mut events = Vec::new();
         for chunk in chunks {
-            events.extend(parser.feed(chunk));
+            events.extend(parser.feed(chunk).unwrap());
         }
-        events.extend(parser.finish());
+        events.extend(parser.finish().unwrap());
         events
     }
 
@@ -134,5 +158,51 @@ mod tests {
     #[test]
     fn a_last_event_without_its_empty_line_still_counts() {
         assert_eq!(all(&[b"data: end"]).len(), 1);
+    }
+
+    #[test]
+    fn an_endless_line_is_refused_without_growing_past_the_limit() {
+        let mut parser = Parser::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut result = Ok(Vec::new());
+        for _ in 0..(MAX_EVENT_BYTES / chunk.len() + 1) {
+            result = parser.feed(&chunk);
+            assert!(parser.line.len() <= MAX_EVENT_BYTES);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+
+        // A line of exactly the limit is still fine.
+        let mut parser = Parser::default();
+        let mut line = b"data: ".to_vec();
+        line.resize(MAX_EVENT_BYTES, b'y');
+        line.extend_from_slice(b"\n\n");
+        let events = parser.feed(&line).unwrap();
+        assert_eq!(events[0].data.len(), MAX_EVENT_BYTES - 6);
+    }
+
+    #[test]
+    fn many_data_lines_cannot_add_up_past_the_limit() {
+        let mut parser = Parser::default();
+        let line = format!("data: {}\n", "z".repeat(1000));
+        let mut failed = None;
+        for _ in 0..(MAX_EVENT_BYTES / 1000 + 2) {
+            if let Err(error) = parser.feed(line.as_bytes()) {
+                failed = Some(error);
+                break;
+            }
+            assert!(parser.data.len() <= MAX_EVENT_BYTES);
+        }
+        assert_eq!(failed.unwrap().kind(), "too_large");
+    }
+
+    #[test]
+    fn an_unended_last_line_past_the_limit_is_refused() {
+        let mut parser = Parser::default();
+        let mut line = b"data: ".to_vec();
+        line.resize(MAX_EVENT_BYTES + 10, b'q');
+        assert!(parser.feed(&line).is_err());
     }
 }

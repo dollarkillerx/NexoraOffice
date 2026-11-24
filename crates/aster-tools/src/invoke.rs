@@ -229,7 +229,9 @@ impl Invoker {
         };
         let result = self.call_inner(origin, name, args, &mut record);
         record.ok = !result.is_error;
-        if result.is_error {
+        // The pipeline's own messages are fixed text; a tool's may repeat
+        // what the user looked for, so it is not copied (see `call_inner`).
+        if result.is_error && record.error.is_none() {
             record.error = Some(result.text.chars().take(300).collect());
         }
         self.audit.record(record);
@@ -253,7 +255,7 @@ impl Invoker {
 
         if tool.name == "list_documents" {
             record.verdict = "allow";
-            return ToolResult::ok(self.list_documents(&policy));
+            return ToolResult::ok(self.list_documents(&policy, &origin.session));
         }
 
         // The target and its level.
@@ -264,7 +266,7 @@ impl Invoker {
                 record.verdict = "hidden";
                 return ToolResult::error(unknown_document(id));
             };
-            let level = policy.level_of(&document.id, document.path.as_deref());
+            let level = policy.level_for(&origin.session, &document.id, document.path.as_deref());
             record.document = Some(document.title.clone());
             (Target::Document(document), level)
         } else if let Some(path) = args.get("path").and_then(Value::as_str) {
@@ -278,9 +280,8 @@ impl Invoker {
             let level = policy.level_of_path(&path);
             (Target::Path(path), level)
         } else {
-            // Creating a document is asked about, unless new documents are
-            // trusted.
-            (Target::None, policy.untitled.max(Level::Ask))
+            // Creating a document follows the level of new documents.
+            (Target::None, policy.create_level())
         };
 
         let mut verdict = judge(level, tool.capability);
@@ -350,27 +351,31 @@ impl Invoker {
         }
         match self.host.run(tool, document.as_ref(), &args) {
             Ok(text) => {
-                // A document the caller made itself it may go on editing.
+                // A document the caller made itself it may go on editing;
+                // only that caller, and only until the document is saved.
                 if tool.capability == Capability::Create
                     && let Ok(value) = serde_json::from_str::<Value>(&text)
                     && let Some(id) = value["document"].as_str()
                     && let Ok(mut policy) = self.policy.lock()
                 {
-                    policy.grant(id, Some(Level::Trusted));
+                    policy.grant_creator(&origin.session, id, Level::Trusted);
                 }
                 ToolResult::ok(text)
             }
-            Err(error) => ToolResult::error(error),
+            Err(error) => {
+                record.error = Some("the tool reported an error".to_owned());
+                ToolResult::error(error)
+            }
         }
     }
 
-    fn list_documents(&self, policy: &Policy) -> String {
+    fn list_documents(&self, policy: &Policy, session: &str) -> String {
         let documents: Vec<Value> = self
             .host
             .documents()
             .into_iter()
             .filter_map(|document| {
-                let level = policy.level_of(&document.id, document.path.as_deref());
+                let level = policy.level_for(session, &document.id, document.path.as_deref());
                 (level != Level::Off).then(|| {
                     json!({
                         "id": document.id,
@@ -624,10 +629,12 @@ mod tests {
         let created = invoker.call(&ai(), "create_document", &json!({"text": "# 新"}));
         assert!(!created.is_error);
         assert_eq!(approver.asked.lock().unwrap()[0].reason, Reason::Create);
+        let policy = invoker.policy().lock().unwrap();
         assert_eq!(
-            invoker.policy().lock().unwrap().grants.get("9"),
-            Some(&Level::Trusted)
+            policy.level_for("conversation-1", "9", None),
+            Level::Trusted
         );
+        assert_eq!(policy.level_for("connection-2", "9", None), Level::Off);
     }
 
     #[test]
@@ -667,5 +674,32 @@ mod tests {
         let cut = cut(long);
         assert!(cut.ends_with("max_lines]"));
         assert!(cut.contains("10 more characters"));
+    }
+
+    #[test]
+    fn a_tools_own_error_text_stays_out_of_the_audit_log() {
+        // The tool's message can repeat what was searched for; the caller
+        // gets it, the log does not.
+        let (invoker, _, _) = setup(Approval::Allow);
+        invoker
+            .policy()
+            .lock()
+            .unwrap()
+            .set_folder("/notes".into(), Level::FullAccess);
+        let saved = invoker.call(&ai(), "save_document", &json!({"document": "1"}));
+        assert_eq!(saved.text, "the disk is full");
+        let record = invoker.audit().recent().pop().unwrap();
+        assert_eq!(record.error.as_deref(), Some("the tool reported an error"));
+        // Creating while new documents are read-only is refused, not asked.
+        invoker.policy().lock().unwrap().untitled = Level::ReadOnly;
+        let refused = invoker.call(
+            &ai(),
+            "create_document",
+            &json!({"text": "x", "title": "秘密标题"}),
+        );
+        assert!(refused.is_error);
+        let record = invoker.audit().recent().pop().unwrap();
+        assert_eq!(record.verdict, "deny");
+        assert_eq!(record.arguments["title"]["chars"], 4);
     }
 }

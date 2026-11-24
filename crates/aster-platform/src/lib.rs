@@ -10,3 +10,4 @@ pub mod dialogs;
 pub mod links;
 pub mod paths;
 pub mod reveal;
+pub mod volumes;

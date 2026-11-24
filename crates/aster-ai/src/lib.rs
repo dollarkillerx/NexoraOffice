@@ -20,6 +20,7 @@ pub mod agent;
 pub mod conversation;
 pub mod error;
 mod http;
+pub mod limits;
 pub mod prompt;
 pub mod provider;
 pub mod redact;
@@ -34,7 +35,7 @@ pub use error::AiError;
 pub use prompt::SYSTEM_PROMPT;
 pub use provider::{
     ModelInfo, ModelResponse, Preset, Provider, ProviderConfig, ProviderKind, StopReason, ToolDef,
-    connect, tool_defs,
+    connect, is_loopback_url, tool_defs, url_host,
 };
 pub use redact::{Redacted, redact};
 pub use settings::{AiSettings, KeyStore, KeyStoreError, MemoryKeyStore, SystemKeyStore};

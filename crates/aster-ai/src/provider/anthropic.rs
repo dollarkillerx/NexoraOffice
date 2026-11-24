@@ -20,8 +20,9 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{Value, json};
 
 use super::{
-    Decoder, ModelInfo, ModelResponse, Provider, ProviderConfig, Request, StopReason, cut_off,
-    decode, fetch_json, models_from, parse_input, parse_json,
+    Decoder, ModelInfo, ModelResponse, Provider, ProviderConfig, Request, StopReason, add_text,
+    check_tool_count, check_tool_input, check_tool_name, cut_off, decode, fetch_json, models_from,
+    parse_input, parse_json,
 };
 use crate::conversation::{ContentBlock, Message, Role};
 use crate::error::{AiError, shorten};
@@ -97,6 +98,8 @@ impl Provider for Anthropic {
             headers,
             body: Some(body.to_string()),
         };
+        self.config
+            .check_request(&http_request.url, self.api_key.is_some())?;
         let response = http::send(&self.agent, http_request);
         decode(response, Stream::default(), on_text, cancel)
     }
@@ -108,6 +111,8 @@ impl Provider for Anthropic {
             headers: self.headers(),
             body: None,
         };
+        self.config
+            .check_request(&request.url, self.api_key.is_some())?;
         let list = fetch_json(&self.agent, request, cancel)?;
         models_from(&list, Some("display_name"))
     }
@@ -225,6 +230,11 @@ pub(crate) struct Stream {
     blocks: BTreeMap<u64, Partial>,
     stop: Option<StopReason>,
     done: bool,
+    /// Characters kept so far, of text, thinking and other blocks, against
+    /// [`crate::limits::MAX_RESPONSE_CHARS`].
+    chars: usize,
+    /// Tool calls started so far.
+    tool_calls: usize,
 }
 
 impl Decoder for Stream {
@@ -241,17 +251,29 @@ impl Decoder for Stream {
                 let partial = match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                        add_text(&mut self.chars, text)?;
                         if !text.is_empty() {
                             on_text(text);
                         }
                         Partial::Text(text.to_string())
                     }
-                    Some("tool_use") => Partial::Tool {
-                        id: string(block, "id"),
-                        name: string(block, "name"),
-                        json: String::new(),
-                    },
-                    _ => Partial::Opaque(block.clone()),
+                    Some("tool_use") => {
+                        let name = string(block, "name");
+                        check_tool_name(&name)?;
+                        self.tool_calls += 1;
+                        check_tool_count(self.tool_calls)?;
+                        Partial::Tool {
+                            id: string(block, "id"),
+                            name,
+                            json: String::new(),
+                        }
+                    }
+                    _ => {
+                        // Thinking and unknown blocks are kept and sent
+                        // back, so they count against the reply's size too.
+                        add_text(&mut self.chars, &event.data)?;
+                        Partial::Opaque(block.clone())
+                    }
                 };
                 self.blocks.insert(index, partial);
             }
@@ -261,24 +283,30 @@ impl Decoder for Stream {
                 match (self.blocks.get_mut(&index), delta_type) {
                     (Some(Partial::Text(text)), "text_delta") => {
                         let more = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                        add_text(&mut self.chars, more)?;
                         text.push_str(more);
                         if !more.is_empty() {
                             on_text(more);
                         }
                     }
                     (Some(Partial::Tool { json, .. }), "input_json_delta") => {
-                        json.push_str(
-                            delta
-                                .get("partial_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                        );
+                        let more = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        check_tool_input(json.len() + more.len())?;
+                        json.push_str(more);
                     }
                     (Some(Partial::Opaque(block)), "thinking_delta") => {
                         let more = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
-                        let mut thinking = string(block, "thinking");
-                        thinking.push_str(more);
-                        block["thinking"] = Value::String(thinking);
+                        add_text(&mut self.chars, more)?;
+                        // Appended in place: copying the whole thinking text
+                        // for every small delta would take time growing
+                        // with the square of its length.
+                        match block.get_mut("thinking") {
+                            Some(Value::String(thinking)) => thinking.push_str(more),
+                            _ => block["thinking"] = Value::String(more.to_string()),
+                        }
                     }
                     (Some(Partial::Opaque(block)), "signature_delta") => {
                         block["signature"] = delta.get("signature").cloned().unwrap_or_default();
@@ -441,7 +469,11 @@ mod tests {
         let mut text = String::new();
         let mut on_text = |t: &str| text.push_str(t);
         for chunk in chunks {
-            for event in parser.feed(chunk) {
+            let events = match parser.feed(chunk) {
+                Ok(events) => events,
+                Err(error) => return (Err(error), text),
+            };
+            for event in events {
                 if let Err(error) = stream.event(&event, &mut on_text) {
                     return (Err(error), text);
                 }
@@ -593,5 +625,132 @@ mod tests {
         assert!(proxy["tools"][0].get("eager_input_streaming").is_none());
         assert!(proxy.get("cache_control").is_none());
         assert!(proxy.get("fallbacks").is_none());
+    }
+
+    fn start(index: usize, block: Value) -> String {
+        event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":index,"content_block":block}),
+        )
+    }
+
+    fn delta(index: usize, delta: Value) -> String {
+        event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":delta}),
+        )
+    }
+
+    #[test]
+    fn too_much_text_ends_the_reply_before_it_is_shown() {
+        use crate::limits::MAX_RESPONSE_CHARS;
+        let piece = "あ".repeat(100_000);
+        let mut sse = start(0, json!({"type":"text","text":""}));
+        for _ in 0..(MAX_RESPONSE_CHARS / 100_000) {
+            sse.push_str(&delta(0, json!({"type":"text_delta","text":piece})));
+        }
+        // Exactly at the limit is still fine...
+        let (result, text) = run(&[sse.as_bytes()]);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            "network",
+            "cut off, not too large"
+        );
+        assert_eq!(text.chars().count(), MAX_RESPONSE_CHARS);
+        // ...one character more is not, and it never reaches the caller.
+        sse.push_str(&delta(0, json!({"type":"text_delta","text":"!"})));
+        let (result, text) = run(&[sse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+        assert!(!text.ends_with('!'));
+    }
+
+    #[test]
+    fn thinking_counts_against_the_text_limit() {
+        use crate::limits::MAX_RESPONSE_CHARS;
+        let piece = "t".repeat(500_000);
+        let mut sse = start(0, json!({"type":"thinking","thinking":"","signature":""}));
+        for _ in 0..(MAX_RESPONSE_CHARS / 500_000 + 1) {
+            sse.push_str(&delta(0, json!({"type":"thinking_delta","thinking":piece})));
+        }
+        let (result, _) = run(&[sse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+    }
+
+    #[test]
+    fn tool_calls_are_bounded() {
+        use crate::limits::{MAX_TOOL_CALLS, MAX_TOOL_INPUT_BYTES};
+        let finished = [
+            event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            ),
+            event("message_stop", json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let calls = |count: usize| {
+            let mut sse = String::new();
+            for index in 0..count {
+                sse.push_str(&start(index, json!({"type":"tool_use","id":format!("t{index}"),"name":"list_documents","input":{}})));
+            }
+            sse + &finished
+        };
+        let (result, _) = run(&[calls(MAX_TOOL_CALLS).as_bytes()]);
+        assert_eq!(result.unwrap().content.len(), MAX_TOOL_CALLS);
+        let (result, _) = run(&[calls(MAX_TOOL_CALLS + 1).as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+
+        // A name with characters outside A-Z a-z 0-9 _ -, or too long.
+        for name in ["read document", "x\u{202e}y", &"n".repeat(129)] {
+            let sse = start(
+                0,
+                json!({"type":"tool_use","id":"t","name":name,"input":{}}),
+            ) + &finished;
+            let (result, _) = run(&[sse.as_bytes()]);
+            assert_eq!(result.unwrap_err().kind(), "bad_response", "{name:?}");
+        }
+
+        // An input that grows past the limit, a piece at a time.
+        let piece = "a".repeat(256 * 1024);
+        let mut sse = start(
+            0,
+            json!({"type":"tool_use","id":"t","name":"insert_text","input":{}}),
+        );
+        sse.push_str(&delta(
+            0,
+            json!({"type":"input_json_delta","partial_json":"{\"text\":\""}),
+        ));
+        for _ in 0..(MAX_TOOL_INPUT_BYTES / piece.len()) {
+            sse.push_str(&delta(
+                0,
+                json!({"type":"input_json_delta","partial_json":piece}),
+            ));
+        }
+        sse.push_str(&finished);
+        let (result, _) = run(&[sse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+    }
+
+    #[test]
+    fn thinking_is_appended_in_place() {
+        let mut sse = start(0, json!({"type":"thinking","thinking":"a","signature":""}));
+        for part in ["b", "c"] {
+            sse.push_str(&delta(0, json!({"type":"thinking_delta","thinking":part})));
+        }
+        // A block that started without the field still gets it.
+        sse.push_str(&start(1, json!({"type":"thinking","signature":""})));
+        sse.push_str(&delta(1, json!({"type":"thinking_delta","thinking":"d"})));
+        sse.push_str(&event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        ));
+        sse.push_str(&event("message_stop", json!({"type":"message_stop"})));
+        let (result, _) = run(&[sse.as_bytes()]);
+        let content = result.unwrap().content;
+        assert!(
+            matches!(&content[0], ContentBlock::Opaque { block, .. } if block["thinking"] == "abc")
+        );
+        assert!(
+            matches!(&content[1], ContentBlock::Opaque { block, .. } if block["thinking"] == "d")
+        );
     }
 }

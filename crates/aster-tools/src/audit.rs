@@ -17,7 +17,7 @@ const KEPT: usize = 500;
 
 /// Arguments whose values are recorded as a length only: they hold the
 /// user's text.
-const TEXT_ARGUMENTS: &[&str] = &["text", "find", "replace", "query"];
+const TEXT_ARGUMENTS: &[&str] = &["text", "find", "replace", "query", "title"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditRecord {
@@ -96,7 +96,14 @@ impl Audit {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // Only the user may read what their assistant and clients did.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         Ok(Self {
             file: Some(Mutex::new(file)),
             recent: Mutex::new(VecDeque::new()),
@@ -171,5 +178,11 @@ mod tests {
         assert_eq!(lines[1]["arguments"]["text"]["chars"], 4);
         assert!(!text.contains("你好世界"));
         assert_eq!(audit.recent().len(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 }

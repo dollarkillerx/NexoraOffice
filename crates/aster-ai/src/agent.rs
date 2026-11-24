@@ -1,6 +1,6 @@
 //! The agent loop: one user turn, which may take several model requests.
-//! The model answers; when it stops to use tools, the calls are run (at the
-//! same time when there are several), their results go back in one user
+//! The model answers; when it stops to use tools, the calls are run (up to
+//! [`MAX_PARALLEL_TOOL_CALLS`] at the same time), their results go back in one user
 //! message, and the model is asked again, until it finishes, is cut off,
 //! declines, runs out of steps, or the user stops it.
 //!
@@ -15,8 +15,9 @@
 //! approvals and the audit log of `aster-tools`.
 
 use std::collections::HashSet;
+use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -25,6 +26,7 @@ use serde_json::Value;
 
 use crate::conversation::{ContentBlock, Message, Role};
 use crate::error::AiError;
+use crate::limits::MAX_PARALLEL_TOOL_CALLS;
 use crate::prompt::SYSTEM_PROMPT;
 use crate::provider::{Provider, ProviderConfig, Request, StopReason, ToolDef};
 use crate::redact::redact;
@@ -56,8 +58,9 @@ impl Default for AgentOptions {
     }
 }
 
-/// Runs the model's tool calls. Called from several threads at once when a
-/// reply has several calls, and it may block (an approval can take
+/// Runs the model's tool calls. Called from several threads at once (up to
+/// [`MAX_PARALLEL_TOOL_CALLS`]) when a reply has several calls, and it may
+/// block (an approval can take
 /// minutes).
 pub trait ToolExecutor: Sync {
     fn execute(&self, name: &str, input: &Value) -> ToolResult;
@@ -291,13 +294,38 @@ struct Call {
     raw_input: Option<String>,
 }
 
-/// Run the calls, at the same time, and return their results in the calls'
-/// order. Events are sent from this thread as each call finishes.
+/// The result for a call no thread could be started for.
+pub const NO_THREAD_RESULT: &str = "Not run: the tool call could not be started.";
+
+/// Run the calls, up to [`MAX_PARALLEL_TOOL_CALLS`] at a time, and return
+/// their results in the calls' order. Events are sent from this thread as
+/// each call finishes.
 fn execute(
     calls: &[Call],
     executor: &dyn ToolExecutor,
     redaction: bool,
     sink: &mut dyn FnMut(AgentEvent),
+) -> Vec<ContentBlock> {
+    execute_with(
+        calls,
+        executor,
+        redaction,
+        sink,
+        MAX_PARALLEL_TOOL_CALLS,
+        &|_| true,
+    )
+}
+
+/// [`execute`] with the number of threads and, for the tests, a way to make
+/// starting a thread fail: `may_spawn(n)` false makes the n-th fail as if
+/// the system had refused it.
+fn execute_with(
+    calls: &[Call],
+    executor: &dyn ToolExecutor,
+    redaction: bool,
+    sink: &mut dyn FnMut(AgentEvent),
+    max_threads: usize,
+    may_spawn: &dyn Fn(usize) -> bool,
 ) -> Vec<ContentBlock> {
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut finished = |index: usize, mut result: ToolResult, sink: &mut dyn FnMut(AgentEvent)| {
@@ -329,23 +357,69 @@ fn execute(
             None => valid.push(index),
         }
     }
+    // A few worker threads take the calls from a shared queue, in order,
+    // so a reply with many calls never starts more than `max_threads`
+    // threads, and a call that blocks on an approval holds up only its own
+    // worker.
+    let next = AtomicUsize::new(0);
+    let valid = &valid;
+    let next = &next;
     thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
-        for &index in &valid {
+        let workers = max_threads.max(1).min(valid.len());
+        let mut started = 0;
+        for worker in 0..workers {
             let tx = tx.clone();
-            let call = &calls[index];
-            scope.spawn(move || {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    executor.execute(&call.name, &call.input)
-                }))
-                .unwrap_or_else(|_| ToolResult {
-                    text: "The tool failed unexpectedly.".into(),
-                    is_error: true,
-                });
-                let _ = tx.send((index, result));
-            });
+            let work = move || {
+                loop {
+                    let Some(&index) = valid.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                        return;
+                    };
+                    let call = &calls[index];
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        executor.execute(&call.name, &call.input)
+                    }))
+                    .unwrap_or_else(|_| ToolResult {
+                        text: "The tool failed unexpectedly.".into(),
+                        is_error: true,
+                    });
+                    if tx.send((index, result)).is_err() {
+                        return;
+                    }
+                }
+            };
+            let spawned = if may_spawn(worker) {
+                thread::Builder::new()
+                    .name("aster-ai-tool".into())
+                    .spawn_scoped(scope, work)
+                    .map(drop)
+            } else {
+                // The closure, and its sender with it, is dropped here, as
+                // a failed spawn drops it.
+                drop(work);
+                Err(io::Error::other("refused for the test"))
+            };
+            if spawned.is_ok() {
+                started += 1;
+            }
         }
         drop(tx);
+        if started == 0 {
+            // Not one thread: no call can run. Taking every call from the
+            // queue gives each its error result below, rather than none.
+            while let Some(&index) = valid.get(next.fetch_add(1, Ordering::SeqCst)) {
+                finished(
+                    index,
+                    ToolResult {
+                        text: NO_THREAD_RESULT.into(),
+                        is_error: true,
+                    },
+                    sink,
+                );
+            }
+        }
+        // The workers that did start drain the whole queue between them.
+        // When the last one ends, its sender goes and this loop ends.
         for (index, result) in rx {
             finished(index, result, sink);
         }
@@ -501,5 +575,77 @@ mod tests {
         assert!(result.is_error);
         assert!(result.text.starts_with("INVALID_JSON: "));
         assert!(result.text.ends_with("{\"document\": "));
+    }
+
+    fn calls(count: usize) -> Vec<Call> {
+        (0..count)
+            .map(|index| Call {
+                id: format!("c{index}"),
+                name: "list_documents".into(),
+                input: json!({ "n": index }),
+                raw_input: None,
+            })
+            .collect()
+    }
+
+    fn ids_and_texts(results: &[ContentBlock]) -> Vec<(String, String, bool)> {
+        results
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    text,
+                    is_error,
+                } => (tool_use_id.clone(), text.clone(), *is_error),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn echo(_: &str, input: &Value) -> ToolResult {
+        ToolResult {
+            text: input["n"].to_string(),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn if_no_thread_starts_every_call_gets_an_error_result() {
+        let calls = calls(6);
+        let mut events = Vec::new();
+        let results = execute_with(&calls, &echo, false, &mut |e| events.push(e), 4, &|_| false);
+        let results = ids_and_texts(&results);
+        assert_eq!(results.len(), 6);
+        for (index, (id, text, is_error)) in results.iter().enumerate() {
+            assert_eq!(id, &format!("c{index}"));
+            assert_eq!(text, NO_THREAD_RESULT);
+            assert!(is_error);
+        }
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+            .count();
+        assert_eq!(finished, 6, "every started call is reported finished");
+    }
+
+    #[test]
+    fn if_some_threads_start_they_run_every_call() {
+        let calls = calls(9);
+        // Only the first of four workers starts; it runs all nine calls.
+        let results = execute_with(&calls, &echo, false, &mut |_| {}, 4, &|worker| worker == 0);
+        let results = ids_and_texts(&results);
+        for (index, (id, text, is_error)) in results.iter().enumerate() {
+            assert_eq!(id, &format!("c{index}"));
+            assert_eq!(text, &index.to_string());
+            assert!(!is_error);
+        }
+    }
+
+    #[test]
+    fn no_calls_start_no_threads() {
+        let results = execute_with(&[], &echo, false, &mut |_| {}, 4, &|_| {
+            panic!("no thread needed")
+        });
+        assert!(results.is_empty());
     }
 }

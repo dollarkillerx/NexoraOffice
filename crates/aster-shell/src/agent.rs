@@ -70,7 +70,9 @@ pub struct Assistant {
     pub invoker: Arc<Invoker>,
     policy: Arc<Mutex<Policy>>,
     items: Rc<VecModel<ChatItem>>,
-    approvals: Vec<(ApprovalItem, mpsc::Sender<Approval>)>,
+    /// Questions on screen: the card, where the answer goes, and whether
+    /// an MCP client asked (those are refused when MCP stops).
+    approvals: Vec<(ApprovalItem, mpsc::Sender<Approval>, bool)>,
     approval_items: Rc<VecModel<ApprovalItem>>,
     access_file: Option<PathBuf>,
     mcp_enabled: bool,
@@ -92,8 +94,17 @@ pub struct Assistant {
     tool_rows: HashMap<String, usize>,
     /// Events from the running turn, applied in order.
     inbox: Arc<Mutex<Vec<AgentEvent>>>,
+    /// A drain of the inbox is on its way to the interface thread: the
+    /// worker posts at most one at a time, however fast fragments arrive.
+    drain_posted: Arc<AtomicBool>,
+    /// The text of the reply being streamed. Fragments are added here and
+    /// the row is replaced once per drain, not once per fragment.
+    streaming_text: String,
     /// The models each provider offers, by provider id.
     models: HashMap<String, ModelList>,
+    /// Providers whose key was deleted because their endpoint moved to
+    /// another host, until a key is saved again.
+    keys_cleared: std::collections::HashSet<String>,
 }
 
 /// What listing a provider's models came to.
@@ -152,7 +163,10 @@ impl Assistant {
             streaming: None,
             tool_rows: HashMap::new(),
             inbox: Arc::new(Mutex::new(Vec::new())),
+            drain_posted: Arc::new(AtomicBool::new(false)),
+            streaming_text: String::new(),
             models: HashMap::new(),
+            keys_cleared: Default::default(),
         });
         if mcp_enabled {
             set_mcp(ui, shell, true);
@@ -276,14 +290,27 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
         ui.set_ai_model(provider.model.clone().into());
     }
     let has_key = provider.as_ref().is_some_and(|p| key_known(ai, &p.id));
+    let cleared = provider
+        .as_ref()
+        .is_some_and(|p| ai.keys_cleared.contains(&p.id));
     ui.set_ai_key_state(
         if has_key {
             strings.ai_key_saved
+        } else if cleared {
+            strings.ai_key_cleared
         } else {
             strings.ai_key_missing
         }
         .into(),
     );
+    ui.set_ai_insecure(provider.as_ref().is_some_and(|p| {
+        p.base_url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+            && !aster_ai::is_loopback_url(&p.base_url)
+    }));
+    ui.set_ai_allow_insecure(provider.as_ref().is_some_and(|p| p.allow_insecure));
     ui.set_ai_configured(
         provider
             .as_ref()
@@ -412,8 +439,22 @@ pub fn set_base_url(ui: &AppWindow, shell: &mut Shell, url: &str) {
             url.to_owned()
         };
         let changed = provider.base_url != url;
+        let moved = aster_ai::url_host(&provider.base_url) != aster_ai::url_host(&url);
         provider.base_url = url;
         let id = provider.id.clone();
+        if moved {
+            // A key belongs to the host it was saved for: one typed for one
+            // service must not go to another. It is deleted, and the user
+            // saves it again for the new host. Insecure http is allowed
+            // per address, so it goes too.
+            provider.key_host = None;
+            provider.allow_insecure = false;
+            if key_known(ai, &id) {
+                let _ = ai.keys.delete(&id);
+                ai.has_key.insert(id.clone(), false);
+                ai.keys_cleared.insert(id.clone());
+            }
+        }
         if changed {
             // Another endpoint, other models.
             ai.models.remove(&id);
@@ -443,6 +484,12 @@ pub fn save_key(ui: &AppWindow, shell: &mut Shell, key: &str) {
         match ai.keys.set(&id, key.trim()) {
             Ok(()) => {
                 ai.has_key.insert(id.clone(), true);
+                ai.keys_cleared.remove(&id);
+                // The key is for this host only.
+                if let Some(provider) = selected_mut(ai) {
+                    provider.key_host = aster_ai::url_host(&provider.base_url);
+                }
+                save_settings(ai);
                 // A new key may see other models.
                 ai.models.remove(&id);
             }
@@ -475,8 +522,9 @@ pub fn list_models(ui: &AppWindow, shell: &mut Shell) {
         return;
     }
     ai.models.insert(provider.id.clone(), ModelList::Loading);
+    let id = provider.id.clone();
     let weak = ui.as_weak();
-    std::thread::Builder::new()
+    let started = std::thread::Builder::new()
         .name("aster-models".into())
         .spawn(move || {
             let never = AtomicBool::new(false);
@@ -518,8 +566,12 @@ pub fn list_models(ui: &AppWindow, shell: &mut Shell) {
                     }),
                 );
             });
-        })
-        .expect("cannot start a thread to list the models");
+        });
+    if let Err(error) = started
+        && let Some(ai) = &mut shell.ai
+    {
+        ai.models.insert(id, ModelList::Failed(error.to_string()));
+    }
     refresh(ui, shell);
 }
 
@@ -561,6 +613,23 @@ fn can_chat(id: &str) -> bool {
     ]
     .iter()
     .any(|word| id.contains(word))
+}
+
+/// Allow plain http to a computer other than this one for the selected
+/// provider, after the warning on the settings page.
+pub fn set_allow_insecure(ui: &AppWindow, shell: &mut Shell, on: bool) {
+    if let Some(ai) = &mut shell.ai
+        && let Some(provider) = selected_mut(ai)
+    {
+        provider.allow_insecure = on;
+        let id = provider.id.clone();
+        ai.models.remove(&id);
+        save_settings(ai);
+    }
+    refresh(ui, shell);
+    if on {
+        list_models_if_new(ui, shell);
+    }
 }
 
 pub fn delete_key(ui: &AppWindow, shell: &mut Shell) {
@@ -644,8 +713,9 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
     let options = ai.settings.agent_options();
     let conversation_id = format!("chat-{}", ai.conversation_id);
     let inbox = ai.inbox.clone();
+    let posted = ai.drain_posted.clone();
     let weak = ui.as_weak();
-    std::thread::Builder::new()
+    let started = std::thread::Builder::new()
         .name("aster-assistant".into())
         .spawn(move || {
             let model = connect(provider.clone(), key);
@@ -655,9 +725,11 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
                 if let Ok(mut inbox) = inbox.lock() {
                     inbox.push(event);
                 }
-                let _ = weak.upgrade_in_event_loop(|ui| {
-                    deliver(ui, Box::new(drain));
-                });
+                if !posted.swap(true, Ordering::AcqRel) {
+                    let _ = weak.upgrade_in_event_loop(|ui| {
+                        deliver(ui, Box::new(drain));
+                    });
+                }
             };
             let result = aster_ai::run(
                 &*model,
@@ -686,9 +758,32 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
                     }),
                 );
             });
-        })
-        .expect("cannot start the assistant's thread");
+        });
+    if let Err(error) = started {
+        // Without a thread there is no turn: say so instead of waiting.
+        let strings = shell.language.strings();
+        if let Some(ai) = &mut shell.ai {
+            ai.cancel = None;
+            ai.conversation.pop();
+            ai.push(
+                3,
+                i18n::fill(strings.ai_error, "message", &error.to_string()),
+                String::new(),
+                0,
+            );
+        }
+    }
     refresh(ui, shell);
+}
+
+/// Put the streamed text into its row.
+fn flush_stream(ai: &mut Assistant) {
+    if let Some(row) = ai.streaming
+        && let Some(mut item) = ai.items.row_data(row)
+    {
+        item.text = ai.streaming_text.as_str().into();
+        ai.items.set_row_data(row, item);
+    }
 }
 
 /// Show the events that have come in from the running turn, in order.
@@ -703,23 +798,25 @@ fn drain(ui: &AppWindow, shell: &mut Shell) {
     let Some(ai) = &mut shell.ai else {
         return;
     };
+    // Cleared before taking the events: anything that arrives after this
+    // posts a drain of its own.
+    ai.drain_posted.store(false, Ordering::Release);
     let events: Vec<AgentEvent> = ai
         .inbox
         .lock()
         .map(|mut inbox| std::mem::take(&mut *inbox))
         .unwrap_or_default();
     for event in events {
+        if !matches!(event, AgentEvent::TextDelta(_)) {
+            flush_stream(ai);
+        }
         match event {
             AgentEvent::TextDelta(delta) => match ai.streaming {
-                Some(row) if row < ai.items.row_count() => {
-                    if let Some(mut item) = ai.items.row_data(row) {
-                        item.text = format!("{}{delta}", item.text).into();
-                        ai.items.set_row_data(row, item);
-                    }
-                }
+                Some(row) if row < ai.items.row_count() => ai.streaming_text.push_str(&delta),
                 _ => {
-                    ai.push(1, delta, String::new(), 0);
+                    ai.push(1, String::new(), String::new(), 0);
                     ai.streaming = Some(ai.items.row_count() - 1);
+                    ai.streaming_text = delta;
                 }
             },
             AgentEvent::ToolCallStarted { id, name, input } => {
@@ -762,6 +859,7 @@ fn drain(ui: &AppWindow, shell: &mut Shell) {
             AgentEvent::Redacted { .. } | AgentEvent::StepFinished { .. } => {}
         }
     }
+    flush_stream(ai);
     let _ = ui;
 }
 
@@ -871,6 +969,21 @@ pub fn set_mcp(ui: &AppWindow, shell: &mut Shell, on: bool) {
         server.stop();
     }
     ai.save_access();
+    if !on {
+        // Questions from clients that are gone are refused, so that no
+        // answer given later can reach anything.
+        let waiting: Vec<i32> = ai
+            .approvals
+            .iter()
+            .filter(|(_, _, mcp)| *mcp)
+            .map(|(item, _, _)| item.id)
+            .collect();
+        for id in waiting {
+            if let Some(answer) = take_card(ui, shell, id) {
+                let _ = answer.send(Approval::Deny);
+            }
+        }
+    }
     refresh(ui, shell);
 }
 
@@ -883,7 +996,7 @@ pub fn shut_down(shell: &mut Shell) {
         if let Some(mut server) = ai.mcp.take() {
             server.stop();
         }
-        for (_, answer) in ai.approvals.drain(..) {
+        for (_, answer, _) in ai.approvals.drain(..) {
             let _ = answer.send(Approval::Deny);
         }
     }
@@ -917,18 +1030,169 @@ impl Approver for Cards {
     }
 }
 
-/// What a card shows of the text a tool would write.
-fn preview_of(args: &Value) -> String {
-    let text = ["text", "replace", "find"]
-        .iter()
-        .filter_map(|name| args[*name].as_str())
-        .next()
-        .unwrap_or_default();
-    let mut shown: String = text.chars().take(400).collect();
-    if text.chars().count() > 400 {
-        shown.push('…');
+/// Text for a card, at most `limit` characters, saying how long it was.
+fn shortened(text: &str, limit: usize, strings: &i18n::Strings) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_owned();
     }
-    shown
+    let kept: String = text.chars().take(limit).collect();
+    format!(
+        "{kept}{}",
+        i18n::fill(strings.approval_cut, "chars", &count.to_string())
+    )
+}
+
+/// What a call would do, for its card: a line of facts, the text it would
+/// replace or delete, and the text it would write. Read from the document
+/// as it is now, on the interface thread.
+fn effect(shell: &mut Shell, request: &ApprovalRequest) -> (String, String, String) {
+    const SHOWN: usize = 600;
+    let strings = shell.language.strings();
+    let args = &request.args;
+    let text_arg = |name: &str| args[name].as_str().unwrap_or_default().to_owned();
+    let written = |text: String| {
+        if text.is_empty() {
+            strings.approval_nothing.to_owned()
+        } else {
+            shortened(&text, SHOWN, strings)
+        }
+    };
+    let id = request
+        .document
+        .as_ref()
+        .and_then(|d| d.id.parse().ok())
+        .map(TabId);
+    let editor = id.and_then(|id| shell.markdown(id));
+    match request.tool.name {
+        "replace_lines" => {
+            let (Some(editor), Some(first), Some(last)) = (
+                editor,
+                args["start_line"].as_u64(),
+                args["end_line"].as_u64(),
+            ) else {
+                return (String::new(), String::new(), written(text_arg("text")));
+            };
+            let text = editor.document.text();
+            let total = text.len_lines() as u64;
+            let facts = i18n::fill(
+                &i18n::fill(
+                    &i18n::fill(strings.approval_lines, "start", &first.to_string()),
+                    "end",
+                    &last.to_string(),
+                ),
+                "total",
+                &total.to_string(),
+            );
+            let removed = if first >= 1 && first <= last && last <= total {
+                let start = text.line_to_byte(first as usize - 1);
+                let end = if last < total {
+                    text.line_to_byte(last as usize) - 1
+                } else {
+                    text.len_bytes()
+                };
+                shortened(&text.byte_slice(start..end).to_string(), SHOWN, strings)
+            } else {
+                String::new()
+            };
+            (facts, removed, written(text_arg("text")))
+        }
+        "replace_selection" => {
+            let Some(editor) = editor else {
+                return (String::new(), String::new(), written(text_arg("text")));
+            };
+            let range = editor.document.selection().range();
+            let selected = editor.document.text().byte_slice(range).to_string();
+            let facts = i18n::fill(
+                strings.approval_selection,
+                "chars",
+                &selected.chars().count().to_string(),
+            );
+            (
+                facts,
+                shortened(&selected, SHOWN, strings),
+                written(text_arg("text")),
+            )
+        }
+        "find_and_replace" => {
+            let pattern = text_arg("find");
+            let regex = args["regex"].as_bool().unwrap_or(false);
+            let query = aster_markdown::search::Query {
+                pattern: pattern.clone(),
+                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+                whole_word: false,
+                regex,
+            };
+            // Counting reads the whole text; past this size the card says "?".
+            let count = editor
+                .filter(|e| e.document.len() <= 16 * 1024 * 1024)
+                .and_then(|e| {
+                    let finder = aster_markdown::search::Finder::new(&query).ok()??;
+                    let whole = e.document.text().to_string();
+                    finder
+                        .find_all(&whole, &AtomicBool::new(false), |_| {})
+                        .map(|found| found.matches.len().to_string())
+                })
+                .unwrap_or_else(|| "?".to_owned());
+            let scope = if args["all"].as_bool().unwrap_or(true) {
+                i18n::fill(strings.approval_all, "count", &count)
+            } else {
+                i18n::fill(strings.approval_first, "count", &count)
+            };
+            let facts = i18n::fill(
+                &i18n::fill(
+                    &i18n::fill(
+                        strings.approval_find,
+                        "pattern",
+                        &format!("“{}”", shortened(&pattern, 200, strings)),
+                    ),
+                    "kind",
+                    if regex {
+                        strings.approval_regex
+                    } else {
+                        strings.approval_plain
+                    },
+                ),
+                "scope",
+                &scope,
+            );
+            (facts, String::new(), written(text_arg("replace")))
+        }
+        "insert_text" => {
+            let place = match args["position"].as_str().unwrap_or("cursor") {
+                "start" => strings.approval_at_start.to_owned(),
+                "end" => strings.approval_at_end.to_owned(),
+                "line" => i18n::fill(
+                    strings.approval_at_line,
+                    "line",
+                    &args["line"].as_u64().unwrap_or(0).to_string(),
+                ),
+                _ => strings.approval_at_cursor.to_owned(),
+            };
+            (
+                i18n::fill(strings.approval_where, "where", &place),
+                String::new(),
+                written(text_arg("text")),
+            )
+        }
+        "create_document" => (
+            i18n::fill(strings.approval_new_title, "title", &text_arg("title")),
+            String::new(),
+            written(text_arg("text")),
+        ),
+        "save_document" => {
+            let path = editor
+                .and_then(|e| e.path.clone())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            (
+                i18n::fill(strings.approval_file, "path", &path),
+                String::new(),
+                String::new(),
+            )
+        }
+        _ => (String::new(), String::new(), String::new()),
+    }
 }
 
 fn show_card(
@@ -938,6 +1202,7 @@ fn show_card(
     answer: mpsc::Sender<Approval>,
 ) -> bool {
     let strings = shell.language.strings();
+    let (facts, removed, written) = effect(shell, &request);
     let Some(ai) = &mut shell.ai else {
         return false;
     };
@@ -952,6 +1217,7 @@ fn show_card(
         Reason::Create => strings.approval_create.to_owned(),
         Reason::ReadOnly => i18n::fill(strings.approval_other, "tool", request.tool.name),
     };
+    let mcp = request.origin.is_mcp();
     let title = match request.origin.caller.strip_prefix("mcp:") {
         Some(client) => i18n::fill(
             &i18n::fill(strings.approval_mcp, "client", client),
@@ -964,10 +1230,12 @@ fn show_card(
         id: request.id as i32,
         title: title.into(),
         detail: format!("{} · {}", request.tool.name, request.origin.caller).into(),
-        preview: preview_of(&request.args).into(),
+        facts: facts.into(),
+        removed: removed.into(),
+        preview: written.into(),
     };
     ai.approval_items.push(item.clone());
-    ai.approvals.push((item, answer));
+    ai.approvals.push((item, answer, mcp));
     // Open the panel for the question without moving the keyboard.
     ui.set_assistant_open(true);
     true
@@ -975,8 +1243,8 @@ fn show_card(
 
 fn take_card(_ui: &AppWindow, shell: &mut Shell, id: i32) -> Option<mpsc::Sender<Approval>> {
     let ai = shell.ai.as_mut()?;
-    let index = ai.approvals.iter().position(|(item, _)| item.id == id)?;
-    let (_, answer) = ai.approvals.remove(index);
+    let index = ai.approvals.iter().position(|(item, _, _)| item.id == id)?;
+    let (_, answer, _) = ai.approvals.remove(index);
     if let Some(row) = (0..ai.approval_items.row_count()).find(|row| {
         ai.approval_items
             .row_data(*row)

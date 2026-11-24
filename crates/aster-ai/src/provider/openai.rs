@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde_json::{Value, json};
 
 use super::{
-    Decoder, ModelInfo, ModelResponse, Provider, ProviderConfig, Request, StopReason, cut_off,
-    decode, fetch_json, models_from, parse_input, parse_json,
+    Decoder, ModelInfo, ModelResponse, Provider, ProviderConfig, Request, StopReason, add_text,
+    check_tool_count, check_tool_input, check_tool_name, cut_off, decode, fetch_json, models_from,
+    parse_input, parse_json,
 };
 use crate::conversation::{ContentBlock, Message, Role};
 use crate::error::{AiError, shorten};
 use crate::http::{self, HttpRequest, Method};
+use crate::limits::MAX_TOOL_NAME_BYTES;
 use crate::sse;
 
 pub(crate) struct OpenAi {
@@ -72,6 +74,8 @@ impl Provider for OpenAi {
             headers,
             body: Some(body(&self.config, request).to_string()),
         };
+        self.config
+            .check_request(&http_request.url, self.api_key.is_some())?;
         let response = http::send(&self.agent, http_request);
         decode(response, Stream::default(), on_text, cancel)
     }
@@ -83,6 +87,8 @@ impl Provider for OpenAi {
             headers: self.headers(),
             body: None,
         };
+        self.config
+            .check_request(&request.url, self.api_key.is_some())?;
         let list = fetch_json(&self.agent, request, cancel)?;
         models_from(&list, None)
     }
@@ -206,6 +212,8 @@ struct Call {
 #[derive(Default)]
 pub(crate) struct Stream {
     text: String,
+    /// Characters of `text`, against [`crate::limits::MAX_RESPONSE_CHARS`].
+    chars: usize,
     calls: BTreeMap<u64, Call>,
     finish: Option<String>,
     done: bool,
@@ -232,6 +240,7 @@ impl Decoder for Stream {
         if let Some(text) = delta.get("content").and_then(Value::as_str)
             && !text.is_empty()
         {
+            add_text(&mut self.chars, text)?;
             self.text.push_str(text);
             on_text(text);
         }
@@ -241,6 +250,11 @@ impl Decoder for Stream {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or(position as u64);
+                // Each new index is a new call; the server picks the
+                // indices, so the count is what is bounded.
+                if !self.calls.contains_key(&index) {
+                    check_tool_count(self.calls.len() + 1)?;
+                }
                 let call = self.calls.entry(index).or_default();
                 if let Some(id) = piece.get("id").and_then(Value::as_str)
                     && !id.is_empty()
@@ -250,11 +264,26 @@ impl Decoder for Stream {
                 if let Some(name) = piece.pointer("/function/name").and_then(Value::as_str)
                     && call.name != name
                 {
+                    // Some servers send the name in pieces, so it is bounded
+                    // as it grows; whether it is a valid name is checked
+                    // once it is complete.
+                    if call.name.len() + name.len() > MAX_TOOL_NAME_BYTES {
+                        return Err(AiError::BadResponse(format!(
+                            "the model asked for a tool with a name longer than {MAX_TOOL_NAME_BYTES} bytes"
+                        )));
+                    }
                     call.name.push_str(name);
                 }
                 match piece.pointer("/function/arguments") {
-                    Some(Value::String(more)) => call.arguments.push_str(more),
-                    Some(object @ Value::Object(_)) => call.arguments = object.to_string(),
+                    Some(Value::String(more)) => {
+                        check_tool_input(call.arguments.len() + more.len())?;
+                        call.arguments.push_str(more);
+                    }
+                    Some(object @ Value::Object(_)) => {
+                        let text = object.to_string();
+                        check_tool_input(text.len())?;
+                        call.arguments = text;
+                    }
                     _ => {}
                 }
             }
@@ -272,6 +301,9 @@ impl Decoder for Stream {
         let mut content = Vec::new();
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
+        }
+        for call in self.calls.values() {
+            check_tool_name(&call.name)?;
         }
         for call in self.calls.into_values() {
             let id = if call.id.is_empty() {
@@ -365,7 +397,11 @@ mod tests {
         let mut text = String::new();
         let mut on_text = |t: &str| text.push_str(t);
         for chunk in chunks {
-            for event in parser.feed(chunk) {
+            let events = match parser.feed(chunk) {
+                Ok(events) => events,
+                Err(error) => return (Err(error), text),
+            };
+            for event in events {
                 if let Err(error) = stream.event(&event, &mut on_text) {
                     return (Err(error), text);
                 }
@@ -467,5 +503,91 @@ mod tests {
                 {"role": "tool", "tool_call_id": "c1", "content": "Error: INVALID_JSON: x"}
             ])
         );
+    }
+
+    fn finished() -> String {
+        data(json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}))
+    }
+
+    fn call(index: usize, name: &str, arguments: &str) -> String {
+        data(
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":index,"id":format!("call_{index}"),"type":"function","function":{"name":name,"arguments":arguments}}]}}]}),
+        )
+    }
+
+    #[test]
+    fn too_much_text_ends_the_reply() {
+        use crate::limits::MAX_RESPONSE_CHARS;
+        let piece = "é".repeat(200_000);
+        let mut sse = String::new();
+        for _ in 0..(MAX_RESPONSE_CHARS / 200_000) {
+            sse.push_str(&data(
+                json!({"choices":[{"index":0,"delta":{"content":piece}}]}),
+            ));
+        }
+        let (result, text) = run(&[(sse.clone() + &finished()).as_bytes()]);
+        assert!(result.is_ok());
+        assert_eq!(text.chars().count(), MAX_RESPONSE_CHARS);
+        sse.push_str(&data(
+            json!({"choices":[{"index":0,"delta":{"content":"!"}}]}),
+        ));
+        let (result, text) = run(&[sse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+        assert!(!text.ends_with('!'));
+    }
+
+    #[test]
+    fn tool_calls_are_bounded() {
+        use crate::limits::{MAX_TOOL_CALLS, MAX_TOOL_INPUT_BYTES};
+        let calls = |count: usize| {
+            let mut sse = String::new();
+            for index in 0..count {
+                sse.push_str(&call(index, "list_documents", "{}"));
+            }
+            sse + &finished()
+        };
+        let (result, _) = run(&[calls(MAX_TOOL_CALLS).as_bytes()]);
+        assert_eq!(result.unwrap().content.len(), MAX_TOOL_CALLS);
+        let (result, _) = run(&[calls(MAX_TOOL_CALLS + 1).as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+        // Far-apart indices are still separate calls.
+        let mut sparse = String::new();
+        for index in 0..=MAX_TOOL_CALLS {
+            sparse.push_str(&call(index * 1_000_000, "list_documents", "{}"));
+        }
+        let (result, _) = run(&[sparse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+
+        for name in ["read document", "a\nb", "", &"n".repeat(129)] {
+            let sse = call(0, name, "{}") + &finished();
+            let (result, _) = run(&[sse.as_bytes()]);
+            assert_eq!(result.unwrap_err().kind(), "bad_response", "{name:?}");
+        }
+        // A name sent in pieces that add up past the limit.
+        let mut sse = String::new();
+        for piece in 0..3 {
+            sse.push_str(&call(0, &format!("{piece}{}", "n".repeat(60)), ""));
+        }
+        let (result, _) = run(&[(sse + &finished()).as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "bad_response");
+
+        // Arguments that grow past the limit, a piece at a time.
+        let piece = "a".repeat(256 * 1024);
+        let mut sse = call(0, "insert_text", "{\"text\":\"");
+        for _ in 0..(MAX_TOOL_INPUT_BYTES / piece.len()) {
+            sse.push_str(&call(0, "insert_text", &piece));
+        }
+        let (result, _) = run(&[(sse + &finished()).as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+    }
+
+    #[test]
+    fn an_event_past_the_line_limit_ends_the_stream() {
+        use crate::limits::MAX_EVENT_BYTES;
+        let sse =
+            data(json!({"choices":[{"index":0,"delta":{"content":"x".repeat(MAX_EVENT_BYTES)}}]}));
+        let (result, text) = run(&[sse.as_bytes()]);
+        assert_eq!(result.unwrap_err().kind(), "too_large");
+        assert!(text.is_empty());
     }
 }

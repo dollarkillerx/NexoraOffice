@@ -114,11 +114,19 @@ pub struct Policy {
     /// Session grants, by document id: they win over the folder rules and
     /// end when the program does.
     pub grants: HashMap<String, Level>,
+    /// Documents a caller created, by document id: the conversation or
+    /// connection that created it, and its level for that caller only. It
+    /// holds while the document has no file; once saved, the folder's rule
+    /// applies like for any other document.
+    pub creations: HashMap<String, (String, Level)>,
 }
 
 impl Policy {
-    /// The level of a file or folder by the folder rules.
+    /// The level of a file or folder by the folder rules. Both sides are
+    /// compared normalised, so `/notes/../private` is not under `/notes`
+    /// and a link into a folder counts as that folder.
     pub fn level_of_path(&self, path: &Path) -> Level {
+        let path = normalize(path);
         self.folders
             .iter()
             .filter(|(folder, _)| path.starts_with(folder))
@@ -129,17 +137,45 @@ impl Policy {
     /// The level of an open document: its session grant, else its file's
     /// folder rule, else the level for documents without a file.
     pub fn level_of(&self, id: &str, path: Option<&Path>) -> Level {
+        self.level_for("", id, path)
+    }
+
+    /// The level of an open document for one caller (`session`): as
+    /// [`Self::level_of`], and a document the caller created itself, still
+    /// without a file, at the level it was given then.
+    pub fn level_for(&self, session: &str, id: &str, path: Option<&Path>) -> Level {
         if let Some(level) = self.grants.get(id) {
             return *level;
         }
         match path {
             Some(path) => self.level_of_path(path),
-            None => self.untitled,
+            None => match self.creations.get(id) {
+                Some((creator, level)) if !session.is_empty() && creator == session => *level,
+                _ => self.untitled,
+            },
         }
+    }
+
+    /// The level that decides whether a caller may create a document: that
+    /// of new documents, where Off means asking (the new document would
+    /// otherwise never be visible to anyone) and Read only means no.
+    pub fn create_level(&self) -> Level {
+        match self.untitled {
+            Level::Off => Level::Ask,
+            level => level,
+        }
+    }
+
+    /// The caller in `session` created document `id`: give it `level` for
+    /// that caller, while the document has no file.
+    pub fn grant_creator(&mut self, session: &str, id: &str, level: Level) {
+        self.creations
+            .insert(id.to_owned(), (session.to_owned(), level));
     }
 
     /// Set or clear (with Off) the rule for a folder.
     pub fn set_folder(&mut self, folder: PathBuf, level: Level) {
+        let folder = normalize(&folder);
         self.folders.retain(|(existing, _)| *existing != folder);
         if level != Level::Off {
             self.folders.push((folder, level));
@@ -156,6 +192,41 @@ impl Policy {
             None => {
                 self.grants.remove(id);
             }
+        }
+    }
+}
+
+/// A path with `.` and `..` worked out and links resolved: the deepest
+/// part that exists is resolved on disk, the rest is appended as written.
+/// So a file that does not exist yet still lands in the folder its parent
+/// really is.
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut lexical = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut existing = lexical.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return lexical,
         }
     }
 }
@@ -214,5 +285,54 @@ mod tests {
         // Off removes a rule.
         policy.set_folder("/notes".into(), Level::Off);
         assert_eq!(policy.folders.len(), 1);
+    }
+
+    #[test]
+    fn creations_belong_to_their_creator_until_saved() {
+        let mut policy = Policy::default();
+        policy.grant_creator("chat-1", "9", Level::Trusted);
+        assert_eq!(policy.level_for("chat-1", "9", None), Level::Trusted);
+        // Another conversation or client does not inherit it.
+        assert_eq!(policy.level_for("connection-3", "9", None), Level::Off);
+        assert_eq!(policy.level_of("9", None), Level::Off);
+        // Saved into a folder that is Off: the folder decides.
+        assert_eq!(
+            policy.level_for("chat-1", "9", Some(Path::new("/closed/新.md"))),
+            Level::Off
+        );
+    }
+
+    #[test]
+    fn creating_follows_the_level_of_new_documents() {
+        let mut policy = Policy::default();
+        assert_eq!(policy.create_level(), Level::Ask);
+        policy.untitled = Level::ReadOnly;
+        assert_eq!(
+            judge(policy.create_level(), Capability::Create),
+            Verdict::Deny(Reason::ReadOnly)
+        );
+        policy.untitled = Level::Trusted;
+        assert_eq!(
+            judge(policy.create_level(), Capability::Create),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn paths_are_compared_normalised() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        let mut policy = Policy::default();
+        // A rule given through `..` is the folder it names.
+        policy.set_folder(dir.path().join("private/../notes"), Level::Ask);
+        assert_eq!(policy.level_of_path(&notes.join("a.md")), Level::Ask);
+        assert_eq!(
+            policy.level_of_path(&notes.join("../private/b.md")),
+            Level::Off
+        );
+        // A path that does not exist yet is worked out from its text.
+        assert_eq!(policy.level_of_path(&notes.join("x/../new.md")), Level::Ask);
     }
 }

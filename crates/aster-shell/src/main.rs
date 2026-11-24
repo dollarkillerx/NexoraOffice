@@ -966,6 +966,8 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_approve_session(strings.approve_session.into());
     s.set_approve_deny(strings.approve_deny.into());
     s.set_approval_timeout(strings.approval_timeout.into());
+    s.set_approval_removed_label(strings.approval_removed_label.into());
+    s.set_approval_inserted_label(strings.approval_inserted_label.into());
     s.set_ai_settings_title(strings.ai_settings_title.into());
     s.set_ai_provider(strings.ai_provider.into());
     s.set_provider_custom(strings.provider_custom.into());
@@ -973,6 +975,8 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_ai_model(strings.ai_model.into());
     s.set_ai_api_key(strings.ai_api_key.into());
     s.set_ai_key_hint(strings.ai_key_hint.into());
+    s.set_ai_insecure(strings.ai_insecure.into());
+    s.set_ai_allow_insecure(strings.ai_allow_insecure.into());
     s.set_ai_refresh_models(strings.ai_refresh_models.into());
     s.set_ai_key_save(strings.ai_key_save.into());
     s.set_ai_key_delete(strings.ai_key_delete.into());
@@ -3443,6 +3447,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
     ui.on_ai_set_folder_level(handler!(|ui, shell, level| {
         agent::set_folder_access(&ui, shell, level);
+    }));
+    ui.on_ai_set_allow_insecure(handler!(|ui, shell, on| {
+        agent::set_allow_insecure(&ui, shell, on);
     }));
     ui.on_ai_pick_model(handler!(|ui, shell, id| {
         agent::set_model(&ui, shell, id.as_str());

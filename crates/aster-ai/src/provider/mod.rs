@@ -11,6 +11,7 @@
 mod anthropic;
 mod openai;
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicBool;
 
 use aster_tools::ToolSpec;
@@ -19,6 +20,9 @@ use serde_json::Value;
 use crate::conversation::{ContentBlock, Message};
 use crate::error::AiError;
 use crate::http::{self, Body};
+use crate::limits::{
+    MAX_RESPONSE_CHARS, MAX_TOOL_CALLS, MAX_TOOL_INPUT_BYTES, MAX_TOOL_NAME_BYTES,
+};
 use crate::sse;
 
 /// Which wire format a provider speaks.
@@ -133,6 +137,15 @@ pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
     pub model: String,
+    /// Let requests go over plain `http://` to an address that is not this
+    /// computer. Off by default: on any other network, the API key and the
+    /// whole conversation could be read on the way.
+    pub allow_insecure: bool,
+    /// The host the API key was saved for, from [`url_host`]. The key is
+    /// sent only to that host, so changing the address cannot send a saved
+    /// key somewhere else. `None` for keys saved before hosts were kept;
+    /// those go to whatever the address is, as they always did.
+    pub key_host: Option<String>,
 }
 
 impl ProviderConfig {
@@ -144,7 +157,49 @@ impl ProviderConfig {
             name: preset.display_name().to_string(),
             base_url: preset.default_base_url().to_string(),
             model: preset.default_model().to_string(),
+            allow_insecure: false,
+            key_host: None,
         }
+    }
+
+    /// Whether the saved key may go to the current address: there is no
+    /// recorded host, or it is the address's host.
+    pub fn key_matches_host(&self) -> bool {
+        key_host_matches(self.key_host.as_deref(), url_host(&self.base_url))
+    }
+
+    /// Whether a request to `url` may go out, `with_key` saying whether it
+    /// would carry the API key. Checked before every request, on the full
+    /// URL, parsed the way the HTTP client parses it, so the host checked
+    /// is the host connected to.
+    pub(crate) fn check_request(&self, url: &str, with_key: bool) -> Result<(), AiError> {
+        let Some(uri) = parse_url(url) else {
+            return Err(AiError::NotConfigured(format!(
+                "the address is not valid: {}",
+                crate::error::shorten(url)
+            )));
+        };
+        let scheme = uri.scheme_str().unwrap_or("").to_ascii_lowercase();
+        match scheme.as_str() {
+            "https" => {}
+            "http" if self.allow_insecure || is_loopback_uri(&uri) => {}
+            "http" => {
+                return Err(AiError::NotConfigured(
+                    "plain http:// is only used for this computer (localhost); use https:// or allow insecure connections for this provider".into(),
+                ));
+            }
+            _ => {
+                return Err(AiError::NotConfigured(
+                    "the address must start with https:// (or http:// for this computer)".into(),
+                ));
+            }
+        }
+        if with_key && !key_host_matches(self.key_host.as_deref(), uri_host(&uri)) {
+            return Err(AiError::NotConfigured(
+                "the API key was saved for another address; save it again".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The caller name for tool calls and the audit log:
@@ -157,6 +212,72 @@ impl ProviderConfig {
     pub(crate) fn base(&self) -> &str {
         self.base_url.trim().trim_end_matches('/')
     }
+}
+
+/// The host of `url`, lowercased, without the port, the user info or the
+/// brackets of an IPv6 address: `https://user@API.example.com:8443/v1` is
+/// `api.example.com`, `http://[::1]:11434` is `::1`. `None` when the URL
+/// has no host or cannot be parsed. It reads the URL as the HTTP client
+/// does, so for `http://127.0.0.1@evil.com` it is `evil.com`.
+pub fn url_host(url: &str) -> Option<String> {
+    uri_host(&parse_url(url)?)
+}
+
+/// `url` parsed as the HTTP client parses it, when it is a full URL with a
+/// scheme. A bare `localhost:11434` parses too, as an authority alone, but
+/// the client cannot send to it, so it names no host here.
+fn parse_url(url: &str) -> Option<ureq::http::Uri> {
+    url.trim()
+        .parse::<ureq::http::Uri>()
+        .ok()
+        .filter(|uri| uri.scheme().is_some())
+}
+
+fn uri_host(uri: &ureq::http::Uri) -> Option<String> {
+    // The same steps as the client's own `Authority::host`, done here so an
+    // odd authority gives `None` rather than a panic: the part after the
+    // last `@`, then up to the `]` of an IPv6 address or the `:` of a port.
+    let authority = uri.authority()?.as_str();
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        &rest[..rest.find(']')?]
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Whether `url` names this computer: the host is `localhost`, an address in
+/// 127.0.0.0/8 or `::1`. Names that merely start with one of those
+/// (`localhost.example.com`) do not count. Only these may be reached over
+/// plain `http://` unless the provider allows insecure connections.
+pub fn is_loopback_url(url: &str) -> bool {
+    parse_url(url).is_some_and(|uri| is_loopback_uri(&uri))
+}
+
+fn is_loopback_uri(uri: &ureq::http::Uri) -> bool {
+    let Some(host) = uri_host(uri) else {
+        return false;
+    };
+    host == "localhost"
+        || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|ip| ip == Ipv6Addr::LOCALHOST)
+}
+
+/// Whether a key saved for `saved` may go to `host`.
+fn key_host_matches(saved: Option<&str>, host: Option<String>) -> bool {
+    let Some(saved) = saved else {
+        return true;
+    };
+    // Written by hand or by an older shell, the saved host may have its
+    // brackets or capitals; compare it as `url_host` would give it.
+    let saved = saved.trim().trim_start_matches('[').trim_end_matches(']');
+    host.is_some_and(|host| host.eq_ignore_ascii_case(saved))
 }
 
 /// A tool as the model sees it.
@@ -241,7 +362,11 @@ pub trait Provider: Send + Sync {
 
 /// A provider for `config`, with its API key if it has one. The key is
 /// kept in memory only and sent only to `config.base_url`: redirects are not
-/// followed.
+/// followed. Every request is checked first: plain `http://` goes only to
+/// this computer unless [`ProviderConfig::allow_insecure`] is set, and the
+/// key goes only to [`ProviderConfig::key_host`] when one is recorded; a
+/// request that fails either check is not sent and ends with
+/// [`AiError::NotConfigured`].
 pub fn connect(config: ProviderConfig, api_key: Option<String>) -> Box<dyn Provider> {
     let api_key = api_key.filter(|key| !key.trim().is_empty());
     match config.kind {
@@ -266,14 +391,67 @@ pub(crate) fn decode<D: Decoder>(
 ) -> Result<ModelResponse, AiError> {
     let mut parser = sse::Parser::default();
     while let Some(chunk) = body.next(cancel)? {
-        for event in parser.feed(&chunk) {
+        for event in parser.feed(&chunk)? {
             decoder.event(&event, on_text)?;
         }
     }
-    if let Some(event) = parser.finish() {
+    if let Some(event) = parser.finish()? {
         decoder.event(&event, on_text)?;
     }
     decoder.finish()
+}
+
+/// Count `more` into a reply's text, which may not go past
+/// [`MAX_RESPONSE_CHARS`]. Checked before the text is kept or shown.
+pub(crate) fn add_text(total: &mut usize, more: &str) -> Result<(), AiError> {
+    *total += more.chars().count();
+    if *total > MAX_RESPONSE_CHARS {
+        return Err(AiError::TooLarge(format!(
+            "the reply is longer than {MAX_RESPONSE_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// A reply may ask for at most [`MAX_TOOL_CALLS`] calls; `count` is how
+/// many it would have with the new one.
+pub(crate) fn check_tool_count(count: usize) -> Result<(), AiError> {
+    if count > MAX_TOOL_CALLS {
+        return Err(AiError::TooLarge(format!(
+            "the reply asks for more than {MAX_TOOL_CALLS} tool calls"
+        )));
+    }
+    Ok(())
+}
+
+/// A tool name is 1 to [`MAX_TOOL_NAME_BYTES`] of `A-Z a-z 0-9 _ -`, as the
+/// providers themselves require. Anything else would be shown in the
+/// approval dialog and written to the audit log as the model chose it.
+pub(crate) fn check_tool_name(name: &str) -> Result<(), AiError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(AiError::BadResponse(format!(
+            "the model asked for a tool with an invalid name ({} bytes); names are up to {MAX_TOOL_NAME_BYTES} letters, digits, _ or -",
+            name.len()
+        )))
+    }
+}
+
+/// A tool input of `len` bytes of JSON text may be kept.
+pub(crate) fn check_tool_input(len: usize) -> Result<(), AiError> {
+    if len > MAX_TOOL_INPUT_BYTES {
+        return Err(AiError::TooLarge(format!(
+            "a tool input is larger than {} MiB",
+            MAX_TOOL_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
 }
 
 /// A tool call's input from the JSON text the model streamed: the object,
@@ -387,5 +565,165 @@ mod tests {
         for preset in Preset::ALL {
             assert_eq!(Preset::from_key(preset.key()), Some(preset));
         }
+    }
+
+    #[test]
+    fn hosts_are_read_as_the_client_reads_them() {
+        assert_eq!(
+            url_host("https://user:pw@API.Example.com:8443/v1").as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(url_host(" http://[::1]:11434/v1 ").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("http://127.0.0.1@evil.com").as_deref(),
+            Some("evil.com")
+        );
+        assert_eq!(
+            url_host("https://api.anthropic.com").as_deref(),
+            Some("api.anthropic.com")
+        );
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(url_host("/v1/models"), None);
+        assert_eq!(url_host("localhost:11434"), None);
+        assert_eq!(url_host(""), None);
+    }
+
+    #[test]
+    fn only_this_computer_is_loopback() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST",
+            "http://127.0.0.1",
+            "http://127.8.9.10:8080/v1",
+            "http://[::1]",
+            "http://[::1]:11434/v1",
+            "http://[0:0:0:0:0:0:0:1]/",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://192.168.1.5",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://127.0.0.1@evil.com",
+            "http://localhost@evil.com/v1",
+            "http://evil.com#@localhost",
+            "http://[::2]",
+            "http://128.0.0.1",
+            "http://0.0.0.0",
+            "localhost:11434",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    fn custom(base_url: &str) -> ProviderConfig {
+        let mut config = ProviderConfig::from_preset("c", Preset::Custom);
+        config.base_url = base_url.into();
+        config
+    }
+
+    #[test]
+    fn plain_http_goes_only_to_this_computer_unless_allowed() {
+        let allowed = |config: &ProviderConfig, url: &str| config.check_request(url, false);
+        assert!(allowed(&custom(""), "http://127.0.0.1:8080/v1/models").is_ok());
+        assert!(allowed(&custom(""), "http://[::1]/v1/models").is_ok());
+        assert!(allowed(&custom(""), "https://192.168.1.5/v1/models").is_ok());
+        for url in [
+            "http://192.168.1.5/v1/models",
+            "http://localhost.evil.com/v1/models",
+            "http://127.0.0.1@evil.com/v1/models",
+            "ftp://127.0.0.1/v1/models",
+            "127.0.0.1/v1/models",
+        ] {
+            assert_eq!(
+                allowed(&custom(""), url).unwrap_err().kind(),
+                "not_configured",
+                "{url}"
+            );
+        }
+        let mut insecure = custom("");
+        insecure.allow_insecure = true;
+        assert!(allowed(&insecure, "http://192.168.1.5/v1/models").is_ok());
+        // Allowing insecure connections does not allow other schemes.
+        assert!(allowed(&insecure, "ftp://192.168.1.5/v1/models").is_err());
+    }
+
+    #[test]
+    fn a_key_goes_only_to_the_host_it_was_saved_for() {
+        let mut config = custom("https://api.example.com/v1");
+        assert!(config.key_matches_host(), "no saved host: as before");
+        assert!(
+            config
+                .check_request("https://api.example.com/v1/models", true)
+                .is_ok()
+        );
+
+        config.key_host = Some("api.example.com".into());
+        assert!(config.key_matches_host());
+        assert!(
+            config
+                .check_request("https://api.example.com/v1/models", true)
+                .is_ok()
+        );
+
+        config.base_url = "https://other.example.com/v1".into();
+        assert!(!config.key_matches_host());
+        let error = config
+            .check_request("https://other.example.com/v1/models", true)
+            .unwrap_err();
+        assert_eq!(error.kind(), "not_configured");
+        assert!(error.to_string().contains("save it again"), "{error}");
+        // Without the key, nothing secret goes out, so the request may.
+        assert!(
+            config
+                .check_request("https://other.example.com/v1/models", false)
+                .is_ok()
+        );
+
+        // The saved host is compared as `url_host` gives it.
+        config.base_url = "http://[::1]:11434/v1".into();
+        config.key_host = Some("[::1]".into());
+        assert!(config.key_matches_host());
+        config.base_url = "https://API.EXAMPLE.com".into();
+        config.key_host = Some("Api.Example.Com".into());
+        assert!(config.key_matches_host());
+        // A base URL without a host never matches a saved host.
+        config.base_url = "nowhere".into();
+        assert!(!config.key_matches_host());
+    }
+
+    #[test]
+    fn tool_names_are_checked() {
+        assert!(check_tool_name("read_document").is_ok());
+        assert!(check_tool_name("a-B_9").is_ok());
+        assert!(check_tool_name(&"n".repeat(MAX_TOOL_NAME_BYTES)).is_ok());
+        for bad in [
+            String::new(),
+            "n".repeat(MAX_TOOL_NAME_BYTES + 1),
+            "read document".into(),
+            "read\u{1b}[2Jdocument".into(),
+            "名前".into(),
+            "a.b".into(),
+            "a/b".into(),
+        ] {
+            assert_eq!(
+                check_tool_name(&bad).unwrap_err().kind(),
+                "bad_response",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_and_sizes_are_bounded() {
+        let mut total = 0;
+        add_text(&mut total, &"字".repeat(MAX_RESPONSE_CHARS)).unwrap();
+        assert_eq!(add_text(&mut total, "x").unwrap_err().kind(), "too_large");
+        assert!(check_tool_count(MAX_TOOL_CALLS).is_ok());
+        assert!(check_tool_count(MAX_TOOL_CALLS + 1).is_err());
+        assert!(check_tool_input(MAX_TOOL_INPUT_BYTES).is_ok());
+        assert!(check_tool_input(MAX_TOOL_INPUT_BYTES + 1).is_err());
     }
 }

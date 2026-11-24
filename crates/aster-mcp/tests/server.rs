@@ -73,9 +73,23 @@ impl Approver for GateApprover {
 #[derive(Default)]
 struct Recorder {
     events: Mutex<Vec<String>>,
+    /// Connection ids are unique in the process, and tests run side by side:
+    /// events name connections by the order this server saw them, from 1.
+    ids: Mutex<Vec<u64>>,
 }
 
 impl Recorder {
+    fn local(&self, connection: u64) -> usize {
+        let mut ids = self.ids.lock().unwrap();
+        match ids.iter().position(|id| *id == connection) {
+            Some(index) => index + 1,
+            None => {
+                ids.push(connection);
+                ids.len()
+            }
+        }
+    }
+
     fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
     }
@@ -96,24 +110,26 @@ impl Recorder {
 
 impl McpEvents for Recorder {
     fn client_connected(&self, client: &McpClient) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("connected {} {}", client.connection, client.name));
+        self.events.lock().unwrap().push(format!(
+            "connected {} {}",
+            self.local(client.connection),
+            client.name
+        ));
     }
 
     fn client_disconnected(&self, connection: u64) {
         self.events
             .lock()
             .unwrap()
-            .push(format!("disconnected {connection}"));
+            .push(format!("disconnected {}", self.local(connection)));
     }
 
     fn tool_called(&self, connection: u64, tool: &str, result: &ToolResult) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("called {connection} {tool} {}", result.is_error));
+        self.events.lock().unwrap().push(format!(
+            "called {} {tool} {}",
+            self.local(connection),
+            result.is_error
+        ));
     }
 }
 
@@ -356,6 +372,32 @@ fn bad_messages_get_json_rpc_errors() {
     client.send(json!({"jsonrpc": "2.0", "method": "notifications/whatever"}));
     client.send_raw(b"\r\n\n");
     assert_eq!(client.request(5, "ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn a_server_started_again_gives_new_connection_ids() {
+    let mut first = fixture();
+    let mut client = Client::connect(&first.path);
+    client.initialize("one");
+    first.events.wait_for("connected 1 one");
+    let old = first.server.clients()[0].connection;
+    first.server.stop();
+    drop(client);
+    let path = first.path.clone();
+    let (invoker, _entered, _release) = invoker();
+    let events = Arc::new(Recorder::default());
+    let server = McpServer::start(
+        McpConfig {
+            socket_path: Some(path.clone()),
+        },
+        invoker,
+        events.clone(),
+    )
+    .unwrap();
+    let mut again = Client::connect(&path);
+    again.initialize("two");
+    events.wait_for("connected 1 two");
+    assert!(server.clients()[0].connection > old);
 }
 
 #[test]

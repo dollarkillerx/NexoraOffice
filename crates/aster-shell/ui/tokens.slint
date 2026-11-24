@@ -159,6 +159,8 @@ export global Strings {
     in property <string> approve-session;
     in property <string> approve-deny;
     in property <string> approval-timeout;
+    in property <string> approval-removed-label;
+    in property <string> approval-inserted-label;
     in property <string> ai-settings-title;
     in property <string> ai-provider;
     in property <string> provider-custom;
@@ -166,6 +168,8 @@ export global Strings {
     in property <string> ai-model;
     in property <string> ai-api-key;
     in property <string> ai-key-hint;
+    in property <string> ai-insecure;
+    in property <string> ai-allow-insecure;
     in property <string> ai-refresh-models;
     in property <string> ai-key-save;
     in property <string> ai-key-delete;
@@ -302,6 +306,10 @@ export struct ApprovalItem {
     title: string,
     // The tool, and who asked.
     detail: string,
+    // What it does, in a line: which lines, what is searched for.
+    facts: string,
+    // The text it would replace or delete, shortened; "" for none.
+    removed: string,
     // The text it would write, shortened.
     preview: string,
 }

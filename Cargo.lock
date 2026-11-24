@@ -400,7 +400,9 @@ dependencies = [
 name = "aster-platform"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "rfd",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -451,6 +453,7 @@ dependencies = [
  "aster-image",
  "aster-markdown",
  "aster-ooxml",
+ "aster-platform",
  "aster-sheets",
  "aster-slides",
  "aster-text",

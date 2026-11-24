@@ -649,3 +649,269 @@ fn a_provider_without_a_model_says_so() {
     let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
     assert_eq!(turn.result.unwrap_err().kind(), "not_configured");
 }
+
+#[test]
+fn many_calls_run_a_few_at_a_time_and_keep_their_order() {
+    use aster_ai::limits::MAX_PARALLEL_TOOL_CALLS;
+    let count = MAX_PARALLEL_TOOL_CALLS * 2 + 3;
+    let ids: Vec<String> = (0..count).map(|index| format!("call{index:02}")).collect();
+    let inputs: Vec<String> = (0..count)
+        .map(|index| format!(r#"{{"document": "{index}"}}"#))
+        .collect();
+    let blocks: Vec<Block> = (0..count)
+        .map(|index| Block::Tool(&ids[index], "read_document", &inputs[index]))
+        .collect();
+    let server = MockServer::start(vec![
+        Reply::stream(anthropic(&blocks, "tool_use")),
+        Reply::stream(anthropic(&[Block::Text("All read.")], "end_turn")),
+    ]);
+    let provider = anthropic_provider(&server);
+    let running = AtomicUsize::new(0);
+    let most = AtomicUsize::new(0);
+    let executor = |_: &str, input: &Value| {
+        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(now, Ordering::SeqCst);
+        // Later calls finish sooner, so finishing order differs from the
+        // calls' order.
+        let document: u64 = input["document"].as_str().unwrap().parse().unwrap();
+        thread::sleep(Duration::from_millis(150 - document * 5));
+        running.fetch_sub(1, Ordering::SeqCst);
+        ok(&format!("doc {document}"))
+    };
+    let turn = run_turn(&*provider, hello(), &executor, &AgentOptions::default());
+
+    assert_eq!(turn.result, Ok(TurnEnd::Finished));
+    assert_eq!(
+        most.load(Ordering::SeqCst),
+        MAX_PARALLEL_TOOL_CALLS,
+        "never more at once than the cap, and the cap was reached"
+    );
+    let finished = turn
+        .events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+        .count();
+    assert_eq!(finished, count);
+    let results = sent_results(&server.requests()[1]);
+    let sent: Vec<(&str, &str)> = results
+        .iter()
+        .map(|result| {
+            (
+                result["tool_use_id"].as_str().unwrap(),
+                result["content"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = (0..count)
+        .map(|index| (ids[index].clone(), format!("doc {index}")))
+        .collect();
+    let expected: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|(id, text)| (id.as_str(), text.as_str()))
+        .collect();
+    assert_eq!(sent, expected);
+}
+
+#[test]
+fn too_many_tool_calls_end_the_turn_with_nothing_run() {
+    use aster_ai::limits::MAX_TOOL_CALLS;
+    let ids: Vec<String> = (0..=MAX_TOOL_CALLS)
+        .map(|index| format!("c{index}"))
+        .collect();
+    let blocks: Vec<Block> = ids
+        .iter()
+        .map(|id| Block::Tool(id, "list_documents", "{}"))
+        .collect();
+    for openai_format in [false, true] {
+        let events = if openai_format {
+            openai(&blocks, "tool_calls")
+        } else {
+            anthropic(&blocks, "tool_use")
+        };
+        let server = MockServer::start(vec![Reply::stream(events)]);
+        let provider = if openai_format {
+            openai_provider(&server)
+        } else {
+            anthropic_provider(&server)
+        };
+        let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+        let error = turn.result.unwrap_err();
+        assert_eq!(error.kind(), "too_large", "{error}");
+        assert_eq!(turn.events.last(), Some(&AgentEvent::Error(error)));
+        assert_eq!(turn.conversation, hello(), "nothing of the reply is kept");
+    }
+}
+
+#[test]
+fn an_invalid_tool_name_ends_the_turn() {
+    for openai_format in [false, true] {
+        let blocks = [Block::Tool("c", "read_document\u{1b}[31m", "{}")];
+        let events = if openai_format {
+            openai(&blocks, "tool_calls")
+        } else {
+            anthropic(&blocks, "tool_use")
+        };
+        let server = MockServer::start(vec![Reply::stream(events)]);
+        let provider = if openai_format {
+            openai_provider(&server)
+        } else {
+            anthropic_provider(&server)
+        };
+        let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+        assert_eq!(turn.result.unwrap_err().kind(), "bad_response");
+    }
+}
+
+#[test]
+fn an_endless_line_ends_the_turn() {
+    use aster_ai::limits::MAX_EVENT_BYTES;
+    // A line with no end, sent in pieces well past the limit.
+    let mut pieces = vec![b"event: content_block_delta\ndata: ".to_vec()];
+    pieces.extend(std::iter::repeat_n(
+        vec![b'x'; 256 * 1024],
+        MAX_EVENT_BYTES / (256 * 1024) + 2,
+    ));
+    let server = MockServer::start(vec![Reply::Stream {
+        pieces,
+        pause: Duration::ZERO,
+        hold: Duration::ZERO,
+    }]);
+    let provider = anthropic_provider(&server);
+    let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+    assert_eq!(turn.result.unwrap_err().kind(), "too_large");
+}
+
+fn custom(base_url: &str) -> ProviderConfig {
+    let mut config = ProviderConfig::from_preset("custom", Preset::Custom);
+    config.base_url = base_url.into();
+    config.model = "test-model".into();
+    config
+}
+
+#[test]
+fn plain_http_is_refused_for_other_computers_before_anything_is_sent() {
+    let cancel = AtomicBool::new(false);
+    for base in [
+        "http://192.168.1.5:8080/v1",
+        "http://localhost.evil.com/v1",
+        "http://127.0.0.1@evil.com/v1",
+    ] {
+        let provider = connect(custom(base), Some("secret".into()));
+        let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+        let error = turn.result.unwrap_err();
+        assert_eq!(error.kind(), "not_configured", "{base}: {error}");
+        assert!(error.to_string().contains("http://"), "{error}");
+        let models = provider.list_models(&cancel).unwrap_err();
+        assert_eq!(models.kind(), "not_configured", "{base}");
+    }
+    // An Anthropic provider is held to the same rule.
+    let mut config = ProviderConfig::from_preset("a", Preset::Anthropic);
+    config.base_url = "http://192.168.1.5".into();
+    let turn = run_turn(
+        &*connect(config, None),
+        hello(),
+        &never,
+        &AgentOptions::default(),
+    );
+    assert_eq!(turn.result.unwrap_err().kind(), "not_configured");
+}
+
+#[test]
+fn loopback_over_http_works_and_ipv6_loopback_is_allowed() {
+    // The mock server is on 127.0.0.1, so the other tests cover that; here
+    // `localhost` by name and the IPv6 form, each with and without a key.
+    let server = MockServer::start(vec![
+        Reply::stream(openai(&[Block::Text("one")], "stop")),
+        Reply::json(json!({"data": [{"id": "m"}]})),
+    ]);
+    let port = server.base.rsplit(':').next().unwrap().to_string();
+    let provider = connect(custom(&format!("http://localhost:{port}/v1")), None);
+    let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+    assert_eq!(turn.result, Ok(TurnEnd::Finished), "{:?}", turn.result);
+    let cancel = AtomicBool::new(false);
+    assert_eq!(provider.list_models(&cancel).unwrap()[0].id, "m");
+    assert!(aster_ai::is_loopback_url(&format!(
+        "http://[::1]:{port}/v1"
+    )));
+}
+
+#[test]
+fn allow_insecure_lets_plain_http_through() {
+    // An address that is not loopback by its name but reaches the mock
+    // server: the IPv4-mapped form of 127.0.0.1. Without the setting it is
+    // refused; with it, the request goes.
+    let server = MockServer::start(vec![Reply::json(json!({"data": [{"id": "m"}]}))]);
+    let port = server.base.rsplit(':').next().unwrap().to_string();
+    let base = format!("http://[::ffff:127.0.0.1]:{port}/v1");
+    assert!(!aster_ai::is_loopback_url(&base));
+    let cancel = AtomicBool::new(false);
+    let refused = connect(custom(&base), None).list_models(&cancel);
+    assert_eq!(refused.unwrap_err().kind(), "not_configured");
+    let mut config = custom(&base);
+    config.allow_insecure = true;
+    let result = connect(config, None).list_models(&cancel);
+    // The mapped address may not be reachable on every system; what matters
+    // is that it was not refused by the check.
+    if let Err(error) = &result {
+        assert_ne!(error.kind(), "not_configured", "{error}");
+    } else {
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
+fn a_key_is_not_sent_to_another_host_than_it_was_saved_for() {
+    let server = MockServer::start(vec![
+        Reply::stream(openai(&[Block::Text("saved here")], "stop")),
+        Reply::stream(openai(&[Block::Text("old key")], "stop")),
+    ]);
+    let base = format!("{}/v1", server.base);
+
+    // Saved for another host: refused before anything is sent.
+    let mut elsewhere = custom(&base);
+    elsewhere.key_host = Some("api.example.com".into());
+    assert!(!elsewhere.key_matches_host());
+    let provider = connect(elsewhere.clone(), Some("secret".into()));
+    let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+    let error = turn.result.unwrap_err();
+    assert_eq!(error.kind(), "not_configured");
+    assert!(error.to_string().contains("save it again"), "{error}");
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        provider.list_models(&cancel).unwrap_err().kind(),
+        "not_configured"
+    );
+    assert!(server.requests().is_empty(), "nothing reached the server");
+
+    // Saved for this host: sent.
+    let mut here = custom(&base);
+    here.key_host = aster_ai::url_host(&base);
+    assert_eq!(here.key_host.as_deref(), Some("127.0.0.1"));
+    let turn = run_turn(
+        &*connect(here, Some("secret".into())),
+        hello(),
+        &never,
+        &AgentOptions::default(),
+    );
+    assert_eq!(turn.result, Ok(TurnEnd::Finished));
+
+    // Saved before hosts were kept: sent, as before.
+    let turn = run_turn(
+        &*connect(custom(&base), Some("old".into())),
+        hello(),
+        &never,
+        &AgentOptions::default(),
+    );
+    assert_eq!(turn.result, Ok(TurnEnd::Finished));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].header("authorization"), Some("Bearer secret"));
+    assert_eq!(requests[1].header("authorization"), Some("Bearer old"));
+
+    // Without a key there is nothing to protect, so a stale host does not
+    // block a keyless local server.
+    let server = MockServer::start(vec![Reply::json(json!({"data": []}))]);
+    let mut keyless = custom(&format!("{}/v1", server.base));
+    keyless.key_host = Some("api.example.com".into());
+    assert!(connect(keyless, None).list_models(&cancel).is_ok());
+}

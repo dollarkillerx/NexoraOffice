@@ -9,3 +9,10 @@ publish.workspace = true
 
 [dependencies]
 rfd = { workspace = true }
+
+# Telling local disks from network ones (volumes.rs).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

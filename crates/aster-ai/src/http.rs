@@ -44,7 +44,8 @@ fn install_crypto_provider() {
 }
 
 /// The HTTP agent the providers share their settings with. `http://` works
-/// too, for local models.
+/// too, for local models; which addresses may be reached that way is
+/// decided before a request gets here (`ProviderConfig::check_request`).
 pub(crate) fn agent() -> Agent {
     install_crypto_provider();
     let tls = TlsConfig::builder()

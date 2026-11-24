@@ -2,11 +2,15 @@
 //!
 //! The page carries its own small style sheet and no scripts. Addresses are
 //! written as they are in the source, so pictures next to the Markdown file
-//! show when the page is saved in the same folder. Raw HTML in the source
-//! is passed through, as every Markdown renderer does; the page is the
-//! user's own document.
+//! show when the page is saved in the same folder.
+//!
+//! Raw HTML in the source is written out as text, not as markup: a document
+//! may hold text an assistant, an MCP client or someone else put there, and
+//! the page should not run its scripts, event handlers or load what its
+//! tags point at when it is opened. Links with `javascript:`, `vbscript:`
+//! or `data:` addresses lose them.
 
-use pulldown_cmark::{Parser, html};
+use pulldown_cmark::{CowStr, Event, Parser, Tag, html};
 
 use crate::syntax;
 
@@ -28,8 +32,59 @@ code,pre{background:#2a2a2d}a{color:#a891f0}th,td,hr,blockquote{border-color:#3a
 /// The HTML of the document's body: what the Markdown renders to.
 pub fn body(source: &str) -> String {
     let mut out = String::with_capacity(source.len() * 3 / 2);
-    html::push_html(&mut out, Parser::new_ext(source, syntax::options()));
+    let events = Parser::new_ext(source, syntax::options()).map(|event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: safe_address(dest_url, false),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: safe_address(dest_url, true),
+            title,
+            id,
+        }),
+        other => other,
+    });
+    html::push_html(&mut out, events);
     out
+}
+
+/// An address that cannot run code: `javascript:` and `vbscript:` go, and so
+/// does `data:` except for a picture's own data.
+fn safe_address(address: CowStr<'_>, picture: bool) -> CowStr<'_> {
+    let scheme: String = address
+        .trim_start()
+        .chars()
+        .take_while(|c| *c != ':')
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let unsafe_scheme = address.contains(':')
+        && (scheme == "javascript"
+            || scheme == "vbscript"
+            || (scheme == "data"
+                && !(picture
+                    && address
+                        .split_once(':')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with("image/")))));
+    if unsafe_scheme {
+        CowStr::Borrowed("#")
+    } else {
+        address
+    }
 }
 
 /// A whole HTML page for `source`, with `title` in its head.
@@ -77,5 +132,31 @@ mod tests {
         assert!(page.contains("type=\"checkbox\""));
         assert!(page.contains("<img src=\"pic.png\" alt=\"图\""));
         assert!(!page.contains("<script"));
+    }
+
+    #[test]
+    fn raw_html_and_script_addresses_do_not_survive() {
+        let page = body(
+            "<script>alert(1)</script>\n\n文字 <img src=\"https://track.example/p.gif\" onerror=\"x()\"> 后\n\n\
+             [点我](javascript:alert(1)) [也不行]( JaVaScRiPt:x) [数据](data:text/html,<b>x</b>)\n\n\
+             ![图](data:image/png;base64,AAAA) ![坏图](javascript:x) [正常](https://example.com)",
+        );
+        assert!(!page.contains("<script"), "{page}");
+        assert!(
+            page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{page}"
+        );
+        assert!(!page.contains("<img src=\"https://track.example"), "{page}");
+        assert!(!page.contains("javascript:"), "{page}");
+        assert!(!page.contains("JaVaScRiPt:"), "{page}");
+        assert!(!page.contains("data:text/html"), "{page}");
+        assert!(
+            page.contains("<img src=\"data:image/png;base64,AAAA\""),
+            "{page}"
+        );
+        assert!(
+            page.contains("<a href=\"https://example.com\">正常</a>"),
+            "{page}"
+        );
     }
 }

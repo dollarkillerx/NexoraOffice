@@ -77,6 +77,8 @@ export component AppWindow inherits Window {
     in property <string> mcp-setup-json;
     in property <[string]> ai-models;
     in property <string> ai-models-state;
+    in property <bool> ai-insecure;
+    in property <bool> ai-allow-insecure;
     callback ai-send(string);
     callback ai-stop();
     callback ai-new-chat();
@@ -93,6 +95,7 @@ export component AppWindow inherits Window {
     callback mcp-set-enabled(bool);
     callback ai-pick-model(string);
     callback ai-refresh-models();
+    callback ai-set-allow-insecure(bool);
     in property <[string]> languages;
     in property <int> language-index;
     // Room for the window buttons where the tab strip doubles as the title bar.
@@ -1168,6 +1171,11 @@ export component AppWindow inherits Window {
                 mcp-setup-json: root.mcp-setup-json;
                 models: root.ai-models;
                 models-state: root.ai-models-state;
+                insecure: root.ai-insecure;
+                allow-insecure: root.ai-allow-insecure;
+                set-allow-insecure(on) => {
+                    root.ai-set-allow-insecure(on);
+                }
                 pick-model(id) => {
                     root.ai-pick-model(id);
                 }

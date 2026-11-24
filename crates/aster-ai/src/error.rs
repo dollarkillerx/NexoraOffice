@@ -34,8 +34,12 @@ pub enum AiError {
     Cancelled,
     /// The provider answered with something this crate cannot read.
     BadResponse(String),
-    /// The provider is not set up well enough to be called: no model chosen.
+    /// The provider is not set up well enough to be called: no model
+    /// chosen, an address that is refused, a key saved for another address.
     NotConfigured(String),
+    /// The reply went past one of the [`limits`](crate::limits): a line, the
+    /// text, a tool input or the number of tool calls.
+    TooLarge(String),
 }
 
 impl AiError {
@@ -50,6 +54,7 @@ impl AiError {
             AiError::Cancelled => "cancelled",
             AiError::BadResponse(_) => "bad_response",
             AiError::NotConfigured(_) => "not_configured",
+            AiError::TooLarge(_) => "too_large",
         }
     }
 
@@ -104,6 +109,7 @@ impl fmt::Display for AiError {
             AiError::Cancelled => write!(f, "Stopped"),
             AiError::BadResponse(message) => write!(f, "Unexpected reply: {message}"),
             AiError::NotConfigured(message) => write!(f, "Not set up: {message}"),
+            AiError::TooLarge(message) => write!(f, "The reply is too large: {message}"),
         }
     }
 }

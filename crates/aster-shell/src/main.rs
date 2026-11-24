@@ -934,6 +934,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_link(strings.format_link.into());
     s.set_format_image(strings.format_image.into());
     s.set_format_table(strings.format_table.into());
+    s.set_notes_title(strings.notes_title.into());
+    s.set_notes_empty(strings.notes_empty.into());
+    s.set_notes_show(strings.notes_show.into());
+    s.set_notes_hide(strings.notes_hide.into());
     ui.set_heading_names(model(
         toolbar::heading_names(strings)
             .into_iter()
@@ -2544,12 +2548,21 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         } else {
             ""
         };
+        let notes = tab
+            .view
+            .presentation()
+            .slides
+            .get(tab.view.current())
+            .and_then(|slide| slide.notes.clone())
+            .unwrap_or_default();
         ui.set_viewer(2);
         ui.set_viewer_note(note.into());
+        ui.set_slide_notes(notes.into());
         return;
     }
     ui.set_viewer(0);
     ui.set_viewer_note(SharedString::new());
+    ui.set_slide_notes(SharedString::new());
 }
 
 /// A key on a viewer, decoded from what Slint reports.

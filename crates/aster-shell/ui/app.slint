@@ -16,6 +16,7 @@ import { RecoveryDialog } from "recovery.slint";
 import { Hairline } from "widgets.slint";
 import { FindBar } from "findbar.slint";
 import { FormulaBar, SheetBar } from "sheetbar.slint";
+import { NotesPanel } from "notes.slint";
 
 export { Tokens, Icons, Strings }
 
@@ -133,6 +134,9 @@ export component AppWindow inherits Window {
     // Shown over a viewer's surface: a chart sheet, a presentation without
     // slides.
     in property <string> viewer-note;
+    // The current slide's speaker notes, and whether their panel is open.
+    in property <string> slide-notes;
+    in-out property <bool> notes-expanded: true;
 
     // Writer and Markdown tabs and the viewers show the custom-drawn surface.
     property <bool> surface-active: root.active-kind == 0 || root.active-kind == 3 || root.viewer > 0;
@@ -809,9 +813,21 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    notes-panel := NotesPanel {
+                        x: 0;
+                        y: parent.height - self.height;
+                        width: parent.width;
+                        visible: root.viewer == 2 && root.viewer-note == "";
+                        text: root.slide-notes;
+                        expanded: root.notes-expanded;
+                        toggled => {
+                            root.notes-expanded = !root.notes-expanded;
+                        }
+                    }
+
                     surface := Rectangle {
                         y: findbar.visible ? findbar.height : formula-bar.visible ? formula-bar.height : 0px;
-                        height: parent.height - self.y - (sheet-bar.visible ? sheet-bar.height : 0px);
+                        height: parent.height - self.y - (sheet-bar.visible ? sheet-bar.height : notes-panel.visible ? notes-panel.height : 0px);
                         visible: root.surface-active;
                         // The source takes the whole width, the left half, or
                         // nothing; the preview the rest, after a hairline.

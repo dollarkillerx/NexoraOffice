@@ -1,0 +1,77 @@
+// The speaker notes of the current slide, under a Slides tab: read-only,
+// and folded down to its header with the chevron or a click on the header.
+
+import { Tokens, Strings, Icons } from "tokens.slint";
+import { IconButton } from "widgets.slint";
+
+export component NotesPanel inherits Rectangle {
+    in property <string> text;
+    in property <bool> expanded: true;
+    callback toggled();
+    property <length> header-height: Tokens.control-height + 2 * Tokens.space-xs;
+    property <length> body-height: 120px;
+    height: root.expanded ? self.header-height + self.body-height : self.header-height;
+    background: Tokens.panel;
+    clip: true;
+
+    Rectangle {
+        y: 0;
+        height: 1px;
+        background: Tokens.hairline;
+    }
+
+    header := Rectangle {
+        y: 1px;
+        height: root.header-height - 1px;
+        background: touch.has-hover ? Tokens.hover : transparent;
+
+        touch := TouchArea {
+            clicked => {
+                root.toggled();
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: Tokens.space-md;
+            padding-right: Tokens.space-xs;
+            spacing: Tokens.space-sm;
+            Text {
+                text: Strings.notes-title;
+                color: Tokens.text-secondary;
+                font-size: Tokens.font-sm;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: root.expanded ? Icons.chevron-down : Icons.chevron-up;
+                accessible-role: button;
+                accessible-label: root.expanded ? Strings.notes-hide : Strings.notes-show;
+                clicked => {
+                    root.toggled();
+                }
+            }
+        }
+    }
+
+    if root.expanded: Flickable {
+        y: root.header-height;
+        height: root.body-height;
+        width: parent.width;
+        content-height: body.preferred-height;
+        body := VerticalLayout {
+            padding-left: Tokens.space-md;
+            padding-right: Tokens.space-md;
+            padding-bottom: Tokens.space-sm;
+            Text {
+                text: root.text != "" ? root.text : Strings.notes-empty;
+                color: root.text != "" ? Tokens.text : Tokens.text-tertiary;
+                font-size: Tokens.font-md;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

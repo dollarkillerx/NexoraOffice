@@ -1,6 +1,6 @@
 # Aster Office
 
-用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。`crates/aster-shell` 是应用外壳的原型，可以打开看界面；Markdown 标签能打开、编辑、保存真实的文本文件（100 MB 也可以），源码有语法高亮，可以分屏预览（预览按中日文禁则断行，能选中复制），可以查找替换；侧边栏列出最近打开的文件和一个打开的文件夹。Excel（.xlsx）和 PowerPoint（.pptx）文件可以打开查看：工作簿显示网格、数字格式、合并单元格，公式由 formualizer 重新计算；演示文稿显示幻灯片里的文字和形状轮廓。这两种都只读，Writer 和 PDF 还是占位。
+用 Rust 编写的原生、离线优先的开源办公套件，面向 macOS、Windows 和 Linux。目前处于 Phase 0：用一组小型验证工程回答“这条技术路线走不走得通”，还没有可用的产品。`crates/aster-shell` 是应用外壳的原型，可以打开看界面；Markdown 标签能打开、编辑、保存真实的文本文件（100 MB 也可以），源码有语法高亮，可以分屏预览（预览按中日文禁则断行，能选中复制），可以查找替换；侧边栏列出最近打开的文件和一个打开的文件夹。Excel（.xlsx）和 PowerPoint（.pptx）文件可以打开查看：工作簿显示网格、数字格式、单元格样式、合并单元格、冻结窗格和图片，公式由 formualizer 重新计算；演示文稿按自己的背景、主题颜色和字体显示幻灯片，包括图片、表格和演讲者备注。这两种都只读，Writer 和 PDF 还是占位。
 
 ## 仓库结构
 
@@ -13,9 +13,10 @@
 | `crates/aster-storage` | 原子写入和崩溃恢复（命令日志、检查点、恢复记录），来自 G6 关卡 |
 | `crates/aster-platform` | 系统的打开、保存和选择文件夹对话框，打开网页和邮件链接，在访达或文件管理器里显示文件，应用数据目录 |
 | `crates/aster-ooxml` | Office Open XML：我们自己的包层（按需解压、安全限额、内容类型、关系，ADR 0001），XLSX 和 PPTX 的读取器。还不写回 |
-| `crates/aster-sheets` | Sheets 的模型：工作簿、稀疏单元格、行高列宽、合并单元格、数字格式、共享公式展开，以及 `CalcEngine` 接口 |
+| `crates/aster-sheets` | Sheets 的模型：工作簿、稀疏单元格、行高列宽、合并单元格、数字格式、单元格样式、冻结窗格、图片锚点、共享公式展开，以及 `CalcEngine` 接口 |
 | `crates/aster-calc` | 计算引擎的适配器：formualizer 接在 `CalcEngine` 后面（ADR 0002），只从我们的模型取输入 |
-| `crates/aster-slides` | Slides 的模型：幻灯片、形状、文字框；母版和版式的继承由读取器解析好 |
+| `crates/aster-slides` | Slides 的模型：幻灯片、形状、文字框、填充和线条、图片、表格、背景、演讲者备注；母版、版式和主题由读取器解析好 |
+| `crates/aster-image` | 文档里的图片：PNG 和 JPEG 解码，有像素数上限，大图缩小 |
 | `crates/aster-workspace` | 文档周围的文件：最近文件列表、侧边栏的文件夹树（一次读一个文件夹）、重启后记住的文件夹 |
 | `spikes/` | Phase 0 的验证工程，每道关卡一个，各自带说明和结果 |
 | `assets/brand/` | Logo、图标和品牌说明 |

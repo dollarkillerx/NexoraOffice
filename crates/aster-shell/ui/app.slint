@@ -159,6 +159,13 @@ export component AppWindow inherits Window {
     // The styles at the caret, for check marks in the Format menu: block 0
     // none, 1 bullets, 2 numbers, 3 tasks, 4 quote; heading 0 body text.
     in property <bool> mark-bold;
+    // The active cell of a workbook, for the Format menu's checks.
+    in property <bool> cell-bold;
+    in property <bool> cell-italic;
+    in property <bool> cell-underline;
+    in property <bool> cell-strike;
+    // The Format menu's character formats act on a workbook's cells.
+    property <bool> sheet-formatting: root.viewer == 1 && root.can-save;
     in property <bool> mark-italic;
     in property <bool> mark-strike;
     in property <bool> mark-code;
@@ -264,6 +271,8 @@ export component AppWindow inherits Window {
     // 4 bulleted list, 5 numbered list, 6 task list, 7 quote, 8 link,
     // 9 image, 10 table, 20 body text, 21 to 26 heading levels.
     callback format(int);
+    // Bold, italic, underline, strikethrough (0–3) of a workbook's cells.
+    callback sheet-format(int);
     // Body text and heading levels 1 to 6, for the Format menu.
     in property <[string]> heading-names: ["", "", "", "", "", "", ""];
     callback file-new();
@@ -692,31 +701,54 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-bold;
-                checked: root.formatting && root.mark-bold;
+                checked: (root.formatting && root.mark-bold) || (root.sheet-formatting && root.cell-bold);
                 shortcut: @keys(Control + B);
-                enabled: root.formatting;
+                enabled: root.formatting || root.sheet-formatting;
                 activated => {
-                    root.format(0);
+                    if (root.sheet-formatting) {
+                        root.sheet-format(0);
+                    } else {
+                        root.format(0);
+                    }
                 }
             }
 
             MenuItem {
                 title: Strings.format-italic;
-                checked: root.formatting && root.mark-italic;
+                checked: (root.formatting && root.mark-italic) || (root.sheet-formatting && root.cell-italic);
                 shortcut: @keys(Control + I);
-                enabled: root.formatting;
+                enabled: root.formatting || root.sheet-formatting;
                 activated => {
-                    root.format(1);
+                    if (root.sheet-formatting) {
+                        root.sheet-format(1);
+                    } else {
+                        root.format(1);
+                    }
+                }
+            }
+
+            // Markdown has no underline; workbooks do.
+            MenuItem {
+                title: Strings.format-underline;
+                checked: root.sheet-formatting && root.cell-underline;
+                shortcut: @keys(Control + U);
+                enabled: root.sheet-formatting;
+                activated => {
+                    root.sheet-format(2);
                 }
             }
 
             MenuItem {
                 title: Strings.format-strike;
-                checked: root.formatting && root.mark-strike;
+                checked: (root.formatting && root.mark-strike) || (root.sheet-formatting && root.cell-strike);
                 shortcut: @keys(Control + Shift + X);
-                enabled: root.formatting;
+                enabled: root.formatting || root.sheet-formatting;
                 activated => {
-                    root.format(2);
+                    if (root.sheet-formatting) {
+                        root.sheet-format(3);
+                    } else {
+                        root.format(2);
+                    }
                 }
             }
 

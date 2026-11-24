@@ -1085,6 +1085,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_bold(strings.format_bold.into());
     s.set_format_italic(strings.format_italic.into());
     s.set_format_strike(strings.format_strike.into());
+    s.set_format_underline(strings.format_underline.into());
     s.set_format_code(strings.format_code.into());
     s.set_format_code_block(strings.format_code_block.into());
     s.set_format_rule(strings.format_rule.into());
@@ -1328,6 +1329,10 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     {
         use aster_markdown::format::Block;
         let styles = view.styles;
+        ui.set_cell_bold(view.cell.bold);
+        ui.set_cell_italic(view.cell.italic);
+        ui.set_cell_underline(view.cell.underline);
+        ui.set_cell_strike(view.cell.strike);
         ui.set_mark_bold(styles.bold);
         ui.set_mark_italic(styles.italic);
         ui.set_mark_strike(styles.strike);
@@ -1466,12 +1471,14 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             }
             match &tab.refusal {
                 Some(office::Refusal::Holds(what)) => {
-                    notice = i18n::fill(strings.lines_refused, "what", what);
+                    let what = blocker_label(strings, what);
+                    notice = i18n::fill(strings.lines_refused, "what", &what);
                 }
                 Some(office::Refusal::Full) => notice = strings.lines_full.to_owned(),
                 Some(office::Refusal::LastSheet) => notice = strings.sheet_last.to_owned(),
                 Some(office::Refusal::SheetHolds(what)) => {
-                    notice = i18n::fill(strings.sheet_holds, "what", what);
+                    let what = blocker_label(strings, what);
+                    notice = i18n::fill(strings.sheet_holds, "what", &what);
                 }
                 None => {}
             }
@@ -3244,6 +3251,25 @@ enum Prompt {
     Rename(PathBuf),
     /// A new name for a sheet of this workbook.
     RenameSheet(TabId, usize),
+}
+
+/// What stops rows, columns or a sheet from changing, as a user would say
+/// it: the file names it by its part or element (`vmlDrawing`, `extLst`).
+fn blocker_label(strings: &i18n::Strings, what: &str) -> String {
+    match what {
+        "table" | "tableParts" | "queryTable" => strings.blocker_table.to_owned(),
+        "comments" | "vmlDrawing" | "legacyDrawing" | "threadedComment" | "person" => {
+            strings.blocker_comments.to_owned()
+        }
+        "pivotTable" | "pivotCacheDefinition" => strings.blocker_pivot.to_owned(),
+        "chart" => strings.blocker_chart.to_owned(),
+        "autoFilter" | "sortState" => strings.blocker_filter.to_owned(),
+        "extLst" => strings.blocker_newer.to_owned(),
+        "oleObjects" | "oleObject" | "controls" | "ctrlProp" | "package" | "control" => {
+            strings.blocker_objects.to_owned()
+        }
+        other => i18n::fill(strings.blocker_other, "name", other),
+    }
 }
 
 /// Why a sheet cannot have the name typed.
@@ -5081,6 +5107,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             apply_format(&ui, shell, format);
         }
     }));
+    // The same menu items on a workbook: bold, italic, underline and
+    // strikethrough of the selected cells, as the toolbar does.
+    ui.on_sheet_format(handler!(|ui, shell, code| {
+        let command = match code {
+            0 => Command::Bold,
+            1 => Command::Italic,
+            2 => Command::Underline,
+            _ => Command::Strikethrough,
+        };
+        if shell.run(command) {
+            refresh_toolbar(&ui, shell);
+            after_edit(&ui, shell, true);
+        }
+    }));
 
     for (command, register) in [
         (
@@ -6274,6 +6314,16 @@ mod tests {
             ..TextFormat::default()
         };
         assert_eq!(format_label(&japanese), "Shift_JIS · LF");
+    }
+
+    #[test]
+    fn what_stops_a_change_is_said_in_plain_words() {
+        let strings = i18n::Language::ZhHans.strings();
+        assert_eq!(blocker_label(strings, "vmlDrawing"), "批注");
+        assert_eq!(blocker_label(strings, "comments"), "批注");
+        assert_eq!(blocker_label(strings, "table"), "Excel 表");
+        assert_eq!(blocker_label(strings, "extLst"), strings.blocker_newer);
+        assert!(blocker_label(strings, "scenarios").contains("scenarios"));
     }
 
     #[test]

@@ -227,7 +227,15 @@ impl Command {
                     | Command::NumberedList
                     | Command::Present
             ),
-            DocKind::Pdf => false,
+            DocKind::Pdf => matches!(
+                self,
+                Command::PageThumbnails
+                    | Command::PageNumber
+                    | Command::ZoomOut
+                    | Command::ZoomReset
+                    | Command::ZoomIn
+                    | Command::FitWidth
+            ),
         }
     }
 
@@ -386,6 +394,10 @@ pub struct ViewState {
     pub slide_list: u8,
     /// Slides tabs: there is a slide to put things on.
     pub has_slide: bool,
+    /// PDF tabs: the page on screen (from 1) and the number of pages.
+    pub page: (usize, usize),
+    /// PDF tabs: the page thumbnails are shown.
+    pub thumbnails: bool,
 }
 
 /// How the active cell of a workbook looks, for the toolbar.
@@ -508,6 +520,8 @@ impl Default for ViewState {
             slide_text: false,
             slide_list: 0,
             has_slide: false,
+            page: (0, 0),
+            thumbnails: false,
         }
     }
 }
@@ -600,7 +614,8 @@ impl Builder {
                 && (ViewMode::of(command) == Some(self.view.view_mode)
                     || (self.kind == DocKind::Markdown && self.view.has(command))
                     || (matches!(self.kind, DocKind::Sheets | DocKind::Slides)
-                        && self.view.cell_has(command))),
+                        && self.view.cell_has(command))
+                    || (command == Command::PageThumbnails && self.view.thumbnails)),
             options: Vec::new(),
         });
         self
@@ -913,7 +928,11 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
         DocKind::Pdf => {
             b.icon(Icon::Thumbnails, Command::PageThumbnails)
                 .sep()
-                .value("1 / 1".to_owned(), 56.0, Command::PageNumber)
+                .value(
+                    format!("{} / {}", view.page.0.max(1), view.page.1.max(1)),
+                    72.0,
+                    Command::PageNumber,
+                )
                 .sep()
                 .zoom(view)
                 .icon(Icon::FitWidth, Command::FitWidth)
@@ -1147,6 +1166,17 @@ mod tests {
                         Command::BulletList,
                         Command::NumberedList,
                         Command::Present
+                    ]
+                ),
+                DocKind::Pdf => assert_eq!(
+                    enabled,
+                    [
+                        Command::PageThumbnails,
+                        Command::PageNumber,
+                        Command::ZoomOut,
+                        Command::ZoomReset,
+                        Command::ZoomIn,
+                        Command::FitWidth
                     ]
                 ),
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),

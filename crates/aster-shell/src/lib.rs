@@ -13,6 +13,7 @@ pub mod files;
 pub mod i18n;
 pub mod icons;
 pub mod office;
+pub mod pdf;
 pub mod recovery;
 pub mod sheet_tools;
 pub mod sidebar;

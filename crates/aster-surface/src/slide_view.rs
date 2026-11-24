@@ -1218,7 +1218,7 @@ fn style(size: f32, bold: bool, italic: bool, underline: bool) -> TextStyle {
     }
 }
 
-fn simple(
+pub(crate) fn simple(
     shaper: &mut Shaper,
     text: &str,
     size: f32,

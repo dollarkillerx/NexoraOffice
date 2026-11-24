@@ -103,6 +103,7 @@ export component AppWindow inherits Window {
     in property <string> prompt-problem;
     in property <bool> prompt-multiline;
     in-out property <string> prompt-text;
+    in property <bool> prompt-secret;
     callback prompt-accept();
     callback prompt-cancel();
     callback menu-go-to-line();
@@ -2014,6 +2015,7 @@ export component AppWindow inherits Window {
         problem: root.prompt-problem;
         multiline: root.prompt-multiline;
         text <=> root.prompt-text;
+        secret: root.prompt-secret;
         confirmed => {
             root.prompt-accept();
         }

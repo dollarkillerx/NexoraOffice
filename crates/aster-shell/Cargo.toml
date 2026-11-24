@@ -16,6 +16,7 @@ aster-image = { workspace = true }
 aster-ooxml = { workspace = true }
 aster-platform = { workspace = true }
 aster-sheets = { workspace = true }
+aster-pdf = { workspace = true }
 aster-slides = { workspace = true }
 aster-storage = { workspace = true }
 aster-tools = { workspace = true }

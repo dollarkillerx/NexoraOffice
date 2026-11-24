@@ -5,6 +5,9 @@ export component LabeledInput inherits VerticalLayout {
     in property <string> label;
     // Several lines: Return starts a new line instead of accepting.
     in property <bool> multiline;
+    // Shown as dots, for passwords. Always a single line.
+    in property <bool> secret;
+    property <bool> multi: root.multiline && !root.secret;
     in-out property <string> text;
     callback accepted();
     spacing: 4px;
@@ -21,7 +24,7 @@ export component LabeledInput inherits VerticalLayout {
     }
 
     Rectangle {
-        height: root.multiline ? 5 * Tokens.control-height : Tokens.control-height;
+        height: root.multi ? 5 * Tokens.control-height : Tokens.control-height;
         border-radius: Tokens.radius-md;
         border-width: 1px;
         border-color: input.has-focus ? Tokens.accent : Tokens.hairline;
@@ -29,12 +32,13 @@ export component LabeledInput inherits VerticalLayout {
         clip: true;
         input := TextInput {
             x: Tokens.space-sm;
-            y: root.multiline ? Tokens.space-xs + 2px : 0px;
+            y: root.multi ? Tokens.space-xs + 2px : 0px;
             width: parent.width - 2 * Tokens.space-sm;
-            height: root.multiline ? parent.height - 2 * (Tokens.space-xs + 2px) : parent.height;
-            vertical-alignment: root.multiline ? top : center;
-            single-line: !root.multiline;
-            wrap: root.multiline ? word-wrap : no-wrap;
+            height: root.multi ? parent.height - 2 * (Tokens.space-xs + 2px) : parent.height;
+            vertical-alignment: root.multi ? top : center;
+            single-line: !root.multi;
+            wrap: root.multi ? word-wrap : no-wrap;
+            input-type: root.secret ? InputType.password : InputType.text;
             font-size: Tokens.font-md;
             color: Tokens.text;
             text <=> root.text;

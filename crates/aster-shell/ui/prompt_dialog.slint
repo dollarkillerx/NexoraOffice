@@ -13,6 +13,8 @@ export component PromptDialog inherits Rectangle {
     // accepts.
     in property <bool> multiline;
     in-out property <string> text;
+    // The text is a password: shown as dots.
+    in property <bool> secret;
     callback confirmed();
     callback dismissed();
     background: #00000040;
@@ -64,6 +66,7 @@ export component PromptDialog inherits Rectangle {
                 input := LabeledInput {
                     label: root.label;
                     multiline: root.multiline;
+                    secret: root.secret;
                     text <=> root.text;
                     accepted => {
                         root.confirmed();

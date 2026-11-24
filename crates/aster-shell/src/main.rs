@@ -35,6 +35,7 @@ use aster_shell::files::{self, Dropped, LoadError};
 use aster_shell::i18n::{self, Language};
 use aster_shell::icons::Icon;
 use aster_shell::office::{self, SheetTab, SlidesTab};
+use aster_shell::pdf::{self, PdfTab};
 use aster_shell::recovery::{self, Age, Candidate, RecordInfo};
 use aster_shell::sidebar::{self, Look, SIDEBAR_RECENT};
 use aster_shell::stats::{ImeState, TextStats, group_digits};
@@ -85,7 +86,9 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 /// Extensions offered in the open and save dialogs.
 const TEXT_EXTENSIONS: &[&str] = &["md", "markdown", "txt"];
 /// Everything the open dialog offers at once.
-const SUPPORTED_EXTENSIONS: &[&str] = &["md", "markdown", "txt", "xlsx", "xlsm", "pptx", "pptm"];
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "xlsx", "xlsm", "pptx", "pptm", "pdf",
+];
 
 /// What a tab holds. Untitled Sheets, Slides and PDF tabs hold nothing yet.
 enum Content {
@@ -96,6 +99,8 @@ enum Content {
     Sheet(Box<SheetTab>),
     /// A presentation from a file or a new one.
     Slides(Box<SlidesTab>),
+    /// A PDF file, read-only.
+    Pdf(Box<PdfTab>),
 }
 
 impl Content {
@@ -105,6 +110,7 @@ impl Content {
             Content::Markdown(editor) => &mut editor.surface,
             Content::Sheet(tab) => &mut tab.view,
             Content::Slides(tab) => &mut tab.view,
+            Content::Pdf(tab) => &mut tab.view,
         }
     }
 
@@ -112,7 +118,7 @@ impl Content {
         match self {
             Content::Writer(view) => view.stats,
             Content::Markdown(editor) => editor.stats,
-            Content::Sheet(_) | Content::Slides(_) => TextStats::default(),
+            Content::Sheet(_) | Content::Slides(_) | Content::Pdf(_) => TextStats::default(),
         }
     }
 
@@ -122,6 +128,7 @@ impl Content {
             Content::Markdown(editor) => editor.path.as_deref(),
             Content::Sheet(tab) => tab.path.as_deref(),
             Content::Slides(tab) => tab.path.as_deref(),
+            Content::Pdf(tab) => Some(&tab.path),
             Content::Writer(_) => None,
         }
     }
@@ -176,6 +183,12 @@ struct SaveJob {
     point: SavePoint,
 }
 
+/// A PDF file being opened: its worker, until the file is open or fails.
+struct PdfLoad {
+    path: PathBuf,
+    worker: aster_pdf::Worker,
+}
+
 struct Shell {
     tabs: Tabs,
     contents: HashMap<TabId, Content>,
@@ -228,6 +241,11 @@ struct Shell {
     preview_builder: Option<PreviewBuilder>,
     /// Files being read and prepared on a worker thread.
     opening: Vec<PathBuf>,
+    /// PDF files being opened, by the token their worker's events carry.
+    pdf_loads: HashMap<u64, PdfLoad>,
+    next_pdf_token: u64,
+    /// The PDF page and zoom the toolbar and status bar show.
+    shown_pdf: Option<(usize, u32)>,
     /// Runs once typing has paused, to bring the preview up to date.
     preview_timer: Timer,
     /// Runs once typing has paused, to search again with the find bar open.
@@ -296,6 +314,9 @@ impl Shell {
             dropdown: None,
             move_copy: None,
             opening: Vec::new(),
+            pdf_loads: HashMap::new(),
+            next_pdf_token: 1,
+            shown_pdf: None,
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
             recent: RecentFiles::default(),
@@ -350,6 +371,13 @@ impl Shell {
     fn active_slides(&mut self) -> Option<&mut SlidesTab> {
         match self.active_content()? {
             Content::Slides(tab) => Some(&mut **tab),
+            _ => None,
+        }
+    }
+
+    fn active_pdf(&mut self) -> Option<&mut PdfTab> {
+        match self.active_content()? {
+            Content::Pdf(tab) => Some(&mut **tab),
             _ => None,
         }
     }
@@ -526,6 +554,26 @@ impl Shell {
         };
         let id = self.tabs.open(DocKind::Slides, title);
         self.contents.insert(id, Content::Slides(Box::new(content)));
+        id
+    }
+
+    /// Show a PDF file the worker has opened.
+    fn open_pdf(
+        &mut self,
+        path: PathBuf,
+        token: u64,
+        worker: aster_pdf::Worker,
+        info: aster_pdf::Info,
+    ) -> TabId {
+        self.leave_active_document();
+        if let Some(id) = self.tab_of_file(&path) {
+            self.tabs.activate(id);
+            return id;
+        }
+        let title = files::display_name(&path);
+        let id = self.tabs.open(DocKind::Pdf, title);
+        let tab = PdfTab::new(path, token, worker, info, &self.tokens);
+        self.contents.insert(id, Content::Pdf(Box::new(tab)));
         id
     }
 
@@ -841,6 +889,7 @@ impl Shell {
                 Content::Markdown(editor) => editor.restyle(&self.tokens),
                 Content::Sheet(tab) => tab.restyle(&self.tokens),
                 Content::Slides(tab) => tab.restyle(&self.tokens, strings),
+                Content::Pdf(tab) => tab.restyle(&self.tokens),
             }
         }
     }
@@ -928,6 +977,15 @@ impl Shell {
                     return false;
                 }
                 editor.set_zoom(percent, &tokens);
+                true
+            }
+            (Some(Content::Pdf(tab)), Command::ZoomIn) => tab.zoom(Some(true)),
+            (Some(Content::Pdf(tab)), Command::ZoomOut) => tab.zoom(Some(false)),
+            (Some(Content::Pdf(tab)), Command::ZoomReset) => tab.zoom(None),
+            (Some(Content::Pdf(tab)), Command::FitWidth) => tab.fit(),
+            (Some(Content::Pdf(tab)), Command::PageThumbnails) => {
+                let on = tab.view.strip_on();
+                tab.view.set_strip(!on);
                 true
             }
             (
@@ -1537,7 +1595,14 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         return;
     };
     let view = ViewState {
-        zoom_percent: shell.active_writer().map_or(100, |view| view.zoom_percent),
+        zoom_percent: match shell.active_pdf() {
+            Some(tab) => tab.view.zoom_percent() as u32,
+            None => shell.active_writer().map_or(100, |view| view.zoom_percent),
+        },
+        page: shell
+            .active_pdf()
+            .map_or((0, 0), |tab| (tab.view.current() + 1, tab.view.count())),
+        thumbnails: shell.active_pdf().is_some_and(|tab| tab.view.strip_on()),
         can_undo,
         can_redo,
         view_mode: shell
@@ -1620,6 +1685,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
     // Workbooks and presentations can be edited and saved.
     ui.set_status_note(
         match kind {
+            Some(DocKind::Pdf) if shell.active_pdf().is_some() => strings.read_only_note,
             Some(DocKind::Sheets) if shell.active_sheet().is_some() => "",
             Some(DocKind::Slides) if shell.active_slides().is_some() => "",
             Some(DocKind::Writer) => strings.plain_text_note,
@@ -1744,6 +1810,12 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_format("PPTX".into());
             ui.set_status_notice(SharedString::new());
         }
+        Some(Content::Pdf(tab)) => {
+            ui.set_status_zoom(format!("{}%", tab.view.zoom_percent()).into());
+            ui.set_zoom_enabled(true);
+            ui.set_status_format("PDF".into());
+            ui.set_status_notice(SharedString::new());
+        }
         None => {
             ui.set_status_zoom(SharedString::new());
             ui.set_zoom_enabled(false);
@@ -1755,6 +1827,20 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
     if let Some(tab) = shell.active_sheet() {
         let cells = tab.view.sheet().map_or(0, |sheet| sheet.cell_count());
         ui.set_status_words(i18n::fill(strings.cell_count, "count", &group_digits(cells)).into());
+        ui.set_status_chars(SharedString::new());
+        ui.set_status_ime(SharedString::new());
+        ui.set_status_composing(false);
+    } else if let Some(tab) = shell.active_pdf() {
+        let position = i18n::fill(
+            &i18n::fill(
+                strings.pdf_page_position,
+                "index",
+                &group_digits(tab.view.current() + 1),
+            ),
+            "count",
+            &group_digits(tab.view.count()),
+        );
+        ui.set_status_words(position.into());
         ui.set_status_chars(SharedString::new());
         ui.set_status_ime(SharedString::new());
         ui.set_status_composing(false);
@@ -1899,6 +1985,17 @@ fn present(ui: &AppWindow, shell: &mut Shell) {
         let origin = (ui.get_surface_x(), ui.get_surface_y());
         host::place_candidate_window(ui.window(), origin, surface);
     }
+    // A PDF asks its worker for the pages now on screen, and the page
+    // number and zoom on show follow the view.
+    if let Some(tab) = shell.active_pdf() {
+        tab.request();
+        let shown = Some((tab.view.current(), tab.view.zoom_percent() as u32));
+        if shown != shell.shown_pdf {
+            shell.shown_pdf = shown;
+            refresh_toolbar(ui, shell);
+            refresh_status(ui, shell);
+        }
+    }
 }
 
 /// Draw the preview of the Markdown tab in front, asking for a new layout
@@ -2034,6 +2131,8 @@ fn stop_platform_composition(ui: &AppWindow) {
 
 /// After the set of tabs or the tab in front changed.
 fn after_tab_change(ui: &AppWindow, shell: &mut Shell) {
+    // What a PDF tab showed in the toolbar was another tab's.
+    shell.shown_pdf = None;
     // The document a composition was typed into may be gone or behind another
     // tab; without this its candidate window would stay on screen.
     stop_platform_composition(ui);
@@ -2514,7 +2613,7 @@ fn text_file_types(strings: &'static i18n::Strings) -> [FileType; 1] {
 }
 
 /// What the open dialog offers: everything at once, then each kind.
-fn open_file_types(strings: &'static i18n::Strings) -> [FileType; 4] {
+fn open_file_types(strings: &'static i18n::Strings) -> [FileType; 5] {
     [
         FileType {
             name: strings.file_type_supported,
@@ -2531,6 +2630,10 @@ fn open_file_types(strings: &'static i18n::Strings) -> [FileType; 4] {
         FileType {
             name: strings.file_type_presentation,
             extensions: office::SLIDE_EXTENSIONS,
+        },
+        FileType {
+            name: strings.file_type_pdf,
+            extensions: pdf::EXTENSIONS,
         },
     ]
 }
@@ -3349,6 +3452,18 @@ fn start_load_as(ui: &AppWindow, shell: &mut Shell, path: PathBuf, encoding: Opt
     // Say so in the status bar while it takes: a large file takes seconds.
     // Noted before the reading starts, so that it is never noted after the
     // file has arrived.
+    if pdf::is_pdf(&path) {
+        if let Some(id) = shell.tab_of_file(&path) {
+            shell.leave_active_document();
+            shell.tabs.activate(id);
+            after_tab_change(ui, shell);
+            return;
+        }
+        shell.opening.push(path.clone());
+        refresh_status(ui, shell);
+        start_pdf(ui, shell, path, String::new());
+        return;
+    }
     shell.opening.push(path.clone());
     refresh_status(ui, shell);
     let weak = ui.as_weak();
@@ -3570,6 +3685,10 @@ enum Prompt {
     RenameSheet(TabId, usize),
     /// What the active cell's note says, in this workbook.
     Comment(TabId),
+    /// The password of this PDF file.
+    PdfPassword(PathBuf),
+    /// A page of this PDF to go to.
+    GoToPage(TabId),
 }
 
 /// What stops rows, columns or a sheet from changing, as a user would say
@@ -3622,6 +3741,7 @@ fn show_prompt(
     ui.set_prompt_problem(SharedString::new());
     ui.set_prompt_text(text.into());
     ui.set_prompt_multiline(matches!(shell.prompt, Some(Prompt::Comment(_))));
+    ui.set_prompt_secret(false);
     ui.set_prompt_open(true);
     present(ui, shell);
 }
@@ -3629,6 +3749,8 @@ fn show_prompt(
 fn hide_prompt(ui: &AppWindow, shell: &mut Shell) {
     shell.prompt = None;
     ui.set_prompt_open(false);
+    // A password typed does not stay in the window's text field.
+    ui.set_prompt_text(SharedString::new());
     if shell.active_surface().is_some() {
         ui.invoke_focus_document();
     }
@@ -3930,6 +4052,91 @@ fn accept_encoding(ui: &AppWindow, shell: &mut Shell) {
     }
 }
 
+/// Open a PDF on a worker of its own; what it reports comes back through
+/// [`pdf_event`]. `path` is in `shell.opening` until it answers.
+fn start_pdf(ui: &AppWindow, shell: &mut Shell, path: PathBuf, password: String) {
+    let token = shell.next_pdf_token;
+    shell.next_pdf_token += 1;
+    let weak = ui.as_weak();
+    let worker = pdf::open(path.clone(), password, move |event| {
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| pdf_event(ui, shell, token, event)),
+            );
+        });
+    });
+    shell.pdf_loads.insert(token, PdfLoad { path, worker });
+}
+
+/// Something a PDF worker reported: the file opened or failed, or a page.
+fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Event) {
+    use aster_pdf::{Event, OpenError};
+    if shell.pdf_loads.contains_key(&token) {
+        let (Event::Opened(_) | Event::Failed(_)) = &event else {
+            // A page before the file's opening was handled: the view asks
+            // for it again.
+            return;
+        };
+        let Some(PdfLoad { path, worker }) = shell.pdf_loads.remove(&token) else {
+            return;
+        };
+        if let Some(at) = shell.opening.iter().position(|opening| opening == &path) {
+            shell.opening.remove(at);
+        }
+        let strings = shell.language.strings();
+        match event {
+            Event::Opened(info) => {
+                shell.remember_file(&path);
+                shell.open_pdf(path, token, worker, info);
+                after_tab_change(ui, shell);
+            }
+            Event::Failed(error @ (OpenError::NeedsPassword | OpenError::WrongPassword)) => {
+                refresh_status(ui, shell);
+                let title = i18n::fill(
+                    strings.pdf_password_title,
+                    "name",
+                    &files::display_name(&path),
+                );
+                show_prompt(
+                    ui,
+                    shell,
+                    Prompt::PdfPassword(path),
+                    title,
+                    strings.pdf_password_label.to_owned(),
+                    String::new(),
+                );
+                ui.set_prompt_secret(true);
+                if error == OpenError::WrongPassword {
+                    ui.set_prompt_problem(strings.pdf_password_wrong.into());
+                }
+            }
+            Event::Failed(error) => {
+                refresh_status(ui, shell);
+                let title = i18n::fill(strings.open_failed, "name", &files::display_name(&path));
+                show_dialog(ui, shell, 2, title, pdf::error_message(error, strings));
+            }
+            Event::Page(_) | Event::PageFailed(_) => {}
+        }
+        return;
+    }
+    let active = shell.tabs.active_id();
+    let Some((id, tab)) = shell
+        .contents
+        .iter_mut()
+        .find_map(|(id, content)| match content {
+            Content::Pdf(tab) if tab.token == token => Some((*id, tab)),
+            _ => None,
+        })
+    else {
+        // The tab was closed meanwhile.
+        return;
+    };
+    if tab.take(event) && active == Some(id) {
+        present(ui, shell);
+    }
+}
+
 fn finish_office_load(
     ui: &AppWindow,
     shell: &mut Shell,
@@ -4018,6 +4225,12 @@ fn show_comment(ui: &AppWindow, shell: &mut Shell) {
     }
 }
 
+/// After a PDF scrolled or zoomed: the page number in the toolbar and the
+/// status bar, and the frame.
+fn after_pdf_move(ui: &AppWindow, shell: &mut Shell) {
+    present(ui, shell);
+}
+
 /// What the chrome around a viewer shows: the formula bar and sheet tabs of
 /// a workbook, the note over an empty presentation.
 fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
@@ -4061,6 +4274,12 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_viewer(2);
         ui.set_viewer_note(note.into());
         slides_ui::refresh(ui, tab);
+        return;
+    }
+    if shell.active_pdf().is_some() {
+        ui.set_viewer(3);
+        ui.set_viewer_note(SharedString::new());
+        ui.set_slide_notes(SharedString::new());
         return;
     }
     ui.set_viewer(0);
@@ -4870,7 +5089,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     });
 
     ui.on_key_pressed(handler!(|ui, shell, text, shift, primary, alt| {
-        let zooms = shell.active_writer().is_some() || shell.active_markdown().is_some();
+        let zooms = shell.active_writer().is_some()
+            || shell.active_markdown().is_some()
+            || shell.active_pdf().is_some();
         if zooms && let Some(command) = shell_shortcut(text.as_str(), primary) {
             if shell.run(command) {
                 refresh_toolbar(&ui, shell);
@@ -4900,6 +5121,19 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         if shell.active_sheet().is_some() {
             return sheet_key_pressed(&ui, shell, text.as_str(), shift, primary, alt);
+        }
+        if shell.active_pdf().is_some() {
+            let Some(key) = viewer_key(text.as_str()) else {
+                return false;
+            };
+            let scale = f64::from(ui.window().scale_factor());
+            let moved = shell
+                .active_pdf()
+                .is_some_and(|tab| pdf::pdf_key(&mut tab.view, key, shift, scale));
+            if moved {
+                after_pdf_move(&ui, shell);
+            }
+            return true;
         }
         if shell.active_slides().is_some() {
             return slides_ui::key(&ui, shell, text.as_str(), shift, primary, alt);
@@ -4967,6 +5201,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             }
             Some(Content::Slides(_)) => {
                 slides_ui::pointer_down(&ui, shell, x, y, shift, clicks);
+                return;
+            }
+            Some(Content::Pdf(tab)) => {
+                if tab.view.press(x, y) {
+                    after_pdf_move(&ui, shell);
+                }
                 return;
             }
             None => return,
@@ -5097,6 +5337,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             }
             return;
         }
+        if let Some(tab) = shell.active_pdf() {
+            if tab.view.wheel(f64::from(pointer_x) * scale, dx, dy) {
+                after_pdf_move(&ui, shell);
+            }
+            return;
+        }
         if let Some(tab) = shell.active_slides() {
             if tab.view.wheel(f64::from(pointer_x) * scale, dy) {
                 refresh_viewer(&ui, shell);
@@ -5117,7 +5363,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         if let Some(surface) = shell.active_surface() {
             let (current, _) = surface.scroll_range();
             if surface.scroll_by(f64::from(offset) * scale - current) {
-                present(&ui, shell);
+                if shell.active_pdf().is_some() {
+                    after_pdf_move(&ui, shell);
+                } else {
+                    present(&ui, shell);
+                }
             }
         }
     }));
@@ -5420,6 +5670,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                 _ => {}
             }
         }
+        if Command::from_id(id) == Some(Command::PageNumber) && shell.active_pdf().is_some() {
+            ui.invoke_menu_go_to_line();
+            return;
+        }
         if let Some(command) = Command::from_id(id)
             && shell.run(command)
         {
@@ -5577,6 +5831,20 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         let Some(id) = shell.tabs.active_id() else {
             return;
         };
+        if let Some(tab) = shell.active_pdf() {
+            let count = tab.view.count();
+            let current = tab.view.current() + 1;
+            let strings = shell.language.strings();
+            show_prompt(
+                &ui,
+                shell,
+                Prompt::GoToPage(id),
+                strings.pdf_goto_title.to_owned(),
+                i18n::fill(strings.pdf_goto_label, "count", &group_digits(count)),
+                current.to_string(),
+            );
+            return;
+        }
         let Some(editor) = shell.markdown(id) else {
             return;
         };
@@ -5616,6 +5884,33 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                 }
             }
             Some(Prompt::Rename(from)) => rename_entry(&ui, shell, from),
+            Some(Prompt::PdfPassword(path)) => {
+                let password = ui.get_prompt_text().to_string();
+                hide_prompt(&ui, shell);
+                shell.opening.push(path.clone());
+                refresh_status(&ui, shell);
+                start_pdf(&ui, shell, path, password);
+            }
+            Some(Prompt::GoToPage(id)) => {
+                let strings = shell.language.strings();
+                let Some(Content::Pdf(tab)) = shell.contents.get_mut(&id) else {
+                    hide_prompt(&ui, shell);
+                    return;
+                };
+                let count = tab.view.count();
+                match pdf::parse_page(&ui.get_prompt_text(), count) {
+                    Some(page) => {
+                        tab.view.go_to(page);
+                        hide_prompt(&ui, shell);
+                        refresh_toolbar(&ui, shell);
+                        refresh_status(&ui, shell);
+                        present(&ui, shell);
+                    }
+                    None => ui.set_prompt_problem(
+                        i18n::fill(strings.pdf_goto_invalid, "count", &group_digits(count)).into(),
+                    ),
+                }
+            }
             Some(Prompt::RenameSheet(id, index)) => {
                 let strings = shell.language.strings();
                 let typed = ui.get_prompt_text().trim().to_owned();
@@ -7351,7 +7646,9 @@ mod tests {
                     editor.ime(preedit);
                     editor.document.text().to_string()
                 }
-                Content::Sheet(_) | Content::Slides(_) => unreachable!("not a text tab"),
+                Content::Sheet(_) | Content::Slides(_) | Content::Pdf(_) => {
+                    unreachable!("not a text tab")
+                }
             };
             shell.open_untitled(DocKind::Writer);
             let surface = shell

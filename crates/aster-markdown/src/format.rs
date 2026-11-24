@@ -667,8 +667,9 @@ fn list_item(line: &str) -> Option<(usize, usize, Block)> {
 /// level in or out. In, the first item lines up under the text of the item
 /// above it at its level (two spaces under `- `, three under `1. `), and a
 /// numbered item that starts a new list there is numbered 1; the first item
-/// of a list cannot go in. Out, it lines up with the item it belonged to.
-/// The other lines of the selection move as far. `None` where the first line
+/// of a list cannot go in. Out, it lines up with the item it belonged to,
+/// and numbered items that land in a numbered list count on from that item,
+/// as do the items after them there. The other lines of the selection move as far. `None` where the first line
 /// of the selection is not a list item: Tab is then an ordinary key. An item
 /// that cannot move gives an edit that changes nothing.
 pub fn indent(text: &Rope, selection: Selection, outdent: bool) -> Option<Edit> {
@@ -704,23 +705,31 @@ pub fn indent(text: &Rope, selection: Selection, outdent: bool) -> Option<Edit> 
         if item.is_none() && indent == 0 {
             break;
         }
-        above.push((indent, item));
+        above.push((indent, item, numbered(&head)));
     }
 
+    // Out: the level the items land on, and the number the next numbered
+    // item there takes when that level is a numbered list.
+    let mut target = 0;
+    let mut next_number = None;
     let (delta, restart) = if outdent {
         if own == 0 {
             return Some(unchanged);
         }
-        let parent = above
-            .iter()
-            .find_map(|(indent, item)| item.filter(|_| *indent < own).map(|_| *indent));
-        (own - parent.unwrap_or(0), false)
+        let parent = above.iter().find_map(|(indent, item, number)| {
+            item.filter(|_| *indent < own).map(|_| (*indent, *number))
+        });
+        if let Some((indent, number)) = parent {
+            target = indent;
+            next_number = number.map(|number| number + 1);
+        }
+        (own - target, false)
     } else {
         // The item above at the same level; lines indented further belong to
         // it. One less indented means this is the first item of its list.
         let mut deeper_numbered = None;
         let mut sibling = None;
-        for (indent, item) in &above {
+        for (indent, item, _) in &above {
             if *indent < own {
                 break;
             }
@@ -743,11 +752,25 @@ pub fn indent(text: &Rope, selection: Selection, outdent: bool) -> Option<Edit> 
     };
 
     let mut first = true;
-    Some(rewrite_lines(text, selection, true, |line, _| {
+    let mut edit = rewrite_lines(text, selection, true, |line, _| {
         let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
         let (old_prefix, new_line, new_prefix) = if outdent {
             let take = indent.min(delta);
-            (take, line[take..].to_owned(), 0)
+            let landed = indent - take;
+            match next_number.as_mut() {
+                Some(number)
+                    if landed == target
+                        && matches!(list_item(line), Some((_, _, Block::Numbered))) =>
+                {
+                    let body = &line[indent..];
+                    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+                    let new_digits = number.to_string();
+                    let new = format!("{}{new_digits}{}", &line[take..indent], &body[digits..]);
+                    *number += 1;
+                    (indent + digits, new, landed + new_digits.len())
+                }
+                _ => (take, line[take..].to_owned(), 0),
+            }
         } else {
             let pad = " ".repeat(delta);
             let restart_here = first && restart;
@@ -762,7 +785,15 @@ pub fn indent(text: &Rope, selection: Selection, outdent: bool) -> Option<Edit> 
         };
         first = false;
         (new_line, old_prefix, new_prefix)
-    }))
+    });
+    // The items after the moved ones at the level they landed on.
+    if let Some(number) = next_number
+        && let Some((renumbered, until)) = renumber(text, edit.range.end, target, number)
+    {
+        edit.text.push_str(&renumbered);
+        edit.range.end = until;
+    }
+    Some(edit)
 }
 
 /// The parts of a line: indentation, the block prefix, and the rest.
@@ -1578,7 +1609,20 @@ mod tests {
     #[test]
     fn shift_tab_moves_an_item_out() {
         assert_eq!(tab("- a\n  - b|", true).as_deref(), Some("- a\n- b|"));
-        assert_eq!(tab("1. a\n   1. b|", true).as_deref(), Some("1. a\n1. b|"));
+        // A numbered item counts on from the item it belonged to, and so do
+        // the items after it at that level; its own items stay below it.
+        assert_eq!(tab("1. a\n   1. b|", true).as_deref(), Some("1. a\n2. b|"));
+        assert_eq!(
+            tab("1. a\n   1. b|\n      - x\n2. c\n3. d\n\n- e", true).as_deref(),
+            Some("1. a\n2. b|\n      - x\n3. c\n4. d\n\n- e")
+        );
+        assert_eq!(
+            tab("1. a\n   1. «b\n   2. c»", true).as_deref(),
+            Some("1. a\n2. [b\n3. c]")
+        );
+        // Under a bulleted item a number stays as it is.
+        assert_eq!(tab("- a\n  1. b|", true).as_deref(), Some("- a\n1. b|"));
+        assert_eq!(tab("1) a\n   1) b|", true).as_deref(), Some("1) a\n2) b|"));
         assert_eq!(
             tab("- a\n  - b\n    - c|", true).as_deref(),
             Some("- a\n  - b\n  - c|")

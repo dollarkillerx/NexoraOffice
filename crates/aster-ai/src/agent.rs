@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use aster_tools::{Invoker, Origin, ToolResult};
+use aster_tools::{CallToken, Invoker, Origin, ToolResult};
 use serde_json::Value;
 
 use crate::conversation::{ContentBlock, Message, Role};
@@ -75,25 +75,108 @@ where
     }
 }
 
+/// Stops the tool calls of one turn: those waiting for the user's approval
+/// have their question withdrawn, and those not started yet are refused as
+/// cancelled when they come up. Cloned into the place that can stop the
+/// turn; stopping it does not stop the model's request, which the turn's
+/// own cancel flag does.
+#[derive(Clone, Debug, Default)]
+pub struct TurnStop(std::sync::Arc<std::sync::Mutex<StopState>>);
+
+#[derive(Debug, Default)]
+struct StopState {
+    stopped: bool,
+    next: u64,
+    /// The calls running now, by a number of this turn's own.
+    running: Vec<(u64, CallToken)>,
+}
+
+impl TurnStop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, StopState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.state().stopped
+    }
+
+    /// Stop the turn's calls. Never waits for the user or for a call; safe
+    /// on the interface thread.
+    pub fn stop(&self, invoker: &Invoker) {
+        let running = {
+            let mut state = self.state();
+            state.stopped = true;
+            state
+                .running
+                .iter()
+                .map(|(_, token)| token.clone())
+                .collect::<Vec<_>>()
+        };
+        for token in running {
+            invoker.cancel(&token);
+        }
+    }
+
+    /// A token for a call about to run, cancelled already if the turn was
+    /// stopped. Pair with [`Self::finished`].
+    fn begin(&self, invoker: &Invoker) -> (u64, CallToken) {
+        let token = CallToken::new();
+        let (number, stopped) = {
+            let mut state = self.state();
+            state.next += 1;
+            let number = state.next;
+            state.running.push((number, token.clone()));
+            (number, state.stopped)
+        };
+        if stopped {
+            invoker.cancel(&token);
+        }
+        (number, token)
+    }
+
+    fn finished(&self, number: u64) {
+        self.state().running.retain(|(n, _)| *n != number);
+    }
+}
+
 /// The executor the application uses: every call goes through the
-/// [`Invoker`], as `ai:<provider>/<model>` in the conversation's session.
+/// [`Invoker`], as `ai:<provider>/<model>` in the conversation's session,
+/// and can be stopped with the turn's [`TurnStop`].
 pub struct InvokerExecutor<'a> {
     invoker: &'a Invoker,
     origin: Origin,
+    stop: TurnStop,
 }
 
 impl<'a> InvokerExecutor<'a> {
-    pub fn new(invoker: &'a Invoker, provider: &ProviderConfig, conversation_id: &str) -> Self {
+    pub fn new(
+        invoker: &'a Invoker,
+        provider: &ProviderConfig,
+        conversation_id: &str,
+        stop: TurnStop,
+    ) -> Self {
         Self {
             invoker,
             origin: Origin::new(provider.caller(), conversation_id),
+            stop,
         }
     }
 }
 
 impl ToolExecutor for InvokerExecutor<'_> {
     fn execute(&self, name: &str, input: &Value) -> ToolResult {
-        self.invoker.call(&self.origin, name, input)
+        // A stopped turn's call still goes through the invoker, already
+        // cancelled: it is refused there and audited as cancelled.
+        let (number, token) = self.stop.begin(self.invoker);
+        let result = self.invoker.call_with(&self.origin, name, input, &token);
+        self.stop.finished(number);
+        result
     }
 }
 
@@ -522,6 +605,127 @@ fn redact_message(message: &mut Message) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod stopping {
+        use super::super::*;
+        use aster_tools::{
+            Approval, ApprovalRequest, Approver, Audit, CANCELLED_BY_CALLER, DocumentInfo, Host,
+            Level, Policy, ToolSpec,
+        };
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct OneDocument {
+            runs: Mutex<usize>,
+        }
+
+        impl Host for OneDocument {
+            fn documents(&self) -> Vec<DocumentInfo> {
+                vec![DocumentInfo {
+                    id: "1".into(),
+                    title: "a.md".into(),
+                    path: None,
+                    kind: "markdown".into(),
+                    modified: false,
+                }]
+            }
+            fn run(
+                &self,
+                _: &ToolSpec,
+                _: Option<&DocumentInfo>,
+                _: &Value,
+            ) -> Result<String, String> {
+                *self.runs.lock().unwrap() += 1;
+                Ok("done".into())
+            }
+        }
+
+        /// Answers Allow, but only after the question was withdrawn or a
+        /// second has passed; records what was withdrawn.
+        #[derive(Default)]
+        struct SlowApprover {
+            asked: Mutex<usize>,
+            withdrawn: Mutex<Vec<u64>>,
+            gone: std::sync::Condvar,
+        }
+
+        impl Approver for SlowApprover {
+            fn ask(&self, request: ApprovalRequest, _: Duration) -> Approval {
+                let withdrawn = self.withdrawn.lock().unwrap();
+                *self.asked.lock().unwrap() += 1;
+                let _ = self
+                    .gone
+                    .wait_timeout_while(withdrawn, Duration::from_secs(5), |w| {
+                        !w.contains(&request.id)
+                    })
+                    .unwrap();
+                Approval::Allow
+            }
+            fn withdraw(&self, id: u64) {
+                self.withdrawn.lock().unwrap().push(id);
+                self.gone.notify_all();
+            }
+        }
+
+        fn setup(level: Level) -> (Arc<Invoker>, Arc<OneDocument>, Arc<SlowApprover>) {
+            let host = Arc::new(OneDocument {
+                runs: Mutex::new(0),
+            });
+            let approver = Arc::new(SlowApprover::default());
+            let mut policy = Policy::default();
+            policy.grant("1", Some(level));
+            let invoker = Arc::new(Invoker::new(
+                Arc::new(Mutex::new(policy)),
+                host.clone(),
+                approver.clone(),
+                Arc::new(Audit::in_memory()),
+            ));
+            (invoker, host, approver)
+        }
+
+        fn provider() -> ProviderConfig {
+            ProviderConfig::from_preset("p", crate::provider::Preset::Custom)
+        }
+
+        #[test]
+        fn calls_after_a_stop_are_not_run() {
+            let (invoker, host, _) = setup(Level::Trusted);
+            let stop = TurnStop::new();
+            let executor = InvokerExecutor::new(&invoker, &provider(), "chat-1", stop.clone());
+            let args = json!({"document": "1", "text": "x"});
+            assert!(!executor.execute("insert_text", &args).is_error);
+            assert_eq!(*host.runs.lock().unwrap(), 1);
+            stop.stop(&invoker);
+            let refused = executor.execute("insert_text", &args);
+            assert!(refused.is_error);
+            assert_eq!(refused.text, CANCELLED_BY_CALLER);
+            assert_eq!(*host.runs.lock().unwrap(), 1, "nothing ran after the stop");
+        }
+
+        #[test]
+        fn a_stop_withdraws_the_question_a_call_waits_on() {
+            let (invoker, host, approver) = setup(Level::Ask);
+            let stop = TurnStop::new();
+            let waiting = {
+                let (invoker, stop) = (invoker.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let executor = InvokerExecutor::new(&invoker, &provider(), "chat-1", stop);
+                    executor.execute("insert_text", &json!({"document": "1", "text": "x"}))
+                })
+            };
+            // Until the question is up.
+            while *approver.asked.lock().unwrap() == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            stop.stop(&invoker);
+            let result = waiting.join().unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(approver.withdrawn.lock().unwrap().len(), 1);
+            assert_eq!(*host.runs.lock().unwrap(), 0);
+            assert!(stop.state().running.is_empty());
+        }
+    }
     use serde_json::json;
 
     fn tool_use(id: &str) -> ContentBlock {

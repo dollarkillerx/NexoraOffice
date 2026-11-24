@@ -28,7 +28,8 @@ pub mod settings;
 mod sse;
 
 pub use agent::{
-    AgentEvent, AgentOptions, DEFAULT_MAX_STEPS, InvokerExecutor, ToolExecutor, TurnEnd, run,
+    AgentEvent, AgentOptions, DEFAULT_MAX_STEPS, InvokerExecutor, ToolExecutor, TurnEnd, TurnStop,
+    run,
 };
 pub use conversation::{
     ContentBlock, Message, Role, TurnContext, back_to_last_request, title, user_message,

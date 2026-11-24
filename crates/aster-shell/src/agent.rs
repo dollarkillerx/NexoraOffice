@@ -87,6 +87,9 @@ pub struct Assistant {
     conversation_id: u64,
     /// Set while a turn runs; setting the flag stops it.
     cancel: Option<Arc<AtomicBool>>,
+    /// Stops the running turn's tool calls: questions withdrawn, calls not
+    /// started yet refused.
+    turn_stop: Option<aster_ai::TurnStop>,
     /// Whether a key is stored, by provider id: the key store is asked once.
     has_key: HashMap<String, bool>,
     /// The assistant's reply being streamed, by row.
@@ -193,6 +196,7 @@ impl Assistant {
             keys_cleared: Default::default(),
             key_note: None,
             chats: Vec::new(),
+            turn_stop: None,
             turn_chat: None,
             mcp_connections: Vec::new(),
         });
@@ -802,6 +806,8 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
     ai.cancel = Some(cancel.clone());
     let chat = ai.conversation_id;
     ai.turn_chat = Some(chat);
+    let stop = aster_ai::TurnStop::new();
+    ai.turn_stop = Some(stop.clone());
     let mut conversation = ai.conversation.clone();
     let invoker = ai.invoker.clone();
     let options = ai.settings.agent_options();
@@ -814,7 +820,7 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
         .spawn(move || {
             let model = connect(provider.clone(), key);
             let tools = tool_defs(aster_tools::tools());
-            let executor = InvokerExecutor::new(&invoker, &provider, &conversation_id);
+            let executor = InvokerExecutor::new(&invoker, &provider, &conversation_id, stop);
             let mut sink = |event: AgentEvent| {
                 if let Ok(mut inbox) = inbox.lock() {
                     inbox.push(event);
@@ -854,6 +860,7 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
                             }
                             ai.cancel = None;
                             ai.turn_chat = None;
+                            ai.turn_stop = None;
                             ai.streaming = None;
                         }
                         refresh(ui, shell);
@@ -867,6 +874,7 @@ pub fn send(ui: &AppWindow, shell: &mut Shell, text: &str) {
         if let Some(ai) = &mut shell.ai {
             ai.cancel = None;
             ai.turn_chat = None;
+            ai.turn_stop = None;
             ai.conversation.pop();
             ai.push(
                 3,
@@ -987,15 +995,24 @@ pub fn quick(ui: &AppWindow, shell: &mut Shell, action: i32) {
 }
 
 pub fn stop(ui: &AppWindow, shell: &mut Shell) {
-    if let Some(ai) = &shell.ai
-        && let Some(cancel) = &ai.cancel
-    {
-        cancel.store(true, Ordering::Relaxed);
+    if let Some(ai) = &shell.ai {
+        ai.stop_turn();
     }
     refresh(ui, shell);
 }
 
 impl Assistant {
+    /// Stop the running turn: its request to the model, its questions on
+    /// screen, and its tool calls not started yet.
+    fn stop_turn(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(stop) = &self.turn_stop {
+            stop.stop(&self.invoker);
+        }
+    }
+
     /// The title of the conversation on screen: its first request.
     fn current_title(&self) -> Option<String> {
         self.items
@@ -1040,9 +1057,7 @@ impl Assistant {
 /// "allow for this chat" answers, and can be gone back to.
 pub fn new_chat(ui: &AppWindow, shell: &mut Shell) {
     if let Some(ai) = &mut shell.ai {
-        if let Some(cancel) = &ai.cancel {
-            cancel.store(true, Ordering::Relaxed);
-        }
+        ai.stop_turn();
         ai.stash_current();
         ai.conversation_id = ai.fresh_id();
     }
@@ -1268,10 +1283,30 @@ impl Approver for Cards {
     fn ask(&self, request: ApprovalRequest, timeout: Duration) -> Approval {
         let id = request.id as i32;
         let (sender, answer) = mpsc::channel();
-        let shown = on_ui(&self.ui, UI_WAIT, move |ui, shell| {
-            show_card(ui, shell, request, sender)
+        // Set once this question is no longer waited for, so that a card
+        // the interface gets to only afterwards is not shown at all.
+        let given_up = Arc::new(AtomicBool::new(false));
+        let shown = on_ui(&self.ui, UI_WAIT, {
+            let given_up = given_up.clone();
+            move |ui, shell| {
+                if given_up.load(Ordering::SeqCst) {
+                    return false;
+                }
+                show_card(ui, shell, request, sender)
+            }
         });
         if shown != Some(true) {
+            // The interface did not answer in time: it may still show the
+            // card later. Make sure it does not stay.
+            given_up.store(true, Ordering::SeqCst);
+            let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| {
+                        take_card(ui, shell, id);
+                    }),
+                );
+            });
             return Approval::Deny;
         }
         match answer.recv_timeout(timeout) {

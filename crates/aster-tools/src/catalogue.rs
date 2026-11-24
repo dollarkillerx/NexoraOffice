@@ -235,7 +235,7 @@ const TOOLS: &[ToolSpec] = &[
             object(
                 json!({
                     "document": document(),
-                    "sheet": { "type": "string", "description": "The sheet's name. Default: the sheet in front." },
+                    "sheet": { "type": "string", "description": "The sheet's name. Without it, the sheet in front when the call runs; the result names the sheet read." },
                     "range": { "type": "string", "description": "A cell range like A1:D20, or one cell like B3." }
                 }),
                 &["document"],
@@ -322,7 +322,7 @@ const TOOLS: &[ToolSpec] = &[
             object(
                 json!({
                     "document": document(),
-                    "sheet": { "type": "string", "description": "The sheet's name. Default: the sheet in front." },
+                    "sheet": { "type": "string", "description": "The sheet's name, as get_selection, read_sheet or the context gives it." },
                     "start": { "type": "string", "description": "The top left cell, like B2." },
                     "rows": {
                         "type": "array",
@@ -330,7 +330,7 @@ const TOOLS: &[ToolSpec] = &[
                         "items": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } }
                     }
                 }),
-                &["document", "start", "rows"],
+                &["document", "sheet", "start", "rows"],
             )
         },
     },

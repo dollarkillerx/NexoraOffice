@@ -160,6 +160,8 @@ pub struct SheetView {
     workbook: Arc<Workbook>,
     sheet: usize,
     places: Vec<Place>,
+    /// Where a fill handle drag would fill, while one is going on.
+    fill_preview: Option<CellRange>,
     width: u16,
     height: u16,
     scale: f32,
@@ -251,6 +253,7 @@ impl SheetView {
             workbook,
             sheet: 0,
             places: vec![Place::default(); sheets],
+            fill_preview: None,
             width: 0,
             height: 0,
             scale: 1.0,
@@ -699,6 +702,61 @@ impl SheetView {
             }
         }
         None
+    }
+
+    /// Whether a point (physical pixels) is on the fill handle: the small
+    /// square at the bottom right corner of the selection.
+    pub fn fill_handle_hit(&self, x: f64, y: f64) -> bool {
+        const NEAR: f64 = 5.0;
+        if self.editor.is_some() {
+            return false;
+        }
+        let range = self.selection();
+        if range.rows() == MAX_ROWS || range.cols() == MAX_COLUMNS {
+            return false;
+        }
+        let (x, y) = (x / self.s(), y / self.s());
+        let (_, right) = self.column_span(range.last.col);
+        let (_, bottom) = self.row_span(range.last.row);
+        (x - right).abs() <= NEAR && (y - bottom).abs() <= NEAR
+    }
+
+    /// The range a fill handle dragged to a point (physical pixels) covers:
+    /// the selection stretched down, up, right or left, whichever way the
+    /// point is further out of it.
+    pub fn fill_target(&self, x: f64, y: f64) -> CellRange {
+        let range = self.selection();
+        let Some(at) = self.cell_at(x, y) else {
+            return range;
+        };
+        let below = at.row.saturating_sub(range.last.row);
+        let above = range.first.row.saturating_sub(at.row);
+        let right = at.col.saturating_sub(range.last.col);
+        let left = range.first.col.saturating_sub(at.col);
+        let rows = below.max(above);
+        let cols = right.max(left);
+        if rows == 0 && cols == 0 {
+            return range;
+        }
+        if rows >= cols {
+            if below > 0 {
+                CellRange::new(range.first, CellRef::new(at.row, range.last.col))
+            } else {
+                CellRange::new(CellRef::new(at.row, range.first.col), range.last)
+            }
+        } else if right > 0 {
+            CellRange::new(range.first, CellRef::new(range.last.row, at.col))
+        } else {
+            CellRange::new(CellRef::new(range.first.row, at.col), range.last)
+        }
+    }
+
+    /// Show (or stop showing) where a fill handle drag would fill.
+    pub fn set_fill_preview(&mut self, range: Option<CellRange>) {
+        if self.fill_preview != range {
+            self.fill_preview = range;
+            self.revision += 1;
+        }
     }
 
     /// The size a column or row gets when its far edge is dragged to a
@@ -1286,6 +1344,35 @@ impl SheetView {
             self.ctx.set_stroke(Stroke::new(border));
             self.ctx
                 .stroke_rect(&outline.inset(-border / 2.0 + line / 2.0));
+            // Where a fill handle drag would fill.
+            if let Some(fill) = self.fill_preview {
+                let rect = Rect::new(
+                    pane.x(sheet, fill.first.col, s).round() - line,
+                    pane.y(sheet, fill.first.row, s).round() - line,
+                    pane.x(sheet, fill.last.col + 1, s).round(),
+                    pane.y(sheet, fill.last.row + 1, s).round(),
+                );
+                self.ctx.set_stroke(Stroke::new(line));
+                self.ctx.stroke_rect(&rect.inset(line / 2.0));
+            }
+            // The fill handle at the selection's bottom right corner.
+            let whole = span.rows() == MAX_ROWS || span.cols() == MAX_COLUMNS;
+            if !whole && self.editor.is_none() {
+                let x = pane.x(sheet, span.last.col + 1, s).round();
+                let y = pane.y(sheet, span.last.row + 1, s).round();
+                let half = (3.0 * s).round();
+                let edge = s.round().max(1.0);
+                self.ctx.set_paint(color(style.background));
+                self.ctx.fill_rect(&Rect::new(
+                    x - half - edge,
+                    y - half - edge,
+                    x + half + edge,
+                    y + half + edge,
+                ));
+                self.ctx.set_paint(color(style.accent));
+                self.ctx
+                    .fill_rect(&Rect::new(x - half, y - half, x + half, y + half));
+            }
             if self.editor.is_some() {
                 let cell = Rect::new(outline.x0 + line, outline.y0 + line, outline.x1, outline.y1);
                 self.draw_editor(sheet, cell, pane.clip);

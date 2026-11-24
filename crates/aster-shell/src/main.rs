@@ -4626,7 +4626,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
             Some(Content::Markdown(editor)) => editor.pointer_press(x, y, shift, clicks),
             Some(Content::Sheet(tab)) => {
-                if tab.begin_resize(x, y) {
+                if tab.begin_resize(x, y) || tab.begin_fill(x, y) {
                     present(&ui, shell);
                     return;
                 }
@@ -4671,6 +4671,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return;
             }
+            Some(Content::Sheet(tab)) if tab.is_filling() => {
+                if tab.drag_fill(x, y) {
+                    present(&ui, shell);
+                }
+                return;
+            }
             Some(Content::Sheet(tab)) => {
                 if !tab.view.is_editing() && tab.view.drag(x, y) {
                     refresh_viewer(&ui, shell);
@@ -4686,6 +4692,16 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_pointer_up(handler!(|ui, shell| {
         if let Some(tab) = shell.active_sheet()
+            && tab.is_filling()
+        {
+            let changes = tab.end_fill();
+            if shell.sync_modified() {
+                refresh_tabs(&ui, shell);
+            }
+            after_sheet_change(&ui, shell, changes);
+            return;
+        }
+        if let Some(tab) = shell.active_sheet()
             && tab.end_resize()
         {
             after_sheet_change(&ui, shell, Vec::new());
@@ -4698,16 +4714,15 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_pointer_hover(handler!(|ui, shell, x, y| {
         let scale = f64::from(ui.window().scale_factor());
-        let cursor = shell.active_sheet().map_or(0, |tab| {
-            match tab
-                .view
-                .resize_hit(f64::from(x) * scale, f64::from(y) * scale)
-            {
+        let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
+        let cursor = shell
+            .active_sheet()
+            .map_or(0, |tab| match tab.view.resize_hit(x, y) {
                 Some(aster_surface::sheet_view::Resize::Column(_)) => 1,
                 Some(aster_surface::sheet_view::Resize::Row(_)) => 2,
+                None if tab.view.fill_handle_hit(x, y) => 3,
                 None => 0,
-            }
-        });
+            });
         if cursor != ui.get_resize_cursor() {
             ui.set_resize_cursor(cursor);
         }

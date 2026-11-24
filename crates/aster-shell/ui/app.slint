@@ -1307,7 +1307,7 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
+                                    mouse-cursor: root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();

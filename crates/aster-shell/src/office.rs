@@ -514,6 +514,9 @@ pub struct SheetTab {
     /// Why the last insert or delete of rows or columns was refused, shown
     /// until the next change.
     pub refusal: Option<Refusal>,
+    /// The selection a fill handle drag started from, and where it would
+    /// fill now.
+    filling: Option<(CellRange, CellRange)>,
     /// A column or row being dragged, its size before, and how far the
     /// pointer was from its edge when the drag started.
     resizing: Option<(Resize, f64, f64)>,
@@ -571,6 +574,7 @@ impl SheetTab {
             file: 0,
             refusal: None,
             resizing: None,
+            filling: None,
             file_styles: view_styles,
             source,
             saving: false,
@@ -1846,6 +1850,53 @@ impl SheetTab {
         true
     }
 
+    /// Start dragging the fill handle, if it is under the pointer
+    /// (physical pixels). Returns whether a drag started.
+    pub fn begin_fill(&mut self, x: f64, y: f64) -> bool {
+        if !self.view.fill_handle_hit(x, y) {
+            return false;
+        }
+        let range = self.view.selection();
+        self.filling = Some((range, range));
+        true
+    }
+
+    pub fn is_filling(&self) -> bool {
+        self.filling.is_some()
+    }
+
+    /// The pointer moved during a fill drag: show where it would fill.
+    pub fn drag_fill(&mut self, x: f64, y: f64) -> bool {
+        let Some((source, _)) = self.filling else {
+            return false;
+        };
+        let target = self.view.fill_target(x, y);
+        self.filling = Some((source, target));
+        self.view
+            .set_fill_preview((target != source).then_some(target));
+        true
+    }
+
+    /// The fill drag ended: the cells past the selection are filled from
+    /// it, as one undo step, and the whole range is selected.
+    pub fn end_fill(&mut self) -> Vec<Change> {
+        let Some((source, target)) = self.filling.take() else {
+            return Vec::new();
+        };
+        self.view.set_fill_preview(None);
+        if target == source {
+            return Vec::new();
+        }
+        let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
+        let cells = self.view.workbook().fill(sheet, source, target);
+        let changes = self.view.workbook_mut().set_cells(sheet, cells);
+        let changes = self.record(changes, styles_before);
+        self.view.select(target.first);
+        self.view.extend_to(target.last);
+        changes
+    }
+
     pub fn is_resizing(&self) -> bool {
         self.resizing.is_some()
     }
@@ -2766,6 +2817,39 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn the_fill_handle_continues_a_series_as_one_step() {
+        use aster_surface::cell_editor::EditMode;
+
+        let mut tab = tab();
+        for (cell, text) in [
+            ("C1", "10"),
+            ("C2", "20"),
+            ("D1", "Item 1"),
+            ("D2", "Item 2"),
+        ] {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("en");
+        }
+        let source = CellRange::parse("C1:D2").unwrap();
+        let target = CellRange::parse("C1:D5").unwrap();
+        tab.view.select(source.first);
+        tab.view.extend_to(source.last);
+        tab.filling = Some((source, target));
+        let changes = tab.end_fill();
+        assert_eq!(changes.len(), 6);
+        assert_eq!(value(&tab, "C5"), Some(aster_sheets::Value::Number(50.0)));
+        assert_eq!(
+            value(&tab, "D4"),
+            Some(aster_sheets::Value::Text("Item 4".into()))
+        );
+        assert_eq!(tab.view.selection(), target);
+        tab.undo();
+        assert_eq!(value(&tab, "C5"), None);
+        assert!(!tab.is_filling());
     }
 
     #[test]

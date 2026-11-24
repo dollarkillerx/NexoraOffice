@@ -90,6 +90,15 @@ fn sizes_of(sheet: &aster_sheets::Sheet, index: usize, changes: &Changes, digit:
             .into_iter()
             .map(|row| (row, sheet.row_sizes.size(row) * 0.75))
             .collect(),
+        // Hidden lines are written with the size they come back at.
+        kept_widths: in_sheet(&changes.columns)
+            .into_iter()
+            .filter_map(|col| Some((col, sheet.hidden_sizes.get(&(true, col))? / digit)))
+            .collect(),
+        kept_heights: in_sheet(&changes.rows)
+            .into_iter()
+            .filter_map(|row| Some((row, sheet.hidden_sizes.get(&(false, row))? * 0.75)))
+            .collect(),
         column_styles: styled(true)
             .into_iter()
             .map(|col| {
@@ -968,7 +977,16 @@ fn rewrite_sheet(
     // A row's own format is `s` with `customFormat`.
     let row_tag = |tag: String, row: u32| {
         let tag = match sizes.heights.get(&row) {
-            Some(points) if *points == 0.0 => set_attribute(&tag, "hidden", "1"),
+            Some(points) if *points == 0.0 => {
+                let tag = match sizes.kept_heights.get(&row) {
+                    Some(kept) => {
+                        let tag = set_attribute(&tag, "ht", &number(*kept));
+                        set_attribute(&tag, "customHeight", "1")
+                    }
+                    None => tag,
+                };
+                set_attribute(&tag, "hidden", "1")
+            }
             Some(points) => {
                 let tag = structure::drop_attribute(&tag, "hidden");
                 let tag = set_attribute(&tag, "ht", &number(*points));
@@ -1125,6 +1143,9 @@ pub struct Sizes {
     pub column_styles: Vec<(u32, Option<u32>, f64)>,
     /// Rows whose own format changed: index and format.
     pub row_styles: BTreeMap<u32, Option<u32>>,
+    /// The width (digits) and height (points) hidden columns and rows had.
+    pub kept_widths: BTreeMap<u32, f64>,
+    pub kept_heights: BTreeMap<u32, f64>,
 }
 
 impl Sizes {
@@ -1198,7 +1219,11 @@ fn columns_xml(xml: &[u8], p: &str, sizes: &Sizes, data_start: usize) -> (usize,
                 // gets the default.
                 Some(0.0) => {
                     attributes.retain(|(k, _)| k != "hidden");
-                    if !attributes.iter().any(|(k, _)| k == "width") {
+                    if let Some(kept) = sizes.kept_widths.get(&index) {
+                        attributes.retain(|(k, _)| k != "width" && k != "customWidth");
+                        attributes.push(("width".into(), number(*kept)));
+                        attributes.push(("customWidth".into(), "1".into()));
+                    } else if !attributes.iter().any(|(k, _)| k == "width") {
                         attributes.push(("width".into(), "8.43".into()));
                     }
                     attributes.push(("hidden".into(), "1".into()));

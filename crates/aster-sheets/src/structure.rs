@@ -501,6 +501,16 @@ impl crate::model::Workbook {
         } else {
             axis.remove(lines.at, lines.count);
         }
+        host.hidden_sizes = std::mem::take(&mut host.hidden_sizes)
+            .into_iter()
+            .filter_map(|((columns, line), size)| {
+                if columns == lines.columns {
+                    Some(((columns, lines.moved(line)?), size))
+                } else {
+                    Some(((columns, line), size))
+                }
+            })
+            .collect();
         if lines.columns {
             host.column_styles = host
                 .column_styles

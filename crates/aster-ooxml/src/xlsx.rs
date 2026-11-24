@@ -678,6 +678,17 @@ fn worksheet(
                     .unwrap_or(min)
                     .clamp(min, i64::from(MAX_COLUMNS));
                 let hidden = tag.attr_bool("hidden").unwrap_or(false);
+                // A hidden column keeps the width it had, for showing it.
+                if hidden
+                    && let Some(width) = tag.attr_f64("width").filter(|w| *w > 0.0)
+                    && max - min < 1000
+                {
+                    for col in min as u32 - 1..max as u32 {
+                        builder
+                            .hidden_sizes
+                            .insert((true, col), column_px(width, digit));
+                    }
+                }
                 let width = match tag.attr_f64("width") {
                     _ if hidden => Some(0.0),
                     Some(width) => Some(column_px(width, digit)),
@@ -708,6 +719,11 @@ fn worksheet(
                 next_row = index.saturating_add(1);
                 if tag.attr_bool("hidden").unwrap_or(false) {
                     row_heights.push((index, 0.0));
+                    if let Some(points) = tag.attr_f64("ht").filter(|p| *p > 0.0) {
+                        builder
+                            .hidden_sizes
+                            .insert((false, index), (points * PX_PER_POINT).round());
+                    }
                 } else if let Some(points) = tag.attr_f64("ht") {
                     row_heights.push((index, (points * PX_PER_POINT).round()));
                 }

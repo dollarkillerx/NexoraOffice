@@ -1307,7 +1307,8 @@ impl SheetTab {
     /// Hide the rows (or columns) the selection spans, or show the hidden
     /// ones among them; with none hidden there, the hidden ones right
     /// before it, as one would select around them in Excel. Shown lines
-    /// get the default size. One undo step.
+    /// come back at the size they had (the default if that is not known).
+    /// One undo step.
     pub fn hide_lines(&mut self, columns: bool, hide: bool) -> bool {
         /// More lines than this are not hidden or shown at once.
         const MAX_LINES: u32 = 100_000;
@@ -1347,6 +1348,14 @@ impl SheetTab {
                 lines.push(line);
             }
         }
+        // Shown lines come back at the size they had.
+        let kept = |line: u32| {
+            current
+                .hidden_sizes
+                .get(&(columns, line))
+                .copied()
+                .unwrap_or(default)
+        };
         let sizes: Vec<(usize, Resize, f64, f64)> = lines
             .iter()
             .map(|&line| {
@@ -1355,12 +1364,18 @@ impl SheetTab {
                     sheet,
                     resize(line),
                     before,
-                    if hide { 0.0 } else { default },
+                    if hide { 0.0 } else { kept(line) },
                 )
             })
             .collect();
         if sizes.is_empty() {
             return false;
+        }
+        if hide {
+            let target = &mut self.view.workbook_mut().sheets[sheet];
+            for (&line, &(_, _, before, _)) in lines.iter().zip(&sizes) {
+                target.hidden_sizes.insert((columns, line), before);
+            }
         }
         for &(sheet, resize, _, after) in &sizes {
             self.set_size(sheet, resize, after);
@@ -2967,12 +2982,15 @@ mod tests {
             let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
             String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap()
         };
+        // Hidden, with the size they come back at.
         assert!(
-            xml.contains(r#"<col min="2" max="2" width="8.43" hidden="1"/>"#),
+            xml.contains(
+                r#"<col min="2" max="2" width="9.142857142857142" customWidth="1" hidden="1"/>"#
+            ),
             "{xml}"
         );
         assert!(
-            xml.contains(r#"<row r="4" hidden="1"/><row r="5" hidden="1"/>"#),
+            xml.contains(r#"<row r="4" ht="15" customHeight="1" hidden="1"/><row r="5" ht="15" customHeight="1" hidden="1"/>"#),
             "{xml}"
         );
         let Ok(Loaded::Workbook(again, _)) = load(&file) else {
@@ -2993,6 +3011,25 @@ mod tests {
         tab.view.extend_to(at("A6"));
         assert!(tab.hide_lines(false, false));
         assert!(size(&tab, false, 3) > 0.0 && size(&tab, false, 4) > 0.0);
+
+        // A wide column comes back as wide, also from the saved file.
+        tab.set_size(0, Resize::Column(4), 150.0);
+        tab.view.select(at("E1"));
+        assert!(tab.hide_lines(true, true));
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        tab.view.select(at("F1"));
+        assert!(tab.hide_lines(true, false));
+        assert_eq!(size(&tab, true, 4), 150.0);
+        let Ok(Loaded::Workbook(again, source)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let mut reopened = SheetTab::new(again, source, Some(file.clone()), &tokens);
+        assert_eq!(size(&reopened, true, 4), 0.0);
+        reopened.view.select(at("F1"));
+        assert!(reopened.hide_lines(true, false));
+        assert_eq!(size(&reopened, true, 4), 150.0);
     }
 
     #[test]

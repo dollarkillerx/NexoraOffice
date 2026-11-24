@@ -137,6 +137,9 @@ pub struct Sheet {
     /// Something deleting the sheet would leave broken (an Excel table
     /// others may name, a pivot table): its relationship kind.
     pub delete_blocker: Option<String>,
+    /// The size hidden lines had, to come back with when shown: columns
+    /// (`true`) or rows, and the line.
+    pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
 }
 
 impl Sheet {
@@ -352,6 +355,7 @@ pub struct SheetBuilder {
     pub column_styles: Vec<(u32, u32, u32)>,
     pub row_styles: Vec<(u32, u32)>,
     pub pictures: Vec<Picture>,
+    pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
 }
 
 impl SheetBuilder {
@@ -369,6 +373,7 @@ impl SheetBuilder {
             column_styles: Vec::new(),
             row_styles: Vec::new(),
             pictures: Vec::new(),
+            hidden_sizes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -444,6 +449,7 @@ impl SheetBuilder {
             pictures: self.pictures,
             structure_blocker: None,
             delete_blocker: None,
+            hidden_sizes: self.hidden_sizes,
         }
     }
 }

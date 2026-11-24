@@ -120,6 +120,9 @@ component TreeRow inherits Rectangle {
     in property <TreeItem> item;
     callback clicked;
     callback reveal;
+    // 2 new Markdown file, 3 new folder (both beside a file, inside a
+    // folder), 4 rename, 5 move to the trash.
+    callback act(int);
     height: Tokens.control-height;
     property <bool> note: root.item.kind == -3;
     property <bool> dim: root.item.kind == -2 || (root.item.kind >= 0 && !root.item.opens);
@@ -201,6 +204,32 @@ component TreeRow inherits Rectangle {
 
         rows := VerticalLayout {
             padding: Tokens.space-xs + 2px;
+            // Not for a link back to a folder above: that is not an entry of
+            // its own to change.
+            if root.item.kind != -2: MenuRow {
+                text: Strings.tree-new-file;
+                clicked => {
+                    root.act(2);
+                }
+            }
+            if root.item.kind != -2: MenuRow {
+                text: Strings.tree-new-folder;
+                clicked => {
+                    root.act(3);
+                }
+            }
+            if root.item.kind != -2: MenuRow {
+                text: Strings.tree-rename;
+                clicked => {
+                    root.act(4);
+                }
+            }
+            if root.item.kind != -2: MenuRow {
+                text: Strings.trash;
+                clicked => {
+                    root.act(5);
+                }
+            }
             MenuRow {
                 text: Strings.reveal;
                 clicked => {
@@ -227,6 +256,8 @@ export component Sidebar inherits Rectangle {
     callback clear-recent();
     callback tree-clicked(int);
     callback reveal-tree(int);
+    // As TreeRow's `act`; row -1 is the open folder itself.
+    callback tree-act(int, int);
     callback open-folder();
     callback refresh();
     // The headings of the Markdown document in front, and whether one is.
@@ -463,6 +494,16 @@ export component Sidebar inherits Rectangle {
         if root.lower-page == 0: SectionHeader {
             title: root.folder-name != "" ? root.folder-name : Strings.files;
             if root.folder-name != "": IconButton {
+                icon: Icons.plus;
+                size: 24px;
+                icon-size: 14px;
+                accessible-role: button;
+                accessible-label: Strings.tree-new-file;
+                clicked => {
+                    root.tree-act(2, -1);
+                }
+            }
+            if root.folder-name != "": IconButton {
                 icon: Icons.refresh;
                 size: 24px;
                 icon-size: 14px;
@@ -527,6 +568,9 @@ export component Sidebar inherits Rectangle {
                 }
                 reveal => {
                     root.reveal-tree(index);
+                }
+                act(action) => {
+                    root.tree-act(action, index);
                 }
             }
         }

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 rfd = { workspace = true }
+trash = { workspace = true }
 
 # Telling local disks from network ones (volumes.rs).
 [target.'cfg(unix)'.dependencies]

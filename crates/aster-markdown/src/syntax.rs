@@ -1,9 +1,12 @@
-//! What the highlighter and the preview agree on: which Markdown is read, how
-//! link labels compare, and where bare web addresses are.
+//! What the highlighter and the preview agree on: which Markdown is read,
+//! where front matter is, how link labels compare, where bare web addresses
+//! are, and what a double click calls a word.
 
 use std::ops::Range;
 
-use pulldown_cmark::Options;
+use icu_segmenter::WordSegmenter;
+use icu_segmenter::options::WordBreakInvariantOptions;
+use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 
 /// The Markdown both the editor and the preview read: CommonMark with GitHub's
 /// tables, task lists, strikethrough and alerts, plus footnotes and `$` math.
@@ -16,6 +19,103 @@ pub fn options() -> Options {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_GFM
+}
+
+/// Front matter is only looked for this far into a document, so an opening
+/// `---` that is never closed costs little to look at on every key press.
+/// Real front matter is a few hundred bytes.
+pub const FRONT_MATTER_LIMIT: usize = 64 * 1024;
+
+/// The YAML front matter at the very start of `text`, as Jekyll, Hugo and
+/// Obsidian write it: a `---` line, lines of YAML (the first one not blank),
+/// and a closing `---` or `...` line. The range runs from 0 to the end of the
+/// closing line, its line break included. Only found when the closing line
+/// ends within [`FRONT_MATTER_LIMIT`] bytes.
+///
+/// pulldown-cmark's `ENABLE_YAML_STYLE_METADATA_BLOCKS` has the last word on
+/// what counts, but it is not in [`options`]: the parser takes such a block
+/// after any blank line, so `---`, a line and `---` in the middle of a
+/// document would vanish from the preview. Callers take the front matter off
+/// the start and parse the rest on its own.
+pub fn front_matter(text: &str) -> Option<Range<usize>> {
+    let mut lines = text.split_inclusive('\n');
+    let opening = lines.next()?;
+    if !opening
+        .strip_prefix("---")?
+        .bytes()
+        .all(|b| b.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let mut end = opening.len();
+    for (index, line) in lines.enumerate() {
+        let start = end;
+        end += line.len();
+        if end > FRONT_MATTER_LIMIT {
+            return None;
+        }
+        let closing = closes_front_matter(line);
+        // The first line can be neither blank nor the end.
+        if index == 0 && (closing || line.trim_matches([' ', '\t', '\r', '\n']).is_empty()) {
+            return None;
+        }
+        if closing {
+            return parser_agrees(&text[..end], start).then_some(0..end);
+        }
+    }
+    None
+}
+
+/// A line that ends front matter: exactly `---` or `...`, then only spaces.
+fn closes_front_matter(line: &str) -> bool {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    matches!(line.trim_end_matches(' '), "---" | "...")
+}
+
+/// Whether pulldown-cmark reads `text` as one metadata block from its start
+/// to the closing line, which starts at `closing`.
+fn parser_agrees(text: &str, closing: usize) -> bool {
+    let mut events =
+        Parser::new_ext(text, Options::ENABLE_YAML_STYLE_METADATA_BLOCKS).into_offset_iter();
+    let yaml = MetadataBlockKind::YamlStyle;
+    if !matches!(
+        events.next(),
+        Some((Event::Start(Tag::MetadataBlock(kind)), range)) if kind == yaml && range.start == 0
+    ) {
+        return false;
+    }
+    events.any(|(event, range)| {
+        matches!(event, Event::End(TagEnd::MetadataBlock(_))) && range.end >= closing
+    })
+}
+
+/// The word around byte `offset` of `text`, the way a double click picks one:
+/// the segment the character there is in, as ICU4X's word segmenter cuts the
+/// text with its Chinese and Japanese dictionary. That is the segmentation
+/// Parley gives the editor, so a run of Han characters splits into the same
+/// words in both. A run of spaces and a punctuation mark are segments of
+/// their own. At the end of the text, the last segment.
+pub fn word_range(text: &str, offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+    let mut at = offset.min(text.len());
+    if at == text.len() {
+        at -= 1;
+    }
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let segmenter = WordSegmenter::new_dictionary(WordBreakInvariantOptions::default());
+    let mut start = 0;
+    for boundary in segmenter.segment_str(text) {
+        if boundary > at {
+            return start..boundary;
+        }
+        start = boundary;
+    }
+    start..text.len()
 }
 
 /// A link label the way CommonMark compares them: case folded, with runs of
@@ -291,6 +391,86 @@ mod tests {
             urls("https://example.com/@who/a@b.cn/x and a@b.cn"),
             ["https://example.com/@who/a@b.cn/x", "a@b.cn"]
         );
+    }
+
+    #[test]
+    fn front_matter_at_the_start() {
+        let text = "---\ntitle: 标题\n\ntags:\n  - a\n---\n# 正文\n";
+        let range = front_matter(text).unwrap();
+        assert_eq!(&text[range], "---\ntitle: 标题\n\ntags:\n  - a\n---\n");
+        // Closed by `...`, with trailing spaces, at the end of the text.
+        assert_eq!(front_matter("---\na: 1\n...  "), Some(0..14));
+        assert_eq!(front_matter("---  \r\na: 1\r\n---\r\n"), Some(0..18));
+    }
+
+    #[test]
+    fn things_that_are_not_front_matter() {
+        for text in [
+            "",
+            "---",
+            "---\n",
+            // Never closed.
+            "---\na: 1\n",
+            // The first line is blank, or the end.
+            "---\n\na: 1\n---\n",
+            "---\n---\n",
+            // Not at the very start, indented, or not exactly three.
+            "\n---\na: 1\n---\n",
+            " ---\na: 1\n---\n",
+            "----\na: 1\n---\n",
+            "---\na: 1\n----\n",
+            "---\na: 1\n ---\n",
+            "---x\na: 1\n---\n",
+        ] {
+            assert_eq!(front_matter(text), None, "{text:?}");
+        }
+        // Closed too far in.
+        let long = format!("---\n{}\n---\n", "a".repeat(FRONT_MATTER_LIMIT));
+        assert_eq!(front_matter(&long), None);
+    }
+
+    /// Why the parser option is not in `options()`: it takes a block in the
+    /// middle of a document too.
+    #[test]
+    fn the_parser_takes_metadata_anywhere() {
+        let text = "段落\n\n---\na: 1\n---\n";
+        let options = options() | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        assert!(
+            Parser::new_ext(text, options)
+                .any(|event| matches!(event, Event::Start(Tag::MetadataBlock(_))))
+        );
+        assert_eq!(front_matter(text), None);
+    }
+
+    #[test]
+    fn words_for_a_double_click() {
+        fn word<'a>(text: &'a str, at: &str) -> &'a str {
+            let offset = text.find(at).unwrap();
+            &text[word_range(text, offset)]
+        }
+        let text = "Hello, wide world";
+        assert_eq!(word(text, "ello"), "Hello");
+        assert_eq!(word(text, "wide"), "wide");
+        assert_eq!(word(text, ","), ",");
+        assert_eq!(word(text, " wide"), " ");
+        assert_eq!(&text[word_range(text, text.len())], "world");
+        assert_eq!(&text[word_range(text, 1000)], "world");
+        // Han characters split into dictionary words, not single characters
+        // or the whole run.
+        let text = "我们今天学习中文";
+        let found = word(text, "学");
+        assert!(
+            found.len() > "学".len() && found.len() < text.len(),
+            "{found}"
+        );
+        assert!(found.starts_with('学'), "{found}");
+        // Japanese: kana and kanji.
+        let text = "日本語の文章を選択する";
+        let found = word(text, "文");
+        assert!(found.starts_with('文') && !found.contains('を'), "{found}");
+        // Inside a character: the character it is in.
+        assert_eq!(word_range("中文", 1), 0..6);
+        assert_eq!(word_range("", 0), 0..0);
     }
 
     #[test]

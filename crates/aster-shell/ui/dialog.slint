@@ -8,6 +8,10 @@ export component Dialog inherits Rectangle {
     // 2 message: OK.
     // 3 quitting with unsaved changes: quit anyway, cancel.
     // 4 a recent file is gone: take it off the list, cancel.
+    // 7 moving something to the trash: move, cancel.
+    // 6 a character the file's encoding cannot hold: save in UTF-8, cancel.
+    // 5 another program changed a file with unsaved changes here: load the
+    //   version on disk, keep mine.
     in property <int> kind;
     in property <string> title;
     in property <string> body;
@@ -95,6 +99,24 @@ export component Dialog inherits Rectangle {
                         root.discard();
                     }
                 }
+                if root.kind == 7: TextButton {
+                    text: Strings.trash;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+                if root.kind == 6: TextButton {
+                    text: Strings.button-save-utf8;
+                    clicked => {
+                        root.discard();
+                    }
+                }
+                if root.kind == 5: TextButton {
+                    text: Strings.button-load-disk;
+                    clicked => {
+                        root.discard();
+                    }
+                }
                 if root.kind == 4: TextButton {
                     text: Strings.recent-remove;
                     clicked => {
@@ -106,8 +128,8 @@ export component Dialog inherits Rectangle {
                 }
 
                 if root.kind != 2: TextButton {
-                    text: Strings.button-cancel;
-                    primary: root.kind == 3;
+                    text: root.kind == 5 ? Strings.button-keep-mine : Strings.button-cancel;
+                    primary: root.kind == 3 || root.kind == 5 || root.kind == 6 || root.kind == 7;
                     clicked => {
                         root.cancel();
                     }

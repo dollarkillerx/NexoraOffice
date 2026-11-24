@@ -85,6 +85,10 @@ tempfile = "3.27"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Native open and save dialogs on all three systems.
 rfd = "~0.18.0"
+# Reading and writing files in legacy encodings (GB18030, Shift_JIS, ...).
+encoding_rs = "0.8.35"
+# Moving files to the system trash rather than deleting them.
+trash = { version = "5.4", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"] }
 # JSON for the tool layer, MCP and the AI providers' wire formats.
 serde_json = "1.0.150"
 # The assistant's HTTPS client. Blocking, on the assistant's own thread.

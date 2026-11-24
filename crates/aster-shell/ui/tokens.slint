@@ -58,6 +58,7 @@ export global Strings {
     in property <string> menu-find-previous;
     in property <string> menu-find-selection;
     in property <string> menu-replace;
+    in property <string> menu-go-to-line;
     in property <string> find-placeholder;
     in property <string> replace-placeholder;
     in property <string> find-match-case;
@@ -117,6 +118,18 @@ export global Strings {
     // "Show in Finder" on macOS, "Show in File Manager" elsewhere.
     in property <string> reveal;
     in property <string> recent-remove;
+    in property <string> tree-new-file;
+    in property <string> tree-new-folder;
+    in property <string> tree-rename;
+    in property <string> trash;
+    in property <string> button-open;
+    in property <string> button-save-utf8;
+    in property <string> menu-reopen-encoding;
+    in property <string> menu-convert-utf8;
+    in property <string> menu-line-endings-lf;
+    in property <string> menu-line-endings-crlf;
+    in property <string> button-load-disk;
+    in property <string> button-keep-mine;
     in property <string> recent-empty;
     in property <string> recent-missing;
     in property <string> no-folder;
@@ -331,6 +344,12 @@ export struct ApprovalItem {
 }
 
 // A heading in the sidebar's outline.
+// An encoding a file can be read in, and how its start reads in it.
+export struct EncodingChoice {
+    label: string,
+    preview: string,
+}
+
 export struct OutlineItem {
     level: int,
     text: string,

@@ -9,6 +9,10 @@
 //! it; only the blocks in between are parsed again. A key press in a large
 //! document parses a paragraph, not the document.
 //!
+//! YAML front matter at the very start of the text ([`syntax::front_matter`])
+//! is a block of its own, blank lines and all. An edit that makes, ends or
+//! moves the end of the front matter cuts again from the start.
+//!
 //! What is lost by parsing blocks apart: link reference definitions in one
 //! block are given to the others through the broken-link callback, so
 //! `[text][label]` still highlights; footnotes are matched within a block only.
@@ -26,14 +30,14 @@ use std::ops::{BitOr, BitOrAssign, Range};
 use pulldown_cmark::{BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, TagEnd};
 use ropey::Rope;
 
-use crate::document::slice;
+use crate::document::{floor_char_boundary, slice};
 
 use crate::syntax;
 
 /// What a stretch of source text is. Several can apply at once: a link inside
 /// a heading is both.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct Marks(u16);
+pub struct Marks(u32);
 
 impl Marks {
     pub const NONE: Marks = Marks(0);
@@ -66,8 +70,12 @@ impl Marks {
     pub const RULE: Marks = Marks(1 << 14);
     /// `$math$` and `$$math$$`.
     pub const MATH: Marks = Marks(1 << 15);
+    /// YAML front matter at the start of the document, its `---` lines
+    /// included; those are also [`Marks::MARKER`].
+    pub const FRONT_MATTER: Marks = Marks(1 << 16);
 
-    const NAMES: [&'static str; 16] = [
+    const COUNT: usize = 17;
+    const NAMES: [&'static str; Self::COUNT] = [
         "heading",
         "strong",
         "emphasis",
@@ -84,6 +92,7 @@ impl Marks {
         "table",
         "rule",
         "math",
+        "front-matter",
     ];
 
     pub const fn contains(self, other: Marks) -> bool {
@@ -98,14 +107,15 @@ impl Marks {
         self.0 == 0
     }
 
-    /// Any of the marks that stand for syntax rather than text.
+    /// Any of the marks that stand for syntax or metadata rather than text.
     pub const fn is_syntax(self) -> bool {
         self.intersects(Marks(
             Self::MARKER.0
                 | Self::LIST_MARKER.0
                 | Self::QUOTE_MARKER.0
                 | Self::TABLE.0
-                | Self::RULE.0,
+                | Self::RULE.0
+                | Self::FRONT_MATTER.0,
         ))
     }
 }
@@ -125,7 +135,7 @@ impl BitOrAssign for Marks {
 
 impl std::fmt::Debug for Marks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<_> = (0..16)
+        let names: Vec<_> = (0..Self::COUNT)
             .filter(|bit| self.0 & (1 << bit) != 0)
             .map(|bit| Self::NAMES[bit])
             .collect();
@@ -198,6 +208,8 @@ pub struct Highlighter {
     labels: HashMap<String, usize>,
     /// Bytes parsed by the last call to `new` or `edit`.
     parsed: usize,
+    /// Where the front matter ends, or 0 if there is none.
+    front_matter: usize,
 }
 
 fn new_block(range: Range<usize>, labels: Vec<String>) -> Block {
@@ -212,11 +224,13 @@ fn new_block(range: Range<usize>, labels: Vec<String>) -> Block {
 
 impl Highlighter {
     pub fn new(text: &Rope) -> Self {
-        let (cuts, _) = cut(text, 0, |_| false);
+        let front_matter = front_matter_end(text);
+        let (cuts, _) = cut(text, 0, front_matter, |_| false);
         let mut highlighter = Self {
             groups: Vec::new(),
             labels: HashMap::new(),
             parsed: 0,
+            front_matter,
         };
         let mut blocks: Vec<Block> = Vec::with_capacity(cuts.len());
         for (range, labels) in cuts {
@@ -224,7 +238,7 @@ impl Highlighter {
             blocks.push(new_block(range, labels));
         }
         for block in &mut blocks {
-            highlighter.parsed += parse(block, text, &highlighter.labels);
+            highlighter.parsed += parse(block, text, &highlighter.labels, front_matter);
         }
         highlighter.groups = regroup(blocks);
         highlighter
@@ -237,10 +251,28 @@ impl Highlighter {
         let shift = |offset: usize| (offset + inserted) - old.len();
         self.parsed = 0;
 
+        // The front matter can end somewhere else now: an edit far down can
+        // close it, or turn its closing line into something else. Then the
+        // cutting starts over from the top.
+        let front_matter = front_matter_end(text);
+        let expected = if self.front_matter <= old.start {
+            Some(self.front_matter)
+        } else if self.front_matter >= old.end {
+            Some(shift(self.front_matter))
+        } else {
+            None
+        };
+        let moved = expected != Some(front_matter);
+        self.front_matter = front_matter;
+
         // The block the edit starts in. An edit at the very start of a block
         // can join it to the one before (a space typed there indents it), so
         // start one block earlier.
-        let (mut g, mut b) = self.locate(old.start);
+        let (mut g, mut b) = if moved {
+            (0, 0)
+        } else {
+            self.locate(old.start)
+        };
         if (g, b) != (0, 0) && self.start_of(g, b) == old.start {
             (g, b) = self.previous(g, b);
         }
@@ -251,7 +283,7 @@ impl Highlighter {
         let (mut rg, mut rb) = self.first_starting_after(old.end);
         let groups = &self.groups;
         let start = |rg: usize, rb: usize| groups[rg].start + groups[rg].blocks[rb].start;
-        let (cuts, resynced) = cut(text, from, |at| {
+        let (cuts, resynced) = cut(text, from, front_matter, |at| {
             while rg < groups.len() && shift(start(rg, rb)) < at {
                 rb += 1;
                 if rb == groups[rg].blocks.len() {
@@ -306,7 +338,7 @@ impl Highlighter {
             set_changed |= self.count_labels(&block.labels, true);
         }
         for block in &mut blocks[b..b + added] {
-            self.parsed += parse(block, text, &self.labels);
+            self.parsed += parse(block, text, &self.labels, front_matter);
         }
 
         let regrouped = regroup(blocks);
@@ -325,7 +357,7 @@ impl Highlighter {
                         let mut absolute = block.clone();
                         absolute.start += group.start;
                         absolute.end += group.start;
-                        parsed += parse(&mut absolute, text, labels);
+                        parsed += parse(&mut absolute, text, labels, front_matter);
                         block.spans = absolute.spans;
                         block.uses_labels = absolute.uses_labels;
                     }
@@ -472,9 +504,34 @@ fn regroup(blocks: Vec<Block>) -> Vec<Group> {
     groups
 }
 
+/// Where the front matter of `text` ends, or 0 if it has none: what
+/// [`syntax::front_matter`] finds in the part of the text it looks at.
+fn front_matter_end(text: &Rope) -> usize {
+    let len = text.len_bytes();
+    if !text.bytes().take(3).eq(*b"---") {
+        return 0;
+    }
+    let head = slice(
+        text,
+        0..floor_char_boundary(text, len.min(syntax::FRONT_MATTER_LIMIT)),
+    );
+    match syntax::front_matter(&head) {
+        // A closing line cut off where the head ends may go on in the text.
+        Some(range) if range.end == head.len() && head.len() < len && !head.ends_with('\n') => 0,
+        Some(range) => range.end,
+        None => 0,
+    }
+}
+
 /// Highlight one block with absolute offsets. Returns how many bytes were
-/// parsed: none for a block over [`MAX_PARSED`].
-fn parse(block: &mut Block, text: &Rope, labels: &HashMap<String, usize>) -> usize {
+/// parsed: none for a block over [`MAX_PARSED`]. The block that ends where
+/// the front matter does, at the start of the text, is the front matter.
+fn parse(
+    block: &mut Block,
+    text: &Rope,
+    labels: &HashMap<String, usize>,
+    front_matter: usize,
+) -> usize {
     let len = block.end - block.start;
     if len > MAX_PARSED {
         block.spans = Box::new([]);
@@ -482,7 +539,12 @@ fn parse(block: &mut Block, text: &Rope, labels: &HashMap<String, usize>) -> usi
         return 0;
     }
     let source = slice(text, block.start..block.end);
-    let (spans, uses_labels) = highlight_block(&source, labels);
+    let (spans, uses_labels) = if block.start == 0 && front_matter > 0 && block.end == front_matter
+    {
+        (highlight_front_matter(&source), false)
+    } else {
+        highlight_block(&source, labels)
+    };
     block.spans = spans
         .into_iter()
         .map(|span| Packed {
@@ -577,8 +639,13 @@ type Cut = (Range<usize>, Vec<String>);
 /// Cut `text` into blocks starting at `from`, which must be a block start.
 /// `stop` is asked about every cut after the first block; when it says yes,
 /// cutting ends there and the second value is `true`. Each block comes with
-/// its link reference labels.
-fn cut(text: &Rope, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cut>, bool) {
+/// its link reference labels. The text up to `front_matter` is one block.
+fn cut(
+    text: &Rope,
+    from: usize,
+    front_matter: usize,
+    mut stop: impl FnMut(usize) -> bool,
+) -> (Vec<Cut>, bool) {
     let len = text.len_bytes();
     let mut blocks = Vec::new();
     let mut start = from;
@@ -591,6 +658,20 @@ fn cut(text: &Rope, from: usize, mut stop: impl FnMut(usize) -> bool) -> (Vec<Cu
             break;
         }
         let line_len = line.len_bytes();
+        if at < front_matter {
+            // Inside the front matter: no cuts, fences or labels.
+            at += line_len;
+            continue;
+        }
+        if at == front_matter && at != start {
+            blocks.push((start..at, std::mem::take(&mut labels)));
+            if stop(at) {
+                return (blocks, true);
+            }
+            start = at;
+            open = Open::Nothing;
+            previous_blank = false;
+        }
         // Short lines are read whole; of long ones only the start.
         let whole = line_len <= LINE_PREFIX;
         let prefix = if whole {
@@ -664,6 +745,19 @@ fn highlight_block(source: &str, labels: &HashMap<String, usize>) -> (Vec<Span>,
     }
     marks.definitions();
     (flatten(marks.raw), asked.get())
+}
+
+/// The front matter, its own text: all of it grey, the `---` lines as markers.
+fn highlight_front_matter(source: &str) -> Vec<Span> {
+    let end = source.trim_end().len();
+    let opening = source.find('\n').unwrap_or(end).min(end);
+    let opening = source[..opening].trim_end().len();
+    let closing = source[..end].rfind('\n').map_or(end, |newline| newline + 1);
+    flatten(vec![
+        (0..end, Marks::FRONT_MATTER),
+        (0..opening, Marks::MARKER),
+        (closing..end, Marks::MARKER),
+    ])
 }
 
 /// Turns parser events into raw, possibly overlapping marks.
@@ -998,7 +1092,10 @@ impl<'a> Collector<'a> {
 fn flatten(raw: Vec<(Range<usize>, Marks)>) -> Vec<Span> {
     let mut edges: Vec<(usize, bool, u16)> = Vec::with_capacity(raw.len() * 2);
     for (range, marks) in raw {
-        for bit in 0..16 {
+        if range.start >= range.end {
+            continue;
+        }
+        for bit in 0..Marks::COUNT as u16 {
             if marks.0 & (1 << bit) != 0 {
                 edges.push((range.start, true, bit));
                 edges.push((range.end, false, bit));
@@ -1006,14 +1103,14 @@ fn flatten(raw: Vec<(Range<usize>, Marks)>) -> Vec<Span> {
         }
     }
     edges.sort_unstable_by_key(|edge| edge.0);
-    let mut counts = [0u32; 16];
+    let mut counts = [0u32; Marks::COUNT];
     let mut spans: Vec<Span> = Vec::new();
     let mut previous = 0;
     let mut index = 0;
     while index < edges.len() {
         let at = edges[index].0;
         let current = Marks(
-            (0..16u16)
+            (0..Marks::COUNT as u16)
                 .filter(|bit| counts[usize::from(*bit)] > 0)
                 .fold(0, |acc, bit| acc | (1 << bit)),
         );
@@ -1286,9 +1383,11 @@ mod tests {
 
     #[test]
     fn edits_give_the_same_result_as_starting_over() {
-        const PIECES: [&str; 18] = [
+        const PIECES: [&str; 20] = [
             "\n",
             "\n\n",
+            "---\n",
+            "...\n",
             "```",
             "~~~",
             "# ",
@@ -1335,6 +1434,147 @@ mod tests {
             );
             check_spans(&text, &spans);
         }
+    }
+
+    #[test]
+    fn front_matter_is_grey_and_one_block() {
+        let text = "---\ntitle: *标题*\n\n# 不是标题\ntags:\n  - a\n...\n# 正文\n\n段落\n";
+        assert_eq!(
+            marks_at(text, "---", 0),
+            Marks::FRONT_MATTER | Marks::MARKER
+        );
+        assert_eq!(marks_at(text, "标题", 0), Marks::FRONT_MATTER);
+        assert_eq!(marks_at(text, "# 不是", 0), Marks::FRONT_MATTER);
+        assert_eq!(marks_at(text, "- a", 0), Marks::FRONT_MATTER);
+        assert_eq!(
+            marks_at(text, "...", 0),
+            Marks::FRONT_MATTER | Marks::MARKER
+        );
+        assert!(marks_at(text, "---", 0).is_syntax());
+        assert!(marks_at(text, "# 正文", 0).contains(Marks::HEADING));
+        let ranges = Highlighter::new(&rope(text)).block_ranges();
+        let end = text.find("# 正文").unwrap();
+        assert_eq!(ranges[0], 0..end);
+        assert_eq!(ranges.len(), 3);
+        // Only at the very start: further down it is a rule and a heading.
+        let text = "段落\n\n---\ntitle: 标题\n---\n";
+        assert_eq!(marks_at(text, "---", 0), Marks::RULE);
+        assert!(marks_at(text, "title", 0).contains(Marks::HEADING));
+        // Never closed: Markdown as usual.
+        assert_eq!(marks_at("---\ntitle: 标题\n", "---", 0), Marks::RULE);
+        // Closed on the last line, without a line break.
+        let text = "---\na: 1\n---";
+        let spans = all(text);
+        check_spans(text, &spans);
+        assert_eq!(spans.last().unwrap().range, 9..12);
+    }
+
+    #[test]
+    fn front_matter_made_and_unmade_by_edits() {
+        let mut text = String::from("---\ntitle: 标题\n\n段落\n\n# 标题\n");
+        let mut highlighter = Highlighter::new(&rope(&text));
+        let check = |highlighter: &Highlighter, text: &str| {
+            let fresh = Highlighter::new(&rope(text));
+            assert_eq!(highlighter.block_ranges(), fresh.block_ranges(), "{text:?}");
+            assert_eq!(
+                highlighter.spans(0..text.len()),
+                fresh.spans(0..text.len()),
+                "{text:?}"
+            );
+        };
+        let mut edit = |text: &mut String, range: Range<usize>, insert: &str| {
+            text.replace_range(range.clone(), insert);
+            highlighter.edit(&rope(text), range, insert.len());
+            check(&highlighter, text);
+            highlighter.spans(0..text.len())
+        };
+        // Closing it far below makes everything above front matter.
+        let at = text.find("# 标题").unwrap();
+        let spans = edit(&mut text, at..at, "---\n");
+        assert!(spans[0].marks.contains(Marks::FRONT_MATTER));
+        assert_eq!(spans.last().unwrap().marks, Marks::HEADING);
+        // Typing inside it, and after it.
+        let at = text.find("段落").unwrap();
+        edit(&mut text, at..at, "x: ");
+        let end = text.len();
+        edit(&mut text, end..end, "\n---\n");
+        // Breaking the closing line: the next one down closes it.
+        let at = text.find("---\n#").unwrap();
+        edit(&mut text, at..at, "-");
+        assert_eq!(marks_at(&text, "# 标题", 0), Marks::FRONT_MATTER);
+        edit(&mut text, at..at + 1, "");
+        assert!(marks_at(&text, "# 标题", 0).contains(Marks::HEADING));
+        // Breaking the opening line, and mending it.
+        edit(&mut text, 0..1, "");
+        edit(&mut text, 0..0, "-");
+        assert!(all(&text)[0].marks.contains(Marks::FRONT_MATTER));
+        // A blank first line, and text before it.
+        edit(&mut text, 4..4, "\n");
+        edit(&mut text, 4..5, "");
+        edit(&mut text, 0..0, "前\n");
+        assert!(!all(&text)[0].marks.contains(Marks::FRONT_MATTER));
+    }
+
+    #[test]
+    fn random_edits_around_front_matter_give_the_same_result() {
+        const PIECES: [&str; 14] = [
+            "---\n",
+            "...\n",
+            "---",
+            "-",
+            "\n",
+            "\n\n",
+            "a: b\n",
+            "- x\n",
+            "# h\n",
+            "```",
+            "    ",
+            "中文",
+            "[a]: /u\n",
+            "[a]",
+        ];
+        let mut rng = Lcg(11);
+        let mut text = String::from("---\ntitle: 标题\n\n- a\n---\n# 正文\n\n段落 [a]\n");
+        let mut highlighter = Highlighter::new(&rope(&text));
+        // How often the edits made and unmade front matter.
+        let mut changes = 0;
+        for step in 0..3000 {
+            let had = highlighter.front_matter;
+            // Most edits near the top, where front matter is made and unmade.
+            let near = if rng.next(3) == 0 {
+                text.len() + 1
+            } else {
+                (text.len() + 1).min(40)
+            };
+            let mut start = boundary(&text, rng.next(near));
+            let mut end = boundary(&text, start + rng.next(5)).max(start);
+            let mut insert = if rng.next(4) == 0 {
+                ""
+            } else {
+                PIECES[rng.next(PIECES.len())]
+            };
+            // Now and then a fresh opening line, so it does not stay broken.
+            if rng.next(25) == 0 {
+                (start, end, insert) = (0, 0, "---\n");
+            }
+            text.replace_range(start..end, insert);
+            highlighter.edit(&rope(&text), start..end, insert.len());
+            let fresh = Highlighter::new(&rope(&text));
+            assert_eq!(
+                highlighter.block_ranges(),
+                fresh.block_ranges(),
+                "blocks after step {step}: {text:?}"
+            );
+            let spans = highlighter.spans(0..text.len());
+            assert_eq!(
+                spans,
+                fresh.spans(0..text.len()),
+                "spans after step {step}: {text:?}"
+            );
+            check_spans(&text, &spans);
+            changes += usize::from((had == 0) != (highlighter.front_matter == 0));
+        }
+        assert!(changes > 20, "front matter changed only {changes} times");
     }
 
     #[test]

@@ -1,0 +1,136 @@
+import { Tokens, Strings, EncodingChoice } from "tokens.slint";
+import { TextButton } from "widgets.slint";
+
+// Pick the encoding a file is read in, seeing how its start reads in each.
+// Return opens, Escape cancels, Up and Down move between the choices.
+export component EncodingDialog inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    in property <[EncodingChoice]> choices;
+    in-out property <int> selected;
+    callback confirmed();
+    callback dismissed();
+    background: #00000040;
+
+    TouchArea {
+        scroll-event => {
+            return accept;
+        }
+    }
+
+    FocusScope {
+        init => {
+            self.focus();
+        }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.dismissed();
+            } else if (event.text == Key.Return) {
+                root.confirmed();
+            } else if (event.text == Key.UpArrow) {
+                root.selected = max(0, root.selected - 1);
+            } else if (event.text == Key.DownArrow) {
+                root.selected = min(root.choices.length - 1, root.selected + 1);
+            }
+            return accept;
+        }
+
+        Rectangle {
+            width: 480px;
+            height: card.preferred-height;
+            border-radius: Tokens.radius-lg;
+            border-width: 1px;
+            border-color: Tokens.hairline;
+            background: Tokens.surface;
+            drop-shadow-blur: 32px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: #00000040;
+            TouchArea { }
+
+            card := VerticalLayout {
+                padding: Tokens.space-lg;
+                spacing: Tokens.space-md;
+                Text {
+                    text: root.title;
+                    font-size: Tokens.font-lg;
+                    font-weight: 600;
+                    color: Tokens.text;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: root.body;
+                    font-size: Tokens.font-md;
+                    color: Tokens.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: Tokens.space-xs;
+                    for choice[index] in root.choices: Rectangle {
+                        height: Tokens.control-height;
+                        width: label.preferred-width + 2 * Tokens.space-md;
+                        border-radius: Tokens.radius-md;
+                        border-width: 1px;
+                        border-color: index == root.selected ? Tokens.accent : Tokens.hairline;
+                        background: index == root.selected ? Tokens.accent-soft : (touch.has-hover ? Tokens.hover : Tokens.surface);
+                        label := Text {
+                            text: choice.label;
+                            font-size: Tokens.font-sm;
+                            color: index == root.selected ? Tokens.accent : Tokens.text;
+                        }
+
+                        touch := TouchArea {
+                            clicked => {
+                                root.selected = index;
+                            }
+                            double-clicked => {
+                                root.selected = index;
+                                root.confirmed();
+                            }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                Rectangle {
+                    height: 132px;
+                    border-radius: Tokens.radius-md;
+                    background: Tokens.sunken;
+                    clip: true;
+                    Text {
+                        x: Tokens.space-md;
+                        y: Tokens.space-sm;
+                        width: parent.width - 2 * Tokens.space-md;
+                        text: root.selected >= 0 && root.selected < root.choices.length ? root.choices[root.selected].preview : "";
+                        font-family: "Menlo";
+                        font-size: Tokens.font-sm;
+                        color: Tokens.text;
+                        wrap: word-wrap;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Tokens.space-sm;
+                    TextButton {
+                        text: Strings.button-cancel;
+                        clicked => {
+                            root.dismissed();
+                        }
+                    }
+
+                    TextButton {
+                        text: Strings.button-open;
+                        primary: true;
+                        clicked => {
+                            root.confirmed();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

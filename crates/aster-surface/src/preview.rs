@@ -3,8 +3,10 @@
 //! breaking) and drawn with vello_cpu, with the same fonts as the editor. No
 //! browser engine is involved.
 //!
-//! Text can be selected with the mouse and copied as plain text; links that
-//! start with `#` (footnotes and the way back from them) scroll the preview.
+//! Text can be selected with the mouse and copied as plain text, by
+//! character, by word (a double click) or by whole paragraph, heading or
+//! table cell (a triple click); links that start with `#` (footnotes and the
+//! way back from them) scroll the preview.
 //!
 //! Laying out a document is the slow part, so it happens on a worker thread
 //! ([`PreviewWorker`]) and produces a [`PreviewLayout`]: a display list with
@@ -18,9 +20,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use aster_markdown::preview::{
-    Alignment, Block, BlockKind, Footnote, Inline, Item as ListItem, Outline,
+    Alignment, Block, BlockKind, Footnote, FrontMatterLine, Inline, Item as ListItem, Outline,
 };
-use aster_markdown::syntax::normalize_label;
+use aster_markdown::syntax::{normalize_label, word_range};
 use aster_text::selection::Piece as SelectionPiece;
 use aster_text::{
     Align, Family, Paragraph, Rules, Selection, Shaper, Span, Spec, Style as TextStyle, TextPoint,
@@ -184,6 +186,76 @@ impl PreviewLayout {
             .paragraph
             .offset_at((x - text.x) as f32, (y - text.y) as f32);
         Some(TextPoint { block, offset })
+    }
+
+    /// The character under a point in document coordinates, as the start of
+    /// it: what a double click picks the word around. Unlike
+    /// [`Self::point_at`], which gives the gap between characters nearest the
+    /// point, a point on the right half of a character is still on that
+    /// character, and one past the end of a line is on its last character.
+    pub fn char_at(&self, x: f64, y: f64) -> Option<TextPoint> {
+        let point = self.point_at(x, y)?;
+        let text = &self.texts[point.block];
+        let content = text.paragraph.text();
+        let Some(before) = content[..point.offset].chars().next_back() else {
+            return Some(point);
+        };
+        let start = point.offset - before.len_utf8();
+        let after = content[point.offset..].chars().next();
+        // Relative to the text, on the line the point is level with.
+        let px = (x - text.x) as f32;
+        let height = text.paragraph.height();
+        let py = ((y - text.y) as f32).clamp(0.0, (height - 0.5).max(0.0));
+        let on_line = |range: Range<usize>| {
+            text.paragraph
+                .rects(range)
+                .into_iter()
+                .find(|[_, y0, _, y1]| py >= *y0 && py < *y1)
+        };
+        let after_box = after.and_then(|c| on_line(point.offset..point.offset + c.len_utf8()));
+        let offset = match (on_line(start..point.offset), after_box) {
+            (_, Some([x0, ..])) if px >= x0 => point.offset,
+            (Some(_), _) => start,
+            (None, Some(_)) => point.offset,
+            (None, None) if after.is_none() => start,
+            (None, None) => point.offset,
+        };
+        Some(TextPoint {
+            block: point.block,
+            offset,
+        })
+    }
+
+    /// The word a character is in, from its start to its end: the character
+    /// at `point.offset`, or the last one at the end of a text. Words are cut
+    /// the way the editor cuts them for a double click, with ICU4X's
+    /// dictionary for Chinese and Japanese ([`word_range`]); a run of spaces
+    /// or a punctuation mark is a word of its own. A point outside any
+    /// selectable text gives itself twice.
+    pub fn word_at(&self, point: TextPoint) -> (TextPoint, TextPoint) {
+        let Some(text) = self.texts.get(point.block).filter(|text| text.selectable) else {
+            return (point, point);
+        };
+        let range = word_range(text.paragraph.text(), point.offset);
+        let at = |offset| TextPoint {
+            block: point.block,
+            offset,
+        };
+        (at(range.start), at(range.end))
+    }
+
+    /// The whole text a point is in, from its start to its end: a
+    /// paragraph, a heading, a table cell, the paragraph of a list item, a
+    /// code block. A point outside any selectable text gives itself twice.
+    pub fn block_at(&self, point: TextPoint) -> (TextPoint, TextPoint) {
+        let Some(text) = self.texts.get(point.block).filter(|text| text.selectable) else {
+            return (point, point);
+        };
+        let at = |offset| TextPoint {
+            block: point.block,
+            offset,
+        };
+        (at(0), at(text.paragraph.text().len()))
     }
 
     fn pieces(&self) -> Vec<SelectionPiece<'_>> {
@@ -683,7 +755,112 @@ impl Pass<'_> {
                 bottom
             }
             BlockKind::Footnotes(notes) => self.footnotes(notes, x, y, width, context),
+            BlockKind::FrontMatter(lines) => {
+                let bottom = self.front_matter(lines, x, y, width, context);
+                self.anchor(y, bottom, block.source.clone());
+                bottom
+            }
         }
+    }
+
+    /// Front matter: a box with a row for each field, its key in the
+    /// secondary colour and its value beside it, and other lines in a
+    /// monospaced font across the box. Copied, a field is its key and value
+    /// with a tab between them.
+    fn front_matter(
+        &mut self,
+        lines: &[FrontMatterLine],
+        x: f64,
+        y: f64,
+        width: f64,
+        context: Context,
+    ) -> f64 {
+        let em = self.em(context);
+        let style = *self.style;
+        // A little smaller than the text: it is about the document, not in it.
+        let size = style.font_size * context.size * 0.88;
+        let (pad_x, pad_y) = (em * 0.8, em * 0.5);
+        let inner = (width - 2.0 * pad_x).max(1.0);
+        let plain = |text: &str| Inline {
+            text: text.to_owned(),
+            runs: Vec::new(),
+        };
+        let key_options = TextOptions::body(size, style.secondary);
+        let value_options = TextOptions::body(size, context.color);
+        let text_options = TextOptions {
+            mono: true,
+            ..TextOptions::body(size, context.color)
+        };
+        // The keys' column is as wide as the widest key, up to two fifths.
+        let mut key_width: f64 = 0.0;
+        for line in lines {
+            if let FrontMatterLine::Field { key, .. } = line {
+                let paragraph = self.layout(&plain(key), f64::INFINITY, &key_options);
+                key_width = key_width.max(f64::from(paragraph.width()));
+            }
+        }
+        let key_width = key_width.min(inner * 0.4).ceil().max(1.0);
+        let gap = em * 0.9;
+        let value_x = x + pad_x + key_width + gap;
+        let value_width = (x + width - pad_x - value_x).max(1.0);
+
+        let index = self.items.len();
+        let mut top = y + pad_y;
+        let mut rest = lines;
+        while let Some((line, after)) = rest.split_first() {
+            match line {
+                FrontMatterLine::Field { key, value } => {
+                    let mut bottom =
+                        self.text(&plain(key), x + pad_x, top, key_width, &key_options);
+                    // A value written on the lines below has nothing here.
+                    if !value.is_empty() {
+                        self.before = "\t";
+                        let value_bottom =
+                            self.text(&plain(value), value_x, top, value_width, &value_options);
+                        bottom = bottom.max(value_bottom);
+                    }
+                    top = bottom;
+                    rest = after;
+                }
+                FrontMatterLine::Text(_) => {
+                    // Lines in a row are one text, as a code block is.
+                    let count = rest
+                        .iter()
+                        .take_while(|line| matches!(line, FrontMatterLine::Text(_)))
+                        .count();
+                    let joined: Vec<&str> = rest[..count]
+                        .iter()
+                        .filter_map(|line| match line {
+                            FrontMatterLine::Text(text) => Some(text.as_str()),
+                            FrontMatterLine::Field { .. } => None,
+                        })
+                        .collect();
+                    top = self.text(
+                        &plain(&joined.join("\n")),
+                        x + pad_x,
+                        top,
+                        inner,
+                        &text_options,
+                    );
+                    rest = &rest[count..];
+                }
+            }
+        }
+        let bottom = top + pad_y;
+        // The background goes under the text laid out just now.
+        self.items.insert(
+            index,
+            Painted {
+                shape: Piece::Rect {
+                    rect: Rect::new(x, y, x + width, bottom),
+                    color: style.fill,
+                    radius: 6.0 * self.s,
+                },
+                top: y,
+                bottom,
+            },
+        );
+        bottom
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1123,10 +1300,23 @@ pub struct PreviewView {
     scale: f32,
     glyphs: Vec<Glyph>,
     selection: Option<Selection>,
+    /// What a drag of the selection moves by, and the word or text the
+    /// double or triple click that started it picked.
+    unit: Unit,
     /// Behind selected text.
     selection_color: Rgba8,
     /// What the pixels show. `None` until the first render.
     drawn: Option<Drawn>,
+}
+
+/// What a drag extends the selection by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Character,
+    /// After a double click on this word.
+    Word(TextPoint, TextPoint),
+    /// After a triple click in this text.
+    Block(TextPoint, TextPoint),
 }
 
 /// What a render depends on, to tell whether the pixels are still right.
@@ -1158,6 +1348,7 @@ impl PreviewView {
             scale: 1.0,
             glyphs: Vec::new(),
             selection: None,
+            unit: Unit::Character,
             selection_color: [0xe4, 0xdc, 0xfa, 0xff],
             drawn: None,
         }
@@ -1220,19 +1411,25 @@ impl PreviewView {
     pub fn set_layout(&mut self, layout: Arc<PreviewLayout>) {
         self.layout = Some(layout);
         self.selection = None;
+        self.unit = Unit::Character;
         self.clamp();
     }
 
     // --- Selection ---
 
+    /// The text position nearest to a point in physical pixels relative to
+    /// the view, which may be above or below it: see
+    /// [`PreviewLayout::point_at`].
+    pub fn point_at(&self, x: f64, y: f64) -> Option<TextPoint> {
+        self.layout.as_ref()?.point_at(x, y + self.scroll)
+    }
+
     /// Start a selection at a point in physical pixels relative to the view,
-    /// or with `extend` move the end of the current one there.
+    /// or with `extend` move the end of the current one there. A drag from
+    /// here moves by characters.
     pub fn press(&mut self, x: f64, y: f64, extend: bool) {
-        let Some(point) = self
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.point_at(x, y + self.scroll))
-        else {
+        self.unit = Unit::Character;
+        let Some(point) = self.point_at(x, y) else {
             self.selection = None;
             return;
         };
@@ -1245,28 +1442,99 @@ impl PreviewView {
         };
     }
 
-    /// Move the end of the selection being dragged.
+    /// Select the word under a point in physical pixels relative to the
+    /// view, for a double click; a drag from here moves by words. Returns
+    /// whether there was text to select.
+    pub fn select_word(&mut self, x: f64, y: f64) -> bool {
+        let Some(layout) = &self.layout else {
+            return false;
+        };
+        let Some(point) = layout.char_at(x, y + self.scroll) else {
+            return false;
+        };
+        let (start, end) = layout.word_at(point);
+        self.unit = Unit::Word(start, end);
+        self.selection = Some(Selection {
+            anchor: start,
+            focus: end,
+        });
+        true
+    }
+
+    /// Select the whole paragraph, heading, table cell or code block under a
+    /// point in physical pixels relative to the view, for a triple click; a
+    /// drag from here moves by whole texts. Returns whether there was text
+    /// to select.
+    pub fn select_block(&mut self, x: f64, y: f64) -> bool {
+        let Some(layout) = &self.layout else {
+            return false;
+        };
+        let Some(point) = layout.point_at(x, y + self.scroll) else {
+            return false;
+        };
+        let (start, end) = layout.block_at(point);
+        self.unit = Unit::Block(start, end);
+        self.selection = Some(Selection {
+            anchor: start,
+            focus: end,
+        });
+        true
+    }
+
+    /// Move the end of the selection being dragged. After a double or
+    /// triple click it moves by words or whole texts, and what was clicked
+    /// stays selected.
     pub fn drag(&mut self, x: f64, y: f64) {
         let Some(selection) = self.selection else {
             return;
         };
-        if let Some(point) = self
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.point_at(x, y + self.scroll))
-        {
-            self.selection = Some(Selection {
-                anchor: selection.anchor,
-                focus: point,
-            });
-        }
+        let Some(layout) = &self.layout else {
+            return;
+        };
+        let y = y + self.scroll;
+        let (clicked, reached) = match self.unit {
+            Unit::Character => {
+                if let Some(point) = layout.point_at(x, y) {
+                    self.selection = Some(Selection {
+                        anchor: selection.anchor,
+                        focus: point,
+                    });
+                }
+                return;
+            }
+            Unit::Word(start, end) => (
+                (start, end),
+                layout.char_at(x, y).map(|point| layout.word_at(point)),
+            ),
+            Unit::Block(start, end) => (
+                (start, end),
+                layout.point_at(x, y).map(|point| layout.block_at(point)),
+            ),
+        };
+        let Some((from, to)) = reached else {
+            return;
+        };
+        let (start, end) = clicked;
+        self.selection = Some(if from < start {
+            Selection {
+                anchor: end,
+                focus: from,
+            }
+        } else {
+            Selection {
+                anchor: start,
+                focus: to.max(end),
+            }
+        });
     }
 
     pub fn select_all(&mut self) {
+        self.unit = Unit::Character;
         self.selection = self.layout.as_ref().and_then(|layout| layout.select_all());
     }
 
     pub fn clear_selection(&mut self) {
+        self.unit = Unit::Character;
         self.selection = None;
     }
 
@@ -1852,6 +2120,197 @@ mod tests {
         let data = view.render().data_as_u8_slice().to_vec();
         let (pixels, _) = data.as_chunks::<4>();
         assert!(pixels.iter().any(|px| *px == style().callouts[3]));
+    }
+
+    const FRONT: &str = "---\ntitle: 标题\ndescription: 一段很长的说明\ntags:\n  - 中文\n  - b\n---\n# 正文\n\n段落。\n";
+
+    #[test]
+    fn front_matter_is_a_box_of_keys_and_values() {
+        let mut view = view(FRONT, 900, 800);
+        let layout = view.layout().unwrap().clone();
+        let texts: Vec<&str> = layout.texts.iter().map(|t| t.paragraph.text()).collect();
+        assert_eq!(
+            texts,
+            [
+                "title",
+                "标题",
+                "description",
+                "一段很长的说明",
+                "tags",
+                "  - 中文\n  - b",
+                "正文",
+                "段落。"
+            ]
+        );
+        let (key, value) = (&layout.texts[0], &layout.texts[1]);
+        // Two columns, the values lined up.
+        assert_eq!(key.y, value.y);
+        assert!(value.x > key.x + f64::from(key.paragraph.width()));
+        assert_eq!(value.x, layout.texts[3].x);
+        assert!(layout.texts[2].y > key.y);
+        // The other lines go across the box, from where the keys start.
+        assert_eq!(layout.texts[5].x, key.x);
+        // One anchor for the whole of it, then the heading below the box.
+        let end = FRONT.find("# 正文").unwrap();
+        assert_eq!(layout.anchors[0].source, 0..end);
+        assert_eq!(layout.anchors[0].top, style().page.padding * 2.0);
+        assert!(layout.texts[6].y > layout.anchors[0].bottom);
+        // Scroll sync maps into and out of the box.
+        let half = layout.y_of(end as f64 / 2.0);
+        assert!(half > layout.anchors[0].top && half < layout.anchors[0].bottom);
+        assert!((layout.position_at(half) - end as f64 / 2.0).abs() < 1.0);
+        let heading = layout.y_of(end as f64);
+        assert!(heading >= layout.anchors[0].bottom && heading <= layout.texts[6].y + 1.0);
+        // Keys in the secondary colour, on the box's fill.
+        let data = view.render().data_as_u8_slice().to_vec();
+        let (pixels, _) = data.as_chunks::<4>();
+        assert!(pixels.iter().any(|px| *px == style().fill));
+        // Copied: a field per line, a tab between key and value.
+        view.select_all();
+        let all = view.selected_text().unwrap();
+        assert!(
+            all.starts_with(
+                "title\t标题\ndescription\t一段很长的说明\ntags\n  - 中文\n  - b\n正文"
+            ),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn front_matter_lines_are_not_shown_as_markdown() {
+        let layout = PreviewBuilder::new().build("---\na: 1\n# 注释\n---\n", 900, 2.0, &style());
+        let texts: Vec<&str> = layout.texts.iter().map(|t| t.paragraph.text()).collect();
+        assert_eq!(texts, ["a", "1", "# 注释"]);
+        // Further down the same lines are a rule and a heading.
+        let layout = PreviewBuilder::new().build("前\n\n---\na: 1\n---\n", 900, 2.0, &style());
+        let texts: Vec<&str> = layout.texts.iter().map(|t| t.paragraph.text()).collect();
+        assert_eq!(texts, ["前", "a: 1"]);
+    }
+
+    /// The middle of the `nth` character of `needle` in text `block`, in
+    /// view coordinates of a view that is not scrolled.
+    fn spot(layout: &PreviewLayout, block: usize, needle: &str, nth: usize) -> (f64, f64) {
+        let text = &layout.texts[block];
+        let start = text.paragraph.text().find(needle).unwrap();
+        let (at, c) = needle.char_indices().nth(nth).unwrap();
+        let [x0, y0, x1, y1] = text.paragraph.rects(start + at..start + at + c.len_utf8())[0];
+        (
+            text.x + f64::from(x0 + x1) / 2.0,
+            text.y + f64::from(y0 + y1) / 2.0,
+        )
+    }
+
+    /// The right edge of that character, just inside it.
+    fn right_of(layout: &PreviewLayout, block: usize, needle: &str, nth: usize) -> (f64, f64) {
+        let text = &layout.texts[block];
+        let start = text.paragraph.text().find(needle).unwrap();
+        let (at, c) = needle.char_indices().nth(nth).unwrap();
+        let [_, y0, x1, y1] = text.paragraph.rects(start + at..start + at + c.len_utf8())[0];
+        (
+            text.x + f64::from(x1) - 1.0,
+            text.y + f64::from(y0 + y1) / 2.0,
+        )
+    }
+
+    const WORDS: &str =
+        "Hello wide world, 我们今天学习中文。\n\n第二段\n\n| 甲 | 中文 |\n|---|---|\n| 一 | 二 |\n";
+
+    #[test]
+    fn a_double_click_selects_a_word() {
+        let mut view = view(WORDS, 1200, 800);
+        let layout = view.layout().unwrap().clone();
+        let select = |view: &mut PreviewView, (x, y): (f64, f64)| {
+            assert!(view.select_word(x, y));
+            view.selected_text().unwrap_or_default()
+        };
+        assert_eq!(select(&mut view, spot(&layout, 0, "wide", 1)), "wide");
+        // On the right half of its last letter it is still that word.
+        assert_eq!(select(&mut view, right_of(&layout, 0, "wide", 3)), "wide");
+        assert_eq!(select(&mut view, spot(&layout, 0, "Hello", 0)), "Hello");
+        assert_eq!(select(&mut view, spot(&layout, 0, ",", 0)), ",");
+        // Han characters: the dictionary word, as the editor picks it.
+        let text = layout.texts[0].paragraph.text();
+        let at = text.find('学').unwrap();
+        let expected = &text[word_range(text, at)];
+        assert!(expected.starts_with('学') && expected.len() < "我们今天学习中文".len());
+        assert_eq!(select(&mut view, spot(&layout, 0, "学", 0)), expected);
+        // Past the end of a line: its last word.
+        let line = &layout.texts[1];
+        let (x, y) = (
+            line.x + f64::from(line.paragraph.width()) + 200.0,
+            line.y + 4.0,
+        );
+        let last = select(&mut view, (x, y));
+        assert!("第二段".ends_with(&last) && !last.is_empty(), "{last}");
+        // A table cell.
+        let cell = layout
+            .texts
+            .iter()
+            .position(|t| t.paragraph.text() == "中文")
+            .unwrap();
+        assert_eq!(select(&mut view, spot(&layout, cell, "中文", 1)), "中文");
+        // Nothing to select in an empty preview.
+        let mut empty = PreviewView::new();
+        assert!(!empty.select_word(10.0, 10.0));
+        assert!(!empty.select_block(10.0, 10.0));
+    }
+
+    #[test]
+    fn a_drag_after_a_double_click_goes_by_words() {
+        let mut view = view(WORDS, 1200, 800);
+        let layout = view.layout().unwrap().clone();
+        let (x, y) = spot(&layout, 0, "wide", 0);
+        view.select_word(x, y);
+        let (x, y) = spot(&layout, 0, "world", 1);
+        view.drag(x, y);
+        assert_eq!(view.selected_text().unwrap(), "wide world");
+        // Back over the start: the word clicked stays selected.
+        let (x, y) = spot(&layout, 0, "Hello", 2);
+        view.drag(x, y);
+        assert_eq!(view.selected_text().unwrap(), "Hello wide");
+        let selection = view.selection().unwrap();
+        assert!(selection.focus < selection.anchor);
+        // A plain press goes back to characters.
+        let (x, y) = spot(&layout, 0, "Hello", 0);
+        view.press(x - 20.0, y, false);
+        let (x, y) = right_of(&layout, 0, "Hello", 1);
+        view.drag(x, y);
+        assert_eq!(view.selected_text().unwrap(), "He");
+    }
+
+    #[test]
+    fn a_triple_click_selects_the_whole_text() {
+        let mut view = view(WORDS, 1200, 800);
+        let layout = view.layout().unwrap().clone();
+        let (x, y) = spot(&layout, 0, "wide", 0);
+        assert!(view.select_block(x, y));
+        assert_eq!(
+            view.selected_text().unwrap(),
+            "Hello wide world, 我们今天学习中文。"
+        );
+        // Dragging on to the next paragraph takes all of it.
+        let (x, y) = spot(&layout, 1, "第二段", 0);
+        view.drag(x, y);
+        assert_eq!(
+            view.selected_text().unwrap(),
+            "Hello wide world, 我们今天学习中文。\n第二段"
+        );
+        // A table cell is a text of its own.
+        let cell = layout
+            .texts
+            .iter()
+            .position(|t| t.paragraph.text() == "中文")
+            .unwrap();
+        let (x, y) = spot(&layout, cell, "中文", 1);
+        view.select_block(x, y);
+        assert_eq!(view.selected_text().unwrap(), "中文");
+        // Points outside selectable text give themselves.
+        let point = TextPoint {
+            block: 999,
+            offset: 3,
+        };
+        assert_eq!(layout.word_at(point), (point, point));
+        assert_eq!(layout.block_at(point), (point, point));
     }
 
     #[test]

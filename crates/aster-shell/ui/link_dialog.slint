@@ -1,7 +1,7 @@
 import { Tokens, Strings } from "tokens.slint";
 import { TextButton } from "widgets.slint";
 
-component LabeledInput inherits VerticalLayout {
+export component LabeledInput inherits VerticalLayout {
     in property <string> label;
     in-out property <string> text;
     callback accepted();

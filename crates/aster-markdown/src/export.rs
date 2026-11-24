@@ -34,8 +34,13 @@ img{max-width:100%}hr{border:0;border-top:1px solid #dededd}\
 @media (prefers-color-scheme:dark){body{background:#1b1b1d;color:#e8e8e6}\
 code,pre{background:#2a2a2d}a{color:#a891f0}th,td,hr,blockquote{border-color:#3a3a3d}}";
 
-/// The HTML of the document's body: what the Markdown renders to.
+/// The HTML of the document's body: what the Markdown renders to. Front
+/// matter is data about the document, not part of it, and is left out.
 pub fn body(source: &str) -> String {
+    let source = match syntax::front_matter(source) {
+        Some(front) => &source[front.end..],
+        None => source,
+    };
     let mut out = String::with_capacity(source.len() * 3 / 2);
     // Whether each picture being written is one from the web, turned into a
     // link: its end must end the link.
@@ -139,8 +144,22 @@ fn safe_address(address: CowStr<'_>, picture: bool) -> CowStr<'_> {
     }
 }
 
-/// A whole HTML page for `source`, with `title` in its head.
+/// A whole HTML page for `source`, with `title` in its head unless its
+/// front matter has a `title` of its own.
 pub fn page(source: &str, title: &str) -> String {
+    let own = syntax::front_matter(source).and_then(|front| {
+        crate::preview::read_front_matter(&source[front])
+            .into_iter()
+            .find_map(|line| match line {
+                crate::preview::FrontMatterLine::Field { key, value }
+                    if key.eq_ignore_ascii_case("title") && !value.is_empty() =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+    });
+    let title = own.as_deref().unwrap_or(title);
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -168,6 +187,18 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn front_matter_is_left_out_and_its_title_used() {
+        let source = "---\ntitle: \"周报\"\ntags: [a, b]\n---\n# 正文\n";
+        let page = page(source, "file.md");
+        assert!(page.contains("<title>周报</title>"), "{page}");
+        assert!(!page.contains("tags"));
+        assert!(!page.contains("<hr"));
+        assert!(page.contains("<h1>正文</h1>"));
+        // Without front matter the given title stays.
+        assert!(super::page("# x\n", "file.md").contains("<title>file.md</title>"));
+    }
 
     #[test]
     fn a_page_has_the_rendered_body_and_an_escaped_title() {

@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use aster_platform::files::{NameError, RenameError, TrashError};
 use aster_workspace::{FileKind, Filter, Note, ReadError, RecentFiles, Row, RowKind};
 use chrono::{DateTime, Datelike, Local, Timelike};
 
@@ -222,11 +223,84 @@ pub fn reveal_label(strings: &Strings) -> &'static str {
     }
 }
 
+/// What the system's bin for deleted files is called here.
+pub fn trash_label(strings: &Strings) -> &'static str {
+    if cfg!(target_os = "macos") {
+        strings.trash_mac
+    } else {
+        strings.trash_other
+    }
+}
+
+/// Why a name was refused, in the interface language.
+pub fn name_problem(strings: &Strings, error: NameError) -> String {
+    match error {
+        NameError::Empty => strings.name_empty.to_owned(),
+        NameError::Dots => strings.name_dots.to_owned(),
+        NameError::Separator(c) => fill(strings.name_separator, "char", &c.to_string()),
+        NameError::ControlChar => strings.name_control.to_owned(),
+        NameError::Reserved => strings.name_reserved.to_owned(),
+        NameError::TrailingDotOrSpace => strings.name_trailing.to_owned(),
+        NameError::TooLong => strings.name_too_long.to_owned(),
+    }
+}
+
+/// Why creating a file or folder failed.
+pub fn create_problem(strings: &Strings, error: &std::io::Error) -> String {
+    if let Some(name) = error.get_ref().and_then(|e| e.downcast_ref::<NameError>()) {
+        return name_problem(strings, *name);
+    }
+    match error.kind() {
+        std::io::ErrorKind::AlreadyExists => strings.name_exists.to_owned(),
+        std::io::ErrorKind::NotFound => strings.item_gone.to_owned(),
+        _ => error.to_string(),
+    }
+}
+
+/// Why renaming failed.
+pub fn rename_problem(strings: &Strings, error: &RenameError) -> String {
+    match error {
+        RenameError::Name(name) => name_problem(strings, *name),
+        RenameError::Exists => strings.name_exists.to_owned(),
+        RenameError::NotFound => strings.item_gone.to_owned(),
+        RenameError::Io(err) => err.to_string(),
+    }
+}
+
+/// Why moving to the trash failed.
+pub fn trash_problem(strings: &Strings, error: &TrashError) -> String {
+    match error {
+        TrashError::NotFound => strings.item_gone.to_owned(),
+        TrashError::NotLocal => strings.trash_not_local.to_owned(),
+        TrashError::Root => strings.trash_root.to_owned(),
+        TrashError::Io(err) => err.to_string(),
+        TrashError::Failed(err) => err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::i18n::{EN, Language, ZH_HANS};
     use chrono::TimeZone;
+
+    #[test]
+    fn file_operation_problems_are_worded() {
+        assert_eq!(
+            name_problem(&ZH_HANS, NameError::Separator('/')),
+            "名称里不能有“/”。"
+        );
+        let refused = aster_platform::files::create_file(Path::new("/tmp"), "a/b").unwrap_err();
+        assert_eq!(create_problem(&EN, &refused), "A name cannot contain “/”.");
+        let exists = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert_eq!(create_problem(&ZH_HANS, &exists), ZH_HANS.name_exists);
+        assert_eq!(rename_problem(&EN, &RenameError::Exists), EN.name_exists);
+        assert_eq!(
+            trash_problem(&EN, &TrashError::NotLocal),
+            EN.trash_not_local
+        );
+        assert!(!trash_label(&ZH_HANS).is_empty());
+    }
 
     fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, m, d, h, min, 0).single().unwrap()

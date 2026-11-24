@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aster_markdown::format::Styles;
-use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
+use aster_markdown::{DecodeError, Encoding, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
 use aster_shell::cli::{self, Options};
 use aster_shell::files::{self, Dropped, LoadError};
@@ -135,6 +135,18 @@ enum Pending {
     Quit,
     /// A recent file is no longer there; it may be taken off the list.
     MissingRecent(PathBuf),
+    /// Another program changed the file of a document with unsaved changes;
+    /// what the file holds now waits in `Shell::disk_loaded`.
+    DiskChanged(TabId),
+    /// Saving failed because the file's encoding cannot hold a character;
+    /// it may be saved in UTF-8 instead.
+    SaveInUtf8 {
+        id: TabId,
+        path: PathBuf,
+        after: AfterSave,
+    },
+    /// Moving this file or folder to the trash, once confirmed.
+    Trash(PathBuf),
 }
 
 /// What happens once a save has succeeded.
@@ -172,6 +184,20 @@ struct Shell {
     caret_on: bool,
     last_blink: Instant,
     pending: Option<Pending>,
+    /// The file's new content, while the user decides whether to load it.
+    disk_loaded: Option<(TabId, files::Loaded)>,
+    /// Files behind open documents are being looked at on another thread.
+    checking_disk: bool,
+    /// What the one-line question on screen is about.
+    prompt: Option<Prompt>,
+    /// Where a selection is being dragged past the preview's edge, in
+    /// physical pixels, while `drag_timer` scrolls it.
+    preview_drag_at: Option<(f64, f64)>,
+    /// Counts double and triple clicks in the source and the preview.
+    clicks: content::ClickCounter,
+    drag_timer: Timer,
+    /// What the encoding question is about, and the encodings it offers.
+    encoding_for: Option<(EncodingFor, Vec<Encoding>)>,
     /// Writes recovery records. `None` when the system gives no folder for
     /// them; documents are then not protected against a crash.
     writer: Option<RecordWriter>,
@@ -238,6 +264,13 @@ impl Shell {
             caret_on: true,
             last_blink: Instant::now(),
             pending: None,
+            disk_loaded: None,
+            checking_disk: false,
+            prompt: None,
+            preview_drag_at: None,
+            clicks: content::ClickCounter::default(),
+            drag_timer: Timer::default(),
+            encoding_for: None,
             writer: None,
             next_key: 0,
             candidates: Vec::new(),
@@ -595,7 +628,7 @@ impl Shell {
             return Closing::NoSuchTab;
         };
         let modified = match self.contents.get(&id) {
-            Some(Content::Markdown(editor)) => editor.document.is_modified(),
+            Some(Content::Markdown(editor)) => editor.is_modified(),
             Some(Content::Sheet(tab)) => tab.is_modified(),
             _ => false,
         };
@@ -655,6 +688,7 @@ impl Shell {
         if !command.is_available(kind) {
             return false;
         }
+        let tokens = self.tokens;
         match (self.active_content(), command) {
             (Some(Content::Markdown(editor)), command) if format_of(command).is_some() => {
                 format_of(command).is_some_and(|format| editor.format(format))
@@ -686,6 +720,21 @@ impl Shell {
                 true
             }
             (
+                Some(Content::Markdown(editor)),
+                Command::ZoomIn | Command::ZoomOut | Command::ZoomReset,
+            ) => {
+                let percent = match command {
+                    Command::ZoomIn => zoom_step(editor.zoom_percent, true),
+                    Command::ZoomOut => zoom_step(editor.zoom_percent, false),
+                    _ => 100,
+                };
+                if percent == editor.zoom_percent {
+                    return false;
+                }
+                editor.set_zoom(percent, &tokens);
+                true
+            }
+            (
                 Some(Content::Writer(view)),
                 Command::ZoomIn | Command::ZoomOut | Command::ZoomReset,
             ) => {
@@ -708,7 +757,7 @@ impl Shell {
         for (id, content) in &self.contents {
             match content {
                 Content::Markdown(editor) => {
-                    changed |= self.tabs.set_modified(*id, editor.document.is_modified());
+                    changed |= self.tabs.set_modified(*id, editor.is_modified());
                 }
                 Content::Sheet(tab) => {
                     changed |= self.tabs.set_modified(*id, tab.is_modified());
@@ -782,8 +831,10 @@ impl Shell {
         editor.path = Some(path.to_owned());
         editor.disk = Some(written);
         editor.disk_warning = None;
-        // What is on disk now has one line-ending style.
+        // What is on disk now has one line-ending style, and is what the
+        // format says.
         editor.format.mixed_line_endings = false;
+        editor.format_changed = false;
         editor.document.mark_saved(point);
         self.tabs.rename(id, files::display_name(path));
         self.sync_modified();
@@ -969,6 +1020,19 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_clear_recent(strings.menu_clear_recent.into());
     s.set_reveal(sidebar::reveal_label(strings).into());
     s.set_recent_remove(strings.recent_remove.into());
+    s.set_tree_new_file(strings.tree_new_file.into());
+    s.set_tree_new_folder(strings.tree_new_folder.into());
+    s.set_tree_rename(strings.tree_rename.into());
+    s.set_trash(sidebar::trash_label(strings).into());
+    s.set_button_open(strings.button_open.into());
+    s.set_button_save_utf8(strings.button_save_utf8.into());
+    s.set_menu_reopen_encoding(strings.menu_reopen_encoding.into());
+    s.set_menu_convert_utf8(strings.menu_convert_utf8.into());
+    s.set_menu_line_endings_lf(strings.menu_line_endings_lf.into());
+    s.set_menu_line_endings_crlf(strings.menu_line_endings_crlf.into());
+    s.set_menu_go_to_line(strings.menu_go_to_line.into());
+    s.set_button_load_disk(strings.button_load_disk.into());
+    s.set_button_keep_mine(strings.button_keep_mine.into());
     s.set_recent_empty(strings.recent_empty.into());
     s.set_recent_missing(strings.recent_missing.into());
     s.set_no_folder(strings.no_folder.into());
@@ -1234,8 +1298,12 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
 
 /// What the status bar says about a file's encoding and line endings.
 fn format_label(format: &TextFormat) -> String {
-    let mut label = String::from("UTF-8");
-    if format.bom {
+    let mut label = String::from(format.encoding.label());
+    let has_bom = matches!(
+        format.encoding,
+        Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be
+    );
+    if format.bom && has_bom {
         label.push_str(" BOM");
     }
     label.push_str(" · ");
@@ -1266,7 +1334,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
         .into(),
     );
 
-    // Zoom exists on Writer tabs only; file details on Markdown tabs only.
+    // Zoom exists on Writer and Markdown tabs; file details on Markdown tabs only.
     match shell.active_content() {
         Some(Content::Writer(view)) => {
             ui.set_status_zoom(format!("{}%", view.zoom_percent).into());
@@ -1275,16 +1343,34 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_notice(SharedString::new());
         }
         Some(Content::Markdown(editor)) => {
-            ui.set_status_zoom(SharedString::new());
-            ui.set_zoom_enabled(false);
+            ui.set_status_zoom(format!("{}%", editor.zoom_percent).into());
+            ui.set_zoom_enabled(true);
             ui.set_status_format(format_label(&editor.format).into());
+            ui.set_format_utf8(editor.format.encoding == Encoding::Utf8);
+            ui.set_format_crlf(editor.format.line_ending == aster_markdown::LineEnding::CrLf);
             let notice = if let Some(reason) = &editor.record_failed {
                 i18n::fill(strings.notice_record_failed, "reason", reason)
             } else if let Some(warning) = editor.disk_warning {
                 match warning {
                     DiskWarning::Changed => strings.notice_disk_changed.to_owned(),
                     DiskWarning::Missing => strings.notice_disk_missing.to_owned(),
+                    DiskWarning::ChangedWhileOpen => strings.notice_disk_changed_open.to_owned(),
+                    DiskWarning::MissingWhileOpen => strings.notice_disk_missing_open.to_owned(),
                 }
+            } else if editor.reloaded {
+                strings.notice_reloaded.to_owned()
+            } else if editor.reopened {
+                i18n::fill(
+                    strings.notice_reopened,
+                    "encoding",
+                    editor.format.encoding.label(),
+                )
+            } else if editor.format_changed {
+                i18n::fill(
+                    strings.notice_format_changed,
+                    "format",
+                    &format_label(&editor.format),
+                )
             } else if editor.find.replacing {
                 strings.notice_replacing.to_owned()
             } else if let Some(count) = editor.find.replaced {
@@ -1716,6 +1802,27 @@ fn schedule_outline(ui: &AppWindow, shell: &mut Shell) {
                 deliver(ui, Box::new(build_outline));
             }
         });
+}
+
+/// One step of scrolling the preview while a selection is dragged past its
+/// edge: faster the farther the pointer is past it.
+fn drag_scroll_preview(ui: &AppWindow, shell: &mut Shell) {
+    let Some((x, y)) = shell.preview_drag_at else {
+        shell.drag_timer.stop();
+        return;
+    };
+    let Some(editor) = shell.active_markdown() else {
+        shell.preview_drag_at = None;
+        shell.drag_timer.stop();
+        return;
+    };
+    let height = f64::from(editor.preview.size().1);
+    let past = if y < 0.0 { y } else { y - height };
+    let step = past.signum() * past.abs().clamp(8.0, 120.0);
+    if editor.scroll_preview(step) {
+        editor.preview_drag(x, y);
+        present(ui, shell);
+    }
 }
 
 fn build_outline(ui: &AppWindow, shell: &mut Shell) {
@@ -2238,6 +2345,143 @@ fn read_folders(ui: &AppWindow, shell: &Shell, dirs: Vec<PathBuf>) {
 /// Look at the disk again: the folders on screen and whether the recent
 /// files are still there. The folder is not watched; this runs when the
 /// window comes back to the front and from the refresh button.
+/// Look at the files behind open Markdown documents, on another thread, for
+/// changes another program made. Done when the window comes to the front.
+fn check_disk(ui: &AppWindow, shell: &mut Shell) {
+    if shell.checking_disk || shell.pending.is_some() {
+        return;
+    }
+    let jobs: Vec<(TabId, PathBuf, Fingerprint)> = shell
+        .contents
+        .iter()
+        .filter_map(|(id, content)| match content {
+            // A document already warned about is left alone: saving asks
+            // where to anyway.
+            Content::Markdown(editor) if !editor.saving && editor.disk_warning.is_none() => {
+                Some((*id, editor.path.clone()?, editor.disk?))
+            }
+            _ => None,
+        })
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    shell.checking_disk = true;
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let found: Vec<(TabId, Fingerprint, files::OnDisk)> = jobs
+            .into_iter()
+            .map(|(id, path, disk)| (id, disk, files::look_again(&path, &disk)))
+            .collect();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| finish_check_disk(ui, shell, found)),
+            );
+        });
+    });
+}
+
+/// Documents larger than this are not replaced by what is on disk without
+/// asking: the undo step would hold the whole old text.
+const RELOAD_QUIETLY: usize = 64 * 1024 * 1024;
+
+fn finish_check_disk(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    found: Vec<(TabId, Fingerprint, files::OnDisk)>,
+) {
+    shell.checking_disk = false;
+    let mut ask = None;
+    for (id, looked_at, outcome) in found {
+        let Some(editor) = shell.markdown(id) else {
+            continue;
+        };
+        // Saved or warned about while the files were being looked at.
+        if editor.saving || editor.disk != Some(looked_at) || editor.disk_warning.is_some() {
+            continue;
+        }
+        match outcome {
+            files::OnDisk::Unchanged => {}
+            files::OnDisk::Missing => editor.disk_warning = Some(DiskWarning::MissingWhileOpen),
+            files::OnDisk::Changed(Ok(loaded))
+                if !editor.is_modified()
+                    && editor.document.len() <= RELOAD_QUIETLY
+                    && loaded.decoded.text.len() <= RELOAD_QUIETLY =>
+            {
+                if editor.reload(loaded).is_err() {
+                    // Busy with an input method or a replacement: next time.
+                    continue;
+                }
+                if shell.tabs.active_id() == Some(id) {
+                    after_edit(ui, shell, true);
+                } else {
+                    shell.sync_modified();
+                    shell.sync_records();
+                }
+            }
+            files::OnDisk::Changed(Ok(loaded)) if ask.is_none() => ask = Some((id, loaded)),
+            // Not readable as text any more, or a second document to ask
+            // about: saving it asks where to.
+            files::OnDisk::Changed(_) => {
+                editor.disk_warning = Some(DiskWarning::ChangedWhileOpen);
+            }
+        }
+    }
+    refresh_tabs(ui, shell);
+    refresh_status(ui, shell);
+    if let Some((id, loaded)) = ask {
+        if ui.get_dialog_kind() != 0 || shell.pending.is_some() {
+            if let Some(editor) = shell.markdown(id) {
+                editor.disk_warning = Some(DiskWarning::ChangedWhileOpen);
+            }
+            refresh_status(ui, shell);
+            return;
+        }
+        let name = shell
+            .tabs
+            .get(id)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default();
+        if let Some(index) = shell.tabs.index_of(id) {
+            shell.activate(index);
+            after_tab_change(ui, shell);
+        }
+        shell.pending = Some(Pending::DiskChanged(id));
+        shell.disk_loaded = Some((id, loaded));
+        let strings = shell.language.strings();
+        show_dialog(
+            ui,
+            shell,
+            5,
+            i18n::fill(strings.disk_changed_title, "name", &name),
+            strings.disk_changed_body.to_owned(),
+        );
+    }
+}
+
+/// Replace a document's text with what its file holds now, after the user
+/// chose to, or read again in another encoding (`reopened`).
+fn reload_document(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    loaded: files::Loaded,
+    reopened: bool,
+) {
+    let Some(editor) = shell.markdown(id) else {
+        return;
+    };
+    if editor.reload(loaded).is_err() {
+        editor.disk_warning = Some(DiskWarning::ChangedWhileOpen);
+    } else if reopened {
+        editor.reloaded = false;
+        editor.reopened = true;
+    }
+    after_edit(ui, shell, true);
+    refresh_tabs(ui, shell);
+}
+
 fn refresh_workspace(ui: &AppWindow, shell: &mut Shell) {
     if let Some(tree) = &mut shell.tree {
         let again = tree.reread();
@@ -2645,6 +2889,11 @@ fn spawn_load(ui: &AppWindow, path: PathBuf) {
 /// [`spawn_load`] with the shell at hand. A file that is being read already
 /// is not read twice.
 fn start_load(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
+    start_load_as(ui, shell, path, None);
+}
+
+/// Open a file, in `encoding` if the user chose one.
+fn start_load_as(ui: &AppWindow, shell: &mut Shell, path: PathBuf, encoding: Option<Encoding>) {
     if shell.opening.contains(&path) {
         return;
     }
@@ -2668,7 +2917,11 @@ fn start_load(ui: &AppWindow, shell: &mut Shell, path: PathBuf) {
     }
     std::thread::spawn(move || {
         // Reading, decoding and preparing a large file all happen here.
-        let result = files::load(&path).map(content::open);
+        let result = match encoding {
+            Some(encoding) => files::load_as(&path, encoding),
+            None => files::load(&path),
+        }
+        .map(content::open);
         // The window may be gone by the time the file is read.
         let _ = weak.upgrade_in_event_loop(move |ui| {
             deliver(
@@ -2815,12 +3068,316 @@ fn finish_load(
         Err(err) => {
             let strings = shell.language.strings();
             let reason = match err {
-                LoadError::Decode(DecodeError::NotUtf8 { .. }) => strings.not_utf8.to_owned(),
-                LoadError::Decode(DecodeError::Utf16) => strings.is_utf16.to_owned(),
-                LoadError::Io(err) => err.to_string(),
+                LoadError::OtherEncoding(readings) => {
+                    let title = i18n::fill(
+                        strings.encoding_open_title,
+                        "name",
+                        &files::display_name(&path),
+                    );
+                    show_encoding_dialog(
+                        ui,
+                        shell,
+                        EncodingFor::Open(path),
+                        readings,
+                        title,
+                        strings.encoding_open_body.to_owned(),
+                    );
+                    return;
+                }
+                err => load_problem(strings, &err),
             };
             let title = i18n::fill(strings.open_failed, "name", &files::display_name(&path));
             show_dialog(ui, shell, 2, title, reason);
+        }
+    }
+}
+
+/// Why a file could not be read as text, in the interface language.
+fn load_problem(strings: &i18n::Strings, err: &LoadError) -> String {
+    match err {
+        LoadError::Decode(DecodeError::NotUtf8 { .. }) | LoadError::OtherEncoding(_) => {
+            strings.not_utf8.to_owned()
+        }
+        LoadError::Decode(DecodeError::Malformed { encoding, offset }) => i18n::fill(
+            &i18n::fill(strings.malformed_in, "encoding", encoding.label()),
+            "offset",
+            &group_digits(*offset),
+        ),
+        LoadError::Io(err) => err.to_string(),
+    }
+}
+
+/// What the one-line question is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Prompt {
+    /// Go to a line of this document.
+    GoTo(TabId),
+    /// A new name for this file or folder.
+    Rename(PathBuf),
+}
+
+/// Ask for one line of text.
+fn show_prompt(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    prompt: Prompt,
+    title: String,
+    label: String,
+    text: String,
+) {
+    shell.prompt = Some(prompt);
+    shell.leave_active_document();
+    stop_platform_composition(ui);
+    ui.set_prompt_title(title.into());
+    ui.set_prompt_label(label.into());
+    ui.set_prompt_problem(SharedString::new());
+    ui.set_prompt_text(text.into());
+    ui.set_prompt_open(true);
+    present(ui, shell);
+}
+
+fn hide_prompt(ui: &AppWindow, shell: &mut Shell) {
+    shell.prompt = None;
+    ui.set_prompt_open(false);
+    if shell.active_surface().is_some() {
+        ui.invoke_focus_document();
+    }
+}
+
+/// The folder a new file or folder goes in from a row of the tree: the
+/// folder itself, or the one the file is in.
+fn folder_of_row(row: &Row) -> Option<PathBuf> {
+    match row.kind {
+        RowKind::Folder { .. } => Some(row.path.clone()),
+        _ => row.path.parent().map(Path::to_owned),
+    }
+}
+
+/// New Markdown File, New Folder, Rename and Move to Trash from the tree.
+fn tree_file_action(ui: &AppWindow, shell: &mut Shell, action: i32, row: Row) {
+    let strings = shell.language.strings();
+    match action {
+        2 | 3 => {
+            let Some(dir) = folder_of_row(&row) else {
+                return;
+            };
+            let created = if action == 2 {
+                aster_platform::files::create_untitled_file(&dir, strings.untitled_file_base, "md")
+            } else {
+                aster_platform::files::create_untitled_folder(&dir, strings.untitled_folder_base)
+            };
+            match created {
+                Ok(path) => {
+                    if let Some(tree) = &mut shell.tree
+                        && dir != tree.root()
+                    {
+                        tree.expand(&dir);
+                        shell.save_workspace();
+                    }
+                    refresh_workspace(ui, shell);
+                    if action == 2 {
+                        start_load(ui, shell, path);
+                    } else {
+                        let name = files::display_name(&path);
+                        show_prompt(
+                            ui,
+                            shell,
+                            Prompt::Rename(path),
+                            i18n::fill(strings.rename_title, "name", &name),
+                            strings.rename_label.to_owned(),
+                            name,
+                        );
+                    }
+                }
+                Err(err) => {
+                    let title = i18n::fill(
+                        strings.file_op_failed_create,
+                        "name",
+                        &files::display_name(&dir),
+                    );
+                    show_dialog(ui, shell, 2, title, sidebar::create_problem(strings, &err));
+                }
+            }
+        }
+        4 => {
+            let name = files::display_name(&row.path);
+            show_prompt(
+                ui,
+                shell,
+                Prompt::Rename(row.path),
+                i18n::fill(strings.rename_title, "name", &name),
+                strings.rename_label.to_owned(),
+                name,
+            );
+        }
+        5 => {
+            let name = files::display_name(&row.path);
+            let folder = matches!(row.kind, RowKind::Folder { .. });
+            let title = i18n::fill(
+                &i18n::fill(strings.trash_question, "name", &name),
+                "action",
+                sidebar::trash_label(strings),
+            );
+            let body = if folder {
+                strings.trash_body_folder
+            } else {
+                strings.trash_body_file
+            };
+            shell.pending = Some(Pending::Trash(row.path));
+            show_dialog(ui, shell, 7, title, body.to_owned());
+        }
+        _ => {}
+    }
+}
+
+/// Give `from` the name the user typed. Open documents in it follow it.
+fn rename_entry(ui: &AppWindow, shell: &mut Shell, from: PathBuf) {
+    let strings = shell.language.strings();
+    let typed = ui.get_prompt_text().to_string();
+    match aster_platform::files::rename(&from, typed.trim()) {
+        Ok(to) => {
+            hide_prompt(ui, shell);
+            let ids: Vec<TabId> = shell.contents.keys().copied().collect();
+            for id in ids {
+                let Some(editor) = shell.markdown(id) else {
+                    continue;
+                };
+                let Some(rest) = editor
+                    .path
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix(&from).ok())
+                else {
+                    continue;
+                };
+                let moved = if rest.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    to.join(rest)
+                };
+                editor.path = Some(moved.clone());
+                shell.tabs.rename(id, files::display_name(&moved));
+            }
+            let from_real = std::fs::canonicalize(from.parent().unwrap_or(&from))
+                .map(|dir| dir.join(from.file_name().unwrap_or_default()))
+                .unwrap_or_else(|_| from.clone());
+            if shell.recent.remove(&from_real) || shell.recent.remove(&from) {
+                shell.remember_file(&to);
+            }
+            refresh_workspace(ui, shell);
+            refresh_tabs(ui, shell);
+            refresh_status(ui, shell);
+        }
+        Err(err) => ui.set_prompt_problem(sidebar::rename_problem(strings, &err).into()),
+    }
+}
+
+/// Move a file or folder to the system's trash, on another thread.
+fn trash_entry(ui: &AppWindow, path: PathBuf) {
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = aster_platform::files::move_to_trash(&path);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| {
+                    refresh_workspace(ui, shell);
+                    match result {
+                        // Open documents of it are marked gone.
+                        Ok(()) => check_disk(ui, shell),
+                        Err(err) => {
+                            let strings = shell.language.strings();
+                            let title = i18n::fill(
+                                strings.file_op_failed_trash,
+                                "name",
+                                &files::display_name(&path),
+                            );
+                            show_dialog(ui, shell, 2, title, sidebar::trash_problem(strings, &err));
+                        }
+                    }
+                }),
+            );
+        });
+    });
+}
+
+/// What the encoding question is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EncodingFor {
+    /// A file being opened that is not UTF-8.
+    Open(PathBuf),
+    /// The file behind an open document, to read again.
+    Reopen(TabId, PathBuf),
+}
+
+fn show_encoding_dialog(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    target: EncodingFor,
+    readings: Vec<files::Reading>,
+    title: String,
+    body: String,
+) {
+    let current = match &target {
+        EncodingFor::Reopen(id, _) => shell.markdown(*id).map(|editor| editor.format.encoding),
+        EncodingFor::Open(_) => None,
+    };
+    let selected = current
+        .and_then(|current| readings.iter().position(|r| r.encoding == current))
+        .unwrap_or(0);
+    let choices: Vec<EncodingChoice> = readings
+        .iter()
+        .map(|reading| EncodingChoice {
+            label: reading.encoding.label().into(),
+            preview: reading.preview.clone().into(),
+        })
+        .collect();
+    shell.encoding_for = Some((target, readings.iter().map(|r| r.encoding).collect()));
+    shell.leave_active_document();
+    stop_platform_composition(ui);
+    ui.set_encoding_title(title.into());
+    ui.set_encoding_body(body.into());
+    ui.set_encoding_choices(model(choices));
+    ui.set_encoding_selected(selected as i32);
+    ui.set_encoding_open(true);
+    present(ui, shell);
+}
+
+/// The user picked an encoding.
+fn accept_encoding(ui: &AppWindow, shell: &mut Shell) {
+    ui.set_encoding_open(false);
+    let Some((target, encodings)) = shell.encoding_for.take() else {
+        return;
+    };
+    let Some(encoding) = usize::try_from(ui.get_encoding_selected())
+        .ok()
+        .and_then(|at| encodings.get(at).copied())
+    else {
+        return;
+    };
+    match target {
+        EncodingFor::Open(path) => start_load_as(ui, shell, path, Some(encoding)),
+        EncodingFor::Reopen(id, path) => {
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let result = files::load_as(&path, encoding);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    deliver(
+                        ui,
+                        Box::new(move |ui, shell| match result {
+                            Ok(loaded) => reload_document(ui, shell, id, loaded, true),
+                            Err(err) => {
+                                let strings = shell.language.strings();
+                                let title = i18n::fill(
+                                    strings.open_failed,
+                                    "name",
+                                    &files::display_name(&path),
+                                );
+                                show_dialog(ui, shell, 2, title, load_problem(strings, &err));
+                            }
+                        }),
+                    );
+                });
+            });
         }
     }
 }
@@ -3104,7 +3661,7 @@ fn finish_save(
     id: TabId,
     path: PathBuf,
     point: SavePoint,
-    result: std::io::Result<Fingerprint>,
+    result: Result<Fingerprint, files::SaveError>,
     after: AfterSave,
 ) {
     shell.finish_save(id, &path, point, result.as_ref().ok().copied());
@@ -3120,6 +3677,29 @@ fn finish_save(
         Ok(_) => {
             refresh_chrome(ui, shell);
             present(ui, shell);
+        }
+        Err(files::SaveError::Encode { error, line }) => {
+            let strings = shell.language.strings();
+            let encoding = shell
+                .markdown(id)
+                .map_or("", |editor| editor.format.encoding.label());
+            let name = files::display_name(&path);
+            let title = i18n::fill(
+                &i18n::fill(strings.save_unencodable_title, "name", &name),
+                "encoding",
+                encoding,
+            );
+            let body = i18n::fill(
+                &i18n::fill(
+                    &i18n::fill(strings.save_unencodable_body, "char", &error.ch.to_string()),
+                    "line",
+                    &group_digits(line + 1),
+                ),
+                "encoding",
+                encoding,
+            );
+            shell.pending = Some(Pending::SaveInUtf8 { id, path, after });
+            show_dialog(ui, shell, 6, title, body);
         }
         Err(err) => {
             let strings = shell.language.strings();
@@ -3451,6 +4031,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             if let winit::event::WindowEvent::Focused(true) = event {
                 if let (Some(ui), Ok(mut shell)) = (weak.upgrade(), shell.try_borrow_mut()) {
                     refresh_workspace(&ui, &mut shell);
+                    check_disk(&ui, &mut shell);
                 }
                 return EventResult::Propagate;
             }
@@ -3498,10 +4079,11 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     ui.on_key_pressed(handler!(|ui, shell, text, shift, primary, alt| {
-        let is_writer = shell.active_writer().is_some();
-        if is_writer && let Some(command) = shell_shortcut(text.as_str(), primary) {
+        let zooms = shell.active_writer().is_some() || shell.active_markdown().is_some();
+        if zooms && let Some(command) = shell_shortcut(text.as_str(), primary) {
             if shell.run(command) {
                 refresh_toolbar(&ui, shell);
+                schedule_preview(&ui, shell);
                 after_edit(&ui, shell, false);
             }
             return true;
@@ -3568,11 +4150,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_pointer_down(handler!(|ui, shell, x, y, shift| {
         let language = shell.language.tag();
+        let clicks = shell
+            .clicks
+            .press(f64::from(x), f64::from(y), Instant::now());
         let scale = f64::from(ui.window().scale_factor());
         let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
-            Some(Content::Markdown(editor)) => editor.pointer_down(x, y, shift),
+            Some(Content::Markdown(editor)) => editor.pointer_press(x, y, shift, clicks),
             Some(Content::Sheet(tab)) => {
                 // A click elsewhere keeps what was being typed.
                 let changes = if tab.view.is_editing() {
@@ -3708,11 +4293,20 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_preview_pressed(handler!(|ui, shell, x, y, shift| {
+        let clicks = shell
+            .clicks
+            .press(f64::from(x), f64::from(y), Instant::now());
         let scale = f64::from(ui.window().scale_factor());
         let Some(editor) = shell.active_markdown() else {
             return;
         };
-        editor.preview_press(f64::from(x) * scale, f64::from(y) * scale, shift);
+        let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
+        match clicks {
+            _ if shift => editor.preview_press(x, y, true),
+            2 => editor.preview_select(x, y, false),
+            3 => editor.preview_select(x, y, true),
+            _ => editor.preview_press(x, y, false),
+        }
         present(&ui, shell);
     }));
 
@@ -3721,8 +4315,32 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let Some(editor) = shell.active_markdown() else {
             return;
         };
-        editor.preview_drag(f64::from(x) * scale, f64::from(y) * scale);
+        let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
+        editor.preview_drag(x, y);
+        let height = f64::from(editor.preview.size().1);
+        // Past the top or the bottom: keep scrolling while the button is
+        // held there, as text views do.
+        if y < 0.0 || y > height {
+            shell.preview_drag_at = Some((x, y));
+            if !shell.drag_timer.running() {
+                let weak = ui.as_weak();
+                shell
+                    .drag_timer
+                    .start(TimerMode::Repeated, Duration::from_millis(40), move || {
+                        if let Some(ui) = weak.upgrade() {
+                            deliver(ui, Box::new(drag_scroll_preview));
+                        }
+                    });
+            }
+        } else {
+            shell.preview_drag_at = None;
+            shell.drag_timer.stop();
+        }
         present(&ui, shell);
+    }));
+    ui.on_preview_released(handler!(|_ui, shell| {
+        shell.preview_drag_at = None;
+        shell.drag_timer.stop();
     }));
 
     ui.on_preview_clicked(handler!(|ui, shell, x, y| {
@@ -3813,17 +4431,38 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_tree_action(handler!(|ui, shell, action, index| {
-        let Some(row) = usize::try_from(index)
-            .ok()
-            .and_then(|i| shell.tree_rows.get(i))
-            .cloned()
-        else {
+        // -1: the open folder itself, from the button beside its name.
+        let row = if index == -1 {
+            shell.tree.as_ref().map(|tree| Row {
+                depth: 0,
+                name: String::new(),
+                path: tree.root().to_owned(),
+                kind: RowKind::Folder { expanded: true },
+            })
+        } else {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| shell.tree_rows.get(i))
+                .cloned()
+        };
+        let Some(row) = row else {
             return;
         };
         match action {
             0 => open_tree_row(&ui, shell, row),
             1 => reveal(&ui, row.path),
-            _ => {}
+            // Once the menu the command came from has closed: closing it
+            // gives the keyboard back to where it was, which would take it
+            // from the question this opens.
+            _ => {
+                let ui = ui.clone_strong();
+                Timer::single_shot(Duration::ZERO, move || {
+                    deliver(
+                        ui,
+                        Box::new(move |ui, shell| tree_file_action(ui, shell, action, row)),
+                    );
+                });
+            }
         }
     }));
 
@@ -3839,6 +4478,7 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_refresh_folder(handler!(|ui, shell| {
         refresh_workspace(&ui, shell);
+        check_disk(&ui, shell);
     }));
 
     ui.on_reveal_current(handler!(|ui, shell| {
@@ -3927,6 +4567,129 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     agent::Assistant::start(&ui, &mut shell.borrow_mut());
     ui.on_link_accept(handler!(|ui, shell| {
         accept_link(&ui, shell);
+    }));
+    ui.on_encoding_accept(handler!(|ui, shell| {
+        accept_encoding(&ui, shell);
+    }));
+    ui.on_encoding_cancel(handler!(|ui, shell| {
+        shell.encoding_for = None;
+        ui.set_encoding_open(false);
+        if shell.active_surface().is_some() {
+            ui.invoke_focus_document();
+        }
+    }));
+    ui.on_menu_reopen_encoding(handler!(|ui, shell| {
+        let Some(id) = shell.tabs.active_id() else {
+            return;
+        };
+        let Some(path) = shell.markdown(id).and_then(|editor| editor.path.clone()) else {
+            return;
+        };
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let readings = files::readings_of(&path);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| {
+                        let strings = shell.language.strings();
+                        let name = files::display_name(&path);
+                        match readings {
+                            Ok(readings) if !readings.is_empty() => show_encoding_dialog(
+                                ui,
+                                shell,
+                                EncodingFor::Reopen(id, path),
+                                readings,
+                                strings.encoding_reopen_title.to_owned(),
+                                i18n::fill(strings.encoding_reopen_body, "name", &name),
+                            ),
+                            Ok(_) => {
+                                let title = i18n::fill(strings.open_failed, "name", &name);
+                                show_dialog(ui, shell, 2, title, strings.not_utf8.to_owned());
+                            }
+                            Err(err) => {
+                                let title = i18n::fill(strings.open_failed, "name", &name);
+                                show_dialog(ui, shell, 2, title, err.to_string());
+                            }
+                        }
+                    }),
+                );
+            });
+        });
+    }));
+    ui.on_menu_convert_utf8(handler!(|ui, shell| {
+        if let Some(editor) = shell.active_markdown() {
+            editor.set_format(TextFormat {
+                encoding: Encoding::Utf8,
+                bom: false,
+                ..editor.format
+            });
+        }
+        after_edit(&ui, shell, true);
+    }));
+    ui.on_menu_line_endings(handler!(|ui, shell, crlf| {
+        if let Some(editor) = shell.active_markdown() {
+            let line_ending = if crlf {
+                aster_markdown::LineEnding::CrLf
+            } else {
+                aster_markdown::LineEnding::Lf
+            };
+            editor.set_format(TextFormat {
+                line_ending,
+                mixed_line_endings: false,
+                ..editor.format
+            });
+        }
+        after_edit(&ui, shell, true);
+    }));
+    ui.on_menu_go_to_line(handler!(|ui, shell| {
+        let Some(id) = shell.tabs.active_id() else {
+            return;
+        };
+        let Some(editor) = shell.markdown(id) else {
+            return;
+        };
+        if !editor.view_mode.shows_source() {
+            editor.set_view_mode(ViewMode::Split);
+        }
+        let count = editor.line_count();
+        let strings = shell.language.strings();
+        show_prompt(
+            &ui,
+            shell,
+            Prompt::GoTo(id),
+            strings.goto_title.to_owned(),
+            i18n::fill(strings.goto_label, "count", &group_digits(count)),
+            String::new(),
+        );
+        refresh_toolbar(&ui, shell);
+    }));
+    ui.on_prompt_accept(handler!(|ui, shell| {
+        match shell.prompt.clone() {
+            Some(Prompt::GoTo(id)) => {
+                let strings = shell.language.strings();
+                let Some(editor) = shell.markdown(id) else {
+                    hide_prompt(&ui, shell);
+                    return;
+                };
+                let count = editor.line_count();
+                match content::parse_line_target(&ui.get_prompt_text(), count) {
+                    Some((line, column)) => {
+                        editor.go_to_line(line, column);
+                        hide_prompt(&ui, shell);
+                        after_edit(&ui, shell, false);
+                    }
+                    None => ui.set_prompt_problem(
+                        i18n::fill(strings.goto_invalid, "count", &group_digits(count)).into(),
+                    ),
+                }
+            }
+            Some(Prompt::Rename(from)) => rename_entry(&ui, shell, from),
+            None => hide_prompt(&ui, shell),
+        }
+    }));
+    ui.on_prompt_cancel(handler!(|ui, shell| {
+        hide_prompt(&ui, shell);
     }));
     ui.on_link_cancel(handler!(|ui, shell| {
         ui.set_link_open(false);
@@ -4401,6 +5164,26 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 shell.force_close(id);
                 after_tab_change(&ui, shell);
             }
+            Some(Pending::Trash(path)) => trash_entry(&ui, path),
+            Some(Pending::SaveInUtf8 { id, path, after }) => {
+                if let Some(editor) = shell.markdown(id) {
+                    editor.set_format(TextFormat {
+                        encoding: Encoding::Utf8,
+                        bom: false,
+                        ..editor.format
+                    });
+                }
+                if let Some(job) = shell.begin_save(id, path) {
+                    spawn_save(&ui, job, after);
+                }
+            }
+            Some(Pending::DiskChanged(id)) => {
+                if let Some((loaded_id, loaded)) = shell.disk_loaded.take()
+                    && loaded_id == id
+                {
+                    reload_document(&ui, shell, id, loaded, false);
+                }
+            }
             Some(Pending::Quit) => {
                 // Quitting without saving is a decision, not a crash: nothing
                 // is left to recover.
@@ -4412,7 +5195,17 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_dialog_cancel(handler!(|ui, shell| {
+        let pending = shell.pending.clone();
         hide_dialog(&ui, shell);
+        if let Some(Pending::DiskChanged(id)) = pending {
+            // Kept: never written over without asking where.
+            shell.disk_loaded = None;
+            if let Some(editor) = shell.markdown(id) {
+                editor.disk_warning = Some(DiskWarning::ChangedWhileOpen);
+            }
+            refresh_status(&ui, shell);
+            check_disk(&ui, shell);
+        }
     }));
 
     // --- The recovery question ---
@@ -4876,13 +5669,16 @@ mod tests {
     }
 
     #[test]
-    fn zoom_commands_only_act_on_a_writer_tab() {
+    fn zoom_commands_act_on_writer_and_markdown_tabs() {
         let mut shell = shell();
         assert!(!shell.run(Command::ZoomIn));
         shell.open_untitled(DocKind::Sheets);
         assert!(!shell.run(Command::ZoomIn));
         shell.open_untitled(DocKind::Markdown);
-        assert!(!shell.run(Command::ZoomIn));
+        assert!(shell.run(Command::ZoomIn));
+        assert_eq!(shell.active_markdown().expect("markdown").zoom_percent, 110);
+        assert!(shell.run(Command::ZoomReset));
+        assert!(!shell.run(Command::ZoomReset));
         shell.open_untitled(DocKind::Writer);
         assert!(shell.run(Command::ZoomIn));
         assert!(shell.run(Command::ZoomIn));
@@ -4971,10 +5767,18 @@ mod tests {
         assert_eq!(format_label(&TextFormat::default()), "UTF-8 · LF");
         let windows = TextFormat {
             line_ending: LineEnding::CrLf,
+            encoding: Encoding::Utf8,
             bom: true,
             mixed_line_endings: false,
         };
         assert_eq!(format_label(&windows), "UTF-8 BOM · CRLF");
+        let japanese = TextFormat {
+            encoding: Encoding::ShiftJis,
+            // Ignored: Shift_JIS has no byte-order mark.
+            bom: true,
+            ..TextFormat::default()
+        };
+        assert_eq!(format_label(&japanese), "Shift_JIS · LF");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice } from "tokens.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -13,6 +13,8 @@ import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { LinkDialog } from "link_dialog.slint";
+import { PromptDialog } from "prompt_dialog.slint";
+import { EncodingDialog } from "encoding_dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
 import { Hairline, ScrollBar } from "widgets.slint";
 import { FindBar } from "findbar.slint";
@@ -87,6 +89,30 @@ export component AppWindow inherits Window {
     in-out property <string> link-address;
     callback link-accept();
     callback link-cancel();
+    // A question asking for one line of text: go to line, rename.
+    in property <bool> prompt-open;
+    in property <string> prompt-title;
+    in property <string> prompt-label;
+    in property <string> prompt-problem;
+    in-out property <string> prompt-text;
+    callback prompt-accept();
+    callback prompt-cancel();
+    callback menu-go-to-line();
+    // Choosing the encoding a file is read in.
+    in property <bool> encoding-open;
+    in property <string> encoding-title;
+    in property <string> encoding-body;
+    in property <[EncodingChoice]> encoding-choices;
+    in-out property <int> encoding-selected;
+    callback encoding-accept();
+    callback encoding-cancel();
+    // What the document in front is written as: its encoding is UTF-8, its
+    // lines end in CRLF.
+    in property <bool> format-utf8: true;
+    in property <bool> format-crlf;
+    callback menu-reopen-encoding();
+    callback menu-convert-utf8();
+    callback menu-line-endings(bool);
     // The sidebar's outline of the Markdown document in front.
     in property <[OutlineItem]> outline;
     in property <bool> has-outline;
@@ -290,6 +316,7 @@ export component AppWindow inherits Window {
     // moving with the button down drags it.
     callback preview-pressed(length, length, bool);
     callback preview-dragged(length, length);
+    callback preview-released();
 
     // Give the keyboard to the document surface.
     public function focus-document() {
@@ -390,6 +417,42 @@ export component AppWindow inherits Window {
                     root.file-save-as();
                 }
             }
+
+            MenuItem {
+                title: Strings.menu-reopen-encoding;
+                enabled: root.editing;
+                activated => {
+                    root.menu-reopen-encoding();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-convert-utf8;
+                enabled: root.editing && !root.format-utf8;
+                activated => {
+                    root.menu-convert-utf8();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-line-endings-lf;
+                checked: root.editing && !root.format-crlf;
+                enabled: root.editing;
+                activated => {
+                    root.menu-line-endings(false);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-line-endings-crlf;
+                checked: root.editing && root.format-crlf;
+                enabled: root.editing;
+                activated => {
+                    root.menu-line-endings(true);
+                }
+            }
+
+            MenuSeparator { }
 
             MenuItem {
                 title: Strings.menu-export-html;
@@ -547,6 +610,15 @@ export component AppWindow inherits Window {
                 enabled: root.editing;
                 activated => {
                     root.menu-replace();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-go-to-line;
+                shortcut: @keys(Control + L);
+                enabled: root.editing;
+                activated => {
+                    root.menu-go-to-line();
                 }
             }
         }
@@ -919,6 +991,9 @@ export component AppWindow inherits Window {
                 reveal-tree(index) => {
                     root.tree-action(1, index);
                 }
+                tree-act(action, index) => {
+                    root.tree-action(action, index);
+                }
                 open-folder => {
                     root.open-folder();
                 }
@@ -1152,6 +1227,9 @@ export component AppWindow inherits Window {
                                         preview-scope.focus();
                                         root.preview-pressed(self.mouse-x, self.mouse-y, event.modifiers.shift);
                                     }
+                                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                        root.preview-released();
+                                    }
                                 }
                                 clicked => {
                                     root.preview-clicked(self.mouse-x, self.mouse-y);
@@ -1356,6 +1434,32 @@ export component AppWindow inherits Window {
         }
         later => {
             root.recovery-later();
+        }
+    }
+
+    if root.encoding-open: EncodingDialog {
+        title: root.encoding-title;
+        body: root.encoding-body;
+        choices: root.encoding-choices;
+        selected <=> root.encoding-selected;
+        confirmed => {
+            root.encoding-accept();
+        }
+        dismissed => {
+            root.encoding-cancel();
+        }
+    }
+
+    if root.prompt-open: PromptDialog {
+        title: root.prompt-title;
+        label: root.prompt-label;
+        problem: root.prompt-problem;
+        text <=> root.prompt-text;
+        confirmed => {
+            root.prompt-accept();
+        }
+        dismissed => {
+            root.prompt-cancel();
         }
     }
 

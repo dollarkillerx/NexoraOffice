@@ -675,6 +675,9 @@ impl TextView {
             return;
         }
         let relayout = width != self.width || scale != self.scale;
+        // Never shown before and not scrolled: it opens at the top of the
+        // page, its padding in view, not with the first line at the edge.
+        let first_show = (self.width == 0 || self.height == 0) && self.top == (0, 0.0);
         self.width = width;
         self.height = height;
         self.scale = scale;
@@ -684,6 +687,9 @@ impl TextView {
             let offset = self.top.1 / f64::from(self.lines.line_height.max(1.0));
             self.remeasure();
             self.top.1 = offset * f64::from(self.lines.line_height);
+        }
+        if first_show && width > 0 && height > 0 {
+            self.set_scroll(0.0);
         }
     }
 
@@ -949,6 +955,12 @@ impl TextView {
 
     /// Scroll so that a position from [`Self::top_position`] is at the top.
     pub fn scroll_to_position(&mut self, position: f64) {
+        // The very start: the top of the page with its padding, not the first
+        // line pressed against the edge.
+        if position <= 0.0 {
+            self.set_scroll(0.0);
+            return;
+        }
         self.refresh();
         let at = (position.max(0.0) as usize).min(self.text.len_bytes());
         let line = self.text.byte_to_line(at);
@@ -1653,6 +1665,24 @@ impl Piece {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_start_of_the_text_keeps_the_top_padding_in_view() {
+        let mut v = TextView::new(ropey::Rope::from_str("one\ntwo\nthree\n"));
+        v.set_page_layout(PageLayout {
+            margin: 0.0,
+            padding: 40.0,
+            max_width: None,
+            min_aspect: None,
+        });
+        v.resize(600, 300, 1.0);
+        // Shown for the first time: at the top of the page.
+        assert_eq!(v.scroll_range().0, 0.0);
+        v.scroll_by(100.0);
+        v.scroll_to_position(0.0);
+        assert_eq!(v.scroll_range().0, 0.0);
+        assert_eq!(v.top_position(), 0.0);
+    }
     use crate::text_surface::TextStyle;
 
     fn view(text: &str) -> TextView {

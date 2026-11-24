@@ -17,13 +17,18 @@ pub struct Heading {
 }
 
 /// The headings of `source`, in order. Headings inside code blocks are not
-/// headings; ones in quotes and list items are.
+/// headings; ones in quotes and list items are. Front matter has none, even
+/// where its lines look like Markdown headings.
 pub fn headings(source: &str) -> Vec<Heading> {
     let mut out = Vec::new();
     let mut current: Option<Heading> = None;
+    let start = syntax::front_matter(source).map_or(0, |range| range.end);
     let mut line = 1;
     let mut counted = 0;
-    for (event, range) in Parser::new_ext(source, syntax::options()).into_offset_iter() {
+    let events = Parser::new_ext(&source[start..], syntax::options())
+        .into_offset_iter()
+        .map(|(event, range)| (event, start + range.start..start + range.end));
+    for (event, range) in events {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 line += source[counted..range.start].matches('\n').count();
@@ -91,5 +96,22 @@ mod tests {
         );
         assert_eq!(&source[found[1].offset..found[1].offset + 3], "## ");
         assert!(headings("没有标题").is_empty());
+    }
+
+    #[test]
+    fn front_matter_has_no_headings() {
+        // Without front matter `title: 标题` over `---` would be a heading,
+        // and so would the comment.
+        let source = "---\ntitle: 标题\n# 注释\n---\n\n# 正文\n\n设置\n---\n";
+        let found = headings(source);
+        let summary: Vec<(u8, &str, usize)> = found
+            .iter()
+            .map(|h| (h.level, h.text.as_str(), h.line))
+            .collect();
+        assert_eq!(summary, [(1, "正文", 6), (2, "设置", 8)]);
+        assert_eq!(&source[found[0].offset..found[0].offset + 2], "# ");
+        // Not at the start: no front matter, so the heading is one.
+        let source = "前言\n\n---\ntitle: 标题\n---\n";
+        assert_eq!(headings(source)[0].text, "title: 标题");
     }
 }

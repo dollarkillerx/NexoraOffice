@@ -7,7 +7,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aster_markdown::{DecodeError, Decoded, Rope, TextFormat};
+use aster_markdown::{DecodeError, Decoded, EncodeError, Encoding, Rope, TextFormat};
 use aster_storage::Fingerprint;
 use aster_workspace::FileKind;
 
@@ -18,6 +18,17 @@ pub enum LoadError {
     Io(io::Error),
     /// It was read, but it is not text this version can edit.
     Decode(DecodeError),
+    /// It is not UTF-8, but reads as text in these encodings, most likely
+    /// first. Which one is right is the user's to say.
+    OtherEncoding(Vec<Reading>),
+}
+
+/// How the start of a file reads in an encoding, for the user to judge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub encoding: Encoding,
+    /// The first few lines.
+    pub preview: String,
 }
 
 impl fmt::Display for LoadError {
@@ -25,6 +36,7 @@ impl fmt::Display for LoadError {
         match self {
             LoadError::Io(err) => err.fmt(f),
             LoadError::Decode(err) => err.fmt(f),
+            LoadError::OtherEncoding(_) => f.write_str("the file is not UTF-8"),
         }
     }
 }
@@ -39,22 +51,159 @@ pub struct Loaded {
     pub fingerprint: Fingerprint,
 }
 
-/// Read a text file. Nothing is written, whatever the outcome.
+/// Read a text file. Nothing is written, whatever the outcome. A file that
+/// is not UTF-8 is not guessed at: the encodings it could be in come back
+/// as [`LoadError::OtherEncoding`].
 pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     let bytes = aster_storage::read(path).map_err(LoadError::Io)?;
-    let decoded = aster_markdown::decode(&bytes).map_err(LoadError::Decode)?;
+    let decoded = match aster_markdown::decode(&bytes) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            let readings: Vec<Reading> = aster_markdown::guess_encodings(&bytes)
+                .into_iter()
+                .filter_map(|encoding| reading(&bytes, encoding))
+                .collect();
+            return Err(if readings.is_empty() {
+                LoadError::Decode(err)
+            } else {
+                LoadError::OtherEncoding(readings)
+            });
+        }
+    };
     Ok(Loaded {
         decoded,
         fingerprint: Fingerprint::of(path, &bytes),
     })
 }
 
+/// Read a text file in an encoding the user chose.
+pub fn load_as(path: &Path, encoding: Encoding) -> Result<Loaded, LoadError> {
+    let bytes = aster_storage::read(path).map_err(LoadError::Io)?;
+    let decoded = if encoding == Encoding::Utf8 {
+        aster_markdown::decode(&bytes)
+    } else {
+        aster_markdown::decode_as(&bytes, encoding)
+    }
+    .map_err(LoadError::Decode)?;
+    Ok(Loaded {
+        decoded,
+        fingerprint: Fingerprint::of(path, &bytes),
+    })
+}
+
+/// Every encoding a file reads as, for opening it again in another one:
+/// UTF-8 first if it is valid UTF-8, then the likely others.
+pub fn readings_of(path: &Path) -> io::Result<Vec<Reading>> {
+    let bytes = aster_storage::read(path)?;
+    let mut encodings = Vec::new();
+    if aster_markdown::decode(&bytes).is_ok() {
+        encodings.push(Encoding::Utf8);
+    }
+    encodings.extend(aster_markdown::guess_encodings(&bytes));
+    Ok(encodings
+        .into_iter()
+        .filter_map(|encoding| reading(&bytes, encoding))
+        .collect())
+}
+
+/// How many bytes of a file the preview of a reading decodes.
+const PREVIEW_BYTES: usize = 4096;
+const PREVIEW_LINES: usize = 6;
+
+/// The start of `bytes` read in `encoding`, or `None` if that start is not
+/// valid in it. A character cut off at the end of the sample is dropped.
+fn reading(bytes: &[u8], encoding: Encoding) -> Option<Reading> {
+    let decode = |sample: &[u8]| match encoding {
+        Encoding::Utf8 => aster_markdown::decode(sample),
+        _ => aster_markdown::decode_as(sample, encoding),
+    };
+    let sample = &bytes[..bytes.len().min(PREVIEW_BYTES)];
+    let decoded = match decode(sample) {
+        Ok(decoded) => decoded,
+        // Cut in the middle of a character: try without it.
+        Err(DecodeError::NotUtf8 { offset } | DecodeError::Malformed { offset, .. })
+            if sample.len() < bytes.len() && offset + 4 >= sample.len() && offset > 0 =>
+        {
+            decode(&sample[..offset]).ok()?
+        }
+        Err(_) => return None,
+    };
+    let preview = decoded
+        .text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(PREVIEW_LINES)
+        .map(|line| line.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(Reading { encoding, preview })
+}
+
+/// Why a document could not be saved.
+#[derive(Debug)]
+pub enum SaveError {
+    Io(io::Error),
+    /// The file's encoding has no bytes for a character of the text, on
+    /// `line` (from 0). Nothing was written.
+    Encode {
+        error: EncodeError,
+        line: usize,
+    },
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SaveError::Io(err) => err.fmt(f),
+            SaveError::Encode { error, .. } => error.fmt(f),
+        }
+    }
+}
+
+/// What became of a file since it was last read or written.
+#[derive(Debug)]
+pub enum OnDisk {
+    Unchanged,
+    /// Its content is different: what it holds now, or why that could not
+    /// be read.
+    Changed(Result<Loaded, LoadError>),
+    Missing,
+}
+
+/// Look at `path` again, against what it held `earlier`. A file with the
+/// same length and modification time counts as unchanged without being
+/// read, so that looking costs one `stat` while nothing happens; otherwise
+/// it is read and its content compared.
+pub fn look_again(path: &Path, earlier: &Fingerprint) -> OnDisk {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return OnDisk::Missing,
+        Err(err) => return OnDisk::Changed(Err(LoadError::Io(err))),
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos());
+    if meta.len() == earlier.len && modified.is_some() && modified == earlier.modified_nanos {
+        return OnDisk::Unchanged;
+    }
+    match load(path) {
+        Ok(loaded) if loaded.fingerprint.same_content(earlier) => OnDisk::Unchanged,
+        Err(LoadError::Io(err)) if err.kind() == io::ErrorKind::NotFound => OnDisk::Missing,
+        result => OnDisk::Changed(result),
+    }
+}
+
 /// Write a document's text to its file, in the format the file had. The file
 /// is replaced atomically: a failure leaves the previous contents in place.
 /// Returns the fingerprint of what was written.
-pub fn save(path: &Path, text: &Rope, format: &TextFormat) -> io::Result<Fingerprint> {
-    let bytes = aster_markdown::encode_rope(text, format);
-    aster_storage::write_atomically(path, &bytes)?;
+pub fn save(path: &Path, text: &Rope, format: &TextFormat) -> Result<Fingerprint, SaveError> {
+    let bytes = aster_markdown::encode_rope(text, format).map_err(|error| SaveError::Encode {
+        error,
+        line: text.byte_to_line(error.offset.min(text.len_bytes())),
+    })?;
+    aster_storage::write_atomically(path, &bytes).map_err(SaveError::Io)?;
     Ok(Fingerprint::of(path, &bytes))
 }
 
@@ -186,6 +335,64 @@ pub fn dropped(path: &Path) -> Dropped {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_in_another_encoding_is_offered_in_the_ones_it_reads_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gbk.md");
+        // "中文标题\n正文" in GBK.
+        let gbk: &[u8] = b"\xd6\xd0\xce\xc4\xb1\xea\xcc\xe2\n\xd5\xfd\xce\xc4";
+        std::fs::write(&path, gbk).unwrap();
+        let Err(LoadError::OtherEncoding(readings)) = load(&path) else {
+            panic!("not offered");
+        };
+        let gb = readings
+            .iter()
+            .find(|reading| reading.encoding == Encoding::Gb18030)
+            .expect("GB18030 offered");
+        assert_eq!(gb.preview, "中文标题\n正文");
+        let loaded = load_as(&path, Encoding::Gb18030).unwrap();
+        assert_eq!(loaded.decoded.text, "中文标题\n正文");
+        assert_eq!(loaded.decoded.format.encoding, Encoding::Gb18030);
+        // Saved back in the same bytes.
+        let text = Rope::from_str(&loaded.decoded.text);
+        save(&path, &text, &loaded.decoded.format).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), gbk);
+        // A character the encoding has no bytes for is refused, and nothing
+        // written. (GB18030 holds all of Unicode; Shift_JIS has no emoji.)
+        let text = Rope::from_str("中文\n😀");
+        let japanese = TextFormat {
+            encoding: Encoding::ShiftJis,
+            ..loaded.decoded.format
+        };
+        match save(&path, &text, &japanese) {
+            Err(SaveError::Encode { error, line }) => assert_eq!((error.ch, line), ('😀', 1)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), gbk);
+        // UTF-8 is offered first when the file is valid UTF-8 too.
+        std::fs::write(&path, "plain").unwrap();
+        assert_eq!(readings_of(&path).unwrap()[0].encoding, Encoding::Utf8);
+    }
+
+    #[test]
+    fn a_file_is_looked_at_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "one\n").unwrap();
+        let first = load(&path).unwrap().fingerprint;
+        assert!(matches!(look_again(&path, &first), OnDisk::Unchanged));
+        // The same bytes written again: not a change.
+        std::fs::write(&path, "one\n").unwrap();
+        assert!(matches!(look_again(&path, &first), OnDisk::Unchanged));
+        std::fs::write(&path, "two\n").unwrap();
+        match look_again(&path, &first) {
+            OnDisk::Changed(Ok(loaded)) => assert_eq!(loaded.decoded.text, "two\n"),
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(look_again(&path, &first), OnDisk::Missing));
+    }
     use aster_markdown::LineEnding;
 
     fn write(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
@@ -231,17 +438,22 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_utf8_is_refused_and_left_alone() {
+    fn a_file_that_is_not_utf8_is_not_guessed_at_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         // "中文" in GBK.
         let bytes = b"\xD6\xD0\xCE\xC4\r\n";
         let path = write(&dir, "gbk.txt", bytes);
-        let err = load(&path).unwrap_err();
-        assert!(matches!(
-            err,
-            LoadError::Decode(DecodeError::NotUtf8 { offset: 0 })
-        ));
+        let Err(LoadError::OtherEncoding(readings)) = load(&path) else {
+            panic!("not offered");
+        };
+        assert_eq!(readings[0].encoding, Encoding::Gb18030);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // Bytes no encoding reads are refused as before.
+        let path = write(&dir, "binary.bin", b"\x81\x00\xff\xfe\xfd\x80");
+        assert!(matches!(
+            load(&path),
+            Err(LoadError::Decode(DecodeError::NotUtf8 { .. }) | LoadError::OtherEncoding(_))
+        ));
     }
 
     #[test]

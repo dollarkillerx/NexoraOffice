@@ -73,6 +73,18 @@ fn editor_layout(tokens: &theme::Tokens) -> PageLayout {
     }
 }
 
+/// A page layout for text shown `zoom` times its usual size: the margins
+/// and the column grow with the text, so lines keep their length in
+/// characters.
+fn zoomed(layout: PageLayout, zoom: f64) -> PageLayout {
+    PageLayout {
+        margin: layout.margin * zoom,
+        padding: layout.padding * zoom,
+        max_width: layout.max_width.map(|width| width * zoom),
+        ..layout
+    }
+}
+
 /// The colours of highlighted Markdown source.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SyntaxColors {
@@ -470,6 +482,19 @@ pub struct MarkdownEditor {
     /// The last link clicked in the preview was not opened: it was not a web
     /// or e-mail link.
     pub link_refused: bool,
+    /// The text was just replaced with what another program wrote to the
+    /// file; the status bar says so until the next edit or click.
+    pub reloaded: bool,
+    /// The text was just read again in another encoding.
+    pub reopened: bool,
+    /// How large the source and the preview are drawn, in percent.
+    pub zoom_percent: u32,
+    /// A double or triple click began the selection: dragging extends it by
+    /// this unit from this range.
+    click_unit: Option<(ClickUnit, Range<usize>)>,
+    /// The encoding or line endings to save with were changed since the
+    /// file was last read or written: the document counts as modified.
+    pub format_changed: bool,
     /// The preview was clicked last, not the source: the keyboard scrolls
     /// it, and copying and "select all" act on it. Always so when the
     /// preview is on screen alone.
@@ -485,12 +510,110 @@ pub struct MarkdownEditor {
     force_checkpoint: bool,
 }
 
+/// What a run of clicks selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickUnit {
+    Word,
+    Line,
+}
+
+/// How long and how far apart presses may be to count as one run of
+/// clicks: a double or a triple click.
+pub const MULTI_CLICK_TIME: std::time::Duration = std::time::Duration::from_millis(500);
+pub const MULTI_CLICK_DISTANCE: f64 = 5.0;
+
+/// Counts the presses of a double or triple click.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClickCounter {
+    last: Option<(std::time::Instant, f64, f64, u8)>,
+}
+
+impl ClickCounter {
+    /// A press at `(x, y)` (logical pixels) at `now`: 1, 2 or 3. Presses
+    /// after the third in the same run stay 3, as on macOS.
+    pub fn press(&mut self, x: f64, y: f64, now: std::time::Instant) -> u8 {
+        let count = match self.last {
+            Some((at, last_x, last_y, count))
+                if now.saturating_duration_since(at) <= MULTI_CLICK_TIME
+                    && (x - last_x).abs() <= MULTI_CLICK_DISTANCE
+                    && (y - last_y).abs() <= MULTI_CLICK_DISTANCE =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last = Some((now, x, y, count));
+        count
+    }
+}
+
+/// Where two texts differ: the end of their common start, and where their
+/// common end begins in each (`start..old_end` in `old` became
+/// `start..new_end` in `new`). All three are character boundaries.
+pub fn differing_middle(old: &str, new: &str) -> (usize, usize, usize) {
+    let mut start = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(start) || !new.is_char_boundary(start) {
+        start -= 1;
+    }
+    let room = old.len().min(new.len()) - start;
+    let mut tail = old
+        .bytes()
+        .rev()
+        .zip(new.bytes().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(old.len() - tail) || !new.is_char_boundary(new.len() - tail) {
+        tail -= 1;
+    }
+    (start, old.len() - tail, new.len() - tail)
+}
+
+/// A place typed into "Go to Line": `12` or `12:5`, counted from 1, with
+/// spaces allowed around the parts and `,` or `：` instead of `:`. Gives the
+/// line and the column counted from 0, or `None` if it is not a place
+/// within `lines` lines.
+pub fn parse_line_target(text: &str, lines: usize) -> Option<(usize, usize)> {
+    let text = text.trim();
+    let (line, column) = match text.split_once([':', ',', '：', '，']) {
+        Some((line, column)) => (line.trim(), Some(column.trim())),
+        None => (text, None),
+    };
+    let line: usize = line.parse().ok()?;
+    let column: usize = match column {
+        Some(column) => column.parse().ok()?,
+        None => 1,
+    };
+    (1..=lines).contains(&line).then_some(())?;
+    Some((line - 1, column.saturating_sub(1)))
+}
+
+/// Where line `line` (from 0) starts in `text`; the end of the text if it
+/// has fewer lines.
+fn line_start(text: &str, line: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    text.match_indices('\n')
+        .nth(line - 1)
+        .map_or(text.len(), |(at, _)| at + 1)
+}
+
 /// What became of a restored document's file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskWarning {
     /// Another program changed it, or it could not be read.
     Changed,
     Missing,
+    /// Another program changed the file while it was open here, and the
+    /// changes here were kept.
+    ChangedWhileOpen,
+    /// The file was moved or deleted while it was open here.
+    MissingWhileOpen,
 }
 
 /// What the recovery record of a document needs next. See
@@ -623,6 +746,11 @@ impl MarkdownEditor {
             synced_scroll: None,
             preview_target: None,
             link_refused: false,
+            reloaded: false,
+            reopened: false,
+            zoom_percent: 100,
+            click_unit: None,
+            format_changed: false,
             preview_focused: false,
             find: FindState::default(),
             highlight_stale: false,
@@ -705,9 +833,39 @@ impl MarkdownEditor {
         }
     }
 
+    /// Whether closing would lose anything: changes to the text, or to how
+    /// it is to be written.
+    pub fn is_modified(&self) -> bool {
+        self.document.is_modified() || self.format_changed
+    }
+
+    /// Write the file in `format` from the next save on.
+    pub fn set_format(&mut self, format: TextFormat) {
+        if format != self.format {
+            self.format = format;
+            self.format_changed = true;
+            // What the status bar said about the last reading is past.
+            self.reloaded = false;
+            self.reopened = false;
+        }
+    }
+
+    /// Draw the source and the preview at `percent` of their usual size.
+    pub fn set_zoom(&mut self, percent: u32, tokens: &theme::Tokens) {
+        self.zoom_percent = percent;
+        let zoom = f64::from(percent) / 100.0;
+        self.surface.set_font_size(MARKDOWN_FONT_SIZE * zoom as f32);
+        self.surface
+            .set_page_layout(zoomed(editor_layout(tokens), zoom));
+        self.surface.reveal_caret();
+    }
+
     pub fn restyle(&mut self, tokens: &theme::Tokens) {
         self.surface.set_palette(editor_palette(tokens));
-        self.surface.set_page_layout(editor_layout(tokens));
+        self.surface.set_page_layout(zoomed(
+            editor_layout(tokens),
+            f64::from(self.zoom_percent) / 100.0,
+        ));
         self.syntax = SyntaxColors::of(tokens);
         self.preview
             .set_background(tokens.colors.surface.to_array());
@@ -780,6 +938,12 @@ impl MarkdownEditor {
         if width == 0 || height == 0 {
             return None;
         }
+        let zoom = f64::from(self.zoom_percent) / 100.0;
+        let style = PreviewStyle {
+            font_size: style.font_size * zoom as f32,
+            page: zoomed(style.page, zoom),
+            ..style
+        };
         if let Some(last) = &self.preview_request
             && (last.width, last.scale, last.style) == (width, scale, style)
             && (last.version == self.text_version || !text_changes)
@@ -855,8 +1019,24 @@ impl MarkdownEditor {
     /// selection there, or with `extend` moves the end of the current one.
     pub fn preview_press(&mut self, x: f64, y: f64, extend: bool) {
         self.link_refused = false;
+        self.reloaded = false;
+        self.reopened = false;
         self.preview_focused = true;
         self.preview.press(x, y, extend);
+    }
+
+    /// A double click in the preview selects the word there; a triple
+    /// click (`block`) the paragraph, heading, list item or table cell.
+    pub fn preview_select(&mut self, x: f64, y: f64, block: bool) {
+        self.link_refused = false;
+        self.reloaded = false;
+        self.reopened = false;
+        self.preview_focused = true;
+        if block {
+            self.preview.select_block(x, y);
+        } else {
+            self.preview.select_word(x, y);
+        }
     }
 
     pub fn preview_drag(&mut self, x: f64, y: f64) {
@@ -917,6 +1097,8 @@ impl MarkdownEditor {
         }
         self.text_version += 1;
         self.link_refused = false;
+        self.reloaded = false;
+        self.reopened = false;
         // "Replaced 12" describes the text before any later edit or undo.
         self.find.replaced = None;
         self.surface.apply_change(
@@ -1426,6 +1608,47 @@ impl MarkdownEditor {
         }))
     }
 
+    /// Take what another program wrote to the file: the text becomes the
+    /// file's, as one undo step (only the part between the first and the last
+    /// difference is replaced, so the rest keeps its place), and that state
+    /// counts as saved. The caret stays on the line it was on, as far as the
+    /// new text has one. Refused while an input method is composing or a
+    /// replacement throughout the document runs.
+    pub fn reload(&mut self, loaded: crate::files::Loaded) -> Result<bool, &'static str> {
+        if self.surface.is_composing() {
+            return Err("the user is typing with an input method");
+        }
+        if self.locked() {
+            return Err("a replacement throughout the document is running");
+        }
+        let old = self.document.text().to_string();
+        let new = loaded.decoded.text;
+        let (start, old_end, new_end) = differing_middle(&old, &new);
+        let caret_line = self
+            .document
+            .text()
+            .byte_to_line(self.document.selection().focus.min(old.len()));
+        let caret = line_start(&new, caret_line);
+        let changed = if start == old_end && start == new_end {
+            self.document.set_selection(Selection::caret(caret));
+            false
+        } else {
+            self.apply(format::Edit {
+                range: start..old_end,
+                text: new[start..new_end].to_owned(),
+                selection: Selection::caret(caret),
+            })
+        };
+        self.format = loaded.decoded.format;
+        self.format_changed = false;
+        self.disk = Some(loaded.fingerprint);
+        self.disk_warning = None;
+        let (_, point) = self.snapshot();
+        self.document.mark_saved(point);
+        self.reloaded = true;
+        Ok(changed)
+    }
+
     /// Make an edit that moves list items, then put the numbers of the lists
     /// below right; one undo step.
     fn apply_renumbered(&mut self, edit: format::Edit) -> bool {
@@ -1526,18 +1749,76 @@ impl MarkdownEditor {
     }
 
     pub fn pointer_down(&mut self, x: f64, y: f64, extend: bool) {
+        self.pointer_press(x, y, extend, 1);
+    }
+
+    /// The `clicks`th press of a run of clicks in the source: one puts the
+    /// caret, two select the word, three the line. A drag after two or three
+    /// goes on by whole words or lines.
+    pub fn pointer_press(&mut self, x: f64, y: f64, extend: bool, clicks: u8) {
         self.link_refused = false;
+        self.reloaded = false;
+        self.reopened = false;
         self.preview_focused = false;
         self.surface.pointer_down(x, y, extend);
-        if !self.surface.is_composing() {
-            self.adopt_selection();
+        self.click_unit = None;
+        if self.surface.is_composing() {
+            return;
         }
+        if !extend && clicks >= 2 {
+            let unit = if clicks == 2 {
+                ClickUnit::Word
+            } else {
+                ClickUnit::Line
+            };
+            let (_, at) = self.surface.selection();
+            let range = self.unit_range(unit, at);
+            self.surface.set_selection(range.start, range.end);
+            self.click_unit = Some((unit, range));
+        }
+        self.adopt_selection();
     }
 
     pub fn pointer_drag(&mut self, x: f64, y: f64) {
         self.surface.pointer_drag(x, y);
-        if !self.surface.is_composing() {
-            self.adopt_selection();
+        if self.surface.is_composing() {
+            return;
+        }
+        if let Some((unit, origin)) = self.click_unit.clone() {
+            let (_, at) = self.surface.selection();
+            let reached = self.unit_range(unit, at);
+            let (anchor, focus) = if reached.start < origin.start {
+                (origin.end, reached.start)
+            } else {
+                (origin.start, reached.end.max(origin.end))
+            };
+            self.surface.set_selection(anchor, focus);
+        }
+        self.adopt_selection();
+    }
+
+    /// The word or line around the source offset `at`; a line includes its
+    /// line break.
+    fn unit_range(&self, unit: ClickUnit, at: usize) -> Range<usize> {
+        let text = self.document.text();
+        let at = at.min(text.len_bytes());
+        let line = text.byte_to_line(at);
+        let start = text.line_to_byte(line);
+        let end = if line + 1 < text.len_lines() {
+            text.line_to_byte(line + 1)
+        } else {
+            text.len_bytes()
+        };
+        match unit {
+            ClickUnit::Line => start..end,
+            ClickUnit::Word => {
+                // Without the line break: double-clicking at the end of a line
+                // selects its last word, not the break.
+                let content = text.line(line).to_string();
+                let content = content.trim_end_matches(['\n', '\r']);
+                let local = aster_markdown::syntax::word_range(content, at - start);
+                start + local.start..start + local.end
+            }
         }
     }
 
@@ -1595,6 +1876,29 @@ impl MarkdownEditor {
     pub fn scroll_caret_to_top(&mut self) {
         let caret = self.document.selection().focus;
         self.surface.scroll_to_position(caret as f64);
+    }
+
+    /// How many lines the source has.
+    pub fn line_count(&self) -> usize {
+        self.document.text().len_lines()
+    }
+
+    /// Put the caret on `line` at `column` characters in (both from 0; a
+    /// column past the end of the line is its end) and scroll that line to
+    /// the top.
+    pub fn go_to_line(&mut self, line: usize, column: usize) {
+        let text = self.document.text();
+        let line = line.min(text.len_lines().saturating_sub(1));
+        let start = text.line_to_byte(line);
+        let content = text.line(line);
+        let width = content
+            .chars()
+            .take_while(|c| *c != '\n')
+            .take(column)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        self.place_caret(start + width);
+        self.scroll_caret_to_top();
     }
 
     pub fn place_caret(&mut self, at: usize) {
@@ -1691,6 +1995,163 @@ mod tests {
     }
 
     const END: Action = Action::LineEnd { select: false };
+
+    #[test]
+    fn presses_close_together_count_up_to_three() {
+        let mut clicks = ClickCounter::default();
+        let start = std::time::Instant::now();
+        let ms = |n| start + std::time::Duration::from_millis(n);
+        assert_eq!(clicks.press(10.0, 10.0, ms(0)), 1);
+        assert_eq!(clicks.press(11.0, 10.0, ms(200)), 2);
+        assert_eq!(clicks.press(11.0, 12.0, ms(400)), 3);
+        assert_eq!(clicks.press(11.0, 12.0, ms(500)), 3);
+        // Too slow, or too far.
+        assert_eq!(clicks.press(11.0, 12.0, ms(1200)), 1);
+        assert_eq!(clicks.press(40.0, 12.0, ms(1300)), 1);
+    }
+
+    #[test]
+    fn double_and_triple_clicks_select_words_and_lines() {
+        let mut editor = editor("hello world\n中文分词测试\n");
+        // Somewhere on "world".
+        let (x, y) = point_of(&mut editor, 8);
+        editor.pointer_press(x, y, false, 2);
+        assert_eq!(
+            editor.document.selection(),
+            Selection {
+                anchor: 6,
+                focus: 11
+            }
+        );
+        assert_in_step(&editor);
+        editor.pointer_press(x, y, false, 3);
+        assert_eq!(
+            editor.document.selection(),
+            Selection {
+                anchor: 0,
+                focus: 12
+            }
+        );
+        // A drag after a triple click goes on by lines.
+        let (x2, y2) = point_of(&mut editor, 15);
+        editor.pointer_drag(x2, y2);
+        assert_eq!(
+            editor.document.selection().range(),
+            0..editor.document.len()
+        );
+        // A word in Chinese is a dictionary word, not one character or the
+        // whole run.
+        let (x, y) = point_of(&mut editor, 12 + 1);
+        editor.pointer_press(x, y, false, 2);
+        let range = editor.document.selection().range();
+        assert!(range.len() > 3 && range.len() < 18, "{range:?}");
+    }
+
+    /// Physical pixels in the editor where the character at `offset` is.
+    fn point_of(editor: &mut MarkdownEditor, offset: usize) -> (f64, f64) {
+        editor.surface.set_selection(offset, offset);
+        let (x, y, _, height) = editor.surface.ime_cursor_area();
+        (x + 2.0, y + height / 2.0)
+    }
+
+    #[test]
+    fn a_new_format_counts_as_a_change_until_saved() {
+        let mut editor = editor("x\n");
+        editor.reopened = true;
+        assert!(!editor.is_modified());
+        editor.set_format(TextFormat {
+            line_ending: aster_markdown::LineEnding::CrLf,
+            ..editor.format
+        });
+        assert!(editor.is_modified() && !editor.document.is_modified());
+        assert!(!editor.reopened);
+        // Setting the same format again is no change.
+        let mut same = self::editor("x\n");
+        same.set_format(same.format);
+        assert!(!same.is_modified());
+    }
+
+    #[test]
+    fn places_to_go_to() {
+        assert_eq!(parse_line_target("12", 20), Some((11, 0)));
+        assert_eq!(parse_line_target(" 12 : 5 ", 20), Some((11, 4)));
+        assert_eq!(parse_line_target("3：2", 20), Some((2, 1)));
+        assert_eq!(parse_line_target("3,0", 20), Some((2, 0)));
+        assert_eq!(parse_line_target("1", 1), Some((0, 0)));
+        assert_eq!(parse_line_target("0", 20), None);
+        assert_eq!(parse_line_target("21", 20), None);
+        assert_eq!(parse_line_target("", 20), None);
+        assert_eq!(parse_line_target("a", 20), None);
+        assert_eq!(parse_line_target("2:x", 20), None);
+    }
+
+    #[test]
+    fn going_to_a_line_puts_the_caret_there() {
+        let mut editor = editor("one\n二三四\nthree");
+        editor.go_to_line(1, 2);
+        assert_eq!(editor.document.selection(), Selection::caret(4 + 6));
+        assert_in_step(&editor);
+        // Past the end of the line: its end, not the next line.
+        editor.go_to_line(1, 99);
+        assert_eq!(editor.document.selection(), Selection::caret(4 + 9));
+        editor.go_to_line(9, 0);
+        assert_eq!(editor.document.selection(), Selection::caret(14));
+        assert_eq!(editor.line_count(), 3);
+    }
+
+    #[test]
+    fn the_differing_middle_of_two_texts() {
+        assert_eq!(differing_middle("abc", "abc"), (3, 3, 3));
+        assert_eq!(differing_middle("abXc", "abYYc"), (2, 3, 4));
+        assert_eq!(differing_middle("", "new"), (0, 0, 3));
+        assert_eq!(differing_middle("aaa", "aa"), (2, 3, 2));
+        // Never inside a character: 中 and 丫 share their first byte.
+        let (start, old_end, new_end) = differing_middle("a中b", "a丫b");
+        assert_eq!((start, old_end, new_end), (1, 4, 4));
+        let (start, old_end, new_end) = differing_middle("文中", "文丫");
+        assert!("文中".is_char_boundary(start) && "文中".is_char_boundary(old_end));
+        assert_eq!(&"文丫"[start..new_end], "丫");
+    }
+
+    fn loaded(text: &str) -> crate::files::Loaded {
+        crate::files::Loaded {
+            decoded: aster_markdown::decode(text.as_bytes()).unwrap(),
+            fingerprint: aster_storage::Fingerprint {
+                len: text.len() as u64,
+                checksum: aster_storage::checksum(text.as_bytes()),
+                modified_nanos: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_reload_is_one_undo_step_that_counts_as_saved() {
+        let mut editor = editor("one\ntwo\nthree\n");
+        editor.document.set_selection(Selection::caret(9));
+        assert!(editor.reload(loaded("one\nTWO\nthree\nfour\n")).unwrap());
+        assert_in_step(&editor);
+        assert_eq!(
+            editor.document.text().to_string(),
+            "one\nTWO\nthree\nfour\n"
+        );
+        assert!(!editor.document.is_modified());
+        assert!(editor.reloaded);
+        // The caret stays on its line.
+        assert_eq!(editor.document.selection(), Selection::caret(8));
+        assert!(editor.undo());
+        assert_eq!(editor.document.text().to_string(), "one\ntwo\nthree\n");
+        assert!(editor.document.is_modified());
+        let (top, _) = editor.surface.scroll_range();
+        assert_eq!(top, 0.0, "a reload of a short document scrolled it");
+        let mut fresh = self::editor("一\n二\n三\n");
+        let before = fresh.surface.scroll_range().0;
+        fresh.reload(loaded("一\n二（改）\n三\n四\n")).unwrap();
+        assert_eq!(fresh.surface.scroll_range().0, before);
+        // The same content again changes nothing.
+        let mut same = self::editor("x\n");
+        assert!(!same.reload(loaded("x\n")).unwrap());
+        assert!(!same.document.can_undo());
+    }
 
     #[test]
     fn a_file_opens_at_its_beginning_unmodified() {

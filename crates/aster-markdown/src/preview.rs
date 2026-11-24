@@ -2,6 +2,9 @@
 //! layout. Every block remembers which part of the source it came from, so
 //! the preview and the editor can be scrolled to the same place.
 //!
+//! YAML front matter at the start of the document becomes a block of its
+//! own, read loosely into `key: value` fields without a YAML parser.
+//!
 //! Some things are shown as they are written instead of rendered: HTML and
 //! `$math$` appear as code, and an image as a box with its description,
 //! since the preview loads nothing from disk or the network.
@@ -75,6 +78,73 @@ pub enum BlockKind {
     /// Every footnote of the document, in number order; always the last
     /// block.
     Footnotes(Vec<Footnote>),
+    /// The YAML front matter, which can only be the first block.
+    FrontMatter(Vec<FrontMatterLine>),
+}
+
+/// A line of front matter as the preview shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontMatterLine {
+    /// `key: value`, both trimmed and without quotes around them. The value
+    /// is empty when it is written on the lines below, as a list is.
+    Field { key: String, value: String },
+    /// Any other line, as written: a list item, a nested map, more of a
+    /// value that runs over several lines, a comment.
+    Text(String),
+}
+
+/// Read front matter loosely: lines that start in the first column and have
+/// a key, a colon and a value are fields, other lines are kept as text and
+/// blank ones are left out. `text` is the front matter as
+/// [`syntax::front_matter`] finds it; its `---` lines are not shown.
+pub fn read_front_matter(text: &str) -> Vec<FrontMatterLine> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    // The opening and closing lines.
+    lines.pop();
+    lines
+        .into_iter()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| match field(line) {
+            Some((key, value)) => FrontMatterLine::Field {
+                key: unquote(key).to_owned(),
+                value: unquote(value).to_owned(),
+            },
+            None => FrontMatterLine::Text(line.trim_end().to_owned()),
+        })
+        .collect()
+}
+
+/// The key and value of a `key: value` line, trimmed.
+fn field(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with([' ', '\t', '-', '#', '[', '{', '?', '|', '>']) {
+        return None;
+    }
+    // A quoted key can hold a colon.
+    let search_from = match line.chars().next() {
+        Some(quote @ ('"' | '\'')) => line[1..].find(quote)? + 2,
+        _ => 0,
+    };
+    let bytes = line.as_bytes();
+    let colon = line[search_from..]
+        .match_indices(':')
+        .map(|(at, _)| search_from + at)
+        .find(|at| bytes.get(at + 1).is_none_or(|b| *b == b' ' || *b == b'\t'))?;
+    let key = line[..colon].trim();
+    (!key.is_empty()).then(|| (key, line[colon + 1..].trim()))
+}
+
+/// Text without one pair of matching quotes around it.
+fn unquote(text: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = text
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    text
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,8 +253,19 @@ impl Style {
 /// Read a whole document.
 pub fn outline(source: &str) -> Outline {
     let mut builder = Builder::new();
-    for (event, range) in Parser::new_ext(source, syntax::options()).into_offset_iter() {
-        builder.event(event, range);
+    // Front matter is taken off the start; the rest is parsed on its own.
+    let start = match syntax::front_matter(source) {
+        Some(range) => {
+            builder.top.push(Block {
+                kind: BlockKind::FrontMatter(read_front_matter(&source[range.clone()])),
+                source: range.clone(),
+            });
+            range.end
+        }
+        None => 0,
+    };
+    for (event, range) in Parser::new_ext(&source[start..], syntax::options()).into_offset_iter() {
+        builder.event(event, start + range.start..start + range.end);
     }
     builder.finish()
 }
@@ -1285,6 +1366,78 @@ mod tests {
         assert!(rows.iter().all(|row| row.len() <= 2));
         // Without a delimiter row it is a paragraph.
         assert!(matches!(kinds("| 甲 | 乙 |\n")[0], BlockKind::Paragraph(_)));
+    }
+
+    #[test]
+    fn front_matter_is_read_loosely() {
+        let source = "---\ntitle: \"标题: 副标题\"\ndate: 2026-11-24 10:30\ntags:\n  - 中文\n  - b\n\n# 注释\n'a key': 'v'\nurl: https://example.com/a\nempty:\nauthor:\n  name: 某人\n---\n# 正文\n\n段落\n";
+        let blocks = outline(source).blocks;
+        let end = source.find("# 正文").unwrap();
+        assert_eq!(blocks[0].source, 0..end);
+        let BlockKind::FrontMatter(lines) = &blocks[0].kind else {
+            panic!("{blocks:?}");
+        };
+        let field = |key: &str, value: &str| FrontMatterLine::Field {
+            key: key.into(),
+            value: value.into(),
+        };
+        let text = |line: &str| FrontMatterLine::Text(line.into());
+        assert_eq!(
+            lines,
+            &[
+                field("title", "标题: 副标题"),
+                field("date", "2026-11-24 10:30"),
+                field("tags", ""),
+                text("  - 中文"),
+                text("  - b"),
+                text("# 注释"),
+                field("a key", "v"),
+                field("url", "https://example.com/a"),
+                field("empty", ""),
+                field("author", ""),
+                text("  name: 某人"),
+            ]
+        );
+        // What follows is Markdown as usual, with sources in the document.
+        assert!(matches!(
+            &blocks[1].kind,
+            BlockKind::Heading { level: 1, .. }
+        ));
+        assert!(source[blocks[1].source.clone()].starts_with("# 正文"));
+        assert!(source[blocks[2].source.clone()].starts_with("段落"));
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn front_matter_only_at_the_start() {
+        // Further down it is a rule and a heading, as without front matter.
+        let blocks = kinds("段落\n\n---\ntitle: 标题\n---\n");
+        assert!(matches!(blocks[1], BlockKind::Rule));
+        assert!(matches!(&blocks[2], BlockKind::Heading { level: 2, .. }));
+        // Never closed.
+        let blocks = kinds("---\ntitle: 标题\n");
+        assert!(matches!(blocks[0], BlockKind::Rule));
+        // Lines that are not fields, and odd ones.
+        assert_eq!(
+            read_front_matter("---\n- a\nno colon\nkey:value\n: x\n\"q: r\": s\n...\n"),
+            [
+                FrontMatterLine::Text("- a".into()),
+                FrontMatterLine::Text("no colon".into()),
+                FrontMatterLine::Text("key:value".into()),
+                FrontMatterLine::Text(": x".into()),
+                FrontMatterLine::Field {
+                    key: "q: r".into(),
+                    value: "s".into()
+                },
+            ]
+        );
+        // Footnotes after front matter keep their place in the source.
+        let source = "---\na: 1\n---\n注[^1]\n\n[^1]: 脚注\n";
+        let blocks = outline(source).blocks;
+        let BlockKind::Footnotes(notes) = &blocks.last().unwrap().kind else {
+            panic!("{blocks:?}");
+        };
+        assert!(source[notes[0].source.clone()].starts_with("[^1]:"));
     }
 
     #[test]

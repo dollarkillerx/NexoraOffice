@@ -174,6 +174,9 @@ impl Command {
                         | Command::ViewSource
                         | Command::ViewSplit
                         | Command::ViewPreview
+                        | Command::ZoomIn
+                        | Command::ZoomOut
+                        | Command::ZoomReset
                 ) || self.formats_markdown()
             }
             DocKind::Sheets => matches!(self, Command::Undo | Command::Redo),

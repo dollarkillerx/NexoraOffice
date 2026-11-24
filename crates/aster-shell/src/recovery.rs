@@ -13,7 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use aster_markdown::{LineEnding, Rope, TextFormat};
+use aster_markdown::{Encoding, LineEnding, Rope, TextFormat};
 use aster_storage::{FileState, Fingerprint, FoundRecord, RecoveryRoot};
 
 const KIND: &str = "markdown";
@@ -42,6 +42,10 @@ fn encode_format(format: &TextFormat) -> String {
     if format.mixed_line_endings {
         out.push_str(" mixed");
     }
+    if format.encoding != Encoding::Utf8 {
+        out.push_str(" enc=");
+        out.push_str(format.encoding.key());
+    }
     out
 }
 
@@ -61,7 +65,7 @@ fn decode_format(text: &str) -> Option<TextFormat> {
         match word {
             "bom" => format.bom = true,
             "mixed" => format.mixed_line_endings = true,
-            _ => return None,
+            word => format.encoding = Encoding::from_key(word.strip_prefix("enc=")?)?,
         }
     }
     Some(format)
@@ -244,6 +248,7 @@ mod tests {
             path,
             format: TextFormat {
                 line_ending: LineEnding::CrLf,
+                encoding: Encoding::ShiftJis,
                 bom: true,
                 mixed_line_endings: false,
             },
@@ -280,12 +285,15 @@ mod tests {
         for line_ending in [LineEnding::Lf, LineEnding::CrLf, LineEnding::Cr] {
             for bom in [false, true] {
                 for mixed_line_endings in [false, true] {
-                    let format = TextFormat {
-                        line_ending,
-                        bom,
-                        mixed_line_endings,
-                    };
-                    assert_eq!(decode_format(&encode_format(&format)), Some(format));
+                    for encoding in Encoding::ALL.iter().copied() {
+                        let format = TextFormat {
+                            line_ending,
+                            encoding,
+                            bom,
+                            mixed_line_endings,
+                        };
+                        assert_eq!(decode_format(&encode_format(&format)), Some(format));
+                    }
                 }
             }
         }

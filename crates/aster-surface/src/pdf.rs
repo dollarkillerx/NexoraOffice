@@ -1010,6 +1010,16 @@ fn unmap(map: &[(f32, f32)], value: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// Code colours, as the light theme has them.
+    const CODE: [Rgba8; 6] = [
+        [0xcf, 0x22, 0x2e, 0xff],
+        [0x95, 0x38, 0x00, 0xff],
+        [0x66, 0x39, 0xba, 0xff],
+        [0x0a, 0x30, 0x69, 0xff],
+        [0x05, 0x50, 0xae, 0xff],
+        [0x63, 0x6c, 0x76, 0xff],
+    ];
+
     fn style() -> PreviewStyle {
         PreviewStyle {
             background: [0xff, 0xff, 0xff, 0xff],
@@ -1027,6 +1037,7 @@ mod tests {
                 [0x9a, 0x67, 0x00, 0xff],
                 [0xd1, 0x24, 0x2f, 0xff],
             ],
+            code: CODE,
             callout_labels: ["注意", "提示", "重要", "警告", "当心"],
             font_size: 11.0,
             page: PageLayout::default(),
@@ -1276,6 +1287,26 @@ mod tests {
             PdfPage::A4,
         );
         assert_eq!(plan.title().as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn code_is_printed_in_its_colours() {
+        let source = "```rust\nfn main() {} // 注释\n```\n";
+        let plan = Plan::new(source, None, &style(), PdfPage::A4);
+        let colors: Vec<Rgba8> = plan
+            .layout
+            .texts()
+            .iter()
+            .flat_map(|text| text.paragraph.draw_runs(f32::MIN, f32::MAX))
+            .map(|run| run.color)
+            .collect();
+        // Keyword, function, comment.
+        for color in [CODE[0], CODE[2], CODE[5]] {
+            assert!(colors.contains(&color), "{color:?} in {colors:?}");
+        }
+        // The keyword's red, as the page's fill colour.
+        let pdf = export(source, None, &style(), PdfPage::A4, false).unwrap();
+        assert!(contains(&pdf, b"0.8117647 0.13333334 0.18039216 rg"));
     }
 
     #[test]

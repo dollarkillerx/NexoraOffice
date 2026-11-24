@@ -860,6 +860,14 @@ export component AppWindow inherits Window {
                 }
             }
 
+            MenuItem {
+                title: Strings.format-footnote;
+                enabled: root.formatting;
+                activated => {
+                    root.format(14);
+                }
+            }
+
             // Rows and columns of the table with the caret; greyed out
             // elsewhere.
             Menu {

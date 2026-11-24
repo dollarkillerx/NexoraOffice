@@ -1424,6 +1424,209 @@ pub fn insert_rule(text: &Rope, selection: Selection) -> Edit {
     }
 }
 
+/// A new footnote: `[^n]` at the caret, with `n` one more than the
+/// largest numbered footnote in the document, and its note `[^n]: ` at the
+/// end of the document, after a blank line. Two edits, the reference first;
+/// the caret ends up after the note's colon, ready for its text. Footnotes
+/// with names (`[^why]`) are left alone.
+pub fn insert_footnote(text: &Rope, selection: Selection) -> Option<(Edit, Edit)> {
+    if text.len_bytes() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let whole = text.to_string();
+    let mut largest = 0u32;
+    let mut rest = whole.as_str();
+    while let Some(at) = rest.find("[^") {
+        rest = &rest[at + 2..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty()
+            && rest[digits.len()..].starts_with(']')
+            && let Ok(n) = digits.parse::<u32>()
+        {
+            largest = largest.max(n);
+        }
+    }
+    let n = largest + 1;
+    let at = selection.range().end;
+    let reference = format!("[^{n}]");
+    let end = whole.len();
+    // After the reference goes in, the end has moved by its length.
+    let moved = end + reference.len();
+    let lead = if whole.is_empty() || whole.ends_with("\n\n") {
+        ""
+    } else if whole.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let note = format!("{lead}[^{n}]: ");
+    let first = Edit {
+        range: at..at,
+        text: reference.clone(),
+        selection: Selection::caret(at + reference.len()),
+    };
+    let second = Edit {
+        range: moved..moved,
+        selection: Selection::caret(moved + note.len()),
+        text: note,
+    };
+    Some((first, second))
+}
+
+/// The closing half of a pair typed in Markdown: brackets and backticks.
+fn closer_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// What typing `typed` does when it opens or closes a pair, with `pending`
+/// the offset of a closing half put in automatically that the caret is
+/// still in front of. Returns the edit and the new pending offset.
+///
+/// - An opening bracket or backtick with text selected wraps it.
+/// - With only a caret, one followed by the end of the line, a space or a
+///   closing bracket gets its closing half, and the caret goes between.
+///   A backtick right after another one does not, so fences (```) can be
+///   typed.
+/// - Typing a closing half the editor put in, right before it, steps over
+///   it instead of typing another.
+///
+/// `None`: type it as usual.
+pub fn typed_pair(
+    text: &Rope,
+    selection: Selection,
+    typed: &str,
+    pending: Option<usize>,
+) -> Option<(Edit, Option<usize>)> {
+    let mut chars = typed.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let range = selection.range();
+    let len = text.len_bytes();
+    let next = (range.end < len).then(|| text.byte(range.end) as char);
+    // Stepping over a closing half the editor typed.
+    if range.is_empty()
+        && pending == Some(range.start)
+        && next == Some(c)
+        && matches!(c, ')' | ']' | '}' | '`')
+    {
+        return Some((
+            Edit {
+                range: range.clone(),
+                text: String::new(),
+                selection: Selection::caret(range.start + 1),
+            },
+            None,
+        ));
+    }
+    let close = closer_of(c)?;
+    if !range.is_empty() {
+        // Wrapping a selection on one line; a longer one is typed over.
+        let selected = slice(text, range.clone());
+        if selected.contains('\n') || range.len() > 4096 {
+            return None;
+        }
+        let selection = Selection {
+            anchor: range.start + 1,
+            focus: range.end + 1,
+        };
+        return Some((
+            Edit {
+                range: range.clone(),
+                text: format!("{c}{selected}{close}"),
+                selection,
+            },
+            None,
+        ));
+    }
+    let at = range.start;
+    let previous = (at > 0).then(|| text.byte(at - 1) as char);
+    let fits = match next {
+        None => true,
+        Some(n) => n == '\n' || n == ' ' || n == '\t' || matches!(n, ')' | ']' | '}'),
+    };
+    if !fits || (c == '`' && previous == Some('`')) {
+        return None;
+    }
+    Some((
+        Edit {
+            range: at..at,
+            text: format!("{c}{close}"),
+            selection: Selection::caret(at + 1),
+        },
+        Some(at + 1),
+    ))
+}
+
+/// Backspace between an empty pair the editor completed takes both halves.
+pub fn backspace_pair(text: &Rope, selection: Selection, pending: Option<usize>) -> Option<Edit> {
+    let at = selection.range();
+    if !at.is_empty() || pending != Some(at.start) || at.start == 0 || at.start >= text.len_bytes()
+    {
+        return None;
+    }
+    let open = text.byte(at.start - 1) as char;
+    let close = text.byte(at.start) as char;
+    (closer_of(open) == Some(close)).then(|| Edit {
+        range: at.start - 1..at.start + 1,
+        text: String::new(),
+        selection: Selection::caret(at.start - 1),
+    })
+}
+
+/// Tick or untick the task box of the list item starting at `item` (a
+/// byte offset into the source, as the preview records it): `[ ]` becomes
+/// `[x]` and `[x]` or `[X]` becomes `[ ]`. The text keeps its length, so
+/// the selection stays where it is. `None` when there is no task box there.
+pub fn toggle_task(text: &Rope, item: usize, selection: Selection) -> Option<Edit> {
+    if item >= text.len_bytes() {
+        return None;
+    }
+    let line = text.byte_to_line(item);
+    let end = if line + 1 < text.len_lines() {
+        text.line_to_byte(line + 1)
+    } else {
+        text.len_bytes()
+    };
+    // The box follows the item's marker on its first line.
+    let rest = slice(text, item..end.min(item + 64));
+    let marker = rest.trim_start_matches([' ', '>']);
+    let skipped = rest.len() - marker.len();
+    let after = marker.strip_prefix(['-', '*', '+']).or_else(|| {
+        let digits = marker.len()
+            - marker
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
+        (digits > 0)
+            .then(|| marker[digits..].strip_prefix(['.', ')']))
+            .flatten()
+    })?;
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    if spaces == 0 {
+        return None;
+    }
+    let boxed = &after[spaces..];
+    let ticked = if boxed.starts_with("[ ]") {
+        false
+    } else if boxed.starts_with("[x]") || boxed.starts_with("[X]") {
+        true
+    } else {
+        return None;
+    };
+    let inside = item + skipped + (marker.len() - after.len()) + spaces + 1;
+    Some(Edit {
+        range: inside..inside + 1,
+        text: if ticked { " " } else { "x" }.to_owned(),
+        selection,
+    })
+}
+
 /// A table of contents linking to every heading, put in as its own block
 /// after the caret's line (in place of it when it is empty). `None` when
 /// the document has no headings, or is too large to read them all here.
@@ -1662,6 +1865,106 @@ pub fn insert_table(text: &Rope, selection: Selection) -> Edit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_footnote_gets_the_next_number_and_its_note_at_the_end() {
+        let apply = |text: &str, at: usize| -> (String, Selection) {
+            let (first, second) =
+                insert_footnote(&Rope::from_str(text), Selection::caret(at)).unwrap();
+            let mut out = text.to_owned();
+            out.replace_range(first.range, &first.text);
+            out.replace_range(second.range, &second.text);
+            (out, second.selection)
+        };
+        let (out, sel) = apply("正文。\n", 9);
+        assert_eq!(out, "正文。[^1]\n\n[^1]: ");
+        assert_eq!(sel, Selection::caret(out.len()));
+        let (out, _) = apply("一[^1] 二[^why]\n\n[^1]: 注\n[^why]: 因为\n", 0);
+        assert!(out.starts_with("[^2]一"), "{out}");
+        assert!(out.ends_with("[^why]: 因为\n\n[^2]: "), "{out}");
+    }
+
+    fn typed(
+        text: &str,
+        anchor: usize,
+        focus: usize,
+        c: &str,
+        pending: Option<usize>,
+    ) -> Option<(String, Selection, Option<usize>)> {
+        let rope = Rope::from_str(text);
+        let (edit, pending) = typed_pair(&rope, Selection { anchor, focus }, c, pending)?;
+        let mut out = text.to_owned();
+        out.replace_range(edit.range, &edit.text);
+        Some((out, edit.selection, pending))
+    }
+
+    #[test]
+    fn pairs_are_completed_wrapped_and_stepped_over() {
+        // Completed at the end of a line, with the caret between.
+        let (out, sel, pending) = typed("看 ", 4, 4, "(", None).unwrap();
+        assert_eq!(
+            (out.as_str(), sel, pending),
+            ("看 ()", Selection::caret(5), Some(5))
+        );
+        // Stepped over when typed again right before it.
+        let (out, sel, pending) = typed("看 ()", 5, 5, ")", Some(5)).unwrap();
+        assert_eq!(
+            (out.as_str(), sel, pending),
+            ("看 ()", Selection::caret(6), None)
+        );
+        // Not when the closing half was typed by hand.
+        assert_eq!(typed("()", 1, 1, ")", None), None);
+        // Not in front of a word.
+        assert_eq!(typed("word", 0, 0, "[", None), None);
+        // A selection is wrapped and stays selected.
+        let (out, sel, _) = typed("a link here", 2, 6, "[", None).unwrap();
+        assert_eq!(
+            (out.as_str(), sel),
+            (
+                "a [link] here",
+                Selection {
+                    anchor: 3,
+                    focus: 7
+                }
+            )
+        );
+        let (out, _, _) = typed("code", 0, 4, "`", None).unwrap();
+        assert_eq!(out, "`code`");
+        // Fences can be typed: `, step over, then a third ` stays single.
+        let (out, _, pending) = typed("", 0, 0, "`", None).unwrap();
+        assert_eq!((out.as_str(), pending), ("``", Some(1)));
+        let (out, sel, _) = typed("``", 1, 1, "`", Some(1)).unwrap();
+        assert_eq!((out.as_str(), sel), ("``", Selection::caret(2)));
+        assert_eq!(typed("``", 2, 2, "`", None), None);
+        // Other characters, and full-width brackets, are not paired.
+        assert_eq!(typed("", 0, 0, "（", None), None);
+        assert_eq!(typed("", 0, 0, "ab", None), None);
+        // Backspace in an empty completed pair takes both halves.
+        let rope = Rope::from_str("x()");
+        let edit = backspace_pair(&rope, Selection::caret(2), Some(2)).unwrap();
+        assert_eq!((edit.range, edit.selection), (1..3, Selection::caret(1)));
+        assert!(backspace_pair(&rope, Selection::caret(2), None).is_none());
+    }
+
+    #[test]
+    fn task_boxes_are_ticked_and_unticked_in_place() {
+        let apply = |text: &str, item: usize| -> Option<String> {
+            let rope = Rope::from_str(text);
+            let edit = toggle_task(&rope, item, Selection::caret(0))?;
+            let mut out = text.to_owned();
+            out.replace_range(edit.range, &edit.text);
+            Some(out)
+        };
+        assert_eq!(apply("- [ ] 买菜\n", 0).unwrap(), "- [x] 买菜\n");
+        assert_eq!(apply("- [X] 买菜\n", 0).unwrap(), "- [ ] 买菜\n");
+        let nested = "- 一\n  * [x] 二\n";
+        assert_eq!(apply(nested, 7).unwrap(), "- 一\n  * [ ] 二\n");
+        assert_eq!(apply("12. [ ] 十二\n", 0).unwrap(), "12. [x] 十二\n");
+        assert_eq!(apply("> - [ ] 引用里\n", 2).unwrap(), "> - [x] 引用里\n");
+        assert_eq!(apply("- 普通\n", 0), None);
+        assert_eq!(apply("-[ ] 没有空格\n", 0), None);
+        assert_eq!(apply("- [ ]", 99), None);
+    }
 
     #[test]
     fn a_table_of_contents_goes_in_as_a_block_of_its_own() {

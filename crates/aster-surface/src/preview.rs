@@ -19,6 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use aster_markdown::code;
 use aster_markdown::preview::{
     Alignment, Block, BlockKind, Footnote, FrontMatterLine, Inline, Item as ListItem, Outline,
 };
@@ -66,6 +67,9 @@ pub struct PreviewStyle {
     /// Bars and titles of GitHub's callouts, in the order of
     /// [`aster_markdown::preview::CalloutKind::ALL`].
     pub callouts: [Rgba8; 5],
+    /// Tokens in code blocks, in the order of
+    /// [`aster_markdown::code::Token::ALL`].
+    pub code: [Rgba8; 6],
     /// Their titles, in the interface language.
     pub callout_labels: [&'static str; 5],
     /// Body text size in logical pixels.
@@ -121,6 +125,10 @@ impl TextBox {
         self.y + f64::from(self.paragraph.height())
     }
 }
+
+/// What a task box's link starts with; the source offset of its list item
+/// follows.
+pub const TASK_LINK: &str = "aster-task:";
 
 /// `%XX` escapes decoded; anything that is not UTF-8 afterwards is kept
 /// as written.
@@ -439,6 +447,8 @@ struct TextOptions {
     alignment: Align,
     /// Ordinary text; list markers and labels are not.
     selectable: bool,
+    /// Stretches in other colours, in order: the tokens of code.
+    colors: Vec<(Range<usize>, Rgba8)>,
 }
 
 impl TextOptions {
@@ -450,8 +460,42 @@ impl TextOptions {
             mono: false,
             alignment: Align::Start,
             selectable: true,
+            colors: Vec::new(),
         }
     }
+}
+
+/// The most coloured stretches one code block gets; past them its text is
+/// plain. The layout finds a character's stretch by binary search, so this
+/// only bounds memory: a block of 100,000 lines is still coloured.
+const CODE_COLOR_STRETCHES: usize = 500_000;
+
+/// The colours of the tokens of code in `language`, from `palette`. Tokens
+/// of one colour with only spaces between them are one stretch.
+fn code_colors(language: &str, text: &str, palette: &[Rgba8; 6]) -> Vec<(Range<usize>, Rgba8)> {
+    let Some(language) = code::language(language) else {
+        return Vec::new();
+    };
+    let (tokens, _) = code::highlight(language, text, code::LineState::default());
+    let most = CODE_COLOR_STRETCHES;
+    let mut out: Vec<(Range<usize>, Rgba8)> = Vec::new();
+    for (range, token) in tokens {
+        let color = palette[token.index()];
+        if let Some((last, last_color)) = out.last_mut()
+            && *last_color == color
+            && text[last.end..range.start]
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t')
+        {
+            last.end = range.end;
+            continue;
+        }
+        if out.len() == most {
+            break;
+        }
+        out.push((range, color));
+    }
+    out
 }
 
 struct Pass<'a> {
@@ -649,7 +693,7 @@ impl Pass<'_> {
                 self.anchor(y, bottom, block.source.clone());
                 bottom
             }
-            BlockKind::Code { text, .. } => {
+            BlockKind::Code { language, text } => {
                 let pad = em * 0.8;
                 let inline = Inline {
                     text: text.clone(),
@@ -657,6 +701,7 @@ impl Pass<'_> {
                 };
                 let options = TextOptions {
                     mono: true,
+                    colors: code_colors(language, text, &style.code),
                     ..TextOptions::body((base * 0.9) as f32, context.color)
                 };
                 let index = self.items.len();
@@ -947,6 +992,18 @@ impl Pass<'_> {
                     let top = y + (line_height - side) / 2.0;
                     let left = x + gutter - side - em * 0.45;
                     let rect = Rect::new(left, top, left + side, top + side);
+                    // Clicking the box ticks it in the source: a link the
+                    // shell knows, to where the item starts.
+                    let reach = em * 0.25;
+                    self.links.push((
+                        Rect::new(
+                            rect.x0 - reach,
+                            rect.y0 - reach,
+                            rect.x1 + reach,
+                            rect.y1 + reach,
+                        ),
+                        format!("{TASK_LINK}{}", item.source.start),
+                    ));
                     if ticked {
                         self.push(
                             Piece::Rect {
@@ -1267,6 +1324,13 @@ impl Pass<'_> {
                     style: look,
                 }
             })
+            .chain(options.colors.iter().map(|(range, color)| Span {
+                range: range.clone(),
+                style: TextStyle {
+                    color: *color,
+                    ..base.clone()
+                },
+            }))
             .collect();
         let language = aster_text::segment::guess_language(&inline.text, DEFAULT_LANGUAGE);
         let spec = Spec {
@@ -1941,6 +2005,16 @@ mod tests {
 
     const TOUR: &str = include_str!("../tests/data/markdown-tour.md");
 
+    /// Code colours for tests, as the light theme has them.
+    const CODE: [Rgba8; 6] = [
+        [0xcf, 0x22, 0x2e, 0xff],
+        [0x95, 0x38, 0x00, 0xff],
+        [0x66, 0x39, 0xba, 0xff],
+        [0x0a, 0x30, 0x69, 0xff],
+        [0x05, 0x50, 0xae, 0xff],
+        [0x63, 0x6c, 0x76, 0xff],
+    ];
+
     fn style() -> PreviewStyle {
         PreviewStyle {
             background: [0xff, 0xff, 0xff, 0xff],
@@ -1958,6 +2032,7 @@ mod tests {
                 [0x9a, 0x67, 0x00, 0xff],
                 [0xd1, 0x24, 0x2f, 0xff],
             ],
+            code: CODE,
             callout_labels: ["注意", "提示", "重要", "警告", "当心"],
             font_size: 15.0,
             page: PageLayout {
@@ -2170,6 +2245,20 @@ mod tests {
     }
 
     #[test]
+    fn task_boxes_are_links_to_their_items() {
+        let source = "- [ ] 一\n- [x] 二\n- 三\n";
+        let view = view(source, 900, 400);
+        let layout = view.layout().unwrap().clone();
+        let tasks: Vec<&str> = layout
+            .links
+            .iter()
+            .map(|(_, url)| url.as_str())
+            .filter(|url| url.starts_with(TASK_LINK))
+            .collect();
+        assert_eq!(tasks, ["aster-task:0", "aster-task:10"]);
+    }
+
+    #[test]
     fn links_to_headings_jump_to_them() {
         let filler: String = (0..60).map(|i| format!("第 {i} 段。\n\n")).collect();
         let source = format!(
@@ -2198,6 +2287,59 @@ mod tests {
         let data = view.render().data_as_u8_slice().to_vec();
         let (pixels, _) = data.as_chunks::<4>();
         assert!(pixels.iter().any(|px| *px == style().callouts[3]));
+    }
+
+    /// The colours of a laid-out text's glyphs, in order.
+    fn glyph_colors(layout: &PreviewLayout, index: usize) -> Vec<Rgba8> {
+        layout.texts[index]
+            .paragraph
+            .draw_runs(f32::MIN, f32::MAX)
+            .iter()
+            .map(|run| run.color)
+            .collect()
+    }
+
+    #[test]
+    fn code_blocks_are_coloured_by_their_language() {
+        use aster_markdown::code::Token;
+        let source = "```rust\nfn main() { let n = 1; } // 注释\n```\n\n```\nfn plain() {}\n```\n\n```python\nx = '''a\nb'''\n```\n";
+        let layout = PreviewBuilder::new().build(source, 900, 1.0, &style());
+        let rust = glyph_colors(&layout, 0);
+        for token in [
+            Token::Keyword,
+            Token::Function,
+            Token::Number,
+            Token::Comment,
+        ] {
+            assert!(rust.contains(&CODE[token.index()]), "{token:?}: {rust:?}");
+        }
+        assert!(rust.contains(&style().text));
+        // No language: one colour.
+        assert!(glyph_colors(&layout, 1).iter().all(|c| *c == style().text));
+        // A string over two lines is coloured on both.
+        let text = &layout.texts[2].paragraph;
+        assert_eq!(text.text(), "x = '''a\nb'''");
+        let lines = text.lines();
+        let last = lines.last().unwrap();
+        let colors: Vec<Rgba8> = text
+            .draw_runs(last.top + 1.0, last.top + 2.0)
+            .iter()
+            .map(|run| run.color)
+            .collect();
+        assert_eq!(colors, [CODE[Token::String.index()]]);
+    }
+
+    #[test]
+    fn code_colours_are_joined_and_capped() {
+        let colors = code_colors("rust", "pub fn a() {}", &CODE);
+        assert_eq!(colors[0], (0..6, CODE[0]));
+        assert!(code_colors("brainfuck", "+++", &CODE).is_empty());
+        assert!(code_colors("", "fn a", &CODE).is_empty());
+        // A long block is coloured to its end.
+        let huge = "let x = 1;\n".repeat(20_000);
+        let colors = code_colors("rs", &huge, &CODE);
+        assert!(colors.last().unwrap().0.end > huge.len() - 12);
+        assert!(colors.len() <= CODE_COLOR_STRETCHES);
     }
 
     const FRONT: &str = "---\ntitle: 标题\ndescription: 一段很长的说明\ntags:\n  - 中文\n  - b\n---\n# 正文\n\n段落。\n";

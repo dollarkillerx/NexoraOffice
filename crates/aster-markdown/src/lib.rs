@@ -12,6 +12,7 @@
 //! pointer — is done by the view, which then tells the document where the
 //! selection is.
 
+pub mod code;
 pub mod document;
 pub mod export;
 pub mod file;

@@ -1091,6 +1091,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_format_code_block(strings.format_code_block.into());
     s.set_format_rule(strings.format_rule.into());
     s.set_format_toc(strings.format_toc.into());
+    s.set_format_footnote(strings.format_footnote.into());
     s.set_link_title(strings.link_title.into());
     s.set_image_title(strings.image_title.into());
     s.set_link_label(strings.link_label.into());
@@ -2051,6 +2052,7 @@ fn format_of_menu(code: i32) -> Option<Format> {
         11 => return Some(Format::CodeBlock),
         12 => return Some(Format::Rule),
         13 => return Some(Format::Toc),
+        14 => return Some(Format::Footnote),
         20..=26 => return Some(Format::Heading((code - 20) as u8)),
         30..=38 => {
             use aster_markdown::table::TableEdit;
@@ -4658,6 +4660,16 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         if url.starts_with('#') {
             if editor.follow_preview_link(&url) {
                 present(&ui, shell);
+            }
+            return;
+        }
+        // A task box: tick it in the source.
+        if let Some(item) = url
+            .strip_prefix(aster_surface::preview::TASK_LINK)
+            .and_then(|offset| offset.parse::<usize>().ok())
+        {
+            if editor.toggle_task(item) {
+                after_edit(&ui, shell, true);
             }
             return;
         }

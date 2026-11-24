@@ -18,6 +18,11 @@
 //! `[text][label]` still highlights; footnotes are matched within a block only.
 //! Highlighting is a hint for the eye, so that is good enough.
 //!
+//! Fenced code blocks whose info string names a language [`code`] knows
+//! are coloured inside: keywords, strings, comments and the like get marks
+//! of their own. A code block is always inside one block, so this changes
+//! nothing about how edits are followed.
+//!
 //! Built for large files: the text is a rope and only the lines near an edit
 //! are read; blocks are kept in groups, so an edit moves a few hundred of
 //! them rather than every block after it; a block over [`MAX_PARSED`] bytes
@@ -30,6 +35,7 @@ use std::ops::{BitOr, BitOrAssign, Range};
 use pulldown_cmark::{BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, TagEnd};
 use ropey::Rope;
 
+use crate::code::{self, LineState, Token};
 use crate::document::{floor_char_boundary, slice};
 
 use crate::syntax;
@@ -73,8 +79,18 @@ impl Marks {
     /// YAML front matter at the start of the document, its `---` lines
     /// included; those are also [`Marks::MARKER`].
     pub const FRONT_MATTER: Marks = Marks(1 << 16);
+    /// Inside a fenced code block in a language [`code`] knows: what the
+    /// lexer found. At most one of these on any text.
+    pub const CODE_KEYWORD: Marks = Marks(1 << 17);
+    pub const CODE_TYPE: Marks = Marks(1 << 18);
+    pub const CODE_FUNCTION: Marks = Marks(1 << 19);
+    pub const CODE_STRING: Marks = Marks(1 << 20);
+    pub const CODE_NUMBER: Marks = Marks(1 << 21);
+    pub const CODE_COMMENT: Marks = Marks(1 << 22);
 
-    const COUNT: usize = 17;
+    const COUNT: usize = 23;
+    /// The first of the code token marks, in the order of [`Token::ALL`].
+    const FIRST_TOKEN: u32 = 17;
     const NAMES: [&'static str; Self::COUNT] = [
         "heading",
         "strong",
@@ -93,6 +109,12 @@ impl Marks {
         "rule",
         "math",
         "front-matter",
+        "code-keyword",
+        "code-type",
+        "code-function",
+        "code-string",
+        "code-number",
+        "code-comment",
     ];
 
     pub const fn contains(self, other: Marks) -> bool {
@@ -105,6 +127,18 @@ impl Marks {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// The mark of a code token.
+    pub const fn token(token: Token) -> Marks {
+        Marks(1 << (Self::FIRST_TOKEN + token.index() as u32))
+    }
+
+    /// The code token these marks hold, if any.
+    pub fn code_token(self) -> Option<Token> {
+        Token::ALL
+            .into_iter()
+            .find(|token| self.contains(Marks::token(*token)))
     }
 
     /// Any of the marks that stand for syntax or metadata rather than text.
@@ -773,6 +807,9 @@ struct Collector<'a> {
     last_end: usize,
     /// The open table and the ranges of its cells.
     table: Option<(Range<usize>, Vec<Range<usize>>)>,
+    /// Inside a fenced code block in a known language: the language and the
+    /// state its last line left.
+    code: Option<(code::Language, LineState)>,
 }
 
 impl<'a> Collector<'a> {
@@ -785,6 +822,7 @@ impl<'a> Collector<'a> {
             links: Vec::new(),
             last_end: 0,
             table: None,
+            code: None,
         }
     }
 
@@ -808,7 +846,19 @@ impl<'a> Collector<'a> {
             Event::Start(tag) => self.start(tag, range.clone()),
             Event::End(tag) => self.end(tag),
             Event::Text(_) => {
-                if self.verbatim == 0 {
+                if let Some((language, state)) = self.code {
+                    // Code lines come one or several to an event, without
+                    // the indentation and quote markers of their container.
+                    let (tokens, after) =
+                        code::highlight(language, &self.source[range.clone()], state);
+                    self.code = Some((language, after));
+                    for (found, token) in tokens {
+                        self.mark(
+                            range.start + found.start..range.start + found.end,
+                            Marks::token(token),
+                        );
+                    }
+                } else if self.verbatim == 0 {
                     for url in syntax::find_bare_urls(&self.source[range.clone()]) {
                         self.mark(
                             range.start + url.range.start..range.start + url.range.end,
@@ -875,8 +925,10 @@ impl<'a> Collector<'a> {
                 self.verbatim += 1;
                 let range = self.trim_end(range);
                 self.mark(range.clone(), Marks::CODE_BLOCK);
-                if let CodeBlockKind::Fenced(_) = kind {
+                if let CodeBlockKind::Fenced(info) = kind {
                     self.fence_markers(range);
+                    self.code =
+                        code::language(&info).map(|language| (language, LineState::default()));
                 }
             }
             Tag::HtmlBlock => {
@@ -944,7 +996,8 @@ impl<'a> Collector<'a> {
         match tag {
             TagEnd::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_sub(1),
             TagEnd::CodeBlock | TagEnd::HtmlBlock => {
-                self.verbatim = self.verbatim.saturating_sub(1)
+                self.verbatim = self.verbatim.saturating_sub(1);
+                self.code = None;
             }
             TagEnd::Link | TagEnd::Image => {
                 self.verbatim = self.verbatim.saturating_sub(1);
@@ -1215,6 +1268,85 @@ mod tests {
     }
 
     #[test]
+    fn fenced_code_is_coloured_by_its_language() {
+        let text = "```rust\nfn main() { let s = \"字\"; } // 注\n```\n\n```\nfn plain\n```\n\n> ```py\n> x = 1  # c\n> ```\n\n- item\n\n  ```js\n  /* a\n  b */ let\n  ```\n";
+        let code = Marks::CODE_BLOCK;
+        assert_eq!(marks_at(text, "fn", 0), code | Marks::CODE_KEYWORD);
+        assert_eq!(marks_at(text, "main", 0), code | Marks::CODE_FUNCTION);
+        assert_eq!(marks_at(text, "\"字\"", 0), code | Marks::CODE_STRING);
+        assert_eq!(marks_at(text, "// 注", 0), code | Marks::CODE_COMMENT);
+        assert_eq!(marks_at(text, " {", 0), code);
+        // The fences are markers, not code.
+        assert_eq!(marks_at(text, "rust", 0), code | Marks::MARKER);
+        // A fence without a language, or with one the lexer does not know.
+        assert_eq!(marks_at(text, "fn plain", 0), code);
+        assert_eq!(marks_at("```text\nfn x\n```", "fn", 0), code);
+        // In a quote: the quote markers are not code.
+        assert_eq!(
+            marks_at(text, "1  #", 0),
+            Marks::QUOTE | code | Marks::CODE_NUMBER
+        );
+        assert_eq!(
+            marks_at(text, "# c", 0),
+            Marks::QUOTE | code | Marks::CODE_COMMENT
+        );
+        // In a list item, a comment over two lines.
+        assert_eq!(marks_at(text, "b */", 0), code | Marks::CODE_COMMENT);
+        assert_eq!(marks_at(text, "let\n", 0), code | Marks::CODE_KEYWORD);
+        assert_eq!(marks_at(text, "  b */", 0), code);
+        // Each token kind has its mark, and the marks give the kind back.
+        for token in Token::ALL {
+            assert_eq!(Marks::token(token).code_token(), Some(token));
+            assert!(!Marks::token(token).is_syntax());
+        }
+        assert_eq!(Marks::CODE_BLOCK.code_token(), None);
+        assert_eq!(
+            format!("{:?}", code | Marks::CODE_COMMENT),
+            "Marks(code-block | code-comment)"
+        );
+    }
+
+    #[test]
+    fn edits_recolour_code_blocks() {
+        let mut text = String::from("段落\n\n```text\nlet x = 1; /* a\nb */\n```\n\n后面\n");
+        let mut highlighter = Highlighter::new(&rope(&text));
+        let mut edit = |text: &mut String, range: Range<usize>, insert: &str| {
+            text.replace_range(range.clone(), insert);
+            highlighter.edit(&rope(text), range, insert.len());
+            let spans = highlighter.spans(0..text.len());
+            assert_eq!(spans, all(text), "{text:?}");
+        };
+        assert_eq!(marks_at(&text, "let", 0), Marks::CODE_BLOCK);
+        // Naming the language colours the block.
+        let at = text.find("text").unwrap();
+        edit(&mut text, at..at + 4, "rust");
+        assert_eq!(
+            marks_at(&text, "let", 0),
+            Marks::CODE_BLOCK | Marks::CODE_KEYWORD
+        );
+        assert_eq!(
+            marks_at(&text, "b */", 0),
+            Marks::CODE_BLOCK | Marks::CODE_COMMENT
+        );
+        // Closing the comment early makes what follows code again.
+        let at = text.find(" a\n").unwrap();
+        edit(&mut text, at..at, " */");
+        assert_eq!(marks_at(&text, "b */", 0), Marks::CODE_BLOCK);
+        // Opening a string runs it to the end of the block, not further.
+        let at = text.find("let").unwrap();
+        edit(&mut text, at..at, "\"");
+        assert!(marks_at(&text, "b */", 0).contains(Marks::CODE_STRING));
+        assert_eq!(marks_at(&text, "后面", 0), Marks::NONE);
+        // Another language.
+        let at = text.find("rust").unwrap();
+        edit(&mut text, at..at + 4, "python");
+        assert_eq!(
+            marks_at(&text, "1;", 0),
+            Marks::CODE_BLOCK | Marks::CODE_STRING
+        );
+    }
+
+    #[test]
     fn an_unclosed_fence_runs_to_the_end() {
         let text = "前文\n\n```\n代码\n\n# 不是标题\n\n**也不是**";
         assert_eq!(marks_at(text, "前文", 0), Marks::NONE);
@@ -1383,7 +1515,15 @@ mod tests {
 
     #[test]
     fn edits_give_the_same_result_as_starting_over() {
-        const PIECES: [&str; 20] = [
+        const PIECES: [&str; 28] = [
+            "```rust\n",
+            "```py\n",
+            "/*",
+            "*/",
+            "\"\"\"",
+            "\"",
+            "#",
+            "fn ",
             "\n",
             "\n\n",
             "---\n",
@@ -1407,17 +1547,24 @@ mod tests {
         ];
         let mut rng = Lcg(7);
         let mut text = String::from(
-            "# 标题\n\n段落 *强调*\n\n- 列表\n- [x] 任务\n\n```\n代码\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+            "# 标题\n\n段落 *强调*\n\n- 列表\n- [x] 任务\n\n```\n代码\n```\n\n```rust\nfn a() {} /* 注\n释 */ \"s\"\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
         );
         let mut highlighter = Highlighter::new(&rope(&text));
+        // How many steps had coloured code, so the test covers it.
+        let mut coloured = 0;
         for step in 0..3000 {
             let start = boundary(&text, rng.next(text.len() + 1));
             let end = boundary(&text, start + rng.next(6)).max(start);
-            let insert = if rng.next(3) == 0 {
+            let mut insert = if rng.next(3) == 0 {
                 ""
             } else {
                 PIECES[rng.next(PIECES.len())]
             };
+            // Now and then a whole code block, so that there is code to
+            // colour and to break.
+            if rng.next(15) == 0 {
+                insert = "\n\n```rust\nlet a = 1; /* b\n\"c\" */ fn d()\n```\n\n";
+            }
             text.replace_range(start..end, insert);
             highlighter.edit(&rope(&text), start..end, insert.len());
             let fresh = Highlighter::new(&rope(&text));
@@ -1433,7 +1580,9 @@ mod tests {
                 "spans after step {step}: {text:?}"
             );
             check_spans(&text, &spans);
+            coloured += usize::from(spans.iter().any(|span| span.marks.code_token().is_some()));
         }
+        assert!(coloured > 300, "code was coloured in only {coloured} steps");
     }
 
     #[test]

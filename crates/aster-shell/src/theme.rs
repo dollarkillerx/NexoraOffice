@@ -243,6 +243,58 @@ pub const fn callout_colors(mode: ThemeMode) -> [Rgba; 5] {
     }
 }
 
+/// Colours of the tokens in code blocks, in the editor and the preview.
+/// GitHub's, which readers of code on the web know, with the comment grey
+/// darkened in the light theme. Like the callouts they colour the content,
+/// not the interface, so they are not held to the one hue. All of them are
+/// text and keep at least 4.5:1 against the code background, `fill`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeColors {
+    /// Keywords and literals like `true`.
+    pub keyword: Rgba,
+    /// Type names, and keys: JSON keys, HTML attributes, CSS properties.
+    pub type_name: Rgba,
+    /// Functions being called or defined.
+    pub function: Rgba,
+    pub string: Rgba,
+    pub number: Rgba,
+    pub comment: Rgba,
+}
+
+impl CodeColors {
+    pub fn named(&self) -> [(&'static str, Rgba); 6] {
+        [
+            ("keyword", self.keyword),
+            ("type", self.type_name),
+            ("function", self.function),
+            ("string", self.string),
+            ("number", self.number),
+            ("comment", self.comment),
+        ]
+    }
+}
+
+pub const fn code_colors(mode: ThemeMode) -> CodeColors {
+    match mode {
+        ThemeMode::Light => CodeColors {
+            keyword: Rgba::rgb(0xcf222e),
+            type_name: Rgba::rgb(0x953800),
+            function: Rgba::rgb(0x6639ba),
+            string: Rgba::rgb(0x0a3069),
+            number: Rgba::rgb(0x0550ae),
+            comment: Rgba::rgb(0x636c76),
+        },
+        ThemeMode::Dark => CodeColors {
+            keyword: Rgba::rgb(0xff7b72),
+            type_name: Rgba::rgb(0xffa657),
+            function: Rgba::rgb(0xd2a8ff),
+            string: Rgba::rgb(0xa5d6ff),
+            number: Rgba::rgb(0x79c0ff),
+            comment: Rgba::rgb(0x8b949e),
+        },
+    }
+}
+
 /// Lengths in logical pixels. The same in both themes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
@@ -364,6 +416,35 @@ mod tests {
                 let ratio = contrast(color, page);
                 assert!(ratio >= 4.5, "{mode:?} {color:?}: {ratio}");
             }
+        }
+    }
+
+    #[test]
+    fn code_colours_are_readable_on_code_and_told_apart() {
+        for mode in MODES {
+            let c = Colors::of(mode);
+            let named = code_colors(mode).named();
+            for (name, color) in named {
+                assert_eq!(color.3, 0xff, "{mode:?} {name} is not opaque");
+                // On the code background, and on the page around it.
+                for (place, background) in [("fill", c.fill), ("page", c.page)] {
+                    let ratio = contrast(color, background);
+                    assert!(ratio >= 4.5, "{mode:?} {name} on {place}: {ratio}");
+                }
+                assert_ne!(color, c.ink, "{mode:?} {name} looks like plain code");
+            }
+            for (index, (name, color)) in named.iter().enumerate() {
+                for (other, other_color) in &named[index + 1..] {
+                    assert_ne!(color, other_color, "{mode:?} {name} and {other}");
+                }
+            }
+            // Comments recede: they are the least loud of the colours.
+            let comment = contrast(code_colors(mode).comment, c.fill);
+            assert!(
+                named
+                    .iter()
+                    .all(|(_, color)| contrast(*color, c.fill) >= comment)
+            );
         }
     }
 

@@ -330,11 +330,16 @@ impl Shaper {
 
         let mut styles = vec![spec.base.clone()];
         styles.extend(spec.spans.iter().map(|span| span.style.clone()));
+        // The spans are sorted and do not overlap: the last one starting at
+        // or before `offset` is the only one that can hold it.
         let style_at = |offset: usize| -> usize {
-            spec.spans
-                .iter()
-                .position(|span| span.range.contains(&offset))
-                .map_or(0, |index| index + 1)
+            let after = spec
+                .spans
+                .partition_point(|span| span.range.start <= offset);
+            match after.checked_sub(1) {
+                Some(index) if spec.spans[index].range.contains(&offset) => index + 1,
+                _ => 0,
+            }
         };
 
         let breaks = break_opportunities(text, spec.language);

@@ -100,6 +100,25 @@ struct SyntaxColors {
     current: Rgba8,
     /// Text of the current match.
     on_current: Rgba8,
+    /// Tokens in code blocks, in the order of `code::Token::ALL`.
+    code: [Rgba8; 6],
+}
+
+/// The colours of code tokens, in the order of `code::Token::ALL`.
+fn code_colors(mode: theme::ThemeMode) -> [Rgba8; 6] {
+    use aster_markdown::code::Token;
+    let c = theme::code_colors(mode);
+    Token::ALL.map(|token| {
+        match token {
+            Token::Keyword => c.keyword,
+            Token::Type => c.type_name,
+            Token::Function => c.function,
+            Token::String => c.string,
+            Token::Number => c.number,
+            Token::Comment => c.comment,
+        }
+        .to_array()
+    })
 }
 
 impl SyntaxColors {
@@ -113,6 +132,7 @@ impl SyntaxColors {
             found: c.accent_soft.to_array(),
             current: c.accent.to_array(),
             on_current: c.on_accent.to_array(),
+            code: code_colors(tokens.mode),
         }
     }
 }
@@ -137,6 +157,9 @@ fn text_style(marks: Marks, colors: &SyntaxColors) -> TextStyle {
     }
     if marks.contains(Marks::STRIKE) && !marks.is_syntax() {
         style.strike = true;
+    }
+    if let Some(token) = marks.code_token() {
+        style.color = Some(colors.code[token.index()]);
     }
     if marks.contains(Marks::LINK) {
         style.color = Some(colors.link);
@@ -251,6 +274,8 @@ pub enum Format {
     Rule,
     /// A table of contents linking to the headings, after the caret's line.
     Toc,
+    /// A numbered footnote at the caret and its note at the end.
+    Footnote,
 }
 
 /// The find bar of a tab and what it found.
@@ -385,6 +410,7 @@ pub fn preview_style(
         line: c.page_edge.to_array(),
         selection: c.selection.to_array(),
         callouts: theme::callout_colors(tokens.mode).map(|color| color.to_array()),
+        code: code_colors(tokens.mode),
         callout_labels: [
             strings.callout_note,
             strings.callout_tip,
@@ -491,6 +517,9 @@ pub struct MarkdownEditor {
     pub reopened: bool,
     /// How large the source and the preview are drawn, in percent.
     pub zoom_percent: u32,
+    /// Where a closing bracket or backtick put in for the user sits, while
+    /// the caret is right before it: typing it then steps over it.
+    pending_close: Option<usize>,
     /// A double or triple click began the selection: dragging extends it by
     /// this unit from this range.
     click_unit: Option<(ClickUnit, Range<usize>)>,
@@ -751,6 +780,7 @@ impl MarkdownEditor {
             reloaded: false,
             reopened: false,
             zoom_percent: 100,
+            pending_close: None,
             click_unit: None,
             format_changed: false,
             preview_focused: false,
@@ -1053,6 +1083,19 @@ impl MarkdownEditor {
     }
 
     /// Follow a `#` link in the preview, such as a footnote.
+    /// Tick or untick the task box of the list item starting at `item`, as
+    /// clicking its box in the preview does. One undo step. Not while an
+    /// input method is composing or a replacement throughout runs.
+    pub fn toggle_task(&mut self, item: usize) -> bool {
+        if self.surface.is_composing() || self.locked() {
+            return false;
+        }
+        match format::toggle_task(self.document.text(), item, self.document.selection()) {
+            Some(edit) => self.apply(edit),
+            None => false,
+        }
+    }
+
     pub fn follow_preview_link(&mut self, link: &str) -> bool {
         if !self.preview.follow(link) {
             return false;
@@ -1548,6 +1591,19 @@ impl MarkdownEditor {
             Format::Table => format::insert_table(text, selection),
             Format::CodeBlock => format::toggle_code_block(text, selection),
             Format::Rule => format::insert_rule(text, selection),
+            Format::Footnote => {
+                let Some((reference, note)) = format::insert_footnote(text, selection) else {
+                    return false;
+                };
+                // One undo step: the note goes in with the reference.
+                if !self.apply(reference) {
+                    return false;
+                }
+                let change = self.document.amend(note.range, &note.text, note.selection);
+                self.show(change);
+                self.surface.reveal_caret();
+                return true;
+            }
             Format::Toc => match format::insert_toc(text, selection) {
                 Some(edit) => edit,
                 None => return false,
@@ -1737,8 +1793,53 @@ impl MarkdownEditor {
 
     /// Carry out what a key press decoded to. Returns whether the text changed.
     pub fn key(&mut self, action: Action) -> bool {
+        // A closing half put in for the user counts only until the next key.
+        let pending = self.pending_close.take();
         match action {
-            Action::Insert(text) => self.edit(EditCommand::Type(text)),
+            Action::Insert(text) => {
+                if !self.surface.is_composing()
+                    && !self.locked()
+                    && let Some((edit, next)) = format::typed_pair(
+                        self.document.text(),
+                        self.document.selection(),
+                        &text,
+                        pending,
+                    )
+                {
+                    let changed = self.apply_or_select(edit);
+                    self.pending_close = next;
+                    return changed;
+                }
+                let before = self.document.selection();
+                let changed = self.edit(EditCommand::Type(text));
+                // Typing between the halves keeps the closing one ahead.
+                if before.is_caret() && pending == Some(before.focus) {
+                    let after = self.document.selection();
+                    if after.is_caret() {
+                        self.pending_close = Some(after.focus);
+                    }
+                }
+                changed
+            }
+            Action::Backspace
+                if !self.surface.is_composing()
+                    && !self.locked()
+                    && format::backspace_pair(
+                        self.document.text(),
+                        self.document.selection(),
+                        pending,
+                    )
+                    .is_some() =>
+            {
+                match format::backspace_pair(
+                    self.document.text(),
+                    self.document.selection(),
+                    pending,
+                ) {
+                    Some(edit) => self.apply(edit),
+                    None => false,
+                }
+            }
             Action::Newline => self.newline(),
             Action::PlainNewline => self.edit(EditCommand::LineBreak),
             Action::Indent => self.indent(false),
@@ -2075,6 +2176,56 @@ mod tests {
         let mut same = self::editor("x\n");
         same.set_format(same.format);
         assert!(!same.is_modified());
+    }
+
+    #[test]
+    fn a_task_box_is_ticked_from_the_preview_as_one_step() {
+        let mut editor = editor("- [ ] 买菜\n- [x] 做饭\n");
+        assert!(editor.toggle_task(0));
+        assert_eq!(
+            editor.document.text().to_string(),
+            "- [x] 买菜\n- [x] 做饭\n"
+        );
+        assert!(editor.document.is_modified());
+        assert!(editor.undo());
+        assert_eq!(
+            editor.document.text().to_string(),
+            "- [ ] 买菜\n- [x] 做饭\n"
+        );
+        assert!(!editor.toggle_task(3));
+    }
+
+    #[test]
+    fn brackets_typed_in_the_source_are_closed_and_stepped_over() {
+        let mut editor = editor("");
+        type_text(&mut editor, "看(");
+        assert_eq!(editor.document.text().to_string(), "看()");
+        type_text(&mut editor, "x)");
+        assert_eq!(editor.document.text().to_string(), "看(x)");
+        assert_eq!(
+            editor.document.selection(),
+            Selection::caret(editor.document.len())
+        );
+        // Backspace in an empty pair takes both.
+        type_text(&mut editor, " [");
+        assert!(editor.key(Action::Backspace));
+        assert_eq!(editor.document.text().to_string(), "看(x) ");
+        assert_in_step(&editor);
+    }
+
+    #[test]
+    fn a_footnote_goes_in_as_one_undo_step() {
+        let mut editor = editor("正文。\n");
+        editor.document.set_selection(Selection::caret(9));
+        assert!(editor.format(Format::Footnote));
+        assert_eq!(editor.document.text().to_string(), "正文。[^1]\n\n[^1]: ");
+        assert_eq!(
+            editor.document.selection(),
+            Selection::caret(editor.document.len())
+        );
+        assert_in_step(&editor);
+        assert!(editor.undo());
+        assert_eq!(editor.document.text().to_string(), "正文。\n");
     }
 
     #[test]
@@ -2576,6 +2727,37 @@ mod tests {
             decorated(&mut e, "block").line_background,
             Some(c.fill.to_array())
         );
+    }
+
+    #[test]
+    fn code_tokens_take_the_theme_colours() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let tokens = theme::Tokens::of(mode);
+            let text = "> ```rust\n> fn f() -> u8 { \"s\".len() as u8 + 1 + plain } // c\n> ```\n";
+            let mut e = MarkdownEditor::new(text, TextFormat::default(), None, None, &tokens);
+            let code = theme::code_colors(mode);
+            for (needle, color) in [
+                ("fn", code.keyword),
+                ("f()", code.function),
+                ("u8", code.type_name),
+                ("\"s\"", code.string),
+                ("1 ", code.number),
+                ("// c", code.comment),
+            ] {
+                let style = decorated(&mut e, needle);
+                assert_eq!(style.color, Some(color.to_array()), "{mode:?} {needle}");
+                assert_eq!(style.line_background, Some(tokens.colors.fill.to_array()));
+            }
+            // Plain code in a quote keeps the quote's colour.
+            assert_eq!(
+                decorated(&mut e, "plain").color,
+                Some(tokens.colors.text_secondary.to_array())
+            );
+            assert_eq!(
+                preview_style(&tokens, &crate::i18n::ZH_HANS).code,
+                code_colors(mode)
+            );
+        }
     }
 
     #[test]

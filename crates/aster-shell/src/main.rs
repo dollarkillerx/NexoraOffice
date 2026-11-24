@@ -6546,7 +6546,7 @@ mod tests {
         for kind in DocKind::ALL {
             for item in toolbar::toolbar(kind, ViewState::default(), &i18n::ZH_HANS) {
                 let ui_item = tool_item(&item);
-                assert!((0..=5).contains(&ui_item.control));
+                assert!((0..=6).contains(&ui_item.control));
                 assert_eq!(ui_item.enabled, item.enabled);
                 if let Some(command) = item.command {
                     assert_eq!(Command::from_id(ui_item.command), Some(command));

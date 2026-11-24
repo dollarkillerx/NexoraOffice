@@ -61,6 +61,9 @@ pub struct Changes {
     /// Every other field counts sheets by the workbook's order, except
     /// `structure`, which counts them as the file does.
     pub origins: Vec<Option<usize>>,
+    /// Whole rows and columns whose own format changed: sheet, columns (or
+    /// rows), index.
+    pub line_styles: BTreeSet<(usize, bool, u32)>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -71,6 +74,13 @@ fn sizes_of(sheet: &aster_sheets::Sheet, index: usize, changes: &Changes, digit:
             .map(|&(_, i)| i)
             .collect()
     };
+    let styled = |columns: bool| -> Vec<u32> {
+        changes
+            .line_styles
+            .range((index, columns, 0)..=(index, columns, u32::MAX))
+            .map(|&(_, _, i)| i)
+            .collect()
+    };
     Sizes {
         widths: in_sheet(&changes.columns)
             .into_iter()
@@ -79,6 +89,20 @@ fn sizes_of(sheet: &aster_sheets::Sheet, index: usize, changes: &Changes, digit:
         heights: in_sheet(&changes.rows)
             .into_iter()
             .map(|row| (row, sheet.row_sizes.size(row) * 0.75))
+            .collect(),
+        column_styles: styled(true)
+            .into_iter()
+            .map(|col| {
+                (
+                    col,
+                    sheet.column_style(col),
+                    sheet.columns.size(col) / digit,
+                )
+            })
+            .collect(),
+        row_styles: styled(false)
+            .into_iter()
+            .map(|row| (row, sheet.row_style(row)))
             .collect(),
     }
 }
@@ -936,20 +960,36 @@ fn rewrite_sheet(
     for (&at, &mode) in &cells {
         by_row.entry(at.row).or_default().push((at, mode));
     }
-    for row in sizes.heights.keys() {
+    for row in sizes.heights.keys().chain(sizes.row_styles.keys()) {
         by_row.entry(*row).or_default();
     }
     // A row's start tag, with its new height if it has one.
     // A hidden row (no height) keeps the height it had, to come back with.
-    let row_tag = |tag: String, row: u32| match sizes.heights.get(&row) {
-        Some(points) if *points == 0.0 => set_attribute(&tag, "hidden", "1"),
-        Some(points) => {
-            let tag = structure::drop_attribute(&tag, "hidden");
-            let tag = set_attribute(&tag, "ht", &number(*points));
-            set_attribute(&tag, "customHeight", "1")
+    // A row's own format is `s` with `customFormat`.
+    let row_tag = |tag: String, row: u32| {
+        let tag = match sizes.heights.get(&row) {
+            Some(points) if *points == 0.0 => set_attribute(&tag, "hidden", "1"),
+            Some(points) => {
+                let tag = structure::drop_attribute(&tag, "hidden");
+                let tag = set_attribute(&tag, "ht", &number(*points));
+                set_attribute(&tag, "customHeight", "1")
+            }
+            None => tag,
+        };
+        match sizes.row_styles.get(&row) {
+            Some(Some(style)) => {
+                let tag = set_attribute(&tag, "s", &style.to_string());
+                set_attribute(&tag, "customFormat", "1")
+            }
+            Some(None) => {
+                let tag = structure::drop_attribute(&tag, "s");
+                structure::drop_attribute(&tag, "customFormat")
+            }
+            None => tag,
         }
-        None => tag,
     };
+    let row_changed =
+        |row: u32| sizes.heights.contains_key(&row) || sizes.row_styles.contains_key(&row);
     let mut new_rows: Vec<(u32, String)> = Vec::new();
     for (row_index, targets) in by_row {
         match rows.get(&row_index) {
@@ -981,7 +1021,7 @@ fn rewrite_sheet(
                     }
                 }
                 let tag = String::from_utf8_lossy(&xml[row.start..row.open_end]).into_owned();
-                let resized = sizes.heights.contains_key(&row_index);
+                let resized = row_changed(row_index);
                 let tag = row_tag(tag, row_index);
                 match (row.close, appended.is_empty()) {
                     (Some(close), _) => {
@@ -1016,7 +1056,7 @@ fn rewrite_sheet(
                 let open = row_tag(format!("<{p}row r=\"{}\">", row_index + 1), row_index);
                 if !content.is_empty() {
                     new_rows.push((row_index, format!("{open}{content}</{p}row>")));
-                } else if sizes.heights.contains_key(&row_index) {
+                } else if row_changed(row_index) {
                     let open = open.trim_end_matches('>');
                     new_rows.push((row_index, format!("{open}/>")));
                 }
@@ -1052,8 +1092,8 @@ fn rewrite_sheet(
         let (start, end, text) = merge_cells(xml, &p, merges);
         push(&mut ops, start, end, text);
     }
-    if !sizes.widths.is_empty() {
-        let (start, end, text) = columns_xml(xml, &p, &sizes.widths, data.start);
+    if !sizes.widths.is_empty() || !sizes.column_styles.is_empty() {
+        let (start, end, text) = columns_xml(xml, &p, sizes, data.start);
         push(&mut ops, start, end, text);
     }
     // What is inserted at a place goes before what is replaced from there:
@@ -1080,11 +1120,19 @@ fn rewrite_sheet(
 pub struct Sizes {
     pub widths: Vec<(u32, f64)>,
     pub heights: BTreeMap<u32, f64>,
+    /// Columns whose own format changed: index, format (`None` for none),
+    /// and width (for a `<col>` that has to be made).
+    pub column_styles: Vec<(u32, Option<u32>, f64)>,
+    /// Rows whose own format changed: index and format.
+    pub row_styles: BTreeMap<u32, Option<u32>>,
 }
 
 impl Sizes {
     pub fn is_empty(&self) -> bool {
-        self.widths.is_empty() && self.heights.is_empty()
+        self.widths.is_empty()
+            && self.heights.is_empty()
+            && self.column_styles.is_empty()
+            && self.row_styles.is_empty()
     }
 }
 
@@ -1100,12 +1148,19 @@ struct Col {
 /// column is split around it, keeping its attributes on every part; a
 /// column no `<col>` covers gets one. A sheet without `<cols>` gets it
 /// right before `<sheetData>`.
-fn columns_xml(
-    xml: &[u8],
-    p: &str,
-    widths: &[(u32, f64)],
-    data_start: usize,
-) -> (usize, usize, String) {
+fn columns_xml(xml: &[u8], p: &str, sizes: &Sizes, data_start: usize) -> (usize, usize, String) {
+    // Each column changed: a new width, a new format, and its width for a
+    // `<col>` that has to be made.
+    type Edit = (Option<f64>, Option<Option<u32>>, f64);
+    let mut edits: BTreeMap<u32, Edit> = BTreeMap::new();
+    for &(index, width) in &sizes.widths {
+        let edit = edits.entry(index).or_insert((None, None, width));
+        edit.0 = Some(width);
+    }
+    for &(index, style, width) in &sizes.column_styles {
+        let edit = edits.entry(index).or_insert((None, None, width));
+        edit.1 = Some(style);
+    }
     let children_list = top_level(xml);
     let found = children_list.iter().find(|(name, ..)| name == "cols");
     let mut cols: Vec<Col> = Vec::new();
@@ -1134,22 +1189,40 @@ fn columns_xml(
             }
         }
     }
-    for &(index, width) in widths {
+    for (&index, &(width, style, current)) in &edits {
         let column = index + 1;
-        // A hidden column (no width) keeps the width it had, to come back
-        // with; Excel wants one, so a column without gets the default.
         let set = |attributes: &mut Vec<(String, String)>| {
-            if width == 0.0 {
-                attributes.retain(|(k, _)| k != "hidden");
-                if !attributes.iter().any(|(k, _)| k == "width") {
-                    attributes.push(("width".into(), "8.43".into()));
+            match width {
+                // A hidden column (no width) keeps the width it had, to
+                // come back with; Excel wants one, so a column without
+                // gets the default.
+                Some(0.0) => {
+                    attributes.retain(|(k, _)| k != "hidden");
+                    if !attributes.iter().any(|(k, _)| k == "width") {
+                        attributes.push(("width".into(), "8.43".into()));
+                    }
+                    attributes.push(("hidden".into(), "1".into()));
                 }
-                attributes.push(("hidden".into(), "1".into()));
-                return;
+                Some(width) => {
+                    attributes.retain(|(k, _)| k != "width" && k != "customWidth" && k != "hidden");
+                    attributes.push(("width".into(), number(width)));
+                    attributes.push(("customWidth".into(), "1".into()));
+                }
+                None => {
+                    if !attributes.iter().any(|(k, _)| k == "width") {
+                        let width = if current > 0.0 { current } else { 8.43 };
+                        attributes.push(("width".into(), number(width)));
+                    }
+                }
             }
-            attributes.retain(|(k, _)| k != "width" && k != "customWidth" && k != "hidden");
-            attributes.push(("width".into(), number(width)));
-            attributes.push(("customWidth".into(), "1".into()));
+            match style {
+                Some(Some(style)) => {
+                    attributes.retain(|(k, _)| k != "style");
+                    attributes.push(("style".into(), style.to_string()));
+                }
+                Some(None) => attributes.retain(|(k, _)| k != "style"),
+                None => {}
+            }
         };
         match cols.iter().position(|c| c.min <= column && column <= c.max) {
             Some(i) => {

@@ -342,6 +342,8 @@ pub struct Inherited {
     pub cells: Vec<CellRef>,
     /// The lines were given its height or width.
     pub sized: bool,
+    /// The whole-line format they were given, if it had one.
+    pub line_style: Option<u32>,
 }
 
 /// More formatted cells than this are not copied into inserted lines.
@@ -360,6 +362,20 @@ impl crate::model::Workbook {
             return out;
         };
         let source = lines.at - 1;
+        out.line_style = if lines.columns {
+            target.column_style(source)
+        } else {
+            target.row_style(source)
+        };
+        if let Some(style) = out.line_style {
+            for line in lines.at..lines.at + lines.count {
+                if lines.columns {
+                    target.set_column_style(line, Some(style));
+                } else {
+                    target.set_row_style(line, Some(style));
+                }
+            }
+        }
         // The other coordinate and the format of each formatted cell.
         let styled: Vec<(u32, u32)> = if lines.columns {
             target

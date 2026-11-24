@@ -132,6 +132,35 @@ impl Workbook {
                 .map(|(at, cell)| (at, Some(cell.clone())))
                 .collect()
         };
+        self.restyle_places(sheet, places, edit, &mut HashMap::new())
+    }
+
+    /// The style `old` becomes under `edit`: itself when the edit changes
+    /// nothing, else one that looks like the result. `made` remembers.
+    fn restyled(&mut self, old: u32, edit: &StyleEdit, made: &mut HashMap<u32, u32>) -> u32 {
+        if let Some(&new) = made.get(&old) {
+            return new;
+        }
+        let edited = edit.apply(&self.style(old));
+        let new = if edited.looks_like(&self.style(old)) {
+            old
+        } else {
+            self.style_index(edited)
+        };
+        made.insert(old, new);
+        new
+    }
+
+    fn restyle_places(
+        &mut self,
+        sheet: usize,
+        places: Vec<(CellRef, Option<Cell>)>,
+        edit: &StyleEdit,
+        made: &mut HashMap<u32, u32>,
+    ) -> Vec<(CellRef, Option<Cell>)> {
+        let Some(source) = self.sheets.get(sheet) else {
+            return Vec::new();
+        };
         let styles_of: Vec<u32> = places
             .iter()
             .map(|(at, cell)| {
@@ -139,22 +168,9 @@ impl Workbook {
                     .map_or_else(|| source.style_at(*at), |c| c.style)
             })
             .collect();
-        let mut made: HashMap<u32, u32> = HashMap::new();
         let mut out = Vec::new();
         for ((at, cell), old) in places.into_iter().zip(styles_of) {
-            let new = match made.get(&old) {
-                Some(&new) => new,
-                None => {
-                    let edited = edit.apply(&self.style(old));
-                    let new = if edited.looks_like(&self.style(old)) {
-                        old
-                    } else {
-                        self.style_index(edited)
-                    };
-                    made.insert(old, new);
-                    new
-                }
-            };
+            let new = self.restyled(old, edit, made);
             let current = cell.as_ref().map_or(0, |c| c.style);
             if (cell.is_some() && new == current) || (cell.is_none() && new == old) {
                 continue;
@@ -165,6 +181,81 @@ impl Workbook {
         }
         out
     }
+
+    /// Apply `edit` to whole lines: whole columns when `range` spans every
+    /// row (the whole sheet too), whole rows otherwise. Each line's own
+    /// format changes, as Excel keeps it, and so do the cells already in
+    /// it; empty places follow the line. Returns the lines' changes (made
+    /// already) and the cells to put.
+    pub fn restyle_lines(
+        &mut self,
+        sheet: usize,
+        range: CellRange,
+        edit: &StyleEdit,
+    ) -> (Vec<LineFormat>, Vec<(CellRef, Option<Cell>)>) {
+        let Some(source) = self.sheets.get(sheet) else {
+            return (Vec::new(), Vec::new());
+        };
+        let columns = range.rows() == MAX_ROWS;
+        let (first, last) = if columns {
+            (range.first.col, range.last.col)
+        } else {
+            (range.first.row, range.last.row)
+        };
+        let places: Vec<(CellRef, Option<Cell>)> = source
+            .cells_in(range)
+            .map(|(at, cell)| (at, Some(cell.clone())))
+            .collect();
+        let mut made = HashMap::new();
+        let cells = self.restyle_places(sheet, places, edit, &mut made);
+        let mut lines = Vec::new();
+        for line in first..=last {
+            let target = &self.sheets[sheet];
+            let before = if columns {
+                target.column_style(line)
+            } else {
+                target.row_style(line)
+            };
+            let new = self.restyled(before.unwrap_or(0), edit, &mut made);
+            let after = (before.is_some() || new != 0).then_some(new);
+            if after == before {
+                continue;
+            }
+            let target = &mut self.sheets[sheet];
+            if columns {
+                target.set_column_style(line, after);
+            } else {
+                target.set_row_style(line, after);
+            }
+            lines.push(LineFormat {
+                columns,
+                line,
+                before,
+                after,
+            });
+        }
+        (lines, cells)
+    }
+
+    /// Put a whole line's format as it was or will be (undo, redo).
+    pub fn set_line_style(&mut self, sheet: usize, columns: bool, line: u32, style: Option<u32>) {
+        if let Some(target) = self.sheets.get_mut(sheet) {
+            if columns {
+                target.set_column_style(line, style);
+            } else {
+                target.set_row_style(line, style);
+            }
+        }
+    }
+}
+
+/// A whole row's or column's format changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineFormat {
+    pub columns: bool,
+    pub line: u32,
+    pub before: Option<u32>,
+    pub after: Option<u32>,
 }
 
 /// Excel's fill button colour.

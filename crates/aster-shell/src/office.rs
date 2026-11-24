@@ -316,6 +316,8 @@ pub struct Step {
     lines: Option<Box<Restructure>>,
     /// A sheet added, renamed or deleted.
     sheets: Option<Box<SheetStep>>,
+    /// Whole rows' and columns' own formats changed: sheet, change.
+    line_formats: Vec<(usize, aster_sheets::restyle::LineFormat)>,
 }
 
 /// What happened to a sheet.
@@ -350,6 +352,7 @@ struct Marks {
     merges: bool,
     columns: Vec<u32>,
     rows: Vec<u32>,
+    line_formats: Vec<(bool, u32)>,
 }
 
 /// The find bar on a workbook: what to look for and the cells of the sheet
@@ -410,6 +413,7 @@ impl History {
             && step.sizes.is_empty()
             && step.lines.is_none()
             && step.sheets.is_none()
+            && step.line_formats.is_empty()
         {
             return;
         }
@@ -487,6 +491,9 @@ pub struct SheetTab {
     /// Columns and rows resized since then: sheet and index.
     pub columns_changed: BTreeSet<(usize, u32)>,
     pub rows_changed: BTreeSet<(usize, u32)>,
+    /// Whole rows and columns whose own format changed since then: sheet,
+    /// columns (or rows), index.
+    pub line_formats_changed: BTreeSet<(usize, bool, u32)>,
     /// Rows and columns inserted and deleted since then, in order, by the
     /// file's sheet numbers.
     pub structure: Vec<(usize, Lines)>,
@@ -541,6 +548,7 @@ impl SheetTab {
             merges_changed: BTreeSet::new(),
             columns_changed: BTreeSet::new(),
             rows_changed: BTreeSet::new(),
+            line_formats_changed: BTreeSet::new(),
             structure: Vec::new(),
             origins: (0..sheet_count).map(Some).collect(),
             file: 0,
@@ -994,6 +1002,7 @@ impl SheetTab {
             added: Vec::new(),
             lines: None,
             sheets: None,
+            line_formats: Vec::new(),
         });
         changes
     }
@@ -1037,6 +1046,7 @@ impl SheetTab {
                 merges: self.merges_changed.clone(),
                 columns: self.columns_changed.clone(),
                 rows: self.rows_changed.clone(),
+                line_styles: self.line_formats_changed.clone(),
                 structure: self.structure.clone(),
                 origins: self.origins.clone(),
             },
@@ -1097,6 +1107,7 @@ impl SheetTab {
             self.merges_changed.clear();
             self.columns_changed.clear();
             self.rows_changed.clear();
+            self.line_formats_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -1130,6 +1141,7 @@ impl SheetTab {
         if let Some(step) = &step.sheets {
             self.undo_sheets(step);
         }
+        self.set_line_formats(&step, true);
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
         step.added = self.drop_styles(step.styles_before);
@@ -1171,6 +1183,7 @@ impl SheetTab {
         if let Some(step) = &step.sheets {
             self.redo_sheets(step);
         }
+        self.set_line_formats(&step, false);
         self.note(&step.changes);
         self.show(&step.changes);
         let applied = step.changes.clone();
@@ -1350,6 +1363,16 @@ impl SheetTab {
                 }
             })
             .collect();
+        self.line_formats_changed = std::mem::take(&mut self.line_formats_changed)
+            .into_iter()
+            .filter_map(|(s, columns, i)| {
+                if s == sheet && columns == lines.columns {
+                    Some((s, columns, lines.moved(i)?))
+                } else {
+                    Some((s, columns, i))
+                }
+            })
+            .collect();
         for &cell in others {
             self.dirty.insert(cell);
             self.edited.insert(cell);
@@ -1388,6 +1411,10 @@ impl SheetTab {
             .extend(inherited.cells.iter().map(|&at| (sheet, at)));
         self.edited
             .extend(inherited.cells.iter().map(|&at| (sheet, at)));
+        if inherited.line_style.is_some() {
+            self.line_formats_changed
+                .extend((lines.at..lines.at + lines.count).map(|i| (sheet, lines.columns, i)));
+        }
         if inherited.sized {
             let resized = if lines.columns {
                 &mut self.columns_changed
@@ -1666,6 +1693,10 @@ impl SheetTab {
         };
         lines(&mut self.columns_changed);
         lines(&mut self.rows_changed);
+        self.line_formats_changed = std::mem::take(&mut self.line_formats_changed)
+            .into_iter()
+            .map(|(s, columns, i)| (shift(s), columns, i))
+            .collect();
         self.merges_changed = std::mem::take(&mut self.merges_changed)
             .into_iter()
             .map(shift)
@@ -1698,6 +1729,13 @@ impl SheetTab {
         marks.columns = lines(&mut self.columns_changed);
         marks.rows = lines(&mut self.rows_changed);
         marks.merges = self.merges_changed.remove(&index);
+        marks.line_formats = self
+            .line_formats_changed
+            .iter()
+            .filter(|(s, _, _)| *s == index)
+            .map(|&(_, columns, i)| (columns, i))
+            .collect();
+        self.line_formats_changed.retain(|(s, _, _)| *s != index);
         marks
     }
 
@@ -1712,6 +1750,12 @@ impl SheetTab {
         if marks.merges {
             self.merges_changed.insert(index);
         }
+        self.line_formats_changed.extend(
+            marks
+                .line_formats
+                .iter()
+                .map(|&(columns, i)| (index, columns, i)),
+        );
     }
 
     /// The calculation thread starts again from the workbook as it is.
@@ -1794,6 +1838,7 @@ impl SheetTab {
             added: Vec::new(),
             lines: None,
             sheets: None,
+            line_formats: Vec::new(),
         });
         true
     }
@@ -1811,9 +1856,41 @@ impl SheetTab {
         let sheet = self.view.sheet_index();
         let range = self.view.selection();
         let styles_before = self.view.workbook().styles.len();
-        let cells = self.view.workbook_mut().restyle(sheet, range, edit);
+        if !aster_sheets::restyle::is_whole(&range) {
+            let cells = self.view.workbook_mut().restyle(sheet, range, edit);
+            let changes = self.view.workbook_mut().set_cells(sheet, cells);
+            return self.record(changes, styles_before);
+        }
+        // Whole rows or columns: their own formats, and their cells.
+        let (lines, cells) = self.view.workbook_mut().restyle_lines(sheet, range, edit);
         let changes = self.view.workbook_mut().set_cells(sheet, cells);
-        self.record(changes, styles_before)
+        if changes.is_empty() && lines.is_empty() {
+            self.drop_styles(styles_before);
+            return changes;
+        }
+        self.note(&changes);
+        for change in &lines {
+            self.line_formats_changed
+                .insert((sheet, change.columns, change.line));
+        }
+        self.history.push(Step {
+            changes: changes.clone(),
+            styles_before,
+            line_formats: lines.into_iter().map(|l| (sheet, l)).collect(),
+            ..Step::default()
+        });
+        changes
+    }
+
+    fn set_line_formats(&mut self, step: &Step, undo: bool) {
+        for &(sheet, change) in &step.line_formats {
+            let style = if undo { change.before } else { change.after };
+            self.view
+                .workbook_mut()
+                .set_line_style(sheet, change.columns, change.line, style);
+            self.line_formats_changed
+                .insert((sheet, change.columns, change.line));
+        }
     }
 
     /// The style of the active cell.
@@ -1910,6 +1987,7 @@ impl SheetTab {
             added: Vec::new(),
             lines: None,
             sheets: None,
+            line_formats: Vec::new(),
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -2643,6 +2721,80 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn whole_rows_and_columns_keep_their_own_format() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("行の書式.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        tab.view.select(at("B2"));
+        tab.view.begin_edit(EditMode::Enter, Some("x".into()));
+        tab.commit("en");
+        let last_col = aster_sheets::column_name(aster_sheets::MAX_COLUMNS - 1);
+        let bold_at = |tab: &SheetTab, cell: &str| {
+            let sheet = tab.view.sheet().unwrap();
+            tab.view
+                .workbook()
+                .style(sheet.style_at(at(cell)))
+                .font
+                .bold
+        };
+        // Row 2 bold: its own format, and its one cell; no others are made.
+        tab.view.select(at("A2"));
+        tab.view.extend_to(at(&format!("{last_col}2")));
+        tab.format(&StyleEdit::Bold(true));
+        let sheet = tab.view.sheet().unwrap();
+        assert!(sheet.row_style(1).is_some());
+        assert_eq!(sheet.cell_count(), 1);
+        assert!(bold_at(&tab, "B2") && bold_at(&tab, "Z2") && !bold_at(&tab, "Z3"));
+        // Undo takes it away, redo puts it back.
+        tab.undo();
+        assert!(!bold_at(&tab, "Z2") && !bold_at(&tab, "B2"));
+        tab.redo();
+        assert!(bold_at(&tab, "Z2"));
+        // Column D filled yellow.
+        tab.view.select(at("D1"));
+        tab.view
+            .extend_to(at(&format!("D{}", aster_sheets::MAX_ROWS)));
+        tab.format(&StyleEdit::Fill(Some(aster_sheets::restyle::YELLOW)));
+        assert!(tab.view.sheet().unwrap().column_style(3).is_some());
+        // A row inserted below row 2 takes its format.
+        tab.view.select(at("A3"));
+        tab.change_lines(false, true).unwrap();
+        assert!(bold_at(&tab, "Z3"));
+
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let xml = {
+            let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+            String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap()
+        };
+        assert!(
+            xml.contains(r#"<row r="2" s="#) && xml.contains(r#"customFormat="1""#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<row r="3" s="#), "{xml}");
+        assert!(
+            xml.contains(r#"<col min="4" max="4" width="#) && xml.contains(" style="),
+            "{xml}"
+        );
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let sheet = &again.sheets[0];
+        assert!(again.style(sheet.style_at(at("Z2"))).font.bold);
+        assert!(again.style(sheet.style_at(at("Z3"))).font.bold);
+        assert!(again.style(sheet.style_at(at("D9"))).fill.is_some());
+        assert!(!again.style(sheet.style_at(at("Z4"))).font.bold);
     }
 
     #[test]

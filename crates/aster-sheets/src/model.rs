@@ -253,6 +253,70 @@ impl Sheet {
 
     /// The style a cell is drawn with: its own if it is in the file, else
     /// its row's, else its column's, else the default (0).
+    /// The format of a whole row, if it has one.
+    pub fn row_style(&self, row: u32) -> Option<u32> {
+        self.row_styles
+            .binary_search_by_key(&row, |(r, _)| *r)
+            .ok()
+            .map(|i| self.row_styles[i].1)
+    }
+
+    /// The format of a whole column, if it has one.
+    pub fn column_style(&self, col: u32) -> Option<u32> {
+        let i = self
+            .column_styles
+            .partition_point(|(_, last, _)| *last < col);
+        match self.column_styles.get(i) {
+            Some(&(first, _, style)) if first <= col => Some(style),
+            _ => None,
+        }
+    }
+
+    /// Give a whole row a format, or take it away.
+    pub fn set_row_style(&mut self, row: u32, style: Option<u32>) {
+        match (
+            self.row_styles.binary_search_by_key(&row, |(r, _)| *r),
+            style,
+        ) {
+            (Ok(i), Some(style)) => self.row_styles[i].1 = style,
+            (Ok(i), None) => {
+                self.row_styles.remove(i);
+            }
+            (Err(i), Some(style)) => self.row_styles.insert(i, (row, style)),
+            (Err(_), None) => {}
+        }
+    }
+
+    /// Give a whole column a format, or take it away: the run that covers
+    /// it is split around it, and equal neighbours join again.
+    pub fn set_column_style(&mut self, col: u32, style: Option<u32>) {
+        let mut runs: Vec<(u32, u32, u32)> = Vec::with_capacity(self.column_styles.len() + 2);
+        for &(first, last, s) in &self.column_styles {
+            if first <= col && col <= last {
+                if first < col {
+                    runs.push((first, col - 1, s));
+                }
+                if col < last {
+                    runs.push((col + 1, last, s));
+                }
+            } else {
+                runs.push((first, last, s));
+            }
+        }
+        if let Some(style) = style {
+            runs.push((col, col, style));
+        }
+        runs.sort_by_key(|(first, _, _)| *first);
+        let mut joined: Vec<(u32, u32, u32)> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match joined.last_mut() {
+                Some(last) if last.1 + 1 == run.0 && last.2 == run.2 => last.1 = run.1,
+                _ => joined.push(run),
+            }
+        }
+        self.column_styles = joined;
+    }
+
     pub fn style_at(&self, at: CellRef) -> u32 {
         if let Some(cell) = self.cell(at) {
             return cell.style;

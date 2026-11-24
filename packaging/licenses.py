@@ -105,6 +105,54 @@ def packages(targets):
     return [found[key] for key in sorted(found)]
 
 
+# Data that packages build into the binary under licences of its own, beside
+# the package's code licence. Their notices are copied into the report in
+# full: the BSD licences ask for that in binary distributions.
+EMBEDDED_DATA = [
+    {
+        "package": "hayro-font",
+        "what": "The 14 standard PDF fonts (Foxit's, from PDFium)",
+        "license": "BSD-3-Clause",
+        "notice": "assets/LICENSE_FOXIT",
+    },
+    {
+        "package": "hayro-cmap",
+        "what": "Adobe's predefined CMaps for Chinese, Japanese and Korean text",
+        "license": "BSD-3-Clause",
+        "notice": "assets/LICENSE.txt",
+    },
+    {
+        "package": "hayro-interpret",
+        "what": "Two ICC colour profiles (CMYK and Lab)",
+        "license": "CC0-1.0",
+        "notice": "assets/README.md",
+    },
+]
+
+
+def embedded_data(listed, allow):
+    """The embedded data of packages in the build: what it is, its licence,
+    the notice text, and problems (licence not allowed, notice not found)."""
+    found, problems = [], []
+    by_name = {}
+    for package in listed:
+        by_name.setdefault(package["name"], package)
+    for entry in EMBEDDED_DATA:
+        package = by_name.get(entry["package"])
+        if package is None:
+            continue
+        if not accepted(entry["license"], allow):
+            problems.append(f'{entry["package"]}: {entry["what"]}: {entry["license"]}')
+        notice = Path(package["manifest_path"]).parent / entry["notice"]
+        try:
+            text = notice.read_text(encoding="utf-8")
+        except OSError:
+            problems.append(f'{entry["package"]}: notice {entry["notice"]} not found')
+            text = ""
+        found.append((package, entry, text))
+    return found, problems
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--check", action="store_true", help="fail if a licence is not allowed")
@@ -117,6 +165,7 @@ def main():
         package for package in listed
         if not package.get("license") or not accepted(package["license"], allow)
     ]
+    data, data_problems = embedded_data(listed, allow)
 
     if args.report:
         lines = [
@@ -128,15 +177,28 @@ def main():
         for package in listed:
             source = package.get("repository") or "https://crates.io/crates/" + package["name"]
             lines.append(f'{package["name"]} {package["version"]}  |  {package.get("license") or "UNKNOWN"}  |  {source}')
+        if data:
+            lines += ["", "", "Data built in by these packages, under licences of its own.", ""]
+        for package, entry, text in data:
+            lines += [
+                "=" * 72,
+                f'{entry["what"]}, in {package["name"]} {package["version"]}  |  {entry["license"]}',
+                "=" * 72,
+                text.rstrip(),
+                "",
+            ]
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
         Path(args.report).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print(f"{len(listed)} third-party packages across {len(targets)} targets")
     for package in refused:
         print(f'  NOT ALLOWED: {package["name"]} {package["version"]}: {package.get("license") or "no licence declared"}')
-    if args.check and refused:
+    print(f"{len(data)} packages with data under licences of their own")
+    for problem in data_problems:
+        print(f"  EMBEDDED DATA: {problem}")
+    if args.check and (refused or data_problems):
         sys.exit(1)
-    if not refused:
+    if not refused and not data_problems:
         print("every licence is on the allow list")
 
 

@@ -1,0 +1,22 @@
+[package]
+name = "aster-mcp-bridge"
+version.workspace = true
+license.workspace = true
+description = "aster-mcp: a stdio bridge for MCP clients that only speak stdio; it moves bytes between stdin/stdout and Aster Office's local socket"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aster-mcp"
+path = "src/main.rs"
+
+[dependencies]
+aster-mcp = { workspace = true }
+
+# The end-to-end test runs a real server, which needs a fake application
+# behind its invoker. Both are workspace crates aster-mcp already uses.
+[dev-dependencies]
+aster-tools = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -6,6 +6,7 @@
 //! without a window and survives a change of toolkit. The binary in `main.rs`
 //! binds it to the Slint UI under `ui/`.
 
+pub mod assistant;
 pub mod cli;
 pub mod content;
 pub mod files;

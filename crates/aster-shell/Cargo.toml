@@ -15,10 +15,12 @@ aster-platform = { workspace = true }
 aster-sheets = { workspace = true }
 aster-slides = { workspace = true }
 aster-storage = { workspace = true }
+aster-tools = { workspace = true }
 aster-surface = { workspace = true }
 aster-workspace = { workspace = true }
 chrono = { workspace = true }
 ropey = { workspace = true }
+serde_json = { workspace = true }
 slint = { workspace = true }
 
 [dev-dependencies]

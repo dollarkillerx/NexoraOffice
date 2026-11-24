@@ -1398,6 +1398,34 @@ impl MarkdownEditor {
         self.apply(edit)
     }
 
+    /// A change made by the assistant or an MCP client: `range` becomes
+    /// `text` as one undo step, and the selection goes to `selection`
+    /// (offsets after the change). Refused while an input method is
+    /// composing or a replacement throughout the document runs, so it never
+    /// lands in the middle of the user's own edit.
+    pub fn apply_external(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        selection: Selection,
+    ) -> Result<bool, &'static str> {
+        if self.surface.is_composing() {
+            return Err("the user is typing with an input method; try again in a moment");
+        }
+        if self.locked() {
+            return Err("a replacement throughout the document is running; try again in a moment");
+        }
+        let len = self.document.len();
+        if range.start > range.end || range.end > len {
+            return Err("the range is outside the document");
+        }
+        Ok(self.apply(format::Edit {
+            range,
+            text: text.to_owned(),
+            selection,
+        }))
+    }
+
     /// Make an edit that moves list items, then put the numbers of the lists
     /// below right; one undo step.
     fn apply_renumbered(&mut self, edit: format::Edit) -> bool {

@@ -1,0 +1,19 @@
+[package]
+name = "aster-mcp"
+version.workspace = true
+license.workspace = true
+description = "The MCP server inside Aster Office: JSON-RPC over a local socket, serving the shared tools"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aster-tools = { workspace = true }
+serde_json = { workspace = true }
+
+# Only the Unix socket code calls into the system directly.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

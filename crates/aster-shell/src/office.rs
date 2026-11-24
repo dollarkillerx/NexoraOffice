@@ -697,6 +697,19 @@ impl SheetTab {
     }
 }
 
+/// A new workbook with one sheet, its default font the one Excel uses for
+/// the interface language (it sets the column width unit).
+pub fn blank_workbook(language: &str) -> Vec<u8> {
+    let font = match language {
+        "zh-Hans" => "等线",
+        "zh-Hant" => "新細明體",
+        "ja" => "游ゴシック",
+        "ko" => "맑은 고딕",
+        _ => "Calibri",
+    };
+    aster_ooxml::xlsx_save::blank("Sheet1", font)
+}
+
 /// The engine's edits for cell changes.
 pub fn edits(changes: &[Change]) -> Vec<Edit> {
     changes

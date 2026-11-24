@@ -333,7 +333,15 @@ impl Shell {
                 self.contents
                     .insert(id, Content::Markdown(Box::new(editor)));
             }
-            DocKind::Sheets | DocKind::Slides | DocKind::Pdf => {}
+            DocKind::Sheets => {
+                let source = office::blank_workbook(self.language.tag());
+                // Our own template: it always reads.
+                if let Ok(workbook) = aster_ooxml::xlsx::read(source.clone()) {
+                    let tab = SheetTab::new(workbook, Arc::new(source), None, &self.tokens);
+                    self.contents.insert(id, Content::Sheet(Box::new(tab)));
+                }
+            }
+            DocKind::Slides | DocKind::Pdf => {}
         }
         id
     }
@@ -3519,7 +3527,10 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_new_document(handler!(|ui, shell, kind| {
         if let Some(kind) = usize::try_from(kind).ok().and_then(DocKind::from_index) {
-            shell.open_untitled(kind);
+            let id = shell.open_untitled(kind);
+            if kind == DocKind::Sheets {
+                start_calc(&ui, shell, id);
+            }
             after_tab_change(&ui, shell);
         }
     }));
@@ -4343,10 +4354,18 @@ mod tests {
     }
 
     #[test]
-    fn only_text_tabs_have_content() {
+    fn placeholder_tabs_have_no_content() {
         let mut shell = shell();
-        shell.open_untitled(DocKind::Sheets);
+        shell.open_untitled(DocKind::Slides);
         assert!(shell.active_content().is_none());
+        // A new workbook is a real one: one empty sheet, ready to edit.
+        shell.open_untitled(DocKind::Sheets);
+        let tab = shell.active_sheet().unwrap();
+        assert_eq!(tab.view.workbook().sheets[0].name, "Sheet1");
+        assert!(tab.path.is_none() && !tab.is_modified());
+        let (existing, suggested) = shell.save_target(shell.tabs.active_id().unwrap()).unwrap();
+        assert!(existing.is_none());
+        assert_eq!(suggested.extension().and_then(|e| e.to_str()), Some("xlsx"));
         shell.open_untitled(DocKind::Writer);
         assert!(shell.active_writer().is_some());
         assert!(shell.active_markdown().is_none());
@@ -4355,7 +4374,7 @@ mod tests {
         assert!(shell.active_writer().is_none());
         shell.show_start_page();
         assert!(shell.active_surface().is_none());
-        assert_eq!(shell.contents.len(), 2);
+        assert_eq!(shell.contents.len(), 3);
     }
 
     #[test]

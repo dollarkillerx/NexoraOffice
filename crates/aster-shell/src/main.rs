@@ -973,6 +973,7 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_ai_model(strings.ai_model.into());
     s.set_ai_api_key(strings.ai_api_key.into());
     s.set_ai_key_hint(strings.ai_key_hint.into());
+    s.set_ai_refresh_models(strings.ai_refresh_models.into());
     s.set_ai_key_save(strings.ai_key_save.into());
     s.set_ai_key_delete(strings.ai_key_delete.into());
     s.set_ai_redact(strings.ai_redact.into());
@@ -3442,6 +3443,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
     ui.on_ai_set_folder_level(handler!(|ui, shell, level| {
         agent::set_folder_access(&ui, shell, level);
+    }));
+    ui.on_ai_pick_model(handler!(|ui, shell, id| {
+        agent::set_model(&ui, shell, id.as_str());
+    }));
+    ui.on_ai_refresh_models(handler!(|ui, shell| {
+        agent::list_models(&ui, shell);
     }));
     ui.on_mcp_set_enabled(handler!(|ui, shell, on| {
         agent::set_mcp(&ui, shell, on);

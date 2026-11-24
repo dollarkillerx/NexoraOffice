@@ -361,6 +361,9 @@ export component AssistantPanel inherits Rectangle {
     in property <string> mcp-clients;
     in property <string> mcp-setup-cli;
     in property <string> mcp-setup-json;
+    // The selected provider's models, and what listing them came to.
+    in property <[string]> models;
+    in property <string> models-state;
 
     callback send(string);
     callback stop();
@@ -377,6 +380,9 @@ export component AssistantPanel inherits Rectangle {
     callback set-folder-level(int);
     callback set-mcp(bool);
     callback copy(string);
+    callback pick-model(string);
+    callback refresh-models();
+    callback settings-opened();
 
     background: Tokens.panel;
     clip: true;
@@ -426,6 +432,7 @@ export component AssistantPanel inherits Rectangle {
                 text: Strings.ai-settings;
                 clicked => {
                     root.page = 1;
+                    root.settings-opened();
                 }
             }
 
@@ -628,22 +635,7 @@ export component AssistantPanel inherits Rectangle {
                     }
                 }
 
-                Field {
-                    label: Strings.ai-base-url;
-                    text <=> root.base-url;
-                    accepted(text) => {
-                        root.set-base-url(text);
-                    }
-                }
-
-                Field {
-                    label: Strings.ai-model;
-                    text <=> root.model;
-                    accepted(text) => {
-                        root.set-model(text);
-                    }
-                }
-
+                // The key first: with it the provider's models can be listed.
                 key-field := Field {
                     label: Strings.ai-api-key + " · " + root.key-state;
                     placeholder: Strings.ai-key-hint;
@@ -668,13 +660,85 @@ export component AssistantPanel inherits Rectangle {
                         text: Strings.ai-key-save;
                         primary: true;
                         clicked => {
-                            root.set-base-url(root.base-url);
-                            root.set-model(root.model);
                             if (key-field.text != "") {
                                 root.save-key(key-field.text);
                                 key-field.text = "";
                             }
                         }
+                    }
+                }
+
+                Field {
+                    label: Strings.ai-model;
+                    text <=> root.model;
+                    accepted(text) => {
+                        root.set-model(text);
+                    }
+                }
+
+                // The provider's models, once listed: a click picks one.
+                HorizontalLayout {
+                    spacing: Tokens.space-sm;
+                    Text {
+                        text: root.models-state;
+                        font-size: Tokens.font-sm;
+                        color: Tokens.text-tertiary;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    TextButton {
+                        text: Strings.ai-refresh-models;
+                        clicked => {
+                            root.refresh-models();
+                        }
+                    }
+                }
+
+                if root.models.length > 0: Rectangle {
+                    height: min(200px, model-list.preferred-height);
+                    border-radius: Tokens.radius-md;
+                    border-width: 1px;
+                    border-color: Tokens.hairline;
+                    background: Tokens.surface;
+                    clip: true;
+                    Flickable {
+                        content-height: model-list.preferred-height;
+                        model-list := VerticalLayout {
+                            padding: 4px;
+                            spacing: 1px;
+                            for id in root.models: Rectangle {
+                                height: 26px;
+                                border-radius: Tokens.radius-sm;
+                                background: id == root.model ? Tokens.accent-soft : model-touch.has-hover ? Tokens.hover : transparent;
+                                Text {
+                                    x: Tokens.space-sm;
+                                    width: parent.width - 2 * Tokens.space-sm;
+                                    height: parent.height;
+                                    text: id;
+                                    font-size: Tokens.font-sm;
+                                    font-weight: id == root.model ? 600 : 400;
+                                    color: id == root.model ? Tokens.accent : Tokens.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                model-touch := TouchArea {
+                                    clicked => {
+                                        root.pick-model(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Field {
+                    label: Strings.ai-base-url;
+                    text <=> root.base-url;
+                    accepted(text) => {
+                        root.set-base-url(text);
                     }
                 }
 

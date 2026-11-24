@@ -92,6 +92,16 @@ pub struct Assistant {
     tool_rows: HashMap<String, usize>,
     /// Events from the running turn, applied in order.
     inbox: Arc<Mutex<Vec<AgentEvent>>>,
+    /// The models each provider offers, by provider id.
+    models: HashMap<String, ModelList>,
+}
+
+/// What listing a provider's models came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelList {
+    Loading,
+    Ready(Vec<String>),
+    Failed(String),
 }
 
 impl Assistant {
@@ -142,6 +152,7 @@ impl Assistant {
             streaming: None,
             tool_rows: HashMap::new(),
             inbox: Arc::new(Mutex::new(Vec::new())),
+            models: HashMap::new(),
         });
         if mcp_enabled {
             set_mcp(ui, shell, true);
@@ -278,6 +289,31 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
             .as_ref()
             .is_some_and(|p| !p.model.trim().is_empty() && (has_key || !p.preset.needs_key())),
     );
+    let (models, state) = match provider.as_ref().and_then(|p| ai.models.get(&p.id)) {
+        Some(ModelList::Ready(ids)) => (
+            ids.clone(),
+            i18n::fill(strings.ai_models_count, "count", &ids.len().to_string()),
+        ),
+        Some(ModelList::Loading) => (Vec::new(), strings.ai_models_loading.to_owned()),
+        Some(ModelList::Failed(error)) => (
+            Vec::new(),
+            i18n::fill(strings.ai_models_failed, "error", error),
+        ),
+        None if provider
+            .as_ref()
+            .is_some_and(|p| !has_key && p.preset.needs_key()) =>
+        {
+            (Vec::new(), strings.ai_models_need_key.to_owned())
+        }
+        None => (Vec::new(), String::new()),
+    };
+    ui.set_ai_models(ModelRc::new(VecModel::from(
+        models
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_ai_models_state(state.into());
     ui.set_ai_redact(ai.settings.redact);
     ui.set_ai_running(ai.cancel.is_some());
 
@@ -357,6 +393,7 @@ pub fn set_provider(ui: &AppWindow, shell: &mut Shell, index: i32) {
     ai.settings.selected = Some(id);
     save_settings(ai);
     refresh(ui, shell);
+    list_models_if_new(ui, shell);
 }
 
 fn selected_mut(ai: &mut Assistant) -> Option<&mut ProviderConfig> {
@@ -369,14 +406,22 @@ pub fn set_base_url(ui: &AppWindow, shell: &mut Shell, url: &str) {
         && let Some(provider) = selected_mut(ai)
     {
         let url = url.trim();
-        provider.base_url = if url.is_empty() {
+        let url = if url.is_empty() {
             provider.preset.default_base_url().to_owned()
         } else {
             url.to_owned()
         };
+        let changed = provider.base_url != url;
+        provider.base_url = url;
+        let id = provider.id.clone();
+        if changed {
+            // Another endpoint, other models.
+            ai.models.remove(&id);
+        }
         save_settings(ai);
     }
     refresh(ui, shell);
+    list_models_if_new(ui, shell);
 }
 
 pub fn set_model(ui: &AppWindow, shell: &mut Shell, model: &str) {
@@ -397,7 +442,9 @@ pub fn save_key(ui: &AppWindow, shell: &mut Shell, key: &str) {
     {
         match ai.keys.set(&id, key.trim()) {
             Ok(()) => {
-                ai.has_key.insert(id, true);
+                ai.has_key.insert(id.clone(), true);
+                // A new key may see other models.
+                ai.models.remove(&id);
             }
             Err(error) => ai.push(
                 3,
@@ -408,6 +455,112 @@ pub fn save_key(ui: &AppWindow, shell: &mut Shell, key: &str) {
         }
     }
     refresh(ui, shell);
+    list_models(ui, shell);
+}
+
+/// Ask the selected provider for its models, on a thread of its own. Models
+/// that cannot chat (embeddings, speech, pictures) are left out. When no
+/// model is set yet, the first one is taken.
+pub fn list_models(ui: &AppWindow, shell: &mut Shell) {
+    let Some(ai) = &mut shell.ai else {
+        return;
+    };
+    let Some(provider) = ai.settings.selected_provider().cloned() else {
+        return;
+    };
+    let key = ai.keys.get(&provider.id).ok().flatten();
+    if key.is_none() && provider.preset.needs_key() {
+        ai.models.remove(&provider.id);
+        refresh(ui, shell);
+        return;
+    }
+    ai.models.insert(provider.id.clone(), ModelList::Loading);
+    let weak = ui.as_weak();
+    std::thread::Builder::new()
+        .name("aster-models".into())
+        .spawn(move || {
+            let never = AtomicBool::new(false);
+            let listed = connect(provider.clone(), key).list_models(&never);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| {
+                        let Some(ai) = &mut shell.ai else {
+                            return;
+                        };
+                        let list = match listed {
+                            Ok(models) => {
+                                let mut ids: Vec<String> = models
+                                    .into_iter()
+                                    .map(|m| m.id)
+                                    .filter(|id| can_chat(id))
+                                    .collect();
+                                ids.sort();
+                                ids.dedup();
+                                ModelList::Ready(ids)
+                            }
+                            Err(error) => ModelList::Failed(error.to_string()),
+                        };
+                        if let ModelList::Ready(ids) = &list
+                            && let Some(first) = ids.first()
+                            && let Some(entry) = ai
+                                .settings
+                                .providers
+                                .iter_mut()
+                                .find(|p| p.id == provider.id)
+                            && entry.model.trim().is_empty()
+                        {
+                            entry.model = first.clone();
+                            save_settings(ai);
+                        }
+                        ai.models.insert(provider.id.clone(), list);
+                        refresh(ui, shell);
+                    }),
+                );
+            });
+        })
+        .expect("cannot start a thread to list the models");
+    refresh(ui, shell);
+}
+
+/// List the selected provider's models unless they are listed or being
+/// listed already.
+fn list_models_if_new(ui: &AppWindow, shell: &mut Shell) {
+    let listed = shell.ai.as_ref().is_some_and(|ai| {
+        ai.settings.selected.as_ref().is_some_and(|id| {
+            matches!(
+                ai.models.get(id),
+                Some(ModelList::Ready(_) | ModelList::Loading)
+            )
+        })
+    });
+    if !listed {
+        list_models(ui, shell);
+    }
+}
+
+/// Whether a model id names a model one can chat with: providers list
+/// embedding, speech, picture and moderation models in the same place.
+fn can_chat(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    ![
+        "embed",
+        "tts",
+        "whisper",
+        "dall-e",
+        "audio",
+        "image",
+        "moderation",
+        "babbage",
+        "davinci",
+        "realtime",
+        "transcribe",
+        "search",
+        "rerank",
+        "sora",
+    ]
+    .iter()
+    .any(|word| id.contains(word))
 }
 
 pub fn delete_key(ui: &AppWindow, shell: &mut Shell) {
@@ -1044,4 +1197,35 @@ fn list_folder(path: &Path) -> Result<String, String> {
         json!({ "path": path.display().to_string(), "entries": entries, "total": total })
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_models_one_can_chat_with_are_listed() {
+        for id in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "gpt-5.1",
+            "claude-opus-5-5",
+            "qwen3:8b",
+        ] {
+            assert!(can_chat(id), "{id}");
+        }
+        for id in [
+            "text-embedding-3-small",
+            "whisper-1",
+            "tts-1-hd",
+            "dall-e-3",
+            "gpt-image-1",
+            "omni-moderation-latest",
+            "babbage-002",
+            "gpt-4o-realtime-preview",
+            "gpt-4o-transcribe",
+        ] {
+            assert!(!can_chat(id), "{id}");
+        }
+    }
 }

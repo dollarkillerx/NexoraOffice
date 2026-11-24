@@ -1030,6 +1030,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_insert_columns(strings.menu_insert_columns.into());
     s.set_menu_delete_rows(strings.menu_delete_rows.into());
     s.set_menu_delete_columns(strings.menu_delete_columns.into());
+    s.set_menu_hide_rows(strings.menu_hide_rows.into());
+    s.set_menu_hide_columns(strings.menu_hide_columns.into());
+    s.set_menu_unhide_rows(strings.menu_unhide_rows.into());
+    s.set_menu_unhide_columns(strings.menu_unhide_columns.into());
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
@@ -5580,6 +5584,23 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         tab.refusal = tab.delete_sheet(index).err();
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
+    ui.on_sheet_hide(handler!(|ui, shell, columns, hide| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        tab.hide_lines(columns, hide);
         if shell.sync_modified() {
             refresh_tabs(&ui, shell);
         }

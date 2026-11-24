@@ -1242,6 +1242,76 @@ impl SheetTab {
         Ok(())
     }
 
+    /// Hide the rows (or columns) the selection spans, or show the hidden
+    /// ones among them; with none hidden there, the hidden ones right
+    /// before it, as one would select around them in Excel. Shown lines
+    /// get the default size. One undo step.
+    pub fn hide_lines(&mut self, columns: bool, hide: bool) -> bool {
+        /// More lines than this are not hidden or shown at once.
+        const MAX_LINES: u32 = 100_000;
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let range = self.view.selection();
+        let (first, last) = if columns {
+            (range.first.col, range.last.col)
+        } else {
+            (range.first.row, range.last.row)
+        };
+        let last = last.min(first.saturating_add(MAX_LINES - 1));
+        let resize = |line: u32| {
+            if columns {
+                Resize::Column(line)
+            } else {
+                Resize::Row(line)
+            }
+        };
+        let Some(current) = self.view.sheet() else {
+            return false;
+        };
+        let axis = if columns {
+            &current.columns
+        } else {
+            &current.row_sizes
+        };
+        let default = axis.default_size();
+        let mut lines: Vec<u32> = (first..=last)
+            .filter(|&line| (axis.size(line) == 0.0) != hide)
+            .collect();
+        if !hide && lines.is_empty() {
+            // The hidden run just before the selection.
+            let mut line = first;
+            while line > 0 && axis.size(line - 1) == 0.0 {
+                line -= 1;
+                lines.push(line);
+            }
+        }
+        let sizes: Vec<(usize, Resize, f64, f64)> = lines
+            .iter()
+            .map(|&line| {
+                let before = axis.size(line);
+                (
+                    sheet,
+                    resize(line),
+                    before,
+                    if hide { 0.0 } else { default },
+                )
+            })
+            .collect();
+        if sizes.is_empty() {
+            return false;
+        }
+        for &(sheet, resize, _, after) in &sizes {
+            self.set_size(sheet, resize, after);
+        }
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            sizes,
+            ..Step::default()
+        });
+        self.refusal = None;
+        true
+    }
+
     /// Lines moved on `sheet`: what saving must write moves with them.
     fn moved(&mut self, sheet: usize, lines: Lines, others: &[(usize, CellRef)]) {
         let shift = |at: CellRef| -> Option<CellRef> {
@@ -2571,6 +2641,75 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn rows_and_columns_hide_show_and_save() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("隠す.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        tab.view.select(at("B2"));
+        tab.view.begin_edit(EditMode::Enter, Some("x".into()));
+        tab.commit("en");
+        let size = |tab: &SheetTab, columns: bool, line: u32| {
+            let sheet = tab.view.sheet().unwrap();
+            if columns {
+                sheet.columns.size(line)
+            } else {
+                sheet.row_sizes.size(line)
+            }
+        };
+        let width = size(&tab, true, 1);
+        // Column B and rows 4 to 5.
+        tab.view.select(at("B1"));
+        assert!(tab.hide_lines(true, true));
+        tab.view.select(at("A4"));
+        tab.view.extend_to(at("A5"));
+        assert!(tab.hide_lines(false, true));
+        assert_eq!((size(&tab, true, 1), size(&tab, false, 3)), (0.0, 0.0));
+        // Hiding what is hidden does nothing.
+        assert!(!tab.hide_lines(false, true));
+
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let xml = {
+            let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+            String::from_utf8(package.read("xl/worksheets/sheet1.xml").unwrap()).unwrap()
+        };
+        assert!(
+            xml.contains(r#"<col min="2" max="2" width="8.43" hidden="1"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<row r="4" hidden="1"/><row r="5" hidden="1"/>"#),
+            "{xml}"
+        );
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(again.sheets[0].columns.size(1), 0.0);
+        assert_eq!(again.sheets[0].row_sizes.size(4), 0.0);
+
+        // Showing: with C selected, the hidden B right before it.
+        tab.view.select(at("C1"));
+        assert!(tab.hide_lines(true, false));
+        assert_eq!(size(&tab, true, 1), width);
+        // Undo hides it again.
+        tab.undo();
+        assert_eq!(size(&tab, true, 1), 0.0);
+        // A selection over hidden rows shows them.
+        tab.view.select(at("A3"));
+        tab.view.extend_to(at("A6"));
+        assert!(tab.hide_lines(false, false));
+        assert!(size(&tab, false, 3) > 0.0 && size(&tab, false, 4) > 0.0);
     }
 
     #[test]

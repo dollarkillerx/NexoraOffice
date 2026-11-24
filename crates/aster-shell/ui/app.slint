@@ -295,6 +295,8 @@ export component AppWindow inherits Window {
     callback edit-select-all();
     // Insert (or delete) the columns (or rows) the selection spans.
     callback sheet-lines(/* columns */ bool, /* insert */ bool);
+    // Hide (or show) the columns (or rows) the selection spans.
+    callback sheet-hide(/* columns */ bool, /* hide */ bool);
     callback dialog-save();
     callback dialog-discard();
     callback dialog-cancel();
@@ -638,6 +640,38 @@ export component AppWindow inherits Window {
                 enabled: root.viewer == 1 && root.can-save;
                 activated => {
                     root.sheet-lines(true, false);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-hide-rows;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-hide(false, true);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-hide-columns;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-hide(true, true);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-unhide-rows;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-hide(false, false);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-unhide-columns;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-hide(true, false);
                 }
             }
 

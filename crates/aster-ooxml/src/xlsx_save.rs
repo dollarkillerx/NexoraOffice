@@ -940,8 +940,11 @@ fn rewrite_sheet(
         by_row.entry(*row).or_default();
     }
     // A row's start tag, with its new height if it has one.
+    // A hidden row (no height) keeps the height it had, to come back with.
     let row_tag = |tag: String, row: u32| match sizes.heights.get(&row) {
+        Some(points) if *points == 0.0 => set_attribute(&tag, "hidden", "1"),
         Some(points) => {
+            let tag = structure::drop_attribute(&tag, "hidden");
             let tag = set_attribute(&tag, "ht", &number(*points));
             set_attribute(&tag, "customHeight", "1")
         }
@@ -1133,7 +1136,17 @@ fn columns_xml(
     }
     for &(index, width) in widths {
         let column = index + 1;
+        // A hidden column (no width) keeps the width it had, to come back
+        // with; Excel wants one, so a column without gets the default.
         let set = |attributes: &mut Vec<(String, String)>| {
+            if width == 0.0 {
+                attributes.retain(|(k, _)| k != "hidden");
+                if !attributes.iter().any(|(k, _)| k == "width") {
+                    attributes.push(("width".into(), "8.43".into()));
+                }
+                attributes.push(("hidden".into(), "1".into()));
+                return;
+            }
             attributes.retain(|(k, _)| k != "width" && k != "customWidth" && k != "hidden");
             attributes.push(("width".into(), number(width)));
             attributes.push(("customWidth".into(), "1".into()));

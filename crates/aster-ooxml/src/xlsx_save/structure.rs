@@ -375,7 +375,7 @@ fn columns(element: &str, lines: &Lines) -> String {
 }
 
 /// A start tag without attribute `name`.
-fn drop_attribute(tag: &str, name: &str) -> String {
+pub(super) fn drop_attribute(tag: &str, name: &str) -> String {
     let pattern = format!(" {name}=");
     let Some(found) = tag.find(&pattern) else {
         return tag.to_owned();

@@ -251,16 +251,27 @@ fn calculate_loop(
 /// Undo and redo, one step per entry, paste or clear.
 #[derive(Debug, Default)]
 pub struct History {
-    undo: Vec<Vec<Change>>,
-    redo: Vec<Vec<Change>>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// How deep the undo stack was when the file was last saved; `None`
     /// once that state can no longer be reached.
     saved: Option<usize>,
 }
 
+/// One entry, paste or clear: its cell changes, and the cell formats it
+/// added (a date format for a typed date), which go with it on undo.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub changes: Vec<Change>,
+    /// How many styles the workbook had before the step.
+    styles_before: usize,
+    /// The styles undo took away, put back by redo.
+    added: Vec<aster_sheets::CellStyle>,
+}
+
 impl History {
-    fn push(&mut self, step: Vec<Change>) {
-        if step.is_empty() {
+    fn push(&mut self, step: Step) {
+        if step.changes.is_empty() {
             return;
         }
         if self.saved.is_some_and(|saved| saved > self.undo.len()) {
@@ -334,6 +345,10 @@ pub struct SheetTab {
     pub formulas_changed: bool,
     /// The file as last read or saved: saving starts from it.
     pub source: Arc<Vec<u8>>,
+    /// How many cell formats that file has. Styles past these were added by
+    /// typing and are not in the file yet; undo may take them away, never
+    /// the file's own.
+    file_styles: usize,
     pub saving: bool,
     /// What was last copied or cut here.
     pub clip: Option<aster_sheets::Clip>,
@@ -346,6 +361,7 @@ impl SheetTab {
         path: Option<PathBuf>,
         tokens: &theme::Tokens,
     ) -> Self {
+        let view_styles = workbook.styles.len();
         let mut view = SheetView::new(Arc::new(workbook));
         view.set_style(sheet_style(tokens));
         let mut history = History::default();
@@ -360,6 +376,7 @@ impl SheetTab {
             dirty: BTreeSet::new(),
             edited: BTreeSet::new(),
             formulas_changed: false,
+            file_styles: view_styles,
             source,
             saving: false,
             clip: None,
@@ -440,10 +457,11 @@ impl SheetTab {
             return Vec::new();
         };
         let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
         let (entry, look) = input::read(&text, &reading);
         let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
         let changes = self.view.workbook_mut().set_cells(sheet, vec![(at, cell)]);
-        self.record(changes)
+        self.record(changes, styles_before)
     }
 
     /// Empty the selected cells, keeping their formats. One undo step.
@@ -467,8 +485,9 @@ impl SheetTab {
         if cleared.is_empty() {
             return Vec::new();
         }
+        let styles_before = self.view.workbook().styles.len();
         let changes = self.view.workbook_mut().set_cells(sheet_index, cleared);
-        self.record(changes)
+        self.record(changes, styles_before)
     }
 
     /// Copy (or cut) the selection; returns the text for the system
@@ -495,6 +514,7 @@ impl SheetTab {
             return Vec::new();
         }
         let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
         let range = self.view.selection();
         let target = range.first;
         let same = |a: &str, b: &str| a.replace('\r', "") == b.replace('\r', "");
@@ -578,20 +598,40 @@ impl SheetTab {
         }
         self.view.select(pasted.first);
         self.view.extend_to(pasted.last);
-        self.record(changes)
+        self.record(changes, styles_before)
     }
 
     /// Put cells in place on the current sheet as one undo step.
     pub fn put(&mut self, cells: Vec<(CellRef, Option<aster_sheets::Cell>)>) -> Vec<Change> {
         let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
         let changes = self.view.workbook_mut().set_cells(sheet, cells);
-        self.record(changes)
+        self.record(changes, styles_before)
     }
 
-    fn record(&mut self, changes: Vec<Change>) -> Vec<Change> {
+    fn record(&mut self, changes: Vec<Change>, styles_before: usize) -> Vec<Change> {
+        if changes.is_empty() {
+            // Nothing changed after all: a style made for it is not needed.
+            self.drop_styles(styles_before);
+            return changes;
+        }
         self.note(&changes);
-        self.history.push(changes.clone());
+        self.history.push(Step {
+            changes: changes.clone(),
+            styles_before,
+            added: Vec::new(),
+        });
         changes
+    }
+
+    /// Take away the styles past `count`, but never the file's own; returns
+    /// them.
+    fn drop_styles(&mut self, count: usize) -> Vec<aster_sheets::CellStyle> {
+        let keep = count.max(self.file_styles);
+        if self.view.workbook().styles.len() <= keep {
+            return Vec::new();
+        }
+        self.view.workbook_mut().styles.split_off(keep)
     }
 
     /// Remember which cells saving must write.
@@ -632,6 +672,15 @@ impl SheetTab {
         };
         self.source = bytes;
         self.path = Some(path.to_owned());
+        // The written file holds every style the job had, even one undone
+        // meanwhile: those are the file's own now.
+        let written_styles = &job.workbook.styles;
+        let now = self.view.workbook().styles.len();
+        if now < written_styles.len() {
+            let missing = written_styles[now..].to_vec();
+            self.view.workbook_mut().styles.extend(missing);
+        }
+        self.file_styles = self.file_styles.max(written_styles.len());
         let unchanged_since = self.history.depth() == job.depth;
         for cell in &job.changes.cells {
             // A cell is still to be written if it changed again since.
@@ -656,11 +705,14 @@ impl SheetTab {
     /// Undo the last step. Returns the changes made, to recalculate.
     pub fn undo(&mut self) -> Vec<Change> {
         self.view.cancel_edit();
-        let Some(step) = self.history.undo.pop() else {
+        let Some(mut step) = self.history.undo.pop() else {
             return Vec::new();
         };
-        let inverse: Vec<Change> = step.iter().rev().map(Change::inverse).collect();
+        let inverse: Vec<Change> = step.changes.iter().rev().map(Change::inverse).collect();
         self.view.workbook_mut().apply(&inverse);
+        // The formats the step added go with it: no cell uses them now,
+        // since every later step was undone first.
+        step.added = self.drop_styles(step.styles_before);
         self.note(&inverse);
         self.show(&inverse);
         self.history.redo.push(step);
@@ -669,13 +721,21 @@ impl SheetTab {
 
     pub fn redo(&mut self) -> Vec<Change> {
         self.view.cancel_edit();
-        let Some(step) = self.history.redo.pop() else {
+        let Some(mut step) = self.history.redo.pop() else {
             return Vec::new();
         };
-        self.view.workbook_mut().apply(&step);
-        self.note(&step);
-        self.show(&step);
-        let applied = step.clone();
+        // Its formats come back at the places its cells refer to.
+        let added = std::mem::take(&mut step.added);
+        if !added.is_empty() {
+            let workbook = self.view.workbook_mut();
+            if workbook.styles.len() == step.styles_before.max(self.file_styles) {
+                workbook.styles.extend(added);
+            }
+        }
+        self.view.workbook_mut().apply(&step.changes);
+        self.note(&step.changes);
+        self.show(&step.changes);
+        let applied = step.changes.clone();
         self.history.undo.push(step);
         applied
     }
@@ -1022,7 +1082,7 @@ mod tests {
             .clone();
         assert_eq!(formula.as_deref(), Some("A1+A2"));
         assert!(tab.formulas_changed);
-        let edits = edits(&tab.history.undo[1]);
+        let edits = edits(&tab.history.undo[1].changes);
         assert!(matches!(&edits[0], Edit::Formula { formula, .. } if formula == "A1+A2"));
 
         // A date typed in English is month first; in Chinese year first.
@@ -1210,5 +1270,83 @@ mod tests {
         assert!(failed.is_err());
         tab.finish_save(&job, &file, None);
         assert!(tab.is_modified() && !tab.saving);
+    }
+
+    #[test]
+    fn undo_takes_away_the_formats_an_entry_added() {
+        use aster_surface::cell_editor::EditMode;
+
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("en")
+        };
+        let styles = |tab: &SheetTab| tab.view.workbook().styles.len();
+        let mut tab = tab();
+        assert_eq!(styles(&tab), 2);
+        enter(&mut tab, "B1", "50%");
+        assert_eq!(styles(&tab), 3);
+        // The second percentage uses the same new format.
+        enter(&mut tab, "B2", "60%");
+        assert_eq!(styles(&tab), 3);
+        tab.undo();
+        assert_eq!(styles(&tab), 3, "B1 still uses it");
+        tab.undo();
+        assert_eq!(styles(&tab), 2);
+        assert_eq!(value(&tab, "B1"), None);
+        // Redo brings the format back where B1 refers to it.
+        tab.redo();
+        assert_eq!(styles(&tab), 3);
+        let b1 = tab.view.sheet().unwrap().cell(at("B1")).unwrap().clone();
+        assert_eq!(tab.view.workbook().display(&b1).unwrap().text, "50%");
+        tab.redo();
+        assert_eq!(styles(&tab), 3);
+        // A new step after undoing: the format is made again, at the same
+        // place.
+        tab.undo();
+        tab.undo();
+        enter(&mut tab, "C1", "$7");
+        assert_eq!(styles(&tab), 3);
+        assert!(!tab.history.can_redo());
+        tab.undo();
+        assert_eq!(styles(&tab), 2);
+    }
+
+    #[test]
+    fn formats_already_saved_stay_on_undo() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("formats.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let before = tab.view.workbook().styles.len();
+        tab.view.select(at("A1"));
+        tab.view.begin_edit(EditMode::Enter, Some("¥1,200".into()));
+        tab.commit("ja");
+        assert_eq!(tab.view.workbook().styles.len(), before + 1);
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        // The file has the format now: undoing the entry keeps it, so the
+        // next new format does not take its place.
+        tab.undo();
+        assert_eq!(tab.view.workbook().styles.len(), before + 1);
+        tab.view.begin_edit(EditMode::Enter, Some("$2.50".into()));
+        tab.commit("en");
+        assert_eq!(tab.view.workbook().styles.len(), before + 2);
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let a1 = again.sheets[0].cell(at("A1")).unwrap();
+        assert_eq!(again.display(a1).unwrap().text, "$2.50");
+        assert_eq!(again.styles.len(), before + 2);
     }
 }

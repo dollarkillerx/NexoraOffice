@@ -1482,7 +1482,11 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     let what = blocker_label(strings, what);
                     notice = i18n::fill(strings.sheet_holds, "what", &what);
                 }
-                None => {}
+                None => {
+                    if let Some(count) = tab.find.replaced {
+                        notice = i18n::fill(strings.notice_replaced, "count", &group_digits(count));
+                    }
+                }
             }
             ui.set_status_notice(notice.into());
         }
@@ -2875,6 +2879,24 @@ fn find_position(strings: &i18n::Strings, editor: &MarkdownEditor) -> String {
 /// Push the find bar's state into the window.
 fn refresh_find(ui: &AppWindow, shell: &mut Shell) {
     let strings = shell.language.strings();
+    if let Some(tab) = shell.active_sheet() {
+        let find = &tab.find;
+        ui.set_find_open(find.open);
+        ui.set_find_replace(find.replace_open);
+        ui.set_find_case(find.query.case_sensitive);
+        ui.set_find_whole(find.query.whole_word);
+        ui.set_find_regex(find.query.regex);
+        ui.set_find_error(find.error.is_some());
+        ui.set_find_busy(false);
+        ui.set_find_position(sheet_find_position(strings, find).into());
+        if ui.get_find_query().as_str() != find.query.pattern {
+            ui.set_find_query(find.query.pattern.as_str().into());
+        }
+        if ui.get_find_replacement().as_str() != find.replacement {
+            ui.set_find_replacement(find.replacement.as_str().into());
+        }
+        return;
+    }
     let Some(editor) = shell.active_markdown() else {
         ui.set_find_open(false);
         return;
@@ -2894,6 +2916,43 @@ fn refresh_find(ui: &AppWindow, shell: &mut Shell) {
     if ui.get_find_replacement().as_str() != find.replacement {
         ui.set_find_replacement(find.replacement.as_str().into());
     }
+}
+
+/// Where the find bar is on a workbook: "3 / 12", none, or a bad pattern.
+fn sheet_find_position(strings: &i18n::Strings, find: &office::SheetFind) -> String {
+    if find.error.is_some() {
+        return strings.find_bad_pattern.to_owned();
+    }
+    if find.query.pattern.is_empty() {
+        return String::new();
+    }
+    if find.matches.is_empty() {
+        return strings.find_none.to_owned();
+    }
+    let count = group_digits(find.matches.len());
+    let count = if find.truncated {
+        i18n::fill(strings.find_too_many, "count", &count)
+    } else {
+        count
+    };
+    let index = find
+        .current
+        .map_or_else(|| "–".to_owned(), |index| group_digits(index + 1));
+    i18n::fill(
+        &i18n::fill(strings.find_position, "index", &index),
+        "count",
+        &count,
+    )
+}
+
+/// After the find bar acted on a workbook: the cells it changed are
+/// recalculated, the selection and the bar are shown.
+fn after_sheet_find(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_sheets::Change>) {
+    if !changes.is_empty() && shell.sync_modified() {
+        refresh_tabs(ui, shell);
+    }
+    refresh_find(ui, shell);
+    after_sheet_change(ui, shell, changes);
 }
 
 /// After the find bar's state changed: redraw and say so.
@@ -5547,6 +5606,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     // --- Find and replace ---
 
     ui.on_menu_find(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.open_find(false);
+            let query = tab.find.query.clone();
+            tab.set_query(query);
+            after_sheet_find(&ui, shell, Vec::new());
+            ui.invoke_focus_find_query();
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };
@@ -5559,6 +5626,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_menu_replace(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.open_find(true);
+            let query = tab.find.query.clone();
+            tab.set_query(query);
+            after_sheet_find(&ui, shell, Vec::new());
+            ui.invoke_focus_find_query();
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };
@@ -5571,6 +5646,25 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_menu_find_selection(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            // What the active cell holds, as the formula bar shows it.
+            let text = tab
+                .view
+                .sheet()
+                .and_then(|sheet| sheet.cell(tab.view.selected()))
+                .map(|cell| tab.view.workbook().input_text(cell))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let replace = tab.find.replace_open;
+                tab.open_find(replace);
+                let mut query = tab.find.query.clone();
+                query.pattern = text;
+                query.regex = false;
+                tab.set_query(query);
+            }
+            after_sheet_find(&ui, shell, Vec::new());
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };
@@ -5580,6 +5674,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_query_edited(handler!(|ui, shell, text| {
+        if let Some(tab) = shell.active_sheet() {
+            let mut query = tab.find.query.clone();
+            query.pattern = text.to_string();
+            tab.set_query(query);
+            after_sheet_find(&ui, shell, Vec::new());
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };
@@ -5590,12 +5691,27 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_replacement_edited(handler!(|_ui, shell, text| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.find.replacement = text.to_string();
+            return;
+        }
         if let Some(editor) = shell.active_markdown() {
             editor.find.replacement = text.to_string();
         }
     }));
 
     ui.on_find_toggle(handler!(|ui, shell, option| {
+        if let Some(tab) = shell.active_sheet() {
+            let mut query = tab.find.query.clone();
+            match option {
+                0 => query.case_sensitive = !query.case_sensitive,
+                1 => query.whole_word = !query.whole_word,
+                _ => query.regex = !query.regex,
+            }
+            tab.set_query(query);
+            after_sheet_find(&ui, shell, Vec::new());
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };
@@ -5610,6 +5726,11 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_next(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.find_step(true);
+            after_sheet_find(&ui, shell, Vec::new());
+            return;
+        }
         let job = shell
             .active_markdown()
             .and_then(|editor| editor.find_step(true));
@@ -5617,6 +5738,11 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_previous(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.find_step(false);
+            after_sheet_find(&ui, shell, Vec::new());
+            return;
+        }
         let job = shell
             .active_markdown()
             .and_then(|editor| editor.find_step(false));
@@ -5624,6 +5750,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_close(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            tab.close_find();
+        }
         if let Some(editor) = shell.active_markdown() {
             editor.cancel_replace_all();
             editor.close_find();
@@ -5633,6 +5762,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_replace_one(handler!(|ui, shell| {
+        let language = shell.language.tag();
+        if let Some(tab) = shell.active_sheet() {
+            let changes = tab.replace_one(language);
+            after_sheet_find(&ui, shell, changes);
+            return;
+        }
         let changed = shell
             .active_markdown()
             .is_some_and(MarkdownEditor::replace_one);
@@ -5641,6 +5776,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_replace_all(handler!(|ui, shell| {
+        let language = shell.language.tag();
+        if let Some(tab) = shell.active_sheet() {
+            let changes = tab.replace_all(language);
+            after_sheet_find(&ui, shell, changes);
+            return;
+        }
         let Some(editor) = shell.active_markdown() else {
             return;
         };

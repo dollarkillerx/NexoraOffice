@@ -646,7 +646,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find;
                 shortcut: @keys(Control + F);
-                enabled: root.editing;
+                enabled: root.editing || root.viewer == 1;
                 activated => {
                     root.menu-find();
                 }
@@ -655,7 +655,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-next;
                 shortcut: @keys(Control + G);
-                enabled: root.editing;
+                enabled: root.editing || root.viewer == 1;
                 activated => {
                     root.find-next();
                 }
@@ -664,7 +664,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-previous;
                 shortcut: @keys(Control + Shift + G);
-                enabled: root.editing;
+                enabled: root.editing || root.viewer == 1;
                 activated => {
                     root.find-previous();
                 }
@@ -673,7 +673,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-selection;
                 shortcut: @keys(Control + E);
-                enabled: root.editing;
+                enabled: root.editing || root.viewer == 1;
                 activated => {
                     root.menu-find-selection();
                 }
@@ -682,7 +682,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-replace;
                 shortcut: @keys(Control + Alt + F);
-                enabled: root.editing;
+                enabled: root.editing || root.viewer == 1;
                 activated => {
                     root.menu-replace();
                 }
@@ -1145,7 +1145,8 @@ export component AppWindow inherits Window {
                         x: 0;
                         y: 0;
                         width: parent.width;
-                        visible: root.find-open && root.active-kind == 3;
+                        // Markdown documents and workbooks.
+                        visible: root.find-open && (root.active-kind == 3 || root.viewer == 1);
                         replace-visible: root.find-replace;
                         query <=> root.find-query;
                         replacement <=> root.find-replacement;
@@ -1185,7 +1186,7 @@ export component AppWindow inherits Window {
                     // tab opens; other views are stacked on top of it.
                     formula-bar := FormulaBar {
                         x: 0;
-                        y: 0;
+                        y: findbar.visible ? findbar.height : 0px;
                         width: parent.width;
                         visible: root.viewer == 1;
                         address: root.cell-address;
@@ -1234,7 +1235,7 @@ export component AppWindow inherits Window {
                     }
 
                     surface := Rectangle {
-                        y: findbar.visible ? findbar.height : formula-bar.visible ? formula-bar.height : 0px;
+                        y: (findbar.visible ? findbar.height : 0px) + (formula-bar.visible ? formula-bar.height : 0px);
                         height: parent.height - self.y - (sheet-bar.visible ? sheet-bar.height : notes-panel.visible ? notes-panel.height : 0px);
                         visible: root.surface-active;
                         // The source takes the whole width, the left half, or

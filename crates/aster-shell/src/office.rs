@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use aster_ooxml::{ErrorKind, FormatCodec, Pptx, Xlsx};
 use aster_sheets::input::{self, Reading};
+use std::sync::atomic::AtomicBool;
+
+use aster_markdown::search::{Finder, Query};
 use aster_sheets::structure::Lines;
 use aster_sheets::{HAlign, MAX_COLUMNS, MAX_ROWS, StyleEdit};
 use aster_surface::cell_editor::EditMode;
@@ -349,6 +352,29 @@ struct Marks {
     rows: Vec<u32>,
 }
 
+/// The find bar on a workbook: what to look for and the cells of the sheet
+/// in front that have it, by rows as Excel searches.
+#[derive(Debug, Default)]
+pub struct SheetFind {
+    pub open: bool,
+    pub replace_open: bool,
+    pub query: Query,
+    pub replacement: String,
+    /// The cells that match, in order: row by row, left to right.
+    pub matches: Vec<CellRef>,
+    /// More cells matched than are kept.
+    pub truncated: bool,
+    /// Index of the cell selected from `matches`.
+    pub current: Option<usize>,
+    /// Why the query is not a valid regular expression.
+    pub error: Option<String>,
+    /// How many cells the last "replace all" changed.
+    pub replaced: Option<usize>,
+}
+
+/// A search keeps at most this many cells.
+const MAX_FOUND: usize = 100_000;
+
 /// Rows or columns inserted or deleted: the sheets before and after, and
 /// the cells of other sheets whose formulas changed with them.
 #[derive(Debug, Clone)]
@@ -485,6 +511,8 @@ pub struct SheetTab {
     pub saving: bool,
     /// What was last copied or cut here.
     pub clip: Option<aster_sheets::Clip>,
+    /// The find bar on this workbook and what it found.
+    pub find: SheetFind,
 }
 
 impl SheetTab {
@@ -522,6 +550,7 @@ impl SheetTab {
             source,
             saving: false,
             clip: None,
+            find: SheetFind::default(),
         }
     }
 
@@ -773,6 +802,173 @@ impl SheetTab {
         }
         let changes = self.view.workbook_mut().set_cells(sheet, cells);
         self.record(changes, styles_before)
+    }
+
+    // --- Find and replace ---
+
+    /// Open the find bar, with the replace field if `replace`.
+    pub fn open_find(&mut self, replace: bool) {
+        self.find.open = true;
+        self.find.replace_open = replace;
+        self.find.replaced = None;
+    }
+
+    pub fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.current = None;
+    }
+
+    fn finder(&mut self) -> Option<Finder> {
+        match Finder::new(&self.find.query) {
+            Ok(finder) => {
+                self.find.error = None;
+                finder
+            }
+            Err(error) => {
+                self.find.error = Some(error);
+                None
+            }
+        }
+    }
+
+    /// Look for the query again on the sheet in front, as it is now. The
+    /// cells are searched in what the formula bar shows: the input, or the
+    /// formula with its `=`.
+    fn research(&mut self) {
+        self.find.matches.clear();
+        self.find.truncated = false;
+        self.find.current = None;
+        let Some(finder) = self.finder() else {
+            return;
+        };
+        let workbook = self.view.workbook();
+        let Some(sheet) = self.view.sheet() else {
+            return;
+        };
+        'rows: for row in sheet.rows() {
+            for cell in &row.cells {
+                let text = workbook.input_text(cell);
+                if text.is_empty() {
+                    continue;
+                }
+                if finder.find_from(&text, 0).is_some() {
+                    if self.find.matches.len() == MAX_FOUND {
+                        self.find.truncated = true;
+                        break 'rows;
+                    }
+                    self.find.matches.push(CellRef::new(row.index, cell.col));
+                }
+            }
+        }
+    }
+
+    /// A new query: search, and select the first cell after the active one
+    /// that has it.
+    pub fn set_query(&mut self, query: Query) {
+        self.find.query = query;
+        self.find.replaced = None;
+        self.research();
+        self.step_from(self.view.selected(), true, true);
+    }
+
+    /// Select the next (or previous) cell that has the query, wrapping
+    /// around the sheet. Looks again first: cells may have changed.
+    pub fn find_step(&mut self, forward: bool) {
+        self.view.cancel_edit();
+        self.research();
+        self.step_from(self.view.selected(), forward, false);
+    }
+
+    /// Select the match at or after `from` (`inclusive`), or the one before
+    /// it going back.
+    fn step_from(&mut self, from: CellRef, forward: bool, inclusive: bool) {
+        let key = |at: &CellRef| (at.row, at.col);
+        let from = key(&from);
+        let matches = &self.find.matches;
+        if matches.is_empty() {
+            return;
+        }
+        let index = if forward {
+            matches
+                .iter()
+                .position(|at| {
+                    if inclusive {
+                        key(at) >= from
+                    } else {
+                        key(at) > from
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            matches
+                .iter()
+                .rposition(|at| key(at) < from)
+                .unwrap_or(matches.len() - 1)
+        };
+        self.find.current = Some(index);
+        let at = matches[index];
+        self.view.select(at);
+    }
+
+    /// The input of a cell with every match of the query replaced; `None`
+    /// if it has none.
+    fn replaced_input(&self, finder: &Finder, at: CellRef) -> Option<String> {
+        let workbook = self.view.workbook();
+        let cell = self.view.sheet()?.cell(at)?;
+        let text = workbook.input_text(cell);
+        let never = AtomicBool::new(false);
+        let found = finder.find_all(&text, &never, |_| {})?;
+        let (range, with) =
+            finder.replace_all(&text, &found.matches, &self.find.replacement, &never)?;
+        let mut out = text.clone();
+        out.replace_range(range, &with);
+        (out != text).then_some(out)
+    }
+
+    /// Replace in the selected cell if it is a match, as if its new input
+    /// were typed, then go to the next match. One undo step.
+    pub fn replace_one(&mut self, language: &str) -> Vec<Change> {
+        self.view.cancel_edit();
+        let at = self.view.selected();
+        let Some(finder) = self.finder() else {
+            return Vec::new();
+        };
+        let changes = match self.replaced_input(&finder, at) {
+            Some(text) => self.type_cells(at, &[vec![text]], language),
+            None => Vec::new(),
+        };
+        self.research();
+        self.step_from(at, true, false);
+        changes
+    }
+
+    /// Replace in every cell of the sheet that has the query, as if each new
+    /// input were typed. One undo step.
+    pub fn replace_all(&mut self, language: &str) -> Vec<Change> {
+        self.view.cancel_edit();
+        self.research();
+        let Some(finder) = self.finder() else {
+            return Vec::new();
+        };
+        let sheet = self.view.sheet_index();
+        let styles_before = self.view.workbook().styles.len();
+        let reading = self.reading(language);
+        let targets = self.find.matches.clone();
+        let mut cells = Vec::new();
+        for at in targets {
+            let Some(text) = self.replaced_input(&finder, at) else {
+                continue;
+            };
+            let (entry, look) = input::read(&text, &reading);
+            let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
+            cells.push((at, cell));
+        }
+        let count = cells.len();
+        let changes = self.view.workbook_mut().set_cells(sheet, cells);
+        let changes = self.record(changes, styles_before);
+        self.find.replaced = Some(count);
+        self.research();
+        changes
     }
 
     /// Put cells in place on the current sheet as one undo step.
@@ -2375,6 +2571,75 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn find_and_replace_in_a_sheet() {
+        use aster_surface::cell_editor::EditMode;
+
+        let mut tab = tab();
+        for (cell, text) in [
+            ("B1", "東京 支店"),
+            ("A3", "大阪"),
+            ("C2", "東京本社"),
+            ("D4", "=LEN(B1)"),
+        ] {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("ja");
+        }
+        tab.view.select(at("A1"));
+        tab.open_find(true);
+        let query = |pattern: &str| Query {
+            pattern: pattern.into(),
+            ..Query::default()
+        };
+        tab.set_query(query("東京"));
+        // By rows: B1, then C2. The first after A1 is selected.
+        assert_eq!(tab.find.matches, [at("B1"), at("C2")]);
+        assert_eq!((tab.find.current, tab.view.selected()), (Some(0), at("B1")));
+        tab.find_step(true);
+        assert_eq!(tab.view.selected(), at("C2"));
+        tab.find_step(true);
+        assert_eq!(tab.view.selected(), at("B1"), "wraps around");
+        tab.find_step(false);
+        assert_eq!(tab.view.selected(), at("C2"));
+        // Formulas are found in what the formula bar shows.
+        tab.set_query(query("len("));
+        assert_eq!(tab.find.matches, [at("D4")]);
+        // A bad regular expression says so.
+        tab.set_query(Query {
+            regex: true,
+            ..query("(")
+        });
+        assert!(tab.find.error.is_some() && tab.find.matches.is_empty());
+
+        // Replace one: the selected cell, then on to the next.
+        tab.set_query(query("東京"));
+        tab.find.replacement = "名古屋".into();
+        tab.view.select(at("B1"));
+        tab.replace_one("ja");
+        let text = |tab: &SheetTab, cell: &str| {
+            tab.view
+                .sheet()
+                .and_then(|s| s.cell(at(cell)))
+                .map(|c| tab.view.workbook().input_text(c))
+        };
+        assert_eq!(text(&tab, "B1").as_deref(), Some("名古屋 支店"));
+        assert_eq!(tab.view.selected(), at("C2"));
+        assert_eq!(tab.find.matches, [at("C2")]);
+        tab.undo();
+        assert_eq!(text(&tab, "B1").as_deref(), Some("東京 支店"));
+
+        // Replace all: one undo step.
+        let changes = tab.replace_all("ja");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(tab.find.replaced, Some(2));
+        assert!(tab.find.matches.is_empty());
+        assert_eq!(text(&tab, "C2").as_deref(), Some("名古屋本社"));
+        tab.undo();
+        assert_eq!(text(&tab, "B1").as_deref(), Some("東京 支店"));
+        assert_eq!(text(&tab, "C2").as_deref(), Some("東京本社"));
     }
 
     #[test]

@@ -6,6 +6,9 @@ component ToolControl inherits Rectangle {
     callback activated;
     // An entry of a select field's list was chosen.
     callback chosen(int);
+    // A list is about to open: the keyboard leaves any text field first,
+    // or a click in the list would not arrive.
+    callback opening();
     property <bool> is-button: item.control == 0 || item.control == 1 || item.control == 6;
     property <bool> is-gap: item.control == 4 || item.control == 5;
     property <length> fixed-width: is-button ? Tokens.control-height : item.control == 4 ? 9px : item.control == 5 ? 0px : item.width;
@@ -126,8 +129,10 @@ component ToolControl inherits Rectangle {
         enabled: root.item.enabled && !root.is-gap;
         clicked => {
             if (root.item.control == 6) {
+                root.opening();
                 palette.show();
             } else if (root.item.options.length > 0) {
+                root.opening();
                 options.show();
             } else {
                 root.activated();
@@ -205,6 +210,8 @@ export component Toolbar inherits Rectangle {
     callback command(int);
     // An entry of a select field's list: the field's command, the index.
     callback option(int, int);
+    // A list is about to open.
+    callback opening();
     height: Tokens.toolbar-height + 2 * Tokens.space-xs + 2px;
     background: Tokens.surface;
 
@@ -234,6 +241,9 @@ export component Toolbar inherits Rectangle {
                     }
                     chosen(index) => {
                         root.option(item.command, index);
+                    }
+                    opening => {
+                        root.opening();
                     }
                 }
             }

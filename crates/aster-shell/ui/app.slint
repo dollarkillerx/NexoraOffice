@@ -1168,6 +1168,11 @@ export component AppWindow inherits Window {
                     option(id, index) => {
                         root.toolbar-option(id, index);
                     }
+                    // The list then acts on the document, which takes the
+                    // keyboard back from the find bar or another field.
+                    opening => {
+                        scope.focus();
+                    }
                 }
 
                 content := Rectangle {

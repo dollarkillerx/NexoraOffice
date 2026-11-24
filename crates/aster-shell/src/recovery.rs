@@ -1,4 +1,6 @@
-//! Recovery records of Markdown documents, as the shell sees them.
+//! Recovery records of Markdown documents and workbooks, as the shell sees
+//! them. A workbook's record has no journal of edits: its checkpoint is the
+//! whole workbook as saving would write it.
 //!
 //! A record's journal holds the text; its named values say what the text was:
 //! the tab's title, the file it belongs to, how that file is written, and what
@@ -17,6 +19,7 @@ use aster_markdown::{Encoding, LineEnding, Rope, TextFormat};
 use aster_storage::{FileState, Fingerprint, FoundRecord, RecoveryRoot};
 
 const KIND: &str = "markdown";
+const KIND_WORKBOOK: &str = "workbook";
 const KEY_KIND: &str = "kind";
 const KEY_TITLE: &str = "title";
 const KEY_PATH: &str = "path";
@@ -32,6 +35,8 @@ pub struct RecordInfo {
     pub format: TextFormat,
     /// What the file held when the document last read or wrote it.
     pub disk: Option<Fingerprint>,
+    /// A workbook rather than a Markdown document.
+    pub workbook: bool,
 }
 
 fn encode_format(format: &TextFormat) -> String {
@@ -101,7 +106,12 @@ impl RecordInfo {
     /// The named values to store with a record.
     pub fn to_meta(&self) -> Vec<(String, Vec<u8>)> {
         let mut meta = vec![
-            (KEY_KIND.to_owned(), KIND.as_bytes().to_vec()),
+            (
+                KEY_KIND.to_owned(),
+                if self.workbook { KIND_WORKBOOK } else { KIND }
+                    .as_bytes()
+                    .to_vec(),
+            ),
             (KEY_TITLE.to_owned(), self.title.as_bytes().to_vec()),
             (
                 KEY_FORMAT.to_owned(),
@@ -128,11 +138,12 @@ impl RecordInfo {
                 .map(|bytes| std::str::from_utf8(bytes).map_err(|_| format!("{key} is not UTF-8")))
                 .transpose()
         };
-        match text(KEY_KIND)? {
-            Some(KIND) => {}
+        let workbook = match text(KEY_KIND)? {
+            Some(KIND) => false,
+            Some(KIND_WORKBOOK) => true,
             Some(other) => return Err(format!("a record of an unknown kind ({other})")),
             None => return Err("the record does not say what it holds".to_owned()),
-        }
+        };
         let title = text(KEY_TITLE)?.unwrap_or_default().to_owned();
         let format = match text(KEY_FORMAT)? {
             Some(format) => {
@@ -147,6 +158,7 @@ impl RecordInfo {
             path,
             format,
             disk,
+            workbook,
         })
     }
 }
@@ -157,8 +169,11 @@ pub struct Candidate {
     /// Held until the user decides; restoring adopts it, discarding deletes it.
     pub record: FoundRecord,
     pub info: Option<RecordInfo>,
-    /// The text the record replays to, or why it could not be read.
+    /// The text the record replays to, or why it could not be read. Empty
+    /// for a workbook.
     pub text: Result<Rope, String>,
+    /// A workbook's record: the workbook as saving would write it.
+    pub workbook: Option<Vec<u8>>,
     /// Whatever the shell computed from the text in advance, on the thread
     /// that found the record, so restoring a large document is quick.
     pub prepared: Option<Box<dyn std::any::Any + Send>>,
@@ -178,17 +193,23 @@ impl Candidate {
 /// result, so the user can still see and discard a damaged record.
 pub fn load(record: FoundRecord) -> Candidate {
     let last_written = record.last_written();
-    let read = || -> Result<(RecordInfo, Rope), String> {
+    let read = || -> Result<(RecordInfo, Rope, Option<Vec<u8>>), String> {
         let journal = record.open_journal().map_err(|err| err.to_string())?;
         journal.integrity().map_err(|err| err.to_string())?;
         let info = RecordInfo::from_meta(&journal.meta().map_err(|err| err.to_string())?)?;
         let replay = journal.replay().map_err(|err| err.to_string())?;
+        if info.workbook {
+            if replay.checkpoint.is_empty() {
+                return Err("the record holds no workbook".to_owned());
+            }
+            return Ok((info, Rope::default(), Some(replay.checkpoint)));
+        }
         let text = aster_markdown::journal::rebuild(&replay.checkpoint, &replay.commands)?;
-        Ok((info, text))
+        Ok((info, text, None))
     };
-    let (info, text) = match read() {
-        Ok((info, text)) => (Some(info), Ok(text)),
-        Err(why) => (None, Err(why)),
+    let (info, text, workbook) = match read() {
+        Ok((info, text, workbook)) => (Some(info), Ok(text), workbook),
+        Err(why) => (None, Err(why), None),
     };
     let disk = info.as_ref().and_then(|info| {
         let path = info.path.as_deref()?;
@@ -204,6 +225,7 @@ pub fn load(record: FoundRecord) -> Candidate {
         record,
         info,
         text,
+        workbook,
         prepared: None,
         disk,
         last_written,
@@ -253,6 +275,7 @@ mod tests {
                 mixed_line_endings: false,
             },
             disk: None,
+            workbook: false,
         }
     }
 
@@ -273,8 +296,17 @@ mod tests {
             path: None,
             format: TextFormat::default(),
             disk: None,
+            workbook: false,
         };
-        for original in [with_file, untitled] {
+        // A workbook's record says it is one.
+        let workbook = RecordInfo {
+            title: "帳簿.xlsx".to_owned(),
+            path: Some(PathBuf::from("/文档/帳簿.xlsx")),
+            format: TextFormat::default(),
+            disk: None,
+            workbook: true,
+        };
+        for original in [with_file, untitled, workbook] {
             let meta = meta_map(original.to_meta());
             assert_eq!(RecordInfo::from_meta(&meta), Ok(original));
         }

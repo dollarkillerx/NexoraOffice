@@ -506,6 +506,9 @@ impl Shell {
     /// its own, and keep writing to that record. Unreadable records stay where
     /// they are. Returns the new tab.
     fn restore(&mut self, candidate: Candidate) -> Option<TabId> {
+        if candidate.workbook.is_some() {
+            return self.restore_workbook(candidate);
+        }
         let Candidate {
             record,
             info: Some(info),
@@ -560,6 +563,50 @@ impl Shell {
         Some(id)
     }
 
+    /// Bring back a workbook from its record: the workbook as it was last
+    /// written, in a tab of its own with unsaved changes, saving to the file
+    /// it belongs to. The record is kept writing.
+    fn restore_workbook(&mut self, candidate: Candidate) -> Option<TabId> {
+        let Candidate {
+            record,
+            info: Some(info),
+            workbook: Some(bytes),
+            ..
+        } = candidate
+        else {
+            return None;
+        };
+        let workbook = aster_ooxml::xlsx::read(bytes.clone()).ok()?;
+        self.leave_active_document();
+        let title = if info.title.is_empty() {
+            info.path
+                .as_deref()
+                .map_or_else(String::new, files::display_name)
+        } else {
+            info.title.clone()
+        };
+        let id = self.tabs.open(DocKind::Sheets, title);
+        let source = Arc::new(bytes);
+        let mut tab = SheetTab::new(workbook, source.clone(), info.path.clone(), &self.tokens);
+        tab.disk = info.disk;
+        tab.mark_recovered();
+        if let Some(writer) = &self.writer {
+            let key = self.next_key;
+            self.next_key += 1;
+            writer.adopt(
+                key,
+                record,
+                info.to_meta(),
+                Contents::Bytes((*source).clone()),
+            );
+            tab.record = Some(key);
+            tab.recorded = Some((tab.history.version(), std::time::Instant::now()));
+        }
+        self.contents.insert(id, Content::Sheet(Box::new(tab)));
+        self.sync_modified();
+        Some(id)
+    }
+
     /// What the recovery record of a tab's document says about it.
     fn record_info(&self, id: TabId, editor: &MarkdownEditor) -> RecordInfo {
         RecordInfo {
@@ -571,6 +618,77 @@ impl Shell {
             path: editor.path.clone(),
             format: editor.format,
             disk: editor.disk,
+            workbook: false,
+        }
+    }
+
+    /// What the recovery record of a workbook says about it.
+    fn sheet_record_info(&self, id: TabId, tab: &SheetTab) -> RecordInfo {
+        RecordInfo {
+            title: self
+                .tabs
+                .get(id)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default(),
+            path: tab.path.clone(),
+            format: TextFormat::default(),
+            disk: tab.disk,
+            workbook: true,
+        }
+    }
+
+    /// Write each workbook with unsaved changes to its recovery record, as
+    /// saving would write it, at most every few seconds: the whole workbook
+    /// is made again each time, on the writer thread. A record goes once
+    /// its workbook has no unsaved changes. Called after edits and by a
+    /// timer, which writes what changed since the last time.
+    fn sync_sheet_records(&mut self) {
+        /// The least time between two writes of one workbook's record.
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+        let ids: Vec<TabId> = self.contents.keys().copied().collect();
+        for id in ids {
+            let Some(Content::Sheet(tab)) = self.contents.get(&id) else {
+                continue;
+            };
+            let info = self.sheet_record_info(id, tab);
+            let Some(writer) = &self.writer else {
+                return;
+            };
+            let Some(Content::Sheet(tab)) = self.contents.get_mut(&id) else {
+                continue;
+            };
+            if !tab.is_modified() {
+                if let Some(key) = tab.record.take() {
+                    writer.discard(key);
+                }
+                tab.recorded = None;
+                continue;
+            }
+            let version = tab.history.version();
+            match tab.recorded {
+                Some((done, _)) if done == version && tab.record.is_some() => continue,
+                Some((_, at)) if at.elapsed() < EVERY => continue,
+                _ => {}
+            }
+            let contents = Contents::later(tab.snapshot());
+            match tab.record {
+                Some(key) => {
+                    let meta = info.to_meta();
+                    let remove = RecordInfo::optional_keys()
+                        .into_iter()
+                        .filter(|optional| !meta.iter().any(|(key, _)| key == optional))
+                        .collect();
+                    writer.set_meta(key, meta, remove);
+                    writer.checkpoint(key, contents);
+                }
+                None => {
+                    let key = self.next_key;
+                    self.next_key += 1;
+                    writer.open(key, info.to_meta(), contents);
+                    tab.record = Some(key);
+                }
+            }
+            tab.recorded = Some((version, std::time::Instant::now()));
         }
     }
 
@@ -646,9 +764,12 @@ impl Shell {
     /// with it: closing is the user's decision, not a crash.
     fn force_close(&mut self, id: TabId) {
         self.tabs.close(id);
-        if let Some(Content::Markdown(editor)) = self.contents.remove(&id)
-            && let (Some(writer), Some(key)) = (&self.writer, editor.record)
-        {
+        let record = match self.contents.remove(&id) {
+            Some(Content::Markdown(editor)) => editor.record,
+            Some(Content::Sheet(tab)) => tab.record,
+            _ => None,
+        };
+        if let (Some(writer), Some(key)) = (&self.writer, record) {
             writer.discard(key);
         }
     }
@@ -656,10 +777,12 @@ impl Shell {
     /// Delete every recovery record: the user chose to quit without saving.
     fn discard_all_records(&mut self) {
         for content in self.contents.values_mut() {
-            if let Content::Markdown(editor) = content
-                && let Some(key) = editor.record.take()
-                && let Some(writer) = &self.writer
-            {
+            let record = match content {
+                Content::Markdown(editor) => editor.record.take(),
+                Content::Sheet(tab) => tab.record.take(),
+                _ => None,
+            };
+            if let (Some(key), Some(writer)) = (record, &self.writer) {
                 writer.discard(key);
             }
         }
@@ -3161,6 +3284,9 @@ fn spawn_recovery_scan(ui: &AppWindow, root: RecoveryRoot) {
             // Prepare restorable documents here, so restoring one does not
             // stall the window however large it is.
             for candidate in &mut candidates {
+                if candidate.workbook.is_some() {
+                    continue;
+                }
                 if let Ok(text) = &candidate.text {
                     let prepared: Box<dyn std::any::Any + Send> =
                         Box::new(content::prepare(text.clone()));
@@ -3791,6 +3917,7 @@ fn after_sheet_change(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_shee
     if let Some(tab) = shell.active_sheet() {
         tab.recalc(&changes);
     }
+    shell.sync_sheet_records();
     if !changes.is_empty() && shell.sync_modified() {
         refresh_tabs(ui, shell);
     }
@@ -4049,6 +4176,8 @@ fn finish_sheet_save(
     if let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) {
         tab.finish_save(&job, &path, result.as_ref().ok().cloned());
     }
+    // Saved: the record goes, or says where the workbook is now.
+    shell.sync_sheet_records();
     match result {
         Ok(_) => {
             shell.tabs.rename(id, files::display_name(&path));
@@ -4235,6 +4364,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let ui = AppWindow::new()?;
     let shell = Rc::new(RefCell::new(Shell::new(options.theme, language)));
+    // Workbook records are written at most every few seconds; this writes
+    // the last change of a burst once it is old enough.
+    let record_tick = Timer::default();
     SHELL.with(|cell| *cell.borrow_mut() = Some(shell.clone()));
     {
         let mut shell = shell.borrow_mut();
@@ -5629,6 +5761,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         after_sheet_change(&ui, shell, changes);
     }));
+    record_tick.start(
+        TimerMode::Repeated,
+        std::time::Duration::from_secs(2),
+        handler!(|_ui, shell| {
+            shell.sync_sheet_records();
+        }),
+    );
     ui.on_sheet_hide(handler!(|ui, shell, columns, hide| {
         let language = shell.language.tag();
         let Some(tab) = shell.active_sheet() else {
@@ -5953,7 +6092,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         let candidate = shell.candidates.remove(index);
-        shell.restore(candidate);
+        let workbook = candidate.workbook.is_some();
+        if let Some(id) = shell.restore(candidate)
+            && workbook
+        {
+            start_calc(&ui, shell, id);
+        }
         refresh_recovery(&ui, shell);
         after_tab_change(&ui, shell);
     }));
@@ -5983,7 +6127,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         // Unreadable records stay on the list: only the user may delete them.
         shell.candidates = unreadable;
         for candidate in readable {
-            shell.restore(candidate);
+            let workbook = candidate.workbook.is_some();
+            if let Some(id) = shell.restore(candidate)
+                && workbook
+            {
+                start_calc(&ui, shell, id);
+            }
         }
         refresh_recovery(&ui, shell);
         after_tab_change(&ui, shell);
@@ -6142,6 +6291,89 @@ mod tests {
 
     fn shell() -> Shell {
         Shell::new(ThemeMode::Light, Language::ZhHans)
+    }
+
+    #[test]
+    fn a_workbook_with_unsaved_changes_comes_back_from_its_record() {
+        use aster_sheets::CellRef;
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("帳簿.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let root = RecoveryRoot::new(dir.path().join("records"));
+        let mut shell = shell();
+        shell.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let Ok(office::Loaded::Workbook(workbook, source)) = office::load(&file) else {
+            panic!("the workbook loads");
+        };
+        let id = shell.open_office(file.clone(), office::Loaded::Workbook(workbook, source));
+        let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+            panic!("a sheet tab");
+        };
+        tab.view.select(CellRef::parse("B2").unwrap());
+        tab.view.begin_edit(EditMode::Enter, Some("未保存".into()));
+        tab.commit("ja");
+        shell.sync_sheet_records();
+        // A burst of edits writes once; the next waits for the timer.
+        let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+            panic!("a sheet tab");
+        };
+        assert!(tab.record.is_some());
+        tab.view.select(CellRef::parse("C3").unwrap());
+        tab.view.begin_edit(EditMode::Enter, Some("42".into()));
+        tab.commit("ja");
+        let version = tab.history.version();
+        shell.sync_sheet_records();
+        let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+            panic!("a sheet tab");
+        };
+        assert_ne!(tab.recorded.map(|(v, _)| v), Some(version));
+        // Later the change is written.
+        tab.recorded = tab.recorded.map(|(v, _)| {
+            (
+                v,
+                std::time::Instant::now() - std::time::Duration::from_secs(3),
+            )
+        });
+        shell.sync_sheet_records();
+        if let Some(writer) = &shell.writer {
+            writer.flush();
+        }
+
+        // As after a crash: a new run finds the record and restores it.
+        drop(shell);
+        let mut candidates = recovery::find(&root).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+        assert!(candidate.is_readable());
+        assert_eq!(
+            candidate.info.as_ref().map(|i| i.path.clone()),
+            Some(Some(file.clone()))
+        );
+        assert_eq!(candidate.disk, Some(FileState::Unchanged));
+        let mut again = self::shell();
+        again.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let id = again.restore(candidate).expect("restored");
+        let Some(Content::Sheet(tab)) = again.contents.get(&id) else {
+            panic!("a sheet tab");
+        };
+        assert!(tab.is_modified());
+        assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+        let cell = |at: &str| {
+            tab.view
+                .sheet()
+                .and_then(|s| s.cell(CellRef::parse(at).unwrap()))
+                .map(|c| c.value.clone())
+        };
+        assert_eq!(cell("B2"), Some(aster_sheets::Value::Text("未保存".into())));
+        assert_eq!(cell("C3"), Some(aster_sheets::Value::Number(42.0)));
+        // Closing it is the user's choice: the record goes.
+        again.force_close(id);
+        if let Some(writer) = &again.writer {
+            writer.flush();
+        }
+        assert!(recovery::find(&root).unwrap().is_empty());
     }
 
     fn decoded(text: &str) -> Opened {

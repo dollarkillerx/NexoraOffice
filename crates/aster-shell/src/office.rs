@@ -297,6 +297,8 @@ pub struct History {
     /// How deep the undo stack was when the file was last saved; `None`
     /// once that state can no longer be reached.
     saved: Option<usize>,
+    /// Steps done, undone and redone so far.
+    version: u64,
 }
 
 /// One entry, paste or clear: its cell changes, and the cell formats it
@@ -422,6 +424,12 @@ impl History {
         }
         self.undo.push(step);
         self.redo.clear();
+        self.version += 1;
+    }
+
+    /// Counts every step done, undone or redone: what the workbook is at.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn can_undo(&self) -> bool {
@@ -520,6 +528,12 @@ pub struct SheetTab {
     pub clip: Option<aster_sheets::Clip>,
     /// The find bar on this workbook and what it found.
     pub find: SheetFind,
+    /// The recovery record that keeps unsaved changes through a crash.
+    pub record: Option<u64>,
+    /// The history version last written to the record, and when.
+    pub recorded: Option<(u64, std::time::Instant)>,
+    /// What the file held when it was last read or saved.
+    pub disk: Option<aster_storage::Fingerprint>,
 }
 
 impl SheetTab {
@@ -531,6 +545,9 @@ impl SheetTab {
     ) -> Self {
         let view_styles = workbook.styles.len();
         let sheet_count = workbook.sheets.len();
+        let disk = path
+            .as_deref()
+            .map(|path| aster_storage::Fingerprint::of(path, &source));
         let mut view = SheetView::new(Arc::new(workbook));
         view.set_style(sheet_style(tokens));
         let mut history = History::default();
@@ -559,6 +576,9 @@ impl SheetTab {
             saving: false,
             clip: None,
             find: SheetFind::default(),
+            record: None,
+            recorded: None,
+            disk,
         }
     }
 
@@ -1039,19 +1059,41 @@ impl SheetTab {
         Some(SheetSave {
             source: self.source.clone(),
             workbook: self.view.workbook().clone(),
-            changes: aster_ooxml::xlsx_save::Changes {
-                cells: self.dirty.clone(),
-                edited: self.edited.clone(),
-                formulas_changed: self.formulas_changed,
-                merges: self.merges_changed.clone(),
-                columns: self.columns_changed.clone(),
-                rows: self.rows_changed.clone(),
-                line_styles: self.line_formats_changed.clone(),
-                structure: self.structure.clone(),
-                origins: self.origins.clone(),
-            },
+            changes: self.save_changes(),
             depth: self.history.depth(),
         })
+    }
+
+    /// What saving now would write, as the saver takes it.
+    fn save_changes(&self) -> aster_ooxml::xlsx_save::Changes {
+        aster_ooxml::xlsx_save::Changes {
+            cells: self.dirty.clone(),
+            edited: self.edited.clone(),
+            formulas_changed: self.formulas_changed,
+            merges: self.merges_changed.clone(),
+            columns: self.columns_changed.clone(),
+            rows: self.rows_changed.clone(),
+            line_styles: self.line_formats_changed.clone(),
+            structure: self.structure.clone(),
+            origins: self.origins.clone(),
+        }
+    }
+
+    /// The workbook as saving now would write it, made later on another
+    /// thread: for the recovery record. Empty if it cannot be made.
+    pub fn snapshot(&self) -> impl FnOnce() -> Vec<u8> + Send + 'static {
+        let source = self.source.clone();
+        let workbook = self.view.workbook().clone();
+        let changes = self.save_changes();
+        move || {
+            aster_ooxml::xlsx_save::save((*source).clone(), &workbook, &changes).unwrap_or_default()
+        }
+    }
+
+    /// The workbook came back from a recovery record: it has changes the
+    /// file does not.
+    pub fn mark_recovered(&mut self) {
+        self.history.saved = None;
     }
 
     /// A save has finished. On success the written file is what the next
@@ -1062,6 +1104,7 @@ impl SheetTab {
         let Some(bytes) = written else {
             return;
         };
+        self.disk = Some(aster_storage::Fingerprint::of(path, &bytes));
         self.source = bytes;
         self.path = Some(path.to_owned());
         // The written file holds every style the job had, even one undone
@@ -1118,6 +1161,7 @@ impl SheetTab {
         let Some(mut step) = self.history.undo.pop() else {
             return Vec::new();
         };
+        self.history.version += 1;
         let inverse: Vec<Change> = step.changes.iter().rev().map(Change::inverse).collect();
         self.view.workbook_mut().apply(&inverse);
         for (sheet, before, _) in &step.merges {
@@ -1156,6 +1200,7 @@ impl SheetTab {
         let Some(mut step) = self.history.redo.pop() else {
             return Vec::new();
         };
+        self.history.version += 1;
         // Its formats come back at the places its cells refer to.
         let added = std::mem::take(&mut step.added);
         if !added.is_empty() {

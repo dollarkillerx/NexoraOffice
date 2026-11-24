@@ -15,13 +15,15 @@ use aster_sheets::{
     Anchor, Cell, CellRange, CellRef, DisplayKind, HAlign, Line, LineStyle, MAX_COLUMNS, MAX_ROWS,
     Picture, Placement, Rgba, Sheet, VAlign, Workbook, column_name,
 };
-use aster_text::{Align, Family, Paragraph, Rules, Shaper, Spec, Style as TextStyle};
+use aster_text::{Align, Family, Paragraph, Rules, Shaper, Span, Spec, Style as TextStyle};
 use vello_cpu::kurbo::{Affine, Rect, Shape, Stroke};
 use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
+use crate::cell_editor::{CellEditor, EditMode};
 use crate::picture::{ImageCache, draw_image};
 use crate::preview::draw_text;
+use crate::text_surface::ImeEvent;
 use crate::text_surface::{DEFAULT_LANGUAGE, HAN_FALLBACK_FAMILIES, Rgba8};
 
 /// Text size in headers and picture labels, logical pixels.
@@ -109,7 +111,12 @@ pub enum Direction {
 /// Where each sheet was left, so switching back returns there.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Place {
+    /// The active cell: where typing goes, inside the selection.
     selected: CellRef,
+    /// The corner the selection was started from, and the one it was
+    /// stretched to; both are `selected` for one cell.
+    anchor: CellRef,
+    end: CellRef,
     scroll_x: f64,
     scroll_y: f64,
 }
@@ -122,6 +129,21 @@ struct Drawn {
     size: (u16, u16),
     scale: f32,
     style: SheetStyle,
+    /// Counts changes to the cells and to the editor.
+    revision: u64,
+    caret_on: bool,
+}
+
+/// What is under a point of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    Cell(CellRef),
+    /// A row number.
+    Row(u32),
+    /// A column letter.
+    Column(u32),
+    /// The corner above the row numbers: the whole sheet.
+    All,
 }
 
 pub struct SheetView {
@@ -146,6 +168,13 @@ pub struct SheetView {
     decorated: Vec<bool>,
     any_decorated: bool,
     images: ImageCache,
+    /// The cell being typed into, if any.
+    editor: Option<CellEditor>,
+    revision: u64,
+    caret_on: bool,
+    /// Where the caret was last drawn, for the input method's candidate
+    /// window: x, y, width, height, physical pixels.
+    ime_area: (f64, f64, f64, f64),
 }
 
 /// A cell's text, laid out.
@@ -228,6 +257,10 @@ impl SheetView {
             decorated: Vec::new(),
             any_decorated: false,
             images: ImageCache::default(),
+            editor: None,
+            revision: 0,
+            caret_on: true,
+            ime_area: (0.0, 0.0, 1.0, 1.0),
         };
         view.decorated = decorations(&view.workbook);
         view.any_decorated = view.decorated.contains(&true);
@@ -296,22 +329,144 @@ impl SheetView {
         self.place().selected
     }
 
-    /// The selected cell's address (its merged area, if any) and what the
-    /// formula bar shows for it.
+    /// The selected cells: from the active cell to the other corner,
+    /// widened to whole merged areas at the corners.
+    pub fn selection(&self) -> CellRange {
+        let place = self.place();
+        let mut range = CellRange::new(
+            CellRef::new(
+                place.anchor.row.min(place.end.row),
+                place.anchor.col.min(place.end.col),
+            ),
+            CellRef::new(
+                place.anchor.row.max(place.end.row),
+                place.anchor.col.max(place.end.col),
+            ),
+        );
+        if let Some(sheet) = self.sheet() {
+            for corner in [place.anchor, place.end] {
+                if let Some(merge) = sheet.merge_at(corner) {
+                    range = range.union(merge);
+                }
+            }
+        }
+        range
+    }
+
+    /// The selection's address (a merged area counts as one cell) and what
+    /// the formula bar shows: the active cell's content, or the text being
+    /// typed.
     pub fn selection_text(&self) -> (String, String) {
         let at = self.selected();
         let Some(sheet) = self.sheet() else {
             return (at.to_string(), String::new());
         };
+        let range = self.selection();
         let address = match sheet.merge_at(at) {
-            Some(merge) => merge.to_string(),
-            None => at.to_string(),
+            Some(merge) if *merge == range => merge.to_string(),
+            _ if range.first == range.last => at.to_string(),
+            _ => range.to_string(),
         };
+        if let Some(editor) = &self.editor {
+            return (address, editor.shown().0);
+        }
         let content = sheet
             .cell(at)
             .map(|cell| self.workbook.input_text(cell))
             .unwrap_or_default();
         (address, content)
+    }
+
+    /// The workbook, to change cells. Laid-out texts are dropped, since any
+    /// cell may have changed.
+    pub fn workbook_mut(&mut self) -> &mut Workbook {
+        self.cells.clear();
+        self.revision += 1;
+        Arc::make_mut(&mut self.workbook)
+    }
+
+    // --- Typing into a cell ---
+
+    pub fn editor(&self) -> Option<&CellEditor> {
+        self.editor.as_ref()
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Start typing into the active cell: `text` replaces its content, or
+    /// with `None` the content is edited in place.
+    pub fn begin_edit(&mut self, mode: EditMode, text: Option<String>) {
+        let at = self.selected();
+        let text = text.unwrap_or_else(|| {
+            self.sheet()
+                .and_then(|sheet| sheet.cell(at))
+                .map(|cell| self.workbook.input_text(cell))
+                .unwrap_or_default()
+        });
+        self.editor = Some(CellEditor::new(at, mode, text));
+        self.ensure_visible();
+        self.revision += 1;
+    }
+
+    /// Change the editor (insert, move the caret ...). Returns what `f`
+    /// returns, `None` when nothing is being edited.
+    pub fn edit<T>(&mut self, f: impl FnOnce(&mut CellEditor) -> T) -> Option<T> {
+        let editor = self.editor.as_mut()?;
+        let out = f(editor);
+        self.revision += 1;
+        Some(out)
+    }
+
+    /// An input method event: starts an entry on the active cell when
+    /// nothing is being edited and text is being composed or committed.
+    pub fn ime(&mut self, event: ImeEvent) -> bool {
+        if self.editor.is_none() {
+            match &event {
+                ImeEvent::Preedit { text, .. } if !text.is_empty() => {}
+                ImeEvent::Commit(_) => {}
+                _ => return false,
+            }
+            self.begin_edit(EditMode::Enter, Some(String::new()));
+        }
+        self.edit(|editor| editor.ime(event)).unwrap_or(false)
+    }
+
+    /// Stop editing without keeping what was typed.
+    pub fn cancel_edit(&mut self) -> bool {
+        let had = self.editor.take().is_some();
+        if had {
+            self.revision += 1;
+        }
+        had
+    }
+
+    /// Stop editing and hand back the cell and what was typed.
+    pub fn finish_edit(&mut self) -> Option<(CellRef, String)> {
+        let mut editor = self.editor.take()?;
+        // A composition still open is committed as it stands.
+        if let (shown, Some(_), _) = editor.shown() {
+            editor = CellEditor::new(editor.at, editor.mode, shown);
+        }
+        self.revision += 1;
+        Some((editor.at, editor.text().to_owned()))
+    }
+
+    pub fn set_caret_on(&mut self, on: bool) {
+        self.caret_on = on;
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.editor.as_ref().is_some_and(CellEditor::is_composing)
+    }
+
+    /// Where the input method's candidate window goes: under the caret.
+    pub fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+        if self.needs_render() {
+            self.render();
+        }
+        self.ime_area
     }
 
     fn place(&self) -> Place {
@@ -493,13 +648,81 @@ impl SheetView {
         }
     }
 
-    /// Select the cell under a point (physical pixels). Returns whether the
-    /// selection changed.
-    pub fn press(&mut self, x: f64, y: f64) -> bool {
+    /// What is under a point (physical pixels).
+    pub fn hit(&self, x: f64, y: f64) -> Option<Hit> {
+        let s = self.s();
+        let in_cells = x / s >= self.header_width();
+        let below_headers = y / s >= HEADER_HEIGHT;
+        if !in_cells && !below_headers {
+            return Some(Hit::All);
+        }
+        let at = self.cell_at(x, y)?;
+        Some(match (in_cells, below_headers) {
+            (true, true) => Hit::Cell(at),
+            (false, _) => Hit::Row(at.row),
+            (true, false) => Hit::Column(at.col),
+        })
+    }
+
+    /// A click (physical pixels): selects the cell, or the row, column or
+    /// sheet whose header it is on; with `extend`, stretches the selection
+    /// to there. Returns whether the selection changed.
+    pub fn press(&mut self, x: f64, y: f64, extend: bool) -> bool {
+        let Some(hit) = self.hit(x, y) else {
+            return false;
+        };
+        let before = self.place();
+        let last_row = MAX_ROWS - 1;
+        let last_col = MAX_COLUMNS - 1;
+        match hit {
+            Hit::Cell(at) if extend => {
+                self.extend_to(at);
+            }
+            Hit::Cell(at) => {
+                self.select(at);
+            }
+            Hit::Row(row) => {
+                let first = if extend { self.selected().row } else { row };
+                self.select_range(CellRef::new(first, 0), CellRef::new(row, last_col));
+            }
+            Hit::Column(col) => {
+                let first = if extend { self.selected().col } else { col };
+                self.select_range(CellRef::new(0, first), CellRef::new(last_row, col));
+            }
+            Hit::All => self.select_range(CellRef::default(), CellRef::new(last_row, last_col)),
+        }
+        self.place() != before
+    }
+
+    /// The pointer moved with the button down: stretch the selection to
+    /// the cell under it.
+    pub fn drag(&mut self, x: f64, y: f64) -> bool {
+        let s = self.s();
+        let x = x.max(self.header_width() * s);
+        let y = y.max(HEADER_HEIGHT * s);
         match self.cell_at(x, y) {
-            Some(at) => self.select(at),
+            Some(at) => self.extend_to(at),
             None => false,
         }
+    }
+
+    /// Select from the active cell `active` to `end`, without scrolling.
+    fn select_range(&mut self, active: CellRef, end: CellRef) {
+        let place = self.place_mut();
+        place.selected = active;
+        place.anchor = active;
+        place.end = end;
+    }
+
+    /// Move the selection's far corner to `at`, keeping the active cell.
+    pub fn extend_to(&mut self, at: CellRef) -> bool {
+        let at = CellRef::new(at.row.min(MAX_ROWS - 1), at.col.min(MAX_COLUMNS - 1));
+        if self.place().end == at {
+            return false;
+        }
+        self.place_mut().end = at;
+        self.ensure_cell_visible(at);
+        true
     }
 
     /// Select a cell (the top-left of its merged area) and scroll it into
@@ -510,17 +733,24 @@ impl SheetView {
             .sheet()
             .and_then(|sheet| sheet.merge_at(at))
             .map_or(at, |merge| merge.first);
-        let changed = self.place().selected != at;
-        self.place_mut().selected = at;
+        let place = self.place();
+        let changed = place.selected != at || place.anchor != at || place.end != at;
+        let place = self.place_mut();
+        place.selected = at;
+        place.anchor = at;
+        place.end = at;
         self.ensure_visible();
         changed
     }
 
     fn ensure_visible(&mut self) {
+        self.ensure_cell_visible(self.place().selected);
+    }
+
+    fn ensure_cell_visible(&mut self, at: CellRef) {
         let Some(sheet) = self.sheet() else {
             return;
         };
-        let at = self.place().selected;
         let (frozen_rows, frozen_cols) = sheet.frozen;
         let range = sheet
             .merge_at(at)
@@ -556,10 +786,20 @@ impl SheetView {
 
     /// Move the selection. Returns whether it moved.
     pub fn key(&mut self, key: SheetKey) -> bool {
+        self.key_extending(key, false)
+    }
+
+    /// Move the selection, or with `extend` its far corner (Shift with the
+    /// arrow keys). Returns whether anything moved.
+    pub fn key_extending(&mut self, key: SheetKey, extend: bool) -> bool {
         let Some(sheet) = self.sheet() else {
             return false;
         };
-        let at = self.place().selected;
+        let at = if extend {
+            self.place().end
+        } else {
+            self.place().selected
+        };
         // Leaving a merged area starts from its far edge.
         let span = sheet
             .merge_at(at)
@@ -597,7 +837,67 @@ impl SheetView {
             SheetKey::Last => used.map_or(CellRef::default(), |used| used.last),
             SheetKey::Jump(direction) => jump(sheet, at, direction),
         };
-        self.select(target)
+        if extend {
+            self.extend_to(target)
+        } else {
+            self.select(target)
+        }
+    }
+
+    /// Move the active cell inside the selection, as Return and Tab do in
+    /// Excel when several cells are selected; with one cell selected, it
+    /// moves down or right (up or left when `back`).
+    pub fn step(&mut self, across: bool, back: bool) -> bool {
+        let range = self.selection();
+        if range.first == range.last {
+            let key = match (across, back) {
+                (false, false) => SheetKey::Down,
+                (false, true) => SheetKey::Up,
+                (true, false) => SheetKey::Right,
+                (true, true) => SheetKey::Left,
+            };
+            return self.key(key);
+        }
+        let at = self.selected();
+        let (rows, cols) = (
+            range.last.row - range.first.row + 1,
+            range.last.col - range.first.col + 1,
+        );
+        // Position inside the range, in reading order (rows or columns).
+        let (major, minor, majors, minors) = if across {
+            (
+                at.row - range.first.row,
+                at.col - range.first.col,
+                rows,
+                cols,
+            )
+        } else {
+            (
+                at.col - range.first.col,
+                at.row - range.first.row,
+                cols,
+                rows,
+            )
+        };
+        let total = u64::from(majors) * u64::from(minors);
+        let index = u64::from(major) * u64::from(minors) + u64::from(minor);
+        let next = if back {
+            (index + total - 1) % total
+        } else {
+            (index + 1) % total
+        };
+        let (major, minor) = (
+            (next / u64::from(minors)) as u32,
+            (next % u64::from(minors)) as u32,
+        );
+        let target = if across {
+            CellRef::new(range.first.row + major, range.first.col + minor)
+        } else {
+            CellRef::new(range.first.row + minor, range.first.col + major)
+        };
+        self.place_mut().selected = target;
+        self.ensure_visible();
+        true
     }
 
     /// Text of the cell for a test or a screen reader.
@@ -731,6 +1031,8 @@ impl SheetView {
             size: (self.width, self.height),
             scale: self.scale,
             style: self.style,
+            revision: self.revision,
+            caret_on: self.caret_on && self.editor.is_some(),
         }
     }
 
@@ -807,12 +1109,48 @@ impl SheetView {
             }
         }
 
-        // The selected cell, in the pane it is in.
+        // The selection: a tint over the cells other than the active one
+        // and an outline round it, in each pane it reaches.
         let selected = place.selected;
-        let span = sheet
+        let span = self.selection();
+        let active = sheet
             .merge_at(selected)
             .copied()
             .unwrap_or_else(|| CellRange::single(selected));
+        if span != active {
+            let mut tint = style.accent;
+            tint[3] = 0x2a;
+            for row_span in &rows {
+                for col_span in &columns {
+                    let pane = pane_of(row_span, col_span);
+                    let rect = |range: &CellRange| {
+                        Rect::new(
+                            pane.x(sheet, range.first.col, s).round(),
+                            pane.y(sheet, range.first.row, s).round(),
+                            pane.x(sheet, range.last.col + 1, s).round(),
+                            pane.y(sheet, range.last.row + 1, s).round(),
+                        )
+                    };
+                    let whole = rect(&span);
+                    let hole = rect(&active);
+                    self.ctx.push_clip_layer(&pane.clip.to_path(0.1));
+                    self.ctx.set_paint(color(tint));
+                    let mut path = whole.to_path(0.1);
+                    path.extend(hole.to_path(0.1));
+                    self.ctx.set_fill_rule(Fill::EvenOdd);
+                    self.ctx.fill_path(&path);
+                    self.ctx.set_fill_rule(Fill::NonZero);
+                    let border = (2.0 * s).round();
+                    self.ctx.set_paint(color(style.accent));
+                    self.ctx.set_stroke(Stroke::new(border));
+                    self.ctx.stroke_rect(
+                        &Rect::new(whole.x0 - line, whole.y0 - line, whole.x1, whole.y1)
+                            .inset(-border / 2.0 + line / 2.0),
+                    );
+                    self.ctx.pop_layer();
+                }
+            }
+        }
         let row_span = rows
             .iter()
             .find(|r| (selected.row < frozen_rows) == (r.0 < frozen_rows));
@@ -821,18 +1159,26 @@ impl SheetView {
             .find(|c| (selected.col < frozen_cols) == (c.0 < frozen_cols));
         if let (Some(row_span), Some(col_span)) = (row_span, col_span) {
             let pane = pane_of(row_span, col_span);
-            let border = (2.0 * s).round();
+            let border = if span == active {
+                (2.0 * s).round()
+            } else {
+                line
+            };
             let outline = Rect::new(
-                pane.x(sheet, span.first.col, s).round() - line,
-                pane.y(sheet, span.first.row, s).round() - line,
-                pane.x(sheet, span.last.col + 1, s).round(),
-                pane.y(sheet, span.last.row + 1, s).round(),
+                pane.x(sheet, active.first.col, s).round() - line,
+                pane.y(sheet, active.first.row, s).round() - line,
+                pane.x(sheet, active.last.col + 1, s).round(),
+                pane.y(sheet, active.last.row + 1, s).round(),
             );
             self.ctx.push_clip_layer(&pane.clip.to_path(0.1));
             self.ctx.set_paint(color(style.accent));
             self.ctx.set_stroke(Stroke::new(border));
             self.ctx
                 .stroke_rect(&outline.inset(-border / 2.0 + line / 2.0));
+            if self.editor.is_some() {
+                let cell = Rect::new(outline.x0 + line, outline.y0 + line, outline.x1, outline.y1);
+                self.draw_editor(sheet, cell, pane.clip);
+            }
             self.ctx.pop_layer();
         }
 
@@ -1131,6 +1477,99 @@ impl SheetView {
             }
             self.draw_picture(picture, rect);
         }
+        self.ctx.pop_layer();
+    }
+
+    /// The text being typed, over the active cell (`cell`, physical
+    /// pixels), widened to the right to fit it.
+    fn draw_editor(&mut self, sheet: &Sheet, cell: Rect, clip: Rect) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let s = self.s();
+        let pad = PAD * s;
+        let cell_style = self.workbook.style(sheet.style_at(editor.at));
+        let font = &cell_style.font;
+        let (text, composing, caret) = editor.shown();
+        let base = TextStyle {
+            family: family(font.name.as_deref()),
+            size: font.size * PX_PER_POINT * TEXT_FIT,
+            color: readable(font.color, cell_style.fill, &self.style),
+            bold: font.bold,
+            italic: font.italic,
+            underline: font.underline,
+            strike: font.strike,
+            rise: 0.0,
+        };
+        let spans: Vec<Span> = composing
+            .map(|range| {
+                vec![Span {
+                    range,
+                    style: TextStyle {
+                        underline: true,
+                        ..base.clone()
+                    },
+                }]
+            })
+            .unwrap_or_default();
+        let language = aster_text::segment::guess_language(&text, DEFAULT_LANGUAGE);
+        let paragraph = self.shaper.lay_out(&Spec {
+            text: &text,
+            base,
+            spans: &spans,
+            language,
+            width: None,
+            scale: self.scale,
+            line_height: 1.25,
+            align: Align::Start,
+            rules: Rules::for_language(language),
+        });
+        let (pw, ph) = (f64::from(paragraph.width()), f64::from(paragraph.height()));
+        let width = cell
+            .width()
+            .max(pw + 2.0 * pad + 2.0 * s)
+            .min((clip.x1 - cell.x0).max(cell.width()));
+        let height = cell.height().max(ph + 2.0 * s);
+        let rect = Rect::new(cell.x0, cell.y0, cell.x0 + width, cell.y0 + height);
+        self.ctx
+            .set_paint(color(cell_style.fill.unwrap_or(self.style.background)));
+        self.ctx.fill_rect(&rect);
+        let border = (2.0 * s).round();
+        self.ctx.set_paint(color(self.style.accent));
+        self.ctx.set_stroke(Stroke::new(border));
+        self.ctx.stroke_rect(&rect.inset(-border / 2.0));
+        let x = rect.x0 + pad;
+        let y = if paragraph.lines().len() > 1 {
+            rect.y0 + s
+        } else {
+            (rect.y1 - ph - s).max(rect.y0)
+        };
+        self.ctx.push_clip_layer(&rect.to_path(0.1));
+        self.paint(&paragraph, x, y);
+        // The caret: before the next character, or after the last.
+        let line_height = f64::from(font.size * PX_PER_POINT * TEXT_FIT) * 1.25 * s;
+        let next = text[caret..]
+            .chars()
+            .next()
+            .map(|c| caret..caret + c.len_utf8());
+        let (cx, cy, ch) = match next.and_then(|r| paragraph.rects(r).into_iter().next()) {
+            Some([x0, y0, _, y1]) => (f64::from(x0), f64::from(y0), f64::from(y1 - y0)),
+            None => match paragraph.rects(0..caret).last() {
+                Some([_, y0, x1, y1]) => (f64::from(*x1), f64::from(*y0), f64::from(y1 - y0)),
+                None => (0.0, 0.0, if ph > 0.0 { ph } else { line_height }),
+            },
+        };
+        let caret_rect = Rect::new(x + cx, y + cy, x + cx + s.max(1.0), y + cy + ch);
+        if self.caret_on {
+            self.ctx.set_paint(color(self.style.text));
+            self.ctx.fill_rect(&caret_rect);
+        }
+        self.ime_area = (
+            caret_rect.x0,
+            caret_rect.y0,
+            caret_rect.width(),
+            caret_rect.height(),
+        );
         self.ctx.pop_layer();
     }
 
@@ -1596,13 +2035,15 @@ mod tests {
         // At scale 2 the headers are 44 pixels tall.
         assert_eq!(view.cell_at(10.0, 10.0), None);
         let header = view.header_width() * 2.0;
-        assert!(view.press(header + 5.0, 44.0 + 5.0) || view.selected() == CellRef::default());
+        assert!(
+            view.press(header + 5.0, 44.0 + 5.0, false) || view.selected() == CellRef::default()
+        );
         assert_eq!(view.selected(), CellRef::default());
-        view.press(header + 64.0 * 2.0 + 5.0, 44.0 + 41.0);
+        view.press(header + 64.0 * 2.0 + 5.0, 44.0 + 41.0, false);
         // Column B is hidden, so the second column on screen is C.
         assert_eq!(view.selected().to_string(), "C2");
         // A column letter selects that column in the top row on screen.
-        view.press(header + 5.0, 20.0);
+        view.press(header + 5.0, 20.0, false);
         assert_eq!(view.selected().to_string(), "A1");
     }
 
@@ -1788,5 +2229,82 @@ mod tests {
         let before = view.scroll_range();
         view.select(CellRef::new(0, 0));
         assert_eq!(view.scroll_range(), before);
+    }
+
+    #[test]
+    fn ranges_from_shift_keys_drags_and_headers() {
+        let mut view = view();
+        view.select(CellRef::parse("C3").unwrap());
+        view.key_extending(SheetKey::Down, true);
+        view.key_extending(SheetKey::Right, true);
+        assert_eq!(view.selection().to_string(), "C3:D4");
+        assert_eq!(view.selected().to_string(), "C3");
+        assert_eq!(view.selection_text().0, "C3:D4");
+        // Return walks the range row by row, Tab... column by column here.
+        assert!(view.step(false, false));
+        assert_eq!(view.selected().to_string(), "C4");
+        view.step(false, false);
+        assert_eq!(view.selected().to_string(), "D3");
+        view.step(false, true);
+        assert_eq!(view.selected().to_string(), "C4");
+        assert_eq!(view.selection().to_string(), "C3:D4");
+        // A plain move collapses it.
+        view.key(SheetKey::Down);
+        assert_eq!(view.selection().to_string(), "C5");
+        // Dragging from a cell (scale 2: rows 40 px, header 44 px).
+        let header = view.header_width() * 2.0;
+        view.press(header + 5.0, 44.0 + 5.0, false);
+        assert!(view.drag(header + 64.0 * 2.0 * 3.0 + 5.0, 44.0 + 40.0 * 2.0 + 5.0));
+        assert_eq!(view.selection().first.to_string(), "A1");
+        assert_eq!(view.selection().last.row, 2);
+        // A row number selects the whole row, a column letter the column.
+        view.press(10.0, 44.0 + 40.0 + 5.0, false);
+        assert_eq!(view.selection().to_string(), "A2:XFD2");
+        view.press(header + 5.0, 10.0, false);
+        assert_eq!(view.selection().to_string(), "A1:A1048576");
+        view.press(5.0, 5.0, false);
+        assert_eq!(view.selection().to_string(), "A1:XFD1048576");
+        view.render();
+    }
+
+    #[test]
+    fn typing_into_a_cell_draws_an_editor_and_takes_compositions() {
+        use crate::cell_editor::EditMode;
+
+        let mut view = view();
+        view.select(CellRef::parse("B3").unwrap());
+        let before = view.render().data_as_u8_slice().to_vec();
+        // A composition with nothing being edited starts an entry.
+        assert!(view.ime(ImeEvent::Preedit {
+            text: "とうきょう".into(),
+            cursor: Some((0, 0)),
+        }));
+        assert!(view.is_editing() && view.is_composing());
+        let drawn = view.render().data_as_u8_slice().to_vec();
+        assert_ne!(before, drawn);
+        let (x, y, _, h) = view.ime_cursor_area();
+        assert!(x > 0.0 && y > 0.0 && h > 0.0);
+        view.ime(ImeEvent::Commit("東京".into()));
+        assert_eq!(view.selection_text().1, "東京");
+        assert_eq!(
+            view.finish_edit(),
+            Some((CellRef::parse("B3").unwrap(), "東京".to_owned()))
+        );
+        assert!(!view.is_editing());
+        // F2 edits the content as it is, caret at the end.
+        view.select(CellRef::parse("A1").unwrap());
+        view.begin_edit(EditMode::Edit, None);
+        assert_eq!(view.editor().unwrap().text(), "0");
+        view.edit(|editor| editor.insert("5"));
+        assert_eq!(view.selection_text().1, "05");
+        // A composition left open when the entry ends is kept as shown.
+        view.ime(ImeEvent::Preedit {
+            text: "x".into(),
+            cursor: None,
+        });
+        assert_eq!(view.finish_edit().unwrap().1, "05x");
+        // Enabling the input method alone does not start an entry.
+        assert!(!view.ime(ImeEvent::Enabled));
+        assert!(!view.is_editing());
     }
 }

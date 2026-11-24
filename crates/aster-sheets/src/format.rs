@@ -190,6 +190,35 @@ impl Format {
         &self.code
     }
 
+    /// The order a date format shows year, month and day in; `None` for a
+    /// format that is not a date or shows fewer than two of them.
+    pub fn date_order(&self) -> Option<DateOrder> {
+        let section = self.sections.first().filter(|s| s.kind == Kind::Date)?;
+        let mut order = Vec::new();
+        for token in &section.tokens {
+            let Token::Date(part) = token else { continue };
+            let which = match part {
+                DatePart::Year2 | DatePart::Year4 => 'y',
+                DatePart::Month
+                | DatePart::Month2
+                | DatePart::MonthShort
+                | DatePart::MonthLong
+                | DatePart::MonthLetter => 'm',
+                DatePart::Day | DatePart::Day2 => 'd',
+                _ => continue,
+            };
+            if !order.contains(&which) {
+                order.push(which);
+            }
+        }
+        match order.as_slice() {
+            ['y', 'm', ..] | ['y', 'd', ..] => Some(DateOrder::Ymd),
+            ['m', 'd', ..] | ['m', 'y', ..] => Some(DateOrder::Mdy),
+            ['d', 'm', ..] | ['d', 'y', ..] => Some(DateOrder::Dmy),
+            _ => None,
+        }
+    }
+
     /// Whether numbers in this format are dates or times.
     pub fn is_date(&self) -> bool {
         self.sections.first().is_some_and(|s| s.kind == Kind::Date)
@@ -953,6 +982,46 @@ pub fn date_parts(serial: f64, date1904: bool) -> Option<[u32; 7]> {
     ])
 }
 
+/// How a date typed as three numbers is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateOrder {
+    /// 2026/11/24: Chinese, Japanese, Korean, ISO.
+    Ymd,
+    /// 11/24/2026: American English.
+    Mdy,
+    /// 24/11/2026: most of Europe.
+    Dmy,
+}
+
+/// The serial number of a date, as Excel counts: in the 1900 system day 1
+/// is 1900-01-01 and day 60 the 29 February 1900 that never was. `None` for
+/// dates the system cannot hold or that do not exist.
+pub fn date_serial(year: i64, month: u32, day: u32, date1904: bool) -> Option<f64> {
+    if !(1..=12).contains(&month) || day == 0 || !(1900..=9999).contains(&year) {
+        return None;
+    }
+    let last = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        // Excel's own leap day.
+        2 if year == 1900 && !date1904 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day > last {
+        return None;
+    }
+    if date1904 {
+        let days = days_from_civil(year, month, day) - days_from_civil(1904, 1, 1);
+        return (days >= 0).then_some(days as f64);
+    }
+    if year == 1900 && month == 2 && day == 29 {
+        return Some(60.0);
+    }
+    let days = days_from_civil(year, month, day) - days_from_civil(1899, 12, 31);
+    Some(if days >= 60 { days + 1 } else { days } as f64)
+}
+
 /// Days since 1970-01-01 (Howard Hinnant's algorithm).
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -1098,6 +1167,31 @@ fn pad(value: i64, width: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_to_serials_and_back() {
+        assert_eq!(date_serial(2026, 11, 24, false), Some(46350.0));
+        assert_eq!(date_serial(1900, 1, 1, false), Some(1.0));
+        assert_eq!(date_serial(1900, 2, 28, false), Some(59.0));
+        assert_eq!(date_serial(1900, 2, 29, false), Some(60.0));
+        assert_eq!(date_serial(1900, 3, 1, false), Some(61.0));
+        assert_eq!(date_serial(1904, 1, 1, true), Some(0.0));
+        assert_eq!(date_serial(2026, 2, 29, false), None);
+        assert_eq!(date_serial(2024, 2, 29, false), Some(45351.0));
+        assert_eq!(date_serial(2026, 13, 1, false), None);
+        for serial in [1.0, 59.0, 61.0, 45351.0, 46350.0] {
+            let [y, m, d, ..] = date_parts(serial, false).unwrap();
+            assert_eq!(date_serial(i64::from(y), m, d, false), Some(serial));
+        }
+        assert_eq!(Format::parse("yyyy/m/d").date_order(), Some(DateOrder::Ymd));
+        assert_eq!(Format::parse("m/d/yy").date_order(), Some(DateOrder::Mdy));
+        assert_eq!(
+            Format::parse("dd.mm.yyyy").date_order(),
+            Some(DateOrder::Dmy)
+        );
+        assert_eq!(Format::parse("h:mm").date_order(), None);
+        assert_eq!(Format::parse("0.00").date_order(), None);
+    }
 
     fn show(code: &str, value: f64) -> String {
         Format::parse(code).number(value, false)

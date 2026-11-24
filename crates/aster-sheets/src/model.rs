@@ -170,6 +170,32 @@ impl Sheet {
             })
     }
 
+    pub(crate) fn rows_mut(&mut self) -> &mut Vec<Row> {
+        &mut self.rows
+    }
+
+    /// Work out the used range and the cell count again after cells were
+    /// put in or taken out.
+    pub fn refresh(&mut self) {
+        let mut used: Option<CellRange> = None;
+        let mut count = 0;
+        for row in &self.rows {
+            if let (Some(first), Some(last)) = (row.cells.first(), row.cells.last()) {
+                let span = CellRange::new(
+                    CellRef::new(row.index, first.col),
+                    CellRef::new(row.index, last.col),
+                );
+                used = Some(used.map_or(span, |u| u.union(&span)));
+            }
+            count += row.cells.iter().filter(|cell| !cell.is_blank()).count();
+        }
+        for merge in &self.merges {
+            used = Some(used.map_or(*merge, |u| u.union(merge)));
+        }
+        self.used = used;
+        self.cell_count = count;
+    }
+
     pub(crate) fn cell_mut(&mut self, at: CellRef) -> Option<&mut Cell> {
         let row = self
             .rows

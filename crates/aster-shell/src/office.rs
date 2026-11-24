@@ -2,13 +2,17 @@
 //! calculating formulas after the workbook is on screen, and the read-only
 //! views' colours and keys.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aster_ooxml::{ErrorKind, FormatCodec, Pptx, Xlsx};
-use aster_sheets::{CalcEngine, CalcError, Cancel, Workbook};
+use aster_sheets::input::{self, Reading};
+use aster_sheets::{
+    CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, DateOrder, Edit, Workbook,
+};
 use aster_slides::Presentation;
 use aster_surface::sheet_view::{Direction, SheetKey, SheetStyle, SheetView};
 use aster_surface::slide_view::{SlideStyle, SlideView};
@@ -105,26 +109,242 @@ pub enum Calc {
     Failed(String),
 }
 
+/// Undo and redo, one step per entry, paste or clear.
+#[derive(Debug, Default)]
+pub struct History {
+    undo: Vec<Vec<Change>>,
+    redo: Vec<Vec<Change>>,
+    /// How deep the undo stack was when the file was last saved; `None`
+    /// once that state can no longer be reached.
+    saved: Option<usize>,
+}
+
+impl History {
+    fn push(&mut self, step: Vec<Change>) {
+        if step.is_empty() {
+            return;
+        }
+        if self.saved.is_some_and(|saved| saved > self.undo.len()) {
+            self.saved = None;
+        }
+        self.undo.push(step);
+        self.redo.clear();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.saved != Some(self.undo.len())
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.saved = Some(self.undo.len());
+    }
+}
+
 pub struct SheetTab {
     pub view: SheetView,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub calc: Calc,
+    pub history: History,
+    /// Cells changed since the file was read or saved: what saving
+    /// rewrites.
+    pub dirty: BTreeSet<(usize, CellRef)>,
+    /// A formula appeared or went since the file was read or saved.
+    pub formulas_changed: bool,
 }
 
 impl SheetTab {
-    pub fn new(workbook: Workbook, path: PathBuf, tokens: &theme::Tokens) -> Self {
+    pub fn new(workbook: Workbook, path: Option<PathBuf>, tokens: &theme::Tokens) -> Self {
         let mut view = SheetView::new(Arc::new(workbook));
         view.set_style(sheet_style(tokens));
+        let mut history = History::default();
+        history.mark_saved();
         Self {
             view,
             path,
             calc: Calc::Done(0),
+            history,
+            dirty: BTreeSet::new(),
+            formulas_changed: false,
         }
     }
 
     pub fn restyle(&mut self, tokens: &theme::Tokens) {
         self.view.set_style(sheet_style(tokens));
     }
+
+    pub fn is_modified(&self) -> bool {
+        self.history.is_modified()
+    }
+
+    /// How a date typed into the active cell is read: in the order of its
+    /// date format, else as people writing `language` do.
+    pub fn reading(&self, language: &str) -> Reading {
+        let workbook = self.view.workbook();
+        let at = self.view.selected();
+        let format_order = self
+            .view
+            .sheet()
+            .map(|sheet| workbook.style(sheet.style_at(at)))
+            .and_then(|style| style.format.date_order());
+        Reading {
+            order: format_order.unwrap_or_else(|| date_order(language)),
+            date1904: workbook.date1904,
+            this_year: this_year(),
+        }
+    }
+
+    /// Keep what was typed into the cell being edited. Returns the changes
+    /// made, empty when nothing changed.
+    pub fn commit(&mut self, language: &str) -> Vec<Change> {
+        let reading = self.reading(language);
+        let Some((at, text)) = self.view.finish_edit() else {
+            return Vec::new();
+        };
+        let sheet = self.view.sheet_index();
+        let (entry, look) = input::read(&text, &reading);
+        let cell = self.view.workbook().entry_cell(sheet, at, entry, look);
+        let changes = self.view.workbook_mut().set_cells(sheet, vec![(at, cell)]);
+        self.record(changes)
+    }
+
+    /// Empty the selected cells, keeping their formats. One undo step.
+    pub fn clear_selection(&mut self) -> Vec<Change> {
+        let sheet_index = self.view.sheet_index();
+        let range = self.view.selection();
+        let Some(sheet) = self.view.sheet() else {
+            return Vec::new();
+        };
+        let cleared: Vec<(CellRef, Option<aster_sheets::Cell>)> = sheet
+            .cells_in(range)
+            .filter(|(_, cell)| !cell.is_blank())
+            .map(|(at, cell)| {
+                let kept = (cell.style != 0).then(|| aster_sheets::Cell {
+                    style: cell.style,
+                    ..aster_sheets::Cell::new(at.col, aster_sheets::Value::Empty)
+                });
+                (at, kept)
+            })
+            .collect();
+        if cleared.is_empty() {
+            return Vec::new();
+        }
+        let changes = self.view.workbook_mut().set_cells(sheet_index, cleared);
+        self.record(changes)
+    }
+
+    /// Put cells in place on the current sheet as one undo step.
+    pub fn put(&mut self, cells: Vec<(CellRef, Option<aster_sheets::Cell>)>) -> Vec<Change> {
+        let sheet = self.view.sheet_index();
+        let changes = self.view.workbook_mut().set_cells(sheet, cells);
+        self.record(changes)
+    }
+
+    fn record(&mut self, changes: Vec<Change>) -> Vec<Change> {
+        self.note(&changes);
+        self.history.push(changes.clone());
+        changes
+    }
+
+    /// Remember which cells saving must write.
+    fn note(&mut self, changes: &[Change]) {
+        for change in changes {
+            self.dirty.insert((change.sheet, change.at));
+            self.formulas_changed |= change.touches_formula();
+        }
+    }
+
+    /// Undo the last step. Returns the changes made, to recalculate.
+    pub fn undo(&mut self) -> Vec<Change> {
+        self.view.cancel_edit();
+        let Some(step) = self.history.undo.pop() else {
+            return Vec::new();
+        };
+        let inverse: Vec<Change> = step.iter().rev().map(Change::inverse).collect();
+        self.view.workbook_mut().apply(&inverse);
+        self.note(&inverse);
+        self.show(&inverse);
+        self.history.redo.push(step);
+        inverse
+    }
+
+    pub fn redo(&mut self) -> Vec<Change> {
+        self.view.cancel_edit();
+        let Some(step) = self.history.redo.pop() else {
+            return Vec::new();
+        };
+        self.view.workbook_mut().apply(&step);
+        self.note(&step);
+        self.show(&step);
+        let applied = step.clone();
+        self.history.undo.push(step);
+        applied
+    }
+
+    /// Bring the cells a step changed into view, selected.
+    fn show(&mut self, changes: &[Change]) {
+        let Some(first) = changes.first() else {
+            return;
+        };
+        if first.sheet != self.view.sheet_index() {
+            self.view.set_sheet(first.sheet);
+        }
+        let mut range = CellRange::single(first.at);
+        for change in changes.iter().filter(|c| c.sheet == first.sheet) {
+            range = range.union(&CellRange::single(change.at));
+        }
+        self.view.select(range.first);
+        self.view.extend_to(range.last);
+    }
+}
+
+/// The engine's edits for cell changes.
+pub fn edits(changes: &[Change]) -> Vec<Edit> {
+    changes
+        .iter()
+        .map(
+            |change| match change.after.as_ref().and_then(|c| c.formula.clone()) {
+                Some(formula) => Edit::Formula {
+                    sheet: change.sheet,
+                    at: change.at,
+                    formula: formula.to_string(),
+                },
+                None => Edit::Value {
+                    sheet: change.sheet,
+                    at: change.at,
+                    value: change
+                        .after
+                        .as_ref()
+                        .map(|c| c.value.clone())
+                        .unwrap_or_default(),
+                },
+            },
+        )
+        .collect()
+}
+
+/// The usual order of a date written with numbers in a language.
+pub fn date_order(language: &str) -> DateOrder {
+    match language.split('-').next().unwrap_or_default() {
+        "en" => DateOrder::Mdy,
+        "fr" | "de" | "es" => DateOrder::Dmy,
+        _ => DateOrder::Ymd,
+    }
+}
+
+fn this_year() -> i64 {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400);
+    // Days since 1970 to an Excel serial, then to its year.
+    aster_sheets::date_parts(days as f64 + 25_569.0, false).map_or(2026, |p| i64::from(p[0]))
 }
 
 impl Drop for SheetTab {
@@ -324,5 +544,130 @@ mod tests {
         };
         let (_, formulas) = calculate(&workbook, &Cancel::new()).unwrap();
         assert_eq!(formulas, 0);
+    }
+
+    fn tab() -> SheetTab {
+        let mut sheet = aster_sheets::SheetBuilder::new("表", aster_sheets::SheetKind::Worksheet);
+        sheet.push(
+            0,
+            aster_sheets::Cell::new(0, aster_sheets::Value::Number(1.0)),
+        );
+        sheet.push(
+            1,
+            aster_sheets::Cell::new(0, aster_sheets::Value::Number(2.0)),
+        );
+        let workbook = Workbook {
+            sheets: vec![sheet.finish()],
+            styles: vec![
+                aster_sheets::CellStyle::default(),
+                aster_sheets::CellStyle {
+                    format: Arc::new(aster_sheets::Format::builtin(14)),
+                    ..aster_sheets::CellStyle::default()
+                },
+            ],
+            ..Workbook::default()
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        SheetTab::new(workbook, None, &tokens)
+    }
+
+    fn at(text: &str) -> CellRef {
+        CellRef::parse(text).unwrap()
+    }
+
+    fn value(tab: &SheetTab, cell: &str) -> Option<aster_sheets::Value> {
+        tab.view.sheet()?.cell(at(cell)).map(|c| c.value.clone())
+    }
+
+    #[test]
+    fn typing_commits_one_undoable_step_at_a_time() {
+        use aster_surface::cell_editor::EditMode;
+
+        let mut tab = tab();
+        assert!(!tab.is_modified());
+        tab.view.select(at("B1"));
+        tab.view.begin_edit(EditMode::Enter, Some("12%".into()));
+        let changes = tab.commit("zh-Hans");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(value(&tab, "B1"), Some(aster_sheets::Value::Number(0.12)));
+        assert!(tab.is_modified());
+        assert!(tab.dirty.contains(&(0, at("B1"))));
+        assert!(!tab.formulas_changed);
+
+        tab.view.select(at("C1"));
+        tab.view.begin_edit(EditMode::Enter, Some("=a1+a2".into()));
+        tab.commit("en");
+        let formula = tab
+            .view
+            .sheet()
+            .unwrap()
+            .cell(at("C1"))
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(formula.as_deref(), Some("A1+A2"));
+        assert!(tab.formulas_changed);
+        let edits = edits(&tab.history.undo[1]);
+        assert!(matches!(&edits[0], Edit::Formula { formula, .. } if formula == "A1+A2"));
+
+        // A date typed in English is month first; in Chinese year first.
+        tab.view.select(at("D1"));
+        tab.view
+            .begin_edit(EditMode::Enter, Some("3/4/2026".into()));
+        tab.commit("en");
+        let march = aster_sheets::date_serial(2026, 3, 4, false).unwrap();
+        assert_eq!(value(&tab, "D1"), Some(aster_sheets::Value::Number(march)));
+        assert_eq!(tab.view.sheet().unwrap().cell(at("D1")).unwrap().style, 1);
+
+        // Escape: nothing kept.
+        tab.view.begin_edit(EditMode::Enter, Some("x".into()));
+        assert!(tab.view.cancel_edit());
+        assert!(tab.commit("en").is_empty());
+
+        // Undo back to the file as read: no longer modified.
+        assert_eq!(tab.undo().len(), 1);
+        assert_eq!(tab.undo().len(), 1);
+        assert!(tab.is_modified());
+        assert_eq!(tab.undo().len(), 1);
+        assert!(!tab.is_modified());
+        assert_eq!(value(&tab, "B1"), None);
+        assert!(tab.undo().is_empty());
+        // Redo selects what it changed.
+        assert_eq!(tab.redo().len(), 1);
+        assert_eq!(tab.view.selected(), at("B1"));
+        assert!(tab.is_modified());
+        tab.history.mark_saved();
+        assert!(!tab.is_modified());
+        tab.undo();
+        assert!(tab.is_modified());
+        // A new step after undoing past the save: the saved state is gone.
+        tab.view.begin_edit(EditMode::Enter, Some("z".into()));
+        tab.commit("en");
+        assert!(tab.is_modified());
+        assert!(!tab.history.can_redo());
+    }
+
+    #[test]
+    fn clearing_a_selection_is_one_step() {
+        let mut tab = tab();
+        tab.view.select(at("A1"));
+        tab.view.extend_to(at("C9"));
+        let changes = tab.clear_selection();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(tab.view.sheet().unwrap().cell_count(), 0);
+        // Nothing left to clear: no step.
+        assert!(tab.clear_selection().is_empty());
+        tab.undo();
+        assert_eq!(value(&tab, "A2"), Some(aster_sheets::Value::Number(2.0)));
+        assert!(!tab.is_modified());
+    }
+
+    #[test]
+    fn dates_read_in_the_language_order() {
+        assert_eq!(date_order("en"), DateOrder::Mdy);
+        assert_eq!(date_order("de"), DateOrder::Dmy);
+        assert_eq!(date_order("zh-Hant"), DateOrder::Ymd);
+        assert_eq!(date_order("ja"), DateOrder::Ymd);
+        assert!((2026..2200).contains(&this_year()));
     }
 }

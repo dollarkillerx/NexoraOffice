@@ -8,6 +8,7 @@
 //! input-method gate. The editors will plug in here through the `EditorView`
 //! contract once `aster-model` and `aster-render` exist.
 
+pub mod cell_editor;
 mod glyphs;
 pub mod host;
 pub mod md_picture;
@@ -118,10 +119,35 @@ macro_rules! viewer {
     };
 }
 
-viewer!(
-    sheet_view::SheetView,
-    |view: &mut sheet_view::SheetView, delta| view.scroll_by(0.0, delta)
-);
+impl Surface for sheet_view::SheetView {
+    fn resize(&mut self, width: u16, height: u16, scale: f32) {
+        sheet_view::SheetView::resize(self, width, height, scale)
+    }
+    fn size(&self) -> (u16, u16, f32) {
+        sheet_view::SheetView::size(self)
+    }
+    fn set_caret_on(&mut self, on: bool) {
+        sheet_view::SheetView::set_caret_on(self, on)
+    }
+    fn render(&mut self) -> &Pixmap {
+        sheet_view::SheetView::render(self)
+    }
+    fn scroll_by(&mut self, delta: f64) -> bool {
+        sheet_view::SheetView::scroll_by(self, 0.0, delta)
+    }
+    fn scroll_range(&mut self) -> (f64, f64) {
+        sheet_view::SheetView::scroll_range(self)
+    }
+    fn is_composing(&self) -> bool {
+        sheet_view::SheetView::is_composing(self)
+    }
+    fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+        sheet_view::SheetView::ime_cursor_area(self)
+    }
+    fn text(&self) -> String {
+        sheet_view::SheetView::text(self)
+    }
+}
 viewer!(
     slide_view::SlideView,
     |view: &mut slide_view::SlideView, delta| {

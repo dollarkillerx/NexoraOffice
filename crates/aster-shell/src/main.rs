@@ -45,6 +45,7 @@ use aster_shell::toolbar::{self, Command, Control, ViewMode, ViewState, zoom_ste
 use aster_storage::{
     Contents, Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot,
 };
+use aster_surface::cell_editor::EditMode;
 use aster_surface::host::{self, to_px};
 use aster_surface::preview::{PreviewBuilder, PreviewLayout, PreviewWorker};
 use aster_surface::{Action, ImeEvent, Surface};
@@ -119,7 +120,7 @@ impl Content {
     fn path(&self) -> Option<&Path> {
         match self {
             Content::Markdown(editor) => editor.path.as_deref(),
-            Content::Sheet(tab) => Some(&tab.path),
+            Content::Sheet(tab) => tab.path.as_deref(),
             Content::Slides(tab) => Some(&tab.path),
             Content::Writer(_) => None,
         }
@@ -433,7 +434,7 @@ impl Shell {
         let content = match loaded {
             office::Loaded::Workbook(workbook) => {
                 let id = self.tabs.open(DocKind::Sheets, title);
-                let tab = SheetTab::new(workbook, path, &self.tokens);
+                let tab = SheetTab::new(workbook, Some(path), &self.tokens);
                 self.contents.insert(id, Content::Sheet(Box::new(tab)));
                 return id;
             }
@@ -675,8 +676,14 @@ impl Shell {
     fn sync_modified(&mut self) -> bool {
         let mut changed = false;
         for (id, content) in &self.contents {
-            if let Content::Markdown(editor) = content {
-                changed |= self.tabs.set_modified(*id, editor.document.is_modified());
+            match content {
+                Content::Markdown(editor) => {
+                    changed |= self.tabs.set_modified(*id, editor.document.is_modified());
+                }
+                Content::Sheet(tab) => {
+                    changed |= self.tabs.set_modified(*id, tab.is_modified());
+                }
+                _ => {}
             }
         }
         changed
@@ -2649,6 +2656,117 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
     ui.set_slide_notes(SharedString::new());
 }
 
+/// After cells changed (or only the selection moved, with no changes):
+/// bring the formula bar, the status bar and the frame up to date.
+fn after_sheet_change(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_sheets::Change>) {
+    if !changes.is_empty() && shell.sync_modified() {
+        refresh_tabs(ui, shell);
+    }
+    refresh_viewer(ui, shell);
+    refresh_status(ui, shell);
+    present(ui, shell);
+}
+
+/// Whether a key's text is something to type rather than a control key.
+fn is_typed(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c))
+}
+
+/// A key on a workbook: typing into a cell, moving and stretching the
+/// selection, clearing it. Returns whether the key was used.
+fn sheet_key_pressed(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    text: &str,
+    shift: bool,
+    primary: bool,
+    alt: bool,
+) -> bool {
+    use slint::platform::Key;
+
+    let language = shell.language.tag();
+    let Some(tab) = shell.active_sheet() else {
+        return false;
+    };
+    let is = |key: Key| text.chars().eq(std::iter::once(char::from(key)));
+    let backtab = is(Key::Backtab);
+    let tab_key = is(Key::Tab) || backtab;
+    if let Some(mode) = tab.view.editor().map(|editor| editor.mode) {
+        let edit_mode = mode == EditMode::Edit;
+        let changed = if is(Key::Escape) {
+            tab.view.cancel_edit()
+        } else if is(Key::Return) && alt {
+            tab.view.edit(|editor| editor.insert("\n")).is_some()
+        } else if is(Key::Return) || tab_key {
+            let changes = tab.commit(language);
+            if let Some(tab) = shell.active_sheet() {
+                tab.view.step(tab_key, shift || backtab);
+            }
+            after_sheet_change(ui, shell, changes);
+            return true;
+        } else if (is(Key::LeftArrow) || is(Key::RightArrow)) && edit_mode {
+            let left = is(Key::LeftArrow);
+            tab.view
+                .edit(|editor| if left { editor.left() } else { editor.right() })
+                .unwrap_or(false)
+        } else if is(Key::UpArrow)
+            || is(Key::DownArrow)
+            || is(Key::LeftArrow)
+            || is(Key::RightArrow)
+        {
+            if edit_mode {
+                return true;
+            }
+            // Typing a new entry: the arrows keep it and move on.
+            let changes = tab.commit(language);
+            if let Some(tab) = shell.active_sheet()
+                && let Some(key) = viewer_key(text).and_then(|k| office::sheet_key(k, false, false))
+            {
+                tab.view.key(key);
+            }
+            after_sheet_change(ui, shell, changes);
+            return true;
+        } else if is(Key::Home) {
+            tab.view.edit(|editor| editor.home()).unwrap_or(false)
+        } else if is(Key::End) {
+            tab.view.edit(|editor| editor.end()).unwrap_or(false)
+        } else if is(Key::Backspace) {
+            tab.view.edit(|editor| editor.backspace()).unwrap_or(false)
+        } else if is(Key::Delete) {
+            tab.view.edit(|editor| editor.delete()).unwrap_or(false)
+        } else if is_typed(text) && !primary {
+            tab.view.edit(|editor| editor.insert(text)).is_some()
+        } else {
+            return false;
+        };
+        if changed {
+            refresh_viewer(ui, shell);
+            present(ui, shell);
+        }
+        return true;
+    }
+    if is(Key::F2) {
+        tab.view.begin_edit(EditMode::Edit, None);
+    } else if is(Key::Return) || tab_key {
+        tab.view.step(tab_key, shift || backtab);
+    } else if is(Key::Backspace) || is(Key::Delete) {
+        let changes = tab.clear_selection();
+        after_sheet_change(ui, shell, changes);
+        return true;
+    } else if let Some(key) = viewer_key(text).and_then(|k| office::sheet_key(k, shift, primary)) {
+        tab.view.key_extending(key, shift);
+    } else if is_typed(text) && !primary {
+        tab.view.begin_edit(EditMode::Enter, Some(text.to_owned()));
+    } else {
+        return false;
+    }
+    after_sheet_change(ui, shell, Vec::new());
+    true
+}
+
 /// A key on a viewer, decoded from what Slint reports.
 fn viewer_key(text: &str) -> Option<office::Key> {
     use slint::platform::Key;
@@ -3013,6 +3131,13 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     committed
                 }
                 Some(Content::Markdown(editor)) => editor.ime(event),
+                Some(Content::Sheet(tab)) => {
+                    if tab.view.ime(event) {
+                        refresh_viewer(&ui, shell);
+                        present(&ui, shell);
+                    }
+                    return EventResult::PreventDefault;
+                }
                 _ => return EventResult::Propagate,
             };
             after_edit(&ui, shell, text_changed);
@@ -3048,16 +3173,14 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
             return handled;
         }
-        if shell.active_sheet().is_some() || shell.active_slides().is_some() {
+        if shell.active_sheet().is_some() {
+            return sheet_key_pressed(&ui, shell, text.as_str(), shift, primary, alt);
+        }
+        if shell.active_slides().is_some() {
             let Some(key) = viewer_key(text.as_str()) else {
                 return false;
             };
-            let moved = if let Some(tab) = shell.active_sheet() {
-                match office::sheet_key(key, shift, primary) {
-                    Some(key) => tab.view.key(key),
-                    None => false,
-                }
-            } else if let Some(tab) = shell.active_slides() {
+            let moved = if let Some(tab) = shell.active_slides() {
                 office::slide_key(&mut tab.view, key, shift)
             } else {
                 false
@@ -3092,16 +3215,24 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_pointer_down(handler!(|ui, shell, x, y, shift| {
+        let language = shell.language.tag();
         let scale = f64::from(ui.window().scale_factor());
         let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
             Some(Content::Markdown(editor)) => editor.pointer_down(x, y, shift),
             Some(Content::Sheet(tab)) => {
-                if tab.view.press(x, y) {
-                    refresh_viewer(&ui, shell);
-                    present(&ui, shell);
-                }
+                // A click elsewhere keeps what was being typed.
+                let changes = if tab.view.is_editing() {
+                    tab.commit(language)
+                } else {
+                    Vec::new()
+                };
+                let Some(tab) = shell.active_sheet() else {
+                    return;
+                };
+                tab.view.press(x, y, shift);
+                after_sheet_change(&ui, shell, changes);
                 return;
             }
             Some(Content::Slides(tab)) => {
@@ -3123,10 +3254,40 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         match shell.active_content() {
             Some(Content::Writer(view)) => view.surface.pointer_drag(x, y),
             Some(Content::Markdown(editor)) => editor.pointer_drag(x, y),
+            Some(Content::Sheet(tab)) => {
+                if !tab.view.is_editing() && tab.view.drag(x, y) {
+                    refresh_viewer(&ui, shell);
+                    present(&ui, shell);
+                }
+                return;
+            }
             _ => return,
         }
         follow_selection(&ui, shell);
         present(&ui, shell);
+    }));
+
+    ui.on_pointer_double(handler!(|ui, shell, x, y| {
+        let scale = f64::from(ui.window().scale_factor());
+        let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
+        if let Some(tab) = shell.active_sheet()
+            && !tab.view.is_editing()
+            && let Some(aster_surface::sheet_view::Hit::Cell(_)) = tab.view.hit(x, y)
+        {
+            tab.view.begin_edit(EditMode::Edit, None);
+            refresh_viewer(&ui, shell);
+            present(&ui, shell);
+        }
+    }));
+
+    ui.on_formula_bar_clicked(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet()
+            && !tab.view.is_editing()
+        {
+            tab.view.begin_edit(EditMode::Edit, None);
+            refresh_viewer(&ui, shell);
+            present(&ui, shell);
+        }
     }));
 
     ui.on_scrolled(handler!(|ui, shell, delta_x, delta, pointer_x| {

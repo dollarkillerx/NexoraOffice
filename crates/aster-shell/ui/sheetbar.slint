@@ -7,6 +7,8 @@ import { Tokens } from "tokens.slint";
 export component FormulaBar inherits Rectangle {
     in property <string> address;
     in property <string> content;
+    // A click on the content: edit the active cell there.
+    callback clicked();
     height: Tokens.control-height + 2 * Tokens.space-xs;
     background: Tokens.surface;
 
@@ -45,6 +47,12 @@ export component FormulaBar inherits Rectangle {
             border-radius: Tokens.radius-sm;
             background: Tokens.fill;
             clip: true;
+            TouchArea {
+                mouse-cursor: text;
+                clicked => {
+                    root.clicked();
+                }
+            }
             Text {
                 x: Tokens.space-sm;
                 width: parent.width - 2 * Tokens.space-sm;

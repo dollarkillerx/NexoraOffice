@@ -238,6 +238,9 @@ export component AppWindow inherits Window {
     callback key-pressed(string, bool, bool, bool) -> bool;
     callback pointer-down(length, length, bool);
     callback pointer-drag(length, length);
+    // A double click on the surface; a click in the formula bar.
+    callback pointer-double(length, length);
+    callback formula-bar-clicked();
     // Wheel movement across and down, and where the pointer is across.
     callback scrolled(length, length, length);
     callback sheet-selected(int);
@@ -928,6 +931,10 @@ export component AppWindow inherits Window {
                         visible: root.viewer == 1;
                         address: root.cell-address;
                         content: root.cell-content;
+                        clicked => {
+                            root.formula-bar-clicked();
+                            scope.focus();
+                        }
                     }
 
                     sheet-bar := SheetBar {
@@ -1000,6 +1007,9 @@ export component AppWindow inherits Window {
                                         if (self.pressed) {
                                             root.pointer-drag(self.mouse-x, self.mouse-y);
                                         }
+                                    }
+                                    double-clicked => {
+                                        root.pointer-double(self.mouse-x, self.mouse-y);
                                     }
                                     scroll-event(event) => {
                                         root.scrolled(event.delta-x, event.delta-y, self.mouse-x);

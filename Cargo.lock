@@ -411,8 +411,10 @@ version = "0.0.1"
 name = "aster-shell"
 version = "0.0.1"
 dependencies = [
+ "aster-ai",
  "aster-calc",
  "aster-markdown",
+ "aster-mcp",
  "aster-ooxml",
  "aster-platform",
  "aster-sheets",

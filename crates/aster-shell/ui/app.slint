@@ -3,7 +3,7 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem } from "tokens.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -18,7 +18,7 @@ import { FindBar } from "findbar.slint";
 import { FormulaBar, SheetBar } from "sheetbar.slint";
 import { NotesPanel } from "notes.slint";
 
-export { Tokens, Icons, Strings }
+export { Tokens, Icons, Strings, ChatItem, ApprovalItem }
 
 export component AppWindow inherits Window {
     title: root.active-title == "" ? "Aster Office" : root.active-title + " — Aster Office";
@@ -55,6 +55,40 @@ export component AppWindow inherits Window {
     in property <bool> current-has-file;
     in-out property <bool> sidebar-open: true;
     in-out property <bool> assistant-open;
+    // The assistant panel and MCP; see assistant.slint.
+    in property <[ChatItem]> ai-items;
+    in property <[ApprovalItem]> ai-approvals;
+    in property <bool> ai-running;
+    in property <bool> ai-configured;
+    in property <int> ai-access-level: -1;
+    in property <string> ai-access-label;
+    in property <int> ai-provider;
+    in-out property <string> ai-base-url;
+    in-out property <string> ai-model;
+    in property <string> ai-key-state;
+    in property <bool> ai-redact: true;
+    in property <int> ai-untitled-level;
+    in property <string> ai-folder-label;
+    in property <int> ai-folder-level;
+    in property <bool> mcp-enabled;
+    in property <string> mcp-status;
+    in property <string> mcp-clients;
+    in property <string> mcp-setup-cli;
+    in property <string> mcp-setup-json;
+    callback ai-send(string);
+    callback ai-stop();
+    callback ai-new-chat();
+    callback ai-set-access(int);
+    callback ai-answer(int, int);
+    callback ai-set-provider(int);
+    callback ai-set-base-url(string);
+    callback ai-set-model(string);
+    callback ai-save-key(string);
+    callback ai-delete-key();
+    callback ai-set-redact(bool);
+    callback ai-set-untitled-level(int);
+    callback ai-set-folder-level(int);
+    callback mcp-set-enabled(bool);
     in property <[string]> languages;
     in property <int> language-index;
     // Room for the window buttons where the tab strip doubles as the title bar.
@@ -1109,6 +1143,70 @@ export component AppWindow inherits Window {
 
             AssistantPanel {
                 width: root.assistant-open ? self.panel-width : 0px;
+                items: root.ai-items;
+                approvals: root.ai-approvals;
+                running: root.ai-running;
+                configured: root.ai-configured;
+                access-level: root.ai-access-level;
+                access-label: root.ai-access-label;
+                provider: root.ai-provider;
+                base-url <=> root.ai-base-url;
+                model <=> root.ai-model;
+                key-state: root.ai-key-state;
+                redact: root.ai-redact;
+                untitled-level: root.ai-untitled-level;
+                folder-label: root.ai-folder-label;
+                folder-level: root.ai-folder-level;
+                mcp-enabled: root.mcp-enabled;
+                mcp-status: root.mcp-status;
+                mcp-clients: root.mcp-clients;
+                mcp-setup-cli: root.mcp-setup-cli;
+                mcp-setup-json: root.mcp-setup-json;
+                send(text) => {
+                    root.ai-send(text);
+                }
+                stop => {
+                    root.ai-stop();
+                }
+                new-chat => {
+                    root.ai-new-chat();
+                }
+                set-access(level) => {
+                    root.ai-set-access(level);
+                }
+                answer(id, choice) => {
+                    root.ai-answer(id, choice);
+                }
+                set-provider(index) => {
+                    root.ai-set-provider(index);
+                }
+                set-base-url(text) => {
+                    root.ai-set-base-url(text);
+                }
+                set-model(text) => {
+                    root.ai-set-model(text);
+                }
+                save-key(text) => {
+                    root.ai-save-key(text);
+                }
+                delete-key => {
+                    root.ai-delete-key();
+                }
+                set-redact(on) => {
+                    root.ai-set-redact(on);
+                }
+                set-untitled-level(level) => {
+                    root.ai-set-untitled-level(level);
+                }
+                set-folder-level(level) => {
+                    root.ai-set-folder-level(level);
+                }
+                set-mcp(on) => {
+                    root.mcp-set-enabled(on);
+                }
+                copy(text) => {
+                    root.copy-to-clipboard(text);
+                }
                 animate width {
                     duration: 140ms;
                     easing: ease-out;

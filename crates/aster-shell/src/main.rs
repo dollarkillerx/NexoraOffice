@@ -65,6 +65,8 @@ use aster_shell::content::{
 
 slint::include_modules!();
 
+mod agent;
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -198,6 +200,8 @@ struct Shell {
     recent_loaded: bool,
     /// The folder in the sidebar.
     tree: Option<FileTree>,
+    /// The built-in assistant and MCP; set up once the window exists.
+    ai: Option<agent::Assistant>,
     /// Whether the remembered folder has been looked up; until then the
     /// sidebar state is not written back.
     workspace_loaded: bool,
@@ -239,6 +243,7 @@ impl Shell {
             recent: RecentFiles::default(),
             recent_loaded: false,
             tree: None,
+            ai: None,
             workspace_loaded: false,
             filter: None,
             sidebar_recent: Vec::new(),
@@ -941,6 +946,46 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_notes_empty(strings.notes_empty.into());
     s.set_notes_show(strings.notes_show.into());
     s.set_notes_hide(strings.notes_hide.into());
+    s.set_ai_new_chat(strings.ai_new_chat.into());
+    s.set_ai_settings(strings.ai_settings.into());
+    s.set_ai_back(strings.ai_back.into());
+    s.set_ai_send(strings.ai_send.into());
+    s.set_ai_stop(strings.ai_stop.into());
+    s.set_ai_input_hint(strings.ai_input_hint.into());
+    s.set_ai_empty(strings.ai_empty.into());
+    s.set_ai_access_none(strings.ai_access_none.into());
+    s.set_level_off(strings.level_off.into());
+    s.set_level_read_only(strings.level_read_only.into());
+    s.set_level_ask(strings.level_ask.into());
+    s.set_level_trusted(strings.level_trusted.into());
+    s.set_level_full(strings.level_full.into());
+    s.set_level_help(strings.level_help.into());
+    s.set_ai_not_configured(strings.ai_not_configured.into());
+    s.set_ai_thinking(strings.ai_thinking.into());
+    s.set_approve_allow(strings.approve_allow.into());
+    s.set_approve_session(strings.approve_session.into());
+    s.set_approve_deny(strings.approve_deny.into());
+    s.set_approval_timeout(strings.approval_timeout.into());
+    s.set_ai_settings_title(strings.ai_settings_title.into());
+    s.set_ai_provider(strings.ai_provider.into());
+    s.set_provider_custom(strings.provider_custom.into());
+    s.set_ai_base_url(strings.ai_base_url.into());
+    s.set_ai_model(strings.ai_model.into());
+    s.set_ai_api_key(strings.ai_api_key.into());
+    s.set_ai_key_hint(strings.ai_key_hint.into());
+    s.set_ai_key_save(strings.ai_key_save.into());
+    s.set_ai_key_delete(strings.ai_key_delete.into());
+    s.set_ai_redact(strings.ai_redact.into());
+    s.set_ai_access_title(strings.ai_access_title.into());
+    s.set_ai_untitled_access(strings.ai_untitled_access.into());
+    s.set_ai_no_folder(strings.ai_no_folder.into());
+    s.set_mcp_title(strings.mcp_title.into());
+    s.set_mcp_enable(strings.mcp_enable.into());
+    s.set_mcp_off_note(strings.mcp_off_note.into());
+    s.set_mcp_no_clients(strings.mcp_no_clients.into());
+    s.set_mcp_setup_cli(strings.mcp_setup_cli.into());
+    s.set_mcp_setup_json(strings.mcp_setup_json.into());
+    s.set_mcp_copy(strings.mcp_copy.into());
     s.set_table_edit(strings.table_edit.into());
     s.set_table_row_above(strings.table_row_above.into());
     s.set_table_row_below(strings.table_row_below.into());
@@ -1063,6 +1108,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
         }
     }
     ui.set_editing(shell.active_markdown().is_some());
+    agent::refresh(ui, shell);
     refresh_viewer(ui, shell);
     refresh_toolbar(ui, shell);
     refresh_status(ui, shell);
@@ -3357,6 +3403,50 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
+    agent::Assistant::start(&ui, &mut shell.borrow_mut());
+    ui.on_ai_send(handler!(|ui, shell, text| {
+        agent::send(&ui, shell, text.as_str());
+    }));
+    ui.on_ai_stop(handler!(|ui, shell| {
+        agent::stop(&ui, shell);
+    }));
+    ui.on_ai_new_chat(handler!(|ui, shell| {
+        agent::new_chat(&ui, shell);
+    }));
+    ui.on_ai_set_access(handler!(|ui, shell, level| {
+        agent::set_document_access(&ui, shell, level);
+    }));
+    ui.on_ai_answer(handler!(|ui, shell, id, choice| {
+        agent::answer(&ui, shell, id, choice);
+    }));
+    ui.on_ai_set_provider(handler!(|ui, shell, index| {
+        agent::set_provider(&ui, shell, index);
+    }));
+    ui.on_ai_set_base_url(handler!(|ui, shell, url| {
+        agent::set_base_url(&ui, shell, url.as_str());
+    }));
+    ui.on_ai_set_model(handler!(|ui, shell, model| {
+        agent::set_model(&ui, shell, model.as_str());
+    }));
+    ui.on_ai_save_key(handler!(|ui, shell, key| {
+        agent::save_key(&ui, shell, key.as_str());
+    }));
+    ui.on_ai_delete_key(handler!(|ui, shell| {
+        agent::delete_key(&ui, shell);
+    }));
+    ui.on_ai_set_redact(handler!(|ui, shell, on| {
+        agent::set_redact(&ui, shell, on);
+    }));
+    ui.on_ai_set_untitled_level(handler!(|ui, shell, level| {
+        agent::set_untitled_access(&ui, shell, level);
+    }));
+    ui.on_ai_set_folder_level(handler!(|ui, shell, level| {
+        agent::set_folder_access(&ui, shell, level);
+    }));
+    ui.on_mcp_set_enabled(handler!(|ui, shell, on| {
+        agent::set_mcp(&ui, shell, on);
+    }));
+
     ui.on_format(handler!(|ui, shell, code| {
         if let Some(format) = format_of_menu(code) {
             apply_format(&ui, shell, format);
@@ -3896,6 +3986,9 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ui.run()?;
+    if let Ok(mut shell) = shell.try_borrow_mut() {
+        agent::shut_down(&mut shell);
+    }
     // Carry out what the record writer still has queued (deleting the records
     // of documents that were saved or discarded) before the process ends.
     if let Ok(mut shell) = shell.try_borrow_mut() {

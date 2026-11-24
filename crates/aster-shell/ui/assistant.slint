@@ -1,35 +1,381 @@
-import { Tokens, Icons, Strings } from "tokens.slint";
-import { Icon, Badge, VHairline } from "widgets.slint";
+import { Tokens, Icons, Strings, ChatItem, ApprovalItem } from "tokens.slint";
+import { Icon, IconButton, TextButton, VHairline, Hairline } from "widgets.slint";
 
-component Point inherits HorizontalLayout {
-    in property <string> text;
-    spacing: Tokens.space-sm;
-    VerticalLayout {
-        alignment: start;
-        padding-top: 7px;
+// Five access levels in a row: Off, Read, Ask, Trusted, Full.
+component LevelPicker inherits HorizontalLayout {
+    in property <int> level;
+    in property <bool> enabled: true;
+    callback picked(int);
+    spacing: 2px;
+    for name[index] in [Strings.level-off, Strings.level-read-only, Strings.level-ask, Strings.level-trusted, Strings.level-full]: Rectangle {
+        height: 24px;
+        horizontal-stretch: 1;
+        border-radius: Tokens.radius-sm;
+        background: root.level == index ? Tokens.accent-soft : touch.has-hover && root.enabled ? Tokens.hover : Tokens.fill;
+        accessible-role: button;
+        accessible-label: name;
+        accessible-checked: root.level == index;
+        Text {
+            text: name;
+            font-size: Tokens.font-sm;
+            font-weight: root.level == index ? 600 : 400;
+            color: !root.enabled ? Tokens.text-disabled : root.level == index ? Tokens.accent : Tokens.text-secondary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                root.picked(index);
+            }
+        }
+    }
+}
+
+// Text that can be selected and copied but not edited.
+component ReadText inherits TextInput {
+    read-only: true;
+    single-line: false;
+    wrap: word-wrap;
+    font-size: Tokens.font-md;
+    color: Tokens.text;
+    selection-background-color: Tokens.accent-soft;
+    selection-foreground-color: Tokens.text;
+}
+
+component ChatRow inherits Rectangle {
+    in property <ChatItem> item;
+    in property <length> available;
+
+    // The user's message: on the right, tinted.
+    if root.item.kind == 0: HorizontalLayout {
+        alignment: end;
         Rectangle {
-            width: 4px;
-            height: 4px;
-            border-radius: 2px;
-            background: Tokens.text-tertiary;
+            width: min(root.available * 0.85, user-text.preferred-width + 2 * Tokens.space-md);
+            border-radius: Tokens.radius-lg;
+            background: Tokens.accent-soft;
+            user-text := ReadText {
+                x: Tokens.space-md;
+                y: Tokens.space-sm;
+                width: parent.width - 2 * Tokens.space-md;
+                text: root.item.text;
+            }
+
+            height: user-text.preferred-height + 2 * Tokens.space-sm;
+        }
+    }
+
+    // The assistant's answer: plain text across the panel.
+    if root.item.kind == 1: ReadText {
+        width: root.available;
+        text: root.item.text;
+    }
+
+    // A tool call: one quiet line.
+    if root.item.kind == 2: HorizontalLayout {
+        spacing: Tokens.space-xs;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: root.item.state == 0 ? Tokens.accent : root.item.state == 1 ? Tokens.text-tertiary : #d1242f;
+            }
+        }
+
+        Text {
+            text: root.item.text + (root.item.detail == "" ? "" : " · " + root.item.detail);
+            font-size: Tokens.font-sm;
+            font-family: "Menlo";
+            color: root.item.state == 2 ? #d1242f : Tokens.text-tertiary;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+
+    if root.item.kind == 3: Text {
+        width: root.available;
+        text: root.item.text;
+        font-size: Tokens.font-md;
+        color: #d1242f;
+        wrap: word-wrap;
+    }
+
+    if root.item.kind == 4: Text {
+        width: root.available;
+        text: root.item.text;
+        font-size: Tokens.font-sm;
+        color: Tokens.text-tertiary;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+}
+
+component ApprovalCard inherits Rectangle {
+    in property <ApprovalItem> item;
+    callback answer(int, int);
+    border-radius: Tokens.radius-lg;
+    border-width: 1px;
+    border-color: Tokens.accent;
+    background: Tokens.surface;
+    height: layout.preferred-height;
+
+    layout := VerticalLayout {
+        padding: Tokens.space-md;
+        spacing: Tokens.space-sm;
+        Text {
+            text: root.item.title;
+            font-size: Tokens.font-md;
+            font-weight: 600;
+            color: Tokens.text;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: root.item.detail;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-tertiary;
+            wrap: word-wrap;
+        }
+
+        if root.item.preview != "": Rectangle {
+            border-radius: Tokens.radius-sm;
+            background: Tokens.fill;
+            height: min(preview.preferred-height, 120px) + 2 * Tokens.space-sm;
+            clip: true;
+            preview := Text {
+                x: Tokens.space-sm;
+                y: Tokens.space-sm;
+                width: parent.width - 2 * Tokens.space-sm;
+                text: root.item.preview;
+                font-size: Tokens.font-sm;
+                font-family: "Menlo";
+                color: Tokens.text-secondary;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.space-sm;
+            alignment: end;
+            TextButton {
+                text: Strings.approve-deny;
+                clicked => {
+                    root.answer(root.item.id, 0);
+                }
+            }
+
+            TextButton {
+                text: Strings.approve-session;
+                clicked => {
+                    root.answer(root.item.id, 2);
+                }
+            }
+
+            TextButton {
+                text: Strings.approve-allow;
+                primary: true;
+                clicked => {
+                    root.answer(root.item.id, 1);
+                }
+            }
+        }
+
+        Text {
+            text: Strings.approval-timeout;
+            font-size: Tokens.font-xs;
+            color: Tokens.text-tertiary;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+// A labelled one-line text field.
+component Field inherits VerticalLayout {
+    in property <string> label;
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <InputType> input-type: InputType.text;
+    callback accepted(string);
+    spacing: 4px;
+    Text {
+        text: root.label;
+        font-size: Tokens.font-sm;
+        color: Tokens.text-secondary;
+    }
+
+    Rectangle {
+        height: Tokens.control-height;
+        border-radius: Tokens.radius-md;
+        border-width: 1px;
+        border-color: input.has-focus ? Tokens.accent : Tokens.hairline;
+        background: Tokens.surface;
+        Text {
+            x: Tokens.space-sm;
+            width: parent.width - 2 * Tokens.space-sm;
+            height: parent.height;
+            text: root.placeholder;
+            visible: input.text == "" && !input.has-focus;
+            color: Tokens.text-tertiary;
+            font-size: Tokens.font-md;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        input := TextInput {
+            x: Tokens.space-sm;
+            width: parent.width - 2 * Tokens.space-sm;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            input-type: root.input-type;
+            font-size: Tokens.font-md;
+            color: Tokens.text;
+            text <=> root.text;
+            selection-background-color: Tokens.accent-soft;
+            selection-foreground-color: Tokens.text;
+            accepted => {
+                root.accepted(self.text);
+            }
+        }
+    }
+}
+
+component Section inherits Text {
+    font-size: Tokens.font-md;
+    font-weight: 600;
+    color: Tokens.text;
+}
+
+// A switch with its label.
+component Switch inherits HorizontalLayout {
+    in property <string> label;
+    in property <bool> checked;
+    callback toggled(bool);
+    spacing: Tokens.space-sm;
+    Rectangle {
+        width: 30px;
+        height: 18px;
+        border-radius: 9px;
+        background: root.checked ? Tokens.accent : Tokens.text-disabled;
+        accessible-role: switch;
+        accessible-checked: root.checked;
+        accessible-label: root.label;
+        Rectangle {
+            x: root.checked ? parent.width - self.width - 2px : 2px;
+            y: 2px;
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            background: white;
+            animate x { duration: Tokens.quick; }
+        }
+
+        TouchArea {
+            clicked => {
+                root.toggled(!root.checked);
+            }
         }
     }
 
     Text {
-        text: root.text;
+        text: root.label;
         font-size: Tokens.font-md;
-        color: Tokens.text-secondary;
+        color: Tokens.text;
+        vertical-alignment: center;
         wrap: word-wrap;
         horizontal-stretch: 1;
     }
 }
 
-// Where the built-in assistant will live. Nothing here works: there is no model
-// behind it and no MCP server. The panel exists so the layout has room for it
-// from the start, and it says so.
+// A block of text to copy, with its button.
+component Snippet inherits VerticalLayout {
+    in property <string> label;
+    in property <string> text;
+    callback copy(string);
+    spacing: 4px;
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            font-size: Tokens.font-sm;
+            color: Tokens.text-secondary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        TextButton {
+            text: Strings.mcp-copy;
+            clicked => {
+                root.copy(root.text);
+            }
+        }
+    }
+
+    Rectangle {
+        border-radius: Tokens.radius-sm;
+        background: Tokens.fill;
+        height: code.preferred-height + 2 * Tokens.space-sm;
+        code := ReadText {
+            x: Tokens.space-sm;
+            y: Tokens.space-sm;
+            width: parent.width - 2 * Tokens.space-sm;
+            text: root.text;
+            font-size: Tokens.font-sm;
+            font-family: "Menlo";
+            color: Tokens.text-secondary;
+        }
+    }
+}
+
+// The built-in assistant: a conversation, the questions waiting for the
+// user, the access of the document in front, and a settings page for the
+// provider, document access and MCP.
 export component AssistantPanel inherits Rectangle {
     // Width when open; the caller animates the actual width.
-    in property <length> panel-width: 320px;
+    in property <length> panel-width: 360px;
+    in property <[ChatItem]> items;
+    in property <[ApprovalItem]> approvals;
+    in property <bool> running;
+    in property <bool> configured;
+    // The document in front: its access level, -1 when there is none.
+    in property <int> access-level: -1;
+    in property <string> access-label;
+    // 0 the conversation, 1 settings.
+    in-out property <int> page;
+    // Settings.
+    in property <int> provider;
+    in-out property <string> base-url;
+    in-out property <string> model;
+    in property <string> key-state;
+    in property <bool> redact: true;
+    in property <int> untitled-level;
+    // The sidebar's folder, "" when none, and its level.
+    in property <string> folder-label;
+    in property <int> folder-level;
+    in property <bool> mcp-enabled;
+    in property <string> mcp-status;
+    in property <string> mcp-clients;
+    in property <string> mcp-setup-cli;
+    in property <string> mcp-setup-json;
+
+    callback send(string);
+    callback stop();
+    callback new-chat();
+    callback set-access(int);
+    callback answer(int, int);
+    callback set-provider(int);
+    callback set-base-url(string);
+    callback set-model(string);
+    callback save-key(string);
+    callback delete-key();
+    callback set-redact(bool);
+    callback set-untitled-level(int);
+    callback set-folder-level(int);
+    callback set-mcp(bool);
+    callback copy(string);
+
     background: Tokens.panel;
     clip: true;
 
@@ -41,12 +387,12 @@ export component AssistantPanel inherits Rectangle {
     VerticalLayout {
         x: 1px;
         width: root.panel-width - 1px;
-        padding: Tokens.space-lg;
-        spacing: Tokens.space-md;
 
+        // Header.
         HorizontalLayout {
+            padding: Tokens.space-md;
+            padding-left: Tokens.space-lg;
             spacing: Tokens.space-sm;
-            alignment: start;
             VerticalLayout {
                 alignment: center;
                 Icon {
@@ -56,58 +402,370 @@ export component AssistantPanel inherits Rectangle {
             }
 
             Text {
-                text: Strings.ai-title;
+                text: root.page == 0 ? Strings.ai-title : Strings.ai-settings-title;
                 font-size: Tokens.font-lg;
                 font-weight: 600;
                 color: Tokens.text;
                 vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
             }
 
-            VerticalLayout {
-                alignment: center;
-                Badge {
-                    text: Strings.placeholder-view;
+            if root.page == 0: IconButton {
+                icon: Icons.plus;
+                accessible-role: button;
+                accessible-label: Strings.ai-new-chat;
+                clicked => {
+                    root.new-chat();
+                }
+            }
+
+            if root.page == 0: TextButton {
+                text: Strings.ai-settings;
+                clicked => {
+                    root.page = 1;
+                }
+            }
+
+            if root.page == 1: TextButton {
+                text: Strings.ai-back;
+                clicked => {
+                    root.page = 0;
                 }
             }
         }
 
-        Text {
-            text: Strings.ai-body;
-            font-size: Tokens.font-md;
-            color: Tokens.text-secondary;
-            wrap: word-wrap;
-        }
+        Hairline { }
 
-        Point {
-            text: Strings.ai-point-tools;
-        }
-
-        Point {
-            text: Strings.ai-point-approval;
-        }
-
-        Point {
-            text: Strings.ai-point-keys;
-        }
-
-        Rectangle {
+        // --- The conversation -------------------------------------------
+        if root.page == 0: VerticalLayout {
             vertical-stretch: 1;
+
+            chat := Flickable {
+                vertical-stretch: 1;
+                content-height: max(self.height, messages.preferred-height + 2 * Tokens.space-lg);
+                messages := VerticalLayout {
+                    x: Tokens.space-lg;
+                    y: Tokens.space-lg;
+                    width: chat.width - 2 * Tokens.space-lg;
+                    spacing: Tokens.space-md;
+                    if root.items.length == 0: Text {
+                        text: root.configured ? Strings.ai-empty : Strings.ai-not-configured;
+                        font-size: Tokens.font-md;
+                        color: Tokens.text-secondary;
+                        wrap: word-wrap;
+                    }
+
+                    for item in root.items: ChatRow {
+                        item: item;
+                        available: chat.width - 2 * Tokens.space-lg;
+                    }
+
+                    if root.running: Text {
+                        text: Strings.ai-thinking;
+                        font-size: Tokens.font-sm;
+                        color: Tokens.text-tertiary;
+                    }
+                }
+
+                // Follow the conversation as it grows, unless the user has
+                // scrolled up to read.
+                changed content-height => {
+                    if (self.content-y + self.content-height - self.height < 120px + messages.preferred-height - self.height) {
+                        self.content-y = min(0px, self.height - self.content-height);
+                    }
+                }
+            }
+
+            // Questions waiting for an answer, above the input.
+            for approval in root.approvals: HorizontalLayout {
+                padding-left: Tokens.space-md;
+                padding-right: Tokens.space-md;
+                padding-bottom: Tokens.space-sm;
+                ApprovalCard {
+                    item: approval;
+                    answer(id, choice) => {
+                        root.answer(id, choice);
+                    }
+                }
+            }
+
+            Hairline { }
+
+            // The document in front and what the assistant may do with it.
+            VerticalLayout {
+                padding: Tokens.space-md;
+                padding-bottom: Tokens.space-sm;
+                spacing: 6px;
+                Text {
+                    text: root.access-level < 0 ? Strings.ai-access-none : root.access-label;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-secondary;
+                    overflow: elide;
+                }
+
+                LevelPicker {
+                    level: root.access-level;
+                    enabled: root.access-level >= 0;
+                    picked(level) => {
+                        root.set-access(level);
+                    }
+                }
+            }
+
+            // The prompt.
+            HorizontalLayout {
+                padding: Tokens.space-md;
+                padding-top: Tokens.space-xs;
+                spacing: Tokens.space-sm;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: max(2 * Tokens.control-height, min(160px, prompt.preferred-height + 2 * Tokens.space-sm));
+                    border-radius: Tokens.radius-lg;
+                    border-width: 1px;
+                    border-color: prompt.has-focus ? Tokens.accent : Tokens.hairline;
+                    background: Tokens.surface;
+                    Text {
+                        x: Tokens.space-md;
+                        y: Tokens.space-sm;
+                        width: parent.width - 2 * Tokens.space-md;
+                        text: Strings.ai-input-hint;
+                        visible: prompt.text == "" && !prompt.has-focus;
+                        font-size: Tokens.font-md;
+                        color: Tokens.text-tertiary;
+                        wrap: word-wrap;
+                    }
+
+                    keys := FocusScope {
+                        // Return sends; Shift+Return is a new line.
+                        capture-key-pressed(event) => {
+                            if (event.text == Key.Return && !event.modifiers.shift) {
+                                if (!root.running && prompt.text != "" && root.configured) {
+                                    root.send(prompt.text);
+                                    prompt.text = "";
+                                }
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        prompt := TextInput {
+                            x: Tokens.space-md;
+                            y: Tokens.space-sm;
+                            width: parent.width - 2 * Tokens.space-md;
+                            height: parent.height - 2 * Tokens.space-sm;
+                            single-line: false;
+                            wrap: word-wrap;
+                            font-size: Tokens.font-md;
+                            color: Tokens.text;
+                            selection-background-color: Tokens.accent-soft;
+                            selection-foreground-color: Tokens.text;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: end;
+                    if !root.running: TextButton {
+                        text: Strings.ai-send;
+                        primary: true;
+                        clicked => {
+                            if (prompt.text != "" && root.configured) {
+                                root.send(prompt.text);
+                                prompt.text = "";
+                            }
+                        }
+                    }
+
+                    if root.running: TextButton {
+                        text: Strings.ai-stop;
+                        clicked => {
+                            root.stop();
+                        }
+                    }
+                }
+            }
         }
 
-        // Shows where the prompt goes. It does not take input.
-        Rectangle {
-            height: 2 * Tokens.control-height + Tokens.space-sm;
-            border-radius: Tokens.radius-lg;
-            border-width: 1px;
-            border-color: Tokens.hairline;
-            Text {
-                x: Tokens.space-md;
-                y: Tokens.space-sm + 2px;
-                width: parent.width - 2 * Tokens.space-md;
-                text: Strings.ai-input;
-                font-size: Tokens.font-md;
-                color: Tokens.text-disabled;
-                wrap: word-wrap;
+        // --- Settings -----------------------------------------------------
+        if root.page == 1: Flickable {
+            vertical-stretch: 1;
+            content-height: settings.preferred-height + 2 * Tokens.space-lg;
+            settings := VerticalLayout {
+                x: Tokens.space-lg;
+                y: Tokens.space-lg;
+                width: parent.width - 2 * Tokens.space-lg;
+                spacing: Tokens.space-md;
+
+                Section {
+                    text: Strings.ai-provider;
+                }
+
+                HorizontalLayout {
+                    spacing: 2px;
+                    for name[index] in ["Claude", "OpenAI", "DeepSeek", Strings.provider-custom]: Rectangle {
+                        height: 26px;
+                        horizontal-stretch: 1;
+                        border-radius: Tokens.radius-sm;
+                        background: root.provider == index ? Tokens.accent-soft : provider-touch.has-hover ? Tokens.hover : Tokens.fill;
+                        Text {
+                            text: name;
+                            font-size: Tokens.font-sm;
+                            font-weight: root.provider == index ? 600 : 400;
+                            color: root.provider == index ? Tokens.accent : Tokens.text-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        provider-touch := TouchArea {
+                            clicked => {
+                                root.set-provider(index);
+                            }
+                        }
+                    }
+                }
+
+                Field {
+                    label: Strings.ai-base-url;
+                    text <=> root.base-url;
+                    accepted(text) => {
+                        root.set-base-url(text);
+                    }
+                }
+
+                Field {
+                    label: Strings.ai-model;
+                    text <=> root.model;
+                    accepted(text) => {
+                        root.set-model(text);
+                    }
+                }
+
+                key-field := Field {
+                    label: Strings.ai-api-key + " · " + root.key-state;
+                    placeholder: Strings.ai-key-hint;
+                    input-type: InputType.password;
+                    accepted(text) => {
+                        root.save-key(text);
+                        self.text = "";
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Tokens.space-sm;
+                    alignment: end;
+                    TextButton {
+                        text: Strings.ai-key-delete;
+                        clicked => {
+                            root.delete-key();
+                        }
+                    }
+
+                    TextButton {
+                        text: Strings.ai-key-save;
+                        primary: true;
+                        clicked => {
+                            root.set-base-url(root.base-url);
+                            root.set-model(root.model);
+                            if (key-field.text != "") {
+                                root.save-key(key-field.text);
+                                key-field.text = "";
+                            }
+                        }
+                    }
+                }
+
+                Switch {
+                    label: Strings.ai-redact;
+                    checked: root.redact;
+                    toggled(on) => {
+                        root.set-redact(on);
+                    }
+                }
+
+                Hairline { }
+
+                Section {
+                    text: Strings.ai-access-title;
+                }
+
+                Text {
+                    text: Strings.level-help;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-tertiary;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: root.folder-label == "" ? Strings.ai-no-folder : root.folder-label;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                LevelPicker {
+                    level: root.folder-label == "" ? -1 : root.folder-level;
+                    enabled: root.folder-label != "";
+                    picked(level) => {
+                        root.set-folder-level(level);
+                    }
+                }
+
+                Text {
+                    text: Strings.ai-untitled-access;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-secondary;
+                }
+
+                LevelPicker {
+                    level: root.untitled-level;
+                    picked(level) => {
+                        root.set-untitled-level(level);
+                    }
+                }
+
+                Hairline { }
+
+                Section {
+                    text: Strings.mcp-title;
+                }
+
+                Switch {
+                    label: Strings.mcp-enable;
+                    checked: root.mcp-enabled;
+                    toggled(on) => {
+                        root.set-mcp(on);
+                    }
+                }
+
+                Text {
+                    text: root.mcp-status == "" ? Strings.mcp-off-note : root.mcp-status;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-tertiary;
+                    wrap: word-wrap;
+                }
+
+                if root.mcp-enabled: Text {
+                    text: root.mcp-clients == "" ? Strings.mcp-no-clients : root.mcp-clients;
+                    font-size: Tokens.font-sm;
+                    color: Tokens.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                if root.mcp-setup-cli != "": Snippet {
+                    label: Strings.mcp-setup-cli;
+                    text: root.mcp-setup-cli;
+                    copy(text) => {
+                        root.copy(text);
+                    }
+                }
+
+                if root.mcp-setup-json != "": Snippet {
+                    label: Strings.mcp-setup-json;
+                    text: root.mcp-setup-json;
+                    copy(text) => {
+                        root.copy(text);
+                    }
+                }
             }
         }
     }

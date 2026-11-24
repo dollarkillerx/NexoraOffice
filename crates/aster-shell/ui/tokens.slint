@@ -139,6 +139,46 @@ export global Strings {
     in property <string> notes-empty;
     in property <string> notes-show;
     in property <string> notes-hide;
+    in property <string> ai-new-chat;
+    in property <string> ai-settings;
+    in property <string> ai-back;
+    in property <string> ai-send;
+    in property <string> ai-stop;
+    in property <string> ai-input-hint;
+    in property <string> ai-empty;
+    in property <string> ai-access-none;
+    in property <string> level-off;
+    in property <string> level-read-only;
+    in property <string> level-ask;
+    in property <string> level-trusted;
+    in property <string> level-full;
+    in property <string> level-help;
+    in property <string> ai-not-configured;
+    in property <string> ai-thinking;
+    in property <string> approve-allow;
+    in property <string> approve-session;
+    in property <string> approve-deny;
+    in property <string> approval-timeout;
+    in property <string> ai-settings-title;
+    in property <string> ai-provider;
+    in property <string> provider-custom;
+    in property <string> ai-base-url;
+    in property <string> ai-model;
+    in property <string> ai-api-key;
+    in property <string> ai-key-hint;
+    in property <string> ai-key-save;
+    in property <string> ai-key-delete;
+    in property <string> ai-redact;
+    in property <string> ai-access-title;
+    in property <string> ai-untitled-access;
+    in property <string> ai-no-folder;
+    in property <string> mcp-title;
+    in property <string> mcp-enable;
+    in property <string> mcp-off-note;
+    in property <string> mcp-no-clients;
+    in property <string> mcp-setup-cli;
+    in property <string> mcp-setup-json;
+    in property <string> mcp-copy;
     in property <string> table-edit;
     in property <string> table-row-above;
     in property <string> table-row-below;
@@ -240,4 +280,27 @@ export struct RecoveryItem {
     note: string,
     // False when the record cannot be read: it can only be discarded.
     readable: bool,
+}
+
+// One entry in the assistant's conversation.
+export struct ChatItem {
+    // 0 the user, 1 the assistant, 2 a tool call, 3 an error, 4 a notice.
+    kind: int,
+    text: string,
+    // Tool calls: the document or target, shown after the tool's name.
+    detail: string,
+    // Tool calls: 0 running, 1 done, 2 failed.
+    state: int,
+}
+
+// A question waiting for the user: may the assistant or an MCP client do
+// this?
+export struct ApprovalItem {
+    id: int,
+    // "The assistant wants to change “notes.md”".
+    title: string,
+    // The tool, and who asked.
+    detail: string,
+    // The text it would write, shortened.
+    preview: string,
 }

@@ -8,6 +8,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aster_markdown::TextFormat as FileFormat;
+use aster_shell::recovery::{Candidate, RecordInfo};
+use aster_storage::Contents;
+
 use aster_platform::dialogs::{self, FileType};
 use aster_shell::office::{self, SlidesTab};
 use aster_shell::tabs::TabId;
@@ -27,6 +31,7 @@ pub(crate) fn after_change(ui: &AppWindow, shell: &mut Shell) {
     if shell.sync_modified() {
         refresh_tabs(ui, shell);
     }
+    shell.sync_slide_records();
     refresh_toolbar(ui, shell);
     refresh_viewer(ui, shell);
     refresh_status(ui, shell);
@@ -241,6 +246,7 @@ pub(crate) fn notes_edited(ui: &AppWindow, shell: &mut Shell, text: &str) {
         if shell.sync_modified() {
             refresh_tabs(ui, shell);
         }
+        shell.sync_slide_records();
         refresh_toolbar(ui, shell);
     }
 }
@@ -535,16 +541,18 @@ fn finish_save(
     id: TabId,
     job: office::SlideSave,
     path: PathBuf,
-    result: Result<(), String>,
+    result: Result<Vec<u8>, String>,
     after: AfterSave,
 ) {
     if let Some(Content::Slides(tab)) = shell.contents.get_mut(&id) {
-        tab.finish_save(&job, &path, result.is_ok());
+        tab.finish_save(&job, &path, result.as_ref().ok().map(Vec::as_slice));
     }
     match result {
-        Ok(()) => {
+        Ok(_) => {
             shell.tabs.rename(id, files::display_name(&path));
             shell.sync_modified();
+            // Saved with nothing changed since: the record goes.
+            shell.sync_slide_records();
             shell.remember_file(&path);
             refresh_sidebar(ui, shell);
             if after == AfterSave::CloseTab {
@@ -691,4 +699,128 @@ pub(crate) enum Edit {
     Cut,
     Paste,
     SelectAll,
+}
+
+// --- Recovery records ---
+
+impl Shell {
+    /// What the recovery record of a presentation says about it.
+    fn slide_record_info(&self, id: TabId, tab: &SlidesTab) -> RecordInfo {
+        RecordInfo {
+            title: self
+                .tabs
+                .get(id)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default(),
+            path: tab.path.clone(),
+            format: FileFormat::default(),
+            disk: tab.disk,
+            workbook: false,
+            presentation: true,
+        }
+    }
+
+    /// Write each presentation with unsaved changes to its recovery record,
+    /// as saving would write it (made on the writer thread), at most every
+    /// few seconds; a record goes once its presentation has no unsaved
+    /// changes. Called after edits and by a timer, as for workbooks.
+    pub(crate) fn sync_slide_records(&mut self) {
+        let ids: Vec<TabId> = self.contents.keys().copied().collect();
+        for id in ids {
+            let Some(Content::Slides(tab)) = self.contents.get(&id) else {
+                continue;
+            };
+            let info = self.slide_record_info(id, tab);
+            let Some(writer) = &self.writer else {
+                return;
+            };
+            let Some(Content::Slides(tab)) = self.contents.get_mut(&id) else {
+                continue;
+            };
+            if !tab.is_modified() {
+                if let Some(key) = tab.record.take() {
+                    writer.discard(key);
+                }
+                tab.recorded = None;
+                continue;
+            }
+            let version = tab.view.version();
+            let every = tab.record_every();
+            match tab.recorded {
+                Some((done, _)) if done == version && tab.record.is_some() => continue,
+                Some((_, at)) if at.elapsed() < every => continue,
+                _ => {}
+            }
+            let contents = Contents::maybe(tab.snapshot());
+            match tab.record {
+                Some(key) => {
+                    let meta = info.to_meta();
+                    let remove = RecordInfo::optional_keys()
+                        .into_iter()
+                        .filter(|optional| !meta.iter().any(|(key, _)| key == optional))
+                        .collect();
+                    writer.set_meta(key, meta, remove);
+                    writer.checkpoint(key, contents);
+                }
+                None => {
+                    let key = self.next_key;
+                    self.next_key += 1;
+                    writer.open(key, info.to_meta(), contents);
+                    tab.record = Some(key);
+                }
+            }
+            tab.recorded = Some((version, std::time::Instant::now()));
+        }
+    }
+
+    /// Bring back a presentation from its record: the file as it was last
+    /// written, in a tab of its own with unsaved changes, saving to the file
+    /// it belongs to. The record is kept writing.
+    pub(crate) fn restore_presentation(&mut self, candidate: Candidate) -> Option<TabId> {
+        let Candidate {
+            record,
+            info: Some(info),
+            workbook: Some(bytes),
+            ..
+        } = candidate
+        else {
+            return None;
+        };
+        let presentation = aster_ooxml::pptx::read(bytes.clone()).ok()?;
+        self.leave_active_document();
+        let title = if info.title.is_empty() {
+            info.path
+                .as_deref()
+                .map_or_else(String::new, files::display_name)
+        } else {
+            info.title.clone()
+        };
+        let id = self.tabs.open(aster_shell::tabs::DocKind::Slides, title);
+        let source = Arc::new(bytes);
+        let strings = self.language.strings();
+        let mut tab = SlidesTab::new(
+            presentation,
+            source.clone(),
+            info.path.clone(),
+            &self.tokens,
+            strings,
+        );
+        tab.disk = info.disk;
+        tab.mark_recovered();
+        if let Some(writer) = &self.writer {
+            let key = self.next_key;
+            self.next_key += 1;
+            writer.adopt(
+                key,
+                record,
+                info.to_meta(),
+                Contents::Bytes((*source).clone()),
+            );
+            tab.record = Some(key);
+            tab.recorded = Some((tab.view.version(), std::time::Instant::now()));
+        }
+        self.contents.insert(id, Content::Slides(Box::new(tab)));
+        self.sync_modified();
+        Some(id)
+    }
 }

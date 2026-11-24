@@ -216,6 +216,9 @@ pub(crate) struct History {
     /// The number of steps to undo the saved state had; `None` when it can
     /// no longer be reached.
     saved: Option<usize>,
+    /// Counts every change of the presentation: a recovery record notes the
+    /// one it holds.
+    version: u64,
 }
 
 impl Default for History {
@@ -224,6 +227,7 @@ impl Default for History {
             undo: Vec::new(),
             redo: Vec::new(),
             saved: Some(0),
+            version: 0,
         }
     }
 }
@@ -240,6 +244,13 @@ impl SlideView {
 
     pub fn selection(&self) -> &Selection {
         &self.selection
+    }
+
+    /// Select shape `index` of the current slide, as a click would.
+    pub fn select_shape(&mut self, index: usize) {
+        self.leave_text();
+        self.selection = self.valid(Selection::Shape(index));
+        self.touch();
     }
 
     pub fn is_editing_text(&self) -> bool {
@@ -274,6 +285,17 @@ impl SlideView {
         self.history.saved = Some(depth);
     }
 
+    /// The presentation has changes no file has (it came back from a
+    /// recovery record).
+    pub fn mark_unsaved(&mut self) {
+        self.history.saved = None;
+    }
+
+    /// Changes with every edit, undo and redo.
+    pub fn version(&self) -> u64 {
+        self.history.version
+    }
+
     /// The presentation is now as saved: undo steps of the file before stay,
     /// but the file is a new starting point.
     pub fn replace_presentation(&mut self, presentation: Arc<Presentation>) {
@@ -288,6 +310,7 @@ impl SlideView {
         let Some(step) = self.history.undo.pop() else {
             return false;
         };
+        self.history.version += 1;
         self.restore(&step.change, true);
         self.current = step.before.0.min(self.count().saturating_sub(1));
         self.selection = self.valid(step.before.1.clone());
@@ -301,6 +324,7 @@ impl SlideView {
         let Some(step) = self.history.redo.pop() else {
             return false;
         };
+        self.history.version += 1;
         self.restore(&step.change, false);
         self.current = step.after.0.min(self.count().saturating_sub(1));
         self.selection = self.valid(step.after.1.clone());
@@ -367,6 +391,7 @@ impl SlideView {
         }
         history.redo.clear();
         history.undo.push(step);
+        history.version += 1;
     }
 
     /// Change the current slide in one step. `f` returns whether it changed
@@ -402,6 +427,7 @@ impl SlideView {
                 last.typing == typing && matches!(last.change, Change::Slide(i, ..) if i == index)
             });
         if joins && let Some(last) = history.undo.last_mut() {
+            history.version += 1;
             if let Change::Slide(_, _, then) = &mut last.change {
                 **then = after;
             }

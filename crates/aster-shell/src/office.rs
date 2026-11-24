@@ -2459,6 +2459,15 @@ pub struct SlidesTab {
     /// from it, comparing the presentation with what was read.
     pub source: Arc<Vec<u8>>,
     pub saving: bool,
+    /// The recovery record that keeps unsaved changes through a crash.
+    pub record: Option<u64>,
+    /// The version last written to the record, and when.
+    pub recorded: Option<(u64, std::time::Instant)>,
+    /// How long making the last record took, in milliseconds, set on the
+    /// writer thread.
+    pub record_cost: Arc<std::sync::atomic::AtomicU64>,
+    /// What the file held when it was last read or saved.
+    pub disk: Option<aster_storage::Fingerprint>,
 }
 
 /// What a save of a presentation writes.
@@ -2476,10 +2485,11 @@ impl SlideSave {
     }
 
     /// Make the file and write it in place of `path` in one step. Runs on a
-    /// worker thread.
-    pub fn write(&self, path: &Path) -> Result<(), String> {
+    /// worker thread. Returns what was written.
+    pub fn write(&self, path: &Path) -> Result<Vec<u8>, String> {
         let bytes = self.bytes()?;
-        aster_storage::write_atomically(path, &bytes).map_err(|err| err.to_string())
+        aster_storage::write_atomically(path, &bytes).map_err(|err| err.to_string())?;
+        Ok(bytes)
     }
 }
 
@@ -2493,12 +2503,48 @@ impl SlidesTab {
     ) -> Self {
         let mut view = SlideView::new(Arc::new(presentation));
         view.set_style(slide_style(tokens, strings));
+        let disk = path
+            .as_deref()
+            .map(|path| aster_storage::Fingerprint::of(path, &source));
         Self {
             view,
             path,
             source,
             saving: false,
+            record: None,
+            recorded: None,
+            record_cost: Arc::default(),
+            disk,
         }
+    }
+
+    /// The file as saving would write it now, made later on the record
+    /// writer's thread.
+    pub fn snapshot(&self) -> impl FnOnce() -> Option<Vec<u8>> + Send + 'static {
+        let source = self.source.clone();
+        let presentation = self.view.presentation().clone();
+        let cost = self.record_cost.clone();
+        move || {
+            let started = std::time::Instant::now();
+            let made = aster_ooxml::pptx_save::save((*source).clone(), &presentation).ok();
+            let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            cost.store(took, std::sync::atomic::Ordering::Relaxed);
+            made
+        }
+    }
+
+    /// The least time between two writes of the record: five times what the
+    /// last one took, and never under two seconds.
+    pub fn record_every(&self) -> std::time::Duration {
+        let cost = self.record_cost.load(std::sync::atomic::Ordering::Relaxed);
+        std::time::Duration::from_millis(cost.saturating_mul(5))
+            .max(std::time::Duration::from_secs(2))
+    }
+
+    /// The presentation came back from a recovery record: it has changes the
+    /// file does not.
+    pub fn mark_recovered(&mut self) {
+        self.view.mark_unsaved();
     }
 
     pub fn restyle(&mut self, tokens: &theme::Tokens, strings: &Strings) {
@@ -2523,9 +2569,10 @@ impl SlidesTab {
     }
 
     /// A save has finished: on success the state it wrote counts as saved.
-    pub fn finish_save(&mut self, job: &SlideSave, path: &Path, ok: bool) {
+    pub fn finish_save(&mut self, job: &SlideSave, path: &Path, written: Option<&[u8]>) {
         self.saving = false;
-        if ok {
+        if let Some(bytes) = written {
+            self.disk = Some(aster_storage::Fingerprint::of(path, bytes));
             self.path = Some(path.to_owned());
             self.view.mark_saved_at(job.depth);
         }

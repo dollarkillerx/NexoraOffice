@@ -520,6 +520,13 @@ impl Shell {
     /// its own, and keep writing to that record. Unreadable records stay where
     /// they are. Returns the new tab.
     fn restore(&mut self, candidate: Candidate) -> Option<TabId> {
+        if candidate
+            .info
+            .as_ref()
+            .is_some_and(|info| info.presentation)
+        {
+            return self.restore_presentation(candidate);
+        }
         if candidate.workbook.is_some() {
             return self.restore_workbook(candidate);
         }
@@ -633,6 +640,7 @@ impl Shell {
             format: editor.format,
             disk: editor.disk,
             workbook: false,
+            presentation: false,
         }
     }
 
@@ -648,6 +656,7 @@ impl Shell {
             format: TextFormat::default(),
             disk: tab.disk,
             workbook: true,
+            presentation: false,
         }
     }
 
@@ -782,6 +791,7 @@ impl Shell {
         let record = match self.contents.remove(&id) {
             Some(Content::Markdown(editor)) => editor.record,
             Some(Content::Sheet(tab)) => tab.record,
+            Some(Content::Slides(tab)) => tab.record,
             _ => None,
         };
         if let (Some(writer), Some(key)) = (&self.writer, record) {
@@ -795,6 +805,7 @@ impl Shell {
             let record = match content {
                 Content::Markdown(editor) => editor.record.take(),
                 Content::Sheet(tab) => tab.record.take(),
+                Content::Slides(tab) => tab.record.take(),
                 _ => None,
             };
             if let (Some(key), Some(writer)) = (record, &self.writer) {
@@ -5982,6 +5993,7 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(2),
         handler!(|_ui, shell| {
             shell.sync_sheet_records();
+            shell.sync_slide_records();
         }),
     );
     ui.on_sheet_freeze(handler!(|ui, shell, how| {
@@ -6588,6 +6600,64 @@ mod tests {
         };
         assert_eq!(cell("B2"), Some(aster_sheets::Value::Text("未保存".into())));
         assert_eq!(cell("C3"), Some(aster_sheets::Value::Number(42.0)));
+        // Closing it is the user's choice: the record goes.
+        again.force_close(id);
+        if let Some(writer) = &again.writer {
+            writer.flush();
+        }
+        assert!(recovery::find(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_presentation_with_unsaved_changes_comes_back_from_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("発表.pptx");
+        std::fs::write(&file, office::blank_presentation(&i18n::JA)).unwrap();
+        let root = RecoveryRoot::new(dir.path().join("records"));
+        let mut shell = shell();
+        shell.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let Ok(loaded) = office::load(&file) else {
+            panic!("the presentation loads");
+        };
+        let id = shell.open_office(file.clone(), loaded);
+        let Some(Content::Slides(tab)) = shell.contents.get_mut(&id) else {
+            panic!("a slides tab");
+        };
+        // Into the title placeholder, and a new slide.
+        tab.view.resize(1600, 1000, 1.0);
+        tab.view.render();
+        tab.view.select_shape(0);
+        assert!(tab.view.type_text("未保存のタイトル"));
+        assert!(tab.view.add_slide(1));
+        assert!(tab.view.set_notes("メモ"));
+        shell.sync_slide_records();
+        if let Some(writer) = &shell.writer {
+            writer.flush();
+        }
+
+        // As after a crash: a new run finds the record and restores it.
+        drop(shell);
+        let mut candidates = recovery::find(&root).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+        assert!(candidate.is_readable());
+        assert!(candidate.info.as_ref().is_some_and(|i| i.presentation));
+        assert_eq!(candidate.disk, Some(FileState::Unchanged));
+        let mut again = self::shell();
+        again.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let id = again.restore(candidate).expect("restored");
+        let Some(Content::Slides(tab)) = again.contents.get(&id) else {
+            panic!("a slides tab");
+        };
+        assert!(tab.is_modified());
+        assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+        let presentation = tab.view.presentation();
+        assert_eq!(presentation.slides.len(), 2);
+        assert_eq!(
+            presentation.slides[0].title().as_deref(),
+            Some("未保存のタイトル")
+        );
+        assert_eq!(presentation.slides[1].notes.as_deref(), Some("メモ"));
         // Closing it is the user's choice: the record goes.
         again.force_close(id);
         if let Some(writer) = &again.writer {

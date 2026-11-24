@@ -1,6 +1,6 @@
-//! Recovery records of Markdown documents and workbooks, as the shell sees
-//! them. A workbook's record has no journal of edits: its checkpoint is the
-//! whole workbook as saving would write it.
+//! Recovery records of Markdown documents, workbooks and presentations, as
+//! the shell sees them. A workbook's or presentation's record has no journal
+//! of edits: its checkpoint is the whole file as saving would write it.
 //!
 //! A record's journal holds the text; its named values say what the text was:
 //! the tab's title, the file it belongs to, how that file is written, and what
@@ -20,6 +20,7 @@ use aster_storage::{FileState, Fingerprint, FoundRecord, RecoveryRoot};
 
 const KIND: &str = "markdown";
 const KIND_WORKBOOK: &str = "workbook";
+const KIND_PRESENTATION: &str = "presentation";
 const KEY_KIND: &str = "kind";
 const KEY_TITLE: &str = "title";
 const KEY_PATH: &str = "path";
@@ -37,6 +38,8 @@ pub struct RecordInfo {
     pub disk: Option<Fingerprint>,
     /// A workbook rather than a Markdown document.
     pub workbook: bool,
+    /// A presentation rather than a Markdown document.
+    pub presentation: bool,
 }
 
 fn encode_format(format: &TextFormat) -> String {
@@ -108,9 +111,15 @@ impl RecordInfo {
         let mut meta = vec![
             (
                 KEY_KIND.to_owned(),
-                if self.workbook { KIND_WORKBOOK } else { KIND }
-                    .as_bytes()
-                    .to_vec(),
+                if self.workbook {
+                    KIND_WORKBOOK
+                } else if self.presentation {
+                    KIND_PRESENTATION
+                } else {
+                    KIND
+                }
+                .as_bytes()
+                .to_vec(),
             ),
             (KEY_TITLE.to_owned(), self.title.as_bytes().to_vec()),
             (
@@ -138,9 +147,10 @@ impl RecordInfo {
                 .map(|bytes| std::str::from_utf8(bytes).map_err(|_| format!("{key} is not UTF-8")))
                 .transpose()
         };
-        let workbook = match text(KEY_KIND)? {
-            Some(KIND) => false,
-            Some(KIND_WORKBOOK) => true,
+        let (workbook, presentation) = match text(KEY_KIND)? {
+            Some(KIND) => (false, false),
+            Some(KIND_WORKBOOK) => (true, false),
+            Some(KIND_PRESENTATION) => (false, true),
             Some(other) => return Err(format!("a record of an unknown kind ({other})")),
             None => return Err("the record does not say what it holds".to_owned()),
         };
@@ -159,6 +169,7 @@ impl RecordInfo {
             format,
             disk,
             workbook,
+            presentation,
         })
     }
 }
@@ -172,7 +183,8 @@ pub struct Candidate {
     /// The text the record replays to, or why it could not be read. Empty
     /// for a workbook.
     pub text: Result<Rope, String>,
-    /// A workbook's record: the workbook as saving would write it.
+    /// A workbook's or presentation's record: the file as saving would
+    /// write it.
     pub workbook: Option<Vec<u8>>,
     /// Whatever the shell computed from the text in advance, on the thread
     /// that found the record, so restoring a large document is quick.
@@ -198,9 +210,9 @@ pub fn load(record: FoundRecord) -> Candidate {
         journal.integrity().map_err(|err| err.to_string())?;
         let info = RecordInfo::from_meta(&journal.meta().map_err(|err| err.to_string())?)?;
         let replay = journal.replay().map_err(|err| err.to_string())?;
-        if info.workbook {
+        if info.workbook || info.presentation {
             if replay.checkpoint.is_empty() {
-                return Err("the record holds no workbook".to_owned());
+                return Err("the record holds no file".to_owned());
             }
             return Ok((info, Rope::default(), Some(replay.checkpoint)));
         }
@@ -276,6 +288,7 @@ mod tests {
             },
             disk: None,
             workbook: false,
+            presentation: false,
         }
     }
 
@@ -297,6 +310,7 @@ mod tests {
             format: TextFormat::default(),
             disk: None,
             workbook: false,
+            presentation: false,
         };
         // A workbook's record says it is one.
         let workbook = RecordInfo {
@@ -305,6 +319,7 @@ mod tests {
             format: TextFormat::default(),
             disk: None,
             workbook: true,
+            presentation: false,
         };
         for original in [with_file, untitled, workbook] {
             let meta = meta_map(original.to_meta());

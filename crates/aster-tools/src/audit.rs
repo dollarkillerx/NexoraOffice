@@ -55,17 +55,20 @@ impl AuditRecord {
 }
 
 /// The arguments as they are recorded: the user's text replaced by its
-/// length in characters.
+/// length in characters, and any list or object (the rows of cells a
+/// write carries, say) by its size, since it can hold text too.
 pub fn summarise(args: &Value) -> Value {
     let Some(object) = args.as_object() else {
         return Value::Null;
     };
     let mut out = Map::new();
     for (name, value) in object {
-        let value = match value.as_str() {
-            Some(text) if TEXT_ARGUMENTS.contains(&name.as_str()) => {
+        let value = match value {
+            Value::String(text) if TEXT_ARGUMENTS.contains(&name.as_str()) => {
                 json!({ "chars": text.chars().count() })
             }
+            Value::Array(items) => json!({ "items": items.len() }),
+            Value::Object(fields) => json!({ "fields": fields.len() }),
             _ => value.clone(),
         };
         out.insert(name.clone(), value);
@@ -159,6 +162,21 @@ mod tests {
             summary,
             json!({"document": "1", "text": {"chars": 4}, "line": 3})
         );
+    }
+
+    #[test]
+    fn lists_and_objects_are_recorded_by_size() {
+        let summary = summarise(&json!({
+            "document": "1",
+            "start": "A1",
+            "rows": [["機密", "=A1*2"], ["x"]],
+            "options": {"note": "private"},
+        }));
+        assert_eq!(
+            summary,
+            json!({"document": "1", "start": "A1", "rows": {"items": 2}, "options": {"fields": 1}})
+        );
+        assert!(!summary.to_string().contains("機密"));
     }
 
     #[test]

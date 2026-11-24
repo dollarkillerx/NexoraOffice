@@ -224,8 +224,17 @@ pub fn target(args: &Value, rows: &[Vec<String>]) -> Result<CellRange, String> {
     let start = parse_range(start_text)
         .map(|range| range.first)
         .ok_or_else(|| format!("{start_text:?} is not a cell address like B2"))?;
-    let height = rows.len().max(1) as u32;
-    let width = rows.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+    // The range is walked cell by cell on the interface thread (to show and
+    // fingerprint what it holds), so its area is bounded, not only the
+    // entries: empty rows count as no entries but still stretch it.
+    let height = rows.len().max(1);
+    let width = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    if height.saturating_mul(width) > MAX_WRITE {
+        return Err(format!(
+            "at most {MAX_WRITE} cells can be written at once; these rows span {height} × {width}"
+        ));
+    }
+    let (height, width) = (height as u32, width as u32);
     Ok(CellRange::new(
         start,
         CellRef::new(
@@ -333,6 +342,21 @@ mod tests {
 
     fn json(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn empty_rows_cannot_stretch_a_write_past_the_limit() {
+        // One full row and many empty ones: few entries, a huge range.
+        let mut rows = vec![Value::Array(vec![Value::from("x"); 100])];
+        rows.extend(std::iter::repeat_n(Value::Array(Vec::new()), 200));
+        let args = serde_json::json!({"start": "A1", "rows": rows});
+        let wide = entries(&args).unwrap();
+        assert!(target(&args, &wide).is_err());
+        assert!(before_write(&tab(), &args).is_none());
+
+        let args = json(r#"{"start": "B2", "rows": [["1", "2"], [], ["3"]]}"#);
+        let small = entries(&args).unwrap();
+        assert!(target(&args, &small).is_ok());
     }
 
     #[test]

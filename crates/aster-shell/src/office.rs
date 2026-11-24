@@ -297,6 +297,8 @@ pub struct SheetTab {
     pub dirty: BTreeSet<(usize, CellRef)>,
     /// A formula appeared or went since the file was read or saved.
     pub formulas_changed: bool,
+    /// What was last copied or cut here.
+    pub clip: Option<aster_sheets::Clip>,
 }
 
 impl SheetTab {
@@ -314,6 +316,7 @@ impl SheetTab {
             history,
             dirty: BTreeSet::new(),
             formulas_changed: false,
+            clip: None,
         }
     }
 
@@ -419,6 +422,116 @@ impl SheetTab {
             return Vec::new();
         }
         let changes = self.view.workbook_mut().set_cells(sheet_index, cleared);
+        self.record(changes)
+    }
+
+    /// Copy (or cut) the selection; returns the text for the system
+    /// clipboard. Cutting moves the cells when they are pasted.
+    pub fn copy(&mut self, cut: bool) -> Option<String> {
+        if let Some(editor) = self.view.editor() {
+            return Some(editor.text().to_owned());
+        }
+        let clip =
+            self.view
+                .workbook()
+                .copy(self.view.sheet_index(), self.view.selection(), cut)?;
+        let text = clip.text.clone();
+        self.clip = Some(clip);
+        Some(text)
+    }
+
+    /// Paste text from the system clipboard at the selection. Cells copied
+    /// here come back as cells, with their formulas following; anything
+    /// else is read as tab-separated entries. One undo step.
+    pub fn paste(&mut self, text: &str, language: &str) -> Vec<Change> {
+        if self.view.is_editing() {
+            self.view.edit(|editor| editor.insert(text));
+            return Vec::new();
+        }
+        let sheet = self.view.sheet_index();
+        let range = self.view.selection();
+        let target = range.first;
+        let same = |a: &str, b: &str| a.replace('\r', "") == b.replace('\r', "");
+        let clip = self
+            .clip
+            .clone()
+            .filter(|clip| same(&clip.text, text) && !text.is_empty());
+        let mut changes = Vec::new();
+        let pasted;
+        if let Some(clip) = clip {
+            let single = clip.range.first == clip.range.last;
+            let mut cells = Vec::new();
+            if clip.cut {
+                // Moving: the source is emptied, then the cells land.
+                let cleared: Vec<_> = (0..clip.range.rows())
+                    .flat_map(|r| (0..clip.range.cols()).map(move |c| (r, c)))
+                    .map(|(r, c)| {
+                        (
+                            CellRef::new(clip.range.first.row + r, clip.range.first.col + c),
+                            None,
+                        )
+                    })
+                    .collect();
+                if clip.sheet == sheet {
+                    cells.extend(cleared);
+                } else {
+                    changes.extend(self.view.workbook_mut().set_cells(clip.sheet, cleared));
+                }
+                self.clip = None;
+            }
+            if single && range.first != range.last && !clip.cut {
+                // One cell pasted over a selection fills all of it.
+                let count = u64::from(range.rows()) * u64::from(range.cols());
+                if count <= 1_000_000 {
+                    for row in range.first.row..=range.last.row {
+                        for col in range.first.col..=range.last.col {
+                            cells.extend(clip.cells_at(CellRef::new(row, col)));
+                        }
+                    }
+                }
+                pasted = range;
+            } else {
+                cells.extend(clip.cells_at(target));
+                pasted = CellRange::new(
+                    target,
+                    CellRef::new(
+                        target.row + clip.range.rows() - 1,
+                        target.col + clip.range.cols() - 1,
+                    ),
+                );
+            }
+            changes.extend(self.view.workbook_mut().set_cells(sheet, cells));
+        } else {
+            let rows = aster_sheets::parse_tsv(text);
+            if rows.is_empty() {
+                return Vec::new();
+            }
+            let reading = self.reading(language);
+            let workbook = self.view.workbook().clone();
+            let mut cells = Vec::new();
+            let mut width = 0;
+            for (r, row) in rows.iter().enumerate() {
+                width = width.max(row.len());
+                for (c, field) in row.iter().enumerate() {
+                    let at = CellRef::new(target.row + r as u32, target.col + c as u32);
+                    if at.row >= aster_sheets::MAX_ROWS || at.col >= aster_sheets::MAX_COLUMNS {
+                        continue;
+                    }
+                    let (entry, look) = input::read(field, &reading);
+                    cells.push((at, workbook.entry_cell(sheet, at, entry, look)));
+                }
+            }
+            changes.extend(self.view.workbook_mut().set_cells(sheet, cells));
+            pasted = CellRange::new(
+                target,
+                CellRef::new(
+                    target.row + rows.len() as u32 - 1,
+                    target.col + width.max(1) as u32 - 1,
+                ),
+            );
+        }
+        self.view.select(pasted.first);
+        self.view.extend_to(pasted.last);
         self.record(changes)
     }
 
@@ -861,5 +974,79 @@ mod tests {
         assert_eq!(date_order("zh-Hant"), DateOrder::Ymd);
         assert_eq!(date_order("ja"), DateOrder::Ymd);
         assert!((2026..2200).contains(&this_year()));
+    }
+
+    #[test]
+    fn copy_and_paste_within_and_from_outside() {
+        let mut tab = tab();
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(
+                aster_surface::cell_editor::EditMode::Enter,
+                Some(text.into()),
+            );
+            tab.commit("en");
+        };
+        enter(&mut tab, "B1", "=A1*2");
+        tab.view.select(at("A1"));
+        tab.view.extend_to(at("B1"));
+        let text = tab.copy(false).unwrap();
+        assert_eq!(text, "1\t=A1*2");
+        // Pasting what was copied here moves the formula with it; the
+        // system clipboard may have turned line ends into \n.
+        tab.view.select(at("A3"));
+        let changes = tab.paste(&text, "en");
+        assert_eq!(changes.len(), 2);
+        let b3 = tab
+            .view
+            .sheet()
+            .unwrap()
+            .cell(at("B3"))
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(b3.as_deref(), Some("A3*2"));
+        assert_eq!(tab.view.selection().to_string(), "A3:B3");
+        // Text from elsewhere is read cell by cell.
+        tab.view.select(at("D1"));
+        let changes = tab.paste("12%\tTRUE\r\n2026/1/2\t=d1+1\r\n", "zh-Hans");
+        assert_eq!(changes.len(), 4);
+        assert_eq!(value(&tab, "D1"), Some(aster_sheets::Value::Number(0.12)));
+        assert_eq!(value(&tab, "E1"), Some(aster_sheets::Value::Bool(true)));
+        let e2 = tab
+            .view
+            .sheet()
+            .unwrap()
+            .cell(at("E2"))
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(e2.as_deref(), Some("D1+1"));
+        // One cell over a selection fills it.
+        tab.view.select(at("A1"));
+        tab.copy(false);
+        tab.view.select(at("G1"));
+        tab.view.extend_to(at("H3"));
+        let text = tab.clip.as_ref().unwrap().text.clone();
+        assert_eq!(tab.paste(&text, "en").len(), 6);
+        // Cutting moves: the source empties, the formula stays as it was.
+        tab.view.select(at("B3"));
+        let text = tab.copy(true).unwrap();
+        tab.view.select(at("C9"));
+        tab.paste(&text, "en");
+        assert!(tab.view.sheet().unwrap().cell(at("B3")).is_none());
+        let moved = tab
+            .view
+            .sheet()
+            .unwrap()
+            .cell(at("C9"))
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(moved.as_deref(), Some("A3*2"));
+        // One undo step brings both back.
+        tab.undo();
+        assert!(tab.view.sheet().unwrap().cell(at("B3")).is_some());
+        assert!(tab.view.sheet().unwrap().cell(at("C9")).is_none());
     }
 }

@@ -18,6 +18,7 @@
 pub mod address;
 pub mod axis;
 pub mod calc;
+pub mod clipboard;
 pub mod edit;
 pub mod format;
 pub mod formula;
@@ -28,6 +29,7 @@ pub mod style;
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};
 pub use axis::Axis;
 pub use calc::{CalcEngine, CalcError, Cancel, Computed, Edit, Mismatch};
+pub use clipboard::{Clip, parse_tsv};
 pub use edit::Change;
 pub use format::{DateOrder, Format, date_parts, date_serial};
 pub use model::{

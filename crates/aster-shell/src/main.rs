@@ -3779,6 +3779,12 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     // --- Clipboard and selection ---
 
     ui.on_edit_cut(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_sheet() {
+            if let Some(text) = tab.copy(true) {
+                ui.invoke_copy_to_clipboard(text.into());
+            }
+            return;
+        }
         // The preview cannot be edited: cutting from it copies.
         if let Some(editor) = shell.active_markdown()
             && editor.preview_has_focus()
@@ -3795,10 +3801,11 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_copy(handler!(|ui, shell| {
-        // A workbook copies what its formula bar shows.
+        // A workbook copies the selected cells as tab-separated text.
         if let Some(tab) = shell.active_sheet() {
-            let (_, content) = tab.view.selection_text();
-            ui.invoke_copy_to_clipboard(content.into());
+            if let Some(text) = tab.copy(false) {
+                ui.invoke_copy_to_clipboard(text.into());
+            }
             return;
         }
         let text = shell.active_markdown().and_then(|editor| {
@@ -3814,6 +3821,15 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_paste(handler!(|ui, shell| {
+        if shell.active_sheet().is_some() {
+            let text = ui.invoke_clipboard_text();
+            let language = shell.language.tag();
+            if let Some(tab) = shell.active_sheet() {
+                let changes = tab.paste(text.as_str(), language);
+                after_sheet_change(&ui, shell, changes);
+            }
+            return;
+        }
         if shell
             .active_markdown()
             .is_none_or(|editor| editor.preview_has_focus())

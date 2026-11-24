@@ -218,26 +218,157 @@ impl Table {
     /// The selection that puts the caret in a cell: its text selected, or
     /// in an empty cell the caret after the first space.
     fn select(&self, row: usize, cell: &Range<usize>) -> Selection {
-        let line = &self.rows[row];
-        let content = &line.text[cell.clone()];
-        let trimmed = content.trim();
-        let at = line.start + cell.start;
-        if trimmed.is_empty() {
-            return Selection::caret(at + content.len().min(1));
-        }
-        let start = at + (content.len() - content.trim_start().len());
-        Selection {
-            anchor: start,
-            focus: start + trimmed.len(),
-        }
+        select_in(&self.rows[row], cell)
     }
 
     /// A row of empty cells, as the header has, with the line break before
     /// it, and where the caret goes in it.
     fn new_row(&self) -> (String, usize) {
-        let row = format!("\n{}|{}", self.indent, "  |".repeat(self.columns.max(1)));
+        let row = format!("\n{}", empty_row(&self.indent, self.columns));
         (row, 1 + self.indent.len() + 2)
     }
+}
+
+/// The selection that puts the caret in a cell of `line`: its text
+/// selected, or in an empty cell the caret after the first space.
+fn select_in(line: &Line, cell: &Range<usize>) -> Selection {
+    let content = &line.text[cell.clone()];
+    let trimmed = content.trim();
+    let at = line.start + cell.start;
+    if trimmed.is_empty() {
+        return Selection::caret(at + content.len().min(1));
+    }
+    let start = at + (content.len() - content.trim_start().len());
+    Selection {
+        anchor: start,
+        focus: start + trimmed.len(),
+    }
+}
+
+/// A row of `columns` empty cells.
+fn empty_row(indent: &str, columns: usize) -> String {
+    format!("{indent}|{}", "  |".repeat(columns.max(1)))
+}
+
+/// A row with its cells changed by `change`, written with a pipe at both
+/// ends and the cells' own spacing kept.
+fn rebuild(line: &str, change: impl FnOnce(&mut Vec<String>)) -> String {
+    let indent = &line[..indent_of(line)];
+    let mut cells: Vec<String> = cells(line)
+        .into_iter()
+        .map(|cell| line[cell].to_owned())
+        .collect();
+    change(&mut cells);
+    format!("{indent}|{}|", cells.join("|"))
+}
+
+/// What the table commands of the Format menu do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableEdit {
+    RowAbove,
+    RowBelow,
+    ColumnLeft,
+    ColumnRight,
+    DeleteRow,
+    DeleteColumn,
+}
+
+/// Whether the caret is in a table, for offering the table commands.
+pub fn in_table(text: &Rope, highlighter: Option<&Highlighter>, caret: usize) -> bool {
+    Table::at(text, highlighter, caret).is_some()
+}
+
+/// Add or delete a row or column of the table with the caret, beside the
+/// caret's cell. A new row has as many cells as the header; a new column
+/// gets `---` in the delimiter row, and every row is then written with a
+/// pipe at both ends. Rows with fewer cells than the header get the new
+/// cell at their end. The caret goes into the new row or column, or after
+/// a deletion to the cell that took the deleted one's place. The header
+/// and the delimiter row cannot be deleted or have a row put above them,
+/// and the last column cannot be deleted: `None` then, and outside a table.
+pub fn edit_table(
+    text: &Rope,
+    highlighter: Option<&Highlighter>,
+    selection: Selection,
+    what: TableEdit,
+) -> Option<Edit> {
+    let from = selection.range().start;
+    let (table, row) = Table::at(text, highlighter, from)?;
+    let column = table.cell_at(row, from);
+    let mut lines: Vec<String> = table.rows.iter().map(|line| line.text.clone()).collect();
+    let (target_row, target_cell) = match what {
+        TableEdit::RowAbove | TableEdit::RowBelow => {
+            let at = match what {
+                TableEdit::RowAbove if row < 2 => return None,
+                TableEdit::RowAbove => row,
+                _ => row.max(1) + 1,
+            };
+            lines.insert(at, empty_row(&table.indent, table.columns));
+            (at, column)
+        }
+        TableEdit::DeleteRow => {
+            if row < 2 {
+                return None;
+            }
+            lines.remove(row);
+            let next = if row < lines.len() { row } else { row - 1 };
+            // The only row went: the caret goes up to the header.
+            (if next == 1 { 0 } else { next }, column)
+        }
+        TableEdit::ColumnLeft | TableEdit::ColumnRight => {
+            let at = if what == TableEdit::ColumnLeft {
+                column
+            } else {
+                column + 1
+            };
+            for (index, line) in lines.iter_mut().enumerate() {
+                let fill = if index == 1 { " --- " } else { "  " };
+                *line = rebuild(line, |cells| {
+                    cells.insert(at.min(cells.len()), fill.to_owned())
+                });
+            }
+            (if row == 1 { 0 } else { row }, at)
+        }
+        TableEdit::DeleteColumn => {
+            if table.columns <= 1 {
+                return None;
+            }
+            for line in &mut lines {
+                *line = rebuild(line, |cells| {
+                    if column < cells.len() {
+                        cells.remove(column);
+                    }
+                });
+            }
+            (
+                if row == 1 { 0 } else { row },
+                column.min(table.columns - 2),
+            )
+        }
+    };
+
+    let start = table.rows[0].start;
+    let end = table.rows.last().expect("a header").end();
+    let mut at = start;
+    let mut selection = Selection::caret(start);
+    for (index, text) in lines.iter().enumerate() {
+        if index == target_row {
+            let line = Line {
+                start: at,
+                text: text.clone(),
+            };
+            let cells = cells(text);
+            if let Some(cell) = cells.get(target_cell.min(cells.len().saturating_sub(1))) {
+                selection = select_in(&line, cell);
+            }
+        }
+        at += text.len() + 1;
+    }
+    Some(Edit {
+        range: start..end,
+        text: lines.join("\n"),
+        selection,
+    })
 }
 
 /// Tab and Shift+Tab in a table: the caret goes to the next or previous
@@ -498,5 +629,90 @@ mod tests {
         assert_eq!(tab_in("```\n| a | b‸ |\n|---|---|\n```"), None);
         // Quoted tables are left alone.
         assert_eq!(tab_in("> | a | b‸ |\n> |---|---|"), None);
+    }
+
+    fn table_edit(input: &str, what: TableEdit) -> Option<String> {
+        run(input, |rope, highlighter, selection| {
+            edit_table(rope, highlighter, selection, what)
+        })
+    }
+
+    #[test]
+    fn rows_go_in_above_and_below_and_come_out() {
+        let input = with_caret("3");
+        assert_eq!(
+            table_edit(&input, TableEdit::RowAbove).unwrap(),
+            "| 名称 | 数量 |\n| --- | ---: |\n|  | ‸ |\n| 苹果 | 3 |\n| 梨 |  |"
+        );
+        assert_eq!(
+            table_edit(&input, TableEdit::RowBelow).unwrap(),
+            "| 名称 | 数量 |\n| --- | ---: |\n| 苹果 | 3 |\n|  | ‸ |\n| 梨 |  |"
+        );
+        // From the header, below means under the delimiter row; above is
+        // not possible.
+        assert_eq!(
+            table_edit(&with_caret("名称"), TableEdit::RowBelow).unwrap(),
+            "| 名称 | 数量 |\n| --- | ---: |\n| ‸ |  |\n| 苹果 | 3 |\n| 梨 |  |"
+        );
+        assert_eq!(table_edit(&with_caret("名称"), TableEdit::RowAbove), None);
+        // Deleting a row: the caret goes to the row that took its place, or
+        // the one above at the end, or the header when none is left.
+        assert_eq!(
+            table_edit(&input, TableEdit::DeleteRow).unwrap(),
+            "| 名称 | 数量 |\n| --- | ---: |\n| 梨 | ‸ |"
+        );
+        assert_eq!(
+            table_edit(&with_caret("梨"), TableEdit::DeleteRow).unwrap(),
+            "| 名称 | 数量 |\n| --- | ---: |\n| «苹果» | 3 |"
+        );
+        assert_eq!(
+            table_edit("| a |\n|---|\n| ‸x |", TableEdit::DeleteRow).unwrap(),
+            "| «a» |\n|---|"
+        );
+        assert_eq!(table_edit(&with_caret("名称"), TableEdit::DeleteRow), None);
+        assert_eq!(table_edit(&with_caret(":"), TableEdit::DeleteRow), None);
+    }
+
+    #[test]
+    fn columns_go_in_left_and_right_and_come_out() {
+        let input = with_caret("苹果");
+        assert_eq!(
+            table_edit(&input, TableEdit::ColumnLeft).unwrap(),
+            "|  | 名称 | 数量 |\n| --- | --- | ---: |\n| ‸ | 苹果 | 3 |\n|  | 梨 |  |"
+        );
+        assert_eq!(
+            table_edit(&input, TableEdit::ColumnRight).unwrap(),
+            "| 名称 |  | 数量 |\n| --- | --- | ---: |\n| 苹果 | ‸ | 3 |\n| 梨 |  |  |"
+        );
+        assert_eq!(
+            table_edit(&input, TableEdit::DeleteColumn).unwrap(),
+            "| 数量 |\n| ---: |\n| «3» |\n|  |"
+        );
+        // The last column of a row: the one before takes the caret.
+        assert_eq!(
+            table_edit(&with_caret("3"), TableEdit::DeleteColumn).unwrap(),
+            "| 名称 |\n| --- |\n| «苹果» |\n| 梨 |"
+        );
+        // A row without pipes at its ends gets them; a short row gets the
+        // new cell at its end.
+        assert_eq!(
+            table_edit("a | b‸\n--|--\n1 |", TableEdit::ColumnRight).unwrap(),
+            "|a | b| ‸ |\n|--|--| --- |\n|1 |  |"
+        );
+        // The only column stays.
+        assert_eq!(table_edit("| a‸ |\n|---|", TableEdit::DeleteColumn), None);
+        assert_eq!(table_edit("正文‸", TableEdit::RowBelow), None);
+    }
+
+    #[test]
+    fn the_caret_is_in_a_table_or_not() {
+        let rope = Rope::from_str(TABLE);
+        let highlighter = Highlighter::new(&rope);
+        assert!(in_table(&rope, Some(&highlighter), 0));
+        assert!(in_table(&rope, Some(&highlighter), TABLE.len()));
+        let rope = Rope::from_str("正文 | 一\n\n```\n| a |\n|---|\n```");
+        let highlighter = Highlighter::new(&rope);
+        assert!(!in_table(&rope, Some(&highlighter), 0));
+        assert!(!in_table(&rope, Some(&highlighter), rope.len_bytes() - 6));
     }
 }

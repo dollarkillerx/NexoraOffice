@@ -231,6 +231,8 @@ pub enum Format {
     Link,
     Image,
     Table,
+    /// Add or delete a row or column of the table with the caret.
+    TableEdit(table::TableEdit),
 }
 
 /// The find bar of a tab and what it found.
@@ -1351,6 +1353,12 @@ impl MarkdownEditor {
             Format::Link => format::insert_link(text, selection, false),
             Format::Image => format::insert_link(text, selection, true),
             Format::Table => format::insert_table(text, selection),
+            Format::TableEdit(what) => {
+                match table::edit_table(text, self.fresh_highlighter(), selection, what) {
+                    Some(edit) => edit,
+                    None => return false,
+                }
+            }
         };
         self.apply(edit)
     }
@@ -2362,6 +2370,40 @@ mod tests {
         e.document.set_selection(Selection::caret(start));
         assert!(e.key(Action::Newline));
         assert!(text_of(&e).contains("| 梨 | 3 |\n|  |  |\n\n后文"));
+    }
+
+    #[test]
+    fn table_rows_and_columns_from_the_menu() {
+        use aster_markdown::table::TableEdit;
+        let text = "| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |\n\n后文";
+        let mut e = editor(text);
+        e.document
+            .set_selection(Selection::caret(text.find("苹果").unwrap()));
+        assert!(e.styles().table);
+        assert!(e.format(Format::TableEdit(TableEdit::ColumnRight)));
+        assert_eq!(
+            text_of(&e),
+            "| 名称 |  | 数量 |\n| --- | --- | --- |\n| 苹果 |  | 3 |\n\n后文"
+        );
+        assert_in_step(&e);
+        type_text(&mut e, "红");
+        assert!(text_of(&e).contains("| 苹果 | 红 | 3 |"));
+        assert!(e.format(Format::TableEdit(TableEdit::DeleteRow)));
+        assert_eq!(
+            text_of(&e),
+            "| 名称 |  | 数量 |\n| --- | --- | --- |\n\n后文"
+        );
+        // One undo for each command.
+        e.undo();
+        e.undo();
+        e.undo();
+        assert_eq!(text_of(&e), text);
+        // Outside a table the commands do nothing.
+        let end = text.len();
+        e.document.set_selection(Selection::caret(end));
+        assert!(!e.styles().table);
+        assert!(!e.format(Format::TableEdit(TableEdit::RowBelow)));
+        assert_eq!(text_of(&e), text);
     }
 
     #[test]

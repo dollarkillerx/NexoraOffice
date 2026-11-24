@@ -421,6 +421,14 @@ strings! {
     format_link,
     format_image,
     format_table,
+    /// The Format menu's submenu of table rows and columns, and its items.
+    table_edit,
+    table_row_above,
+    table_row_below,
+    table_column_left,
+    table_column_right,
+    table_delete_row,
+    table_delete_column,
 }
 
 impl Strings {
@@ -691,6 +699,13 @@ Aster Office 外壳原型
     format_link: "链接",
     format_image: "图片",
     format_table: "表格",
+    table_edit: "编辑表格",
+    table_row_above: "在上方插入行",
+    table_row_below: "在下方插入行",
+    table_column_left: "在左侧插入列",
+    table_column_right: "在右侧插入列",
+    table_delete_row: "删除行",
+    table_delete_column: "删除列",
 };
 
 pub const JA: Strings = Strings {
@@ -905,6 +920,13 @@ Aster Office シェルの試作
     format_link: "リンク",
     format_image: "画像",
     format_table: "表",
+    table_edit: "表を編集",
+    table_row_above: "上に行を挿入",
+    table_row_below: "下に行を挿入",
+    table_column_left: "左に列を挿入",
+    table_column_right: "右に列を挿入",
+    table_delete_row: "行を削除",
+    table_delete_column: "列を削除",
 };
 
 pub const EN: Strings = Strings {
@@ -1119,6 +1141,13 @@ What does not: formatting, undo, opening and saving. The greyed-out toolbar butt
     format_link: "Link",
     format_image: "Image",
     format_table: "Table",
+    table_edit: "Edit Table",
+    table_row_above: "Insert Row Above",
+    table_row_below: "Insert Row Below",
+    table_column_left: "Insert Column Left",
+    table_column_right: "Insert Column Right",
+    table_delete_row: "Delete Row",
+    table_delete_column: "Delete Column",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -1315,6 +1344,13 @@ pub const ZH_HANT: Strings = Strings {
     format_link: "連結",
     format_image: "圖片",
     format_table: "表格",
+    table_edit: "編輯表格",
+    table_row_above: "在上方插入列",
+    table_row_below: "在下方插入列",
+    table_column_left: "在左側插入欄",
+    table_column_right: "在右側插入欄",
+    table_delete_row: "刪除列",
+    table_delete_column: "刪除欄",
 };
 
 pub const FR: Strings = Strings {
@@ -1511,6 +1547,13 @@ pub const FR: Strings = Strings {
     format_link: "Lien",
     format_image: "Image",
     format_table: "Tableau",
+    table_edit: "Modifier le tableau",
+    table_row_above: "Insérer une ligne au-dessus",
+    table_row_below: "Insérer une ligne en dessous",
+    table_column_left: "Insérer une colonne à gauche",
+    table_column_right: "Insérer une colonne à droite",
+    table_delete_row: "Supprimer la ligne",
+    table_delete_column: "Supprimer la colonne",
 };
 
 pub const DE: Strings = Strings {
@@ -1707,6 +1750,13 @@ pub const DE: Strings = Strings {
     format_link: "Link",
     format_image: "Bild",
     format_table: "Tabelle",
+    table_edit: "Tabelle bearbeiten",
+    table_row_above: "Zeile oberhalb einfügen",
+    table_row_below: "Zeile unterhalb einfügen",
+    table_column_left: "Spalte links einfügen",
+    table_column_right: "Spalte rechts einfügen",
+    table_delete_row: "Zeile löschen",
+    table_delete_column: "Spalte löschen",
 };
 
 pub const ES: Strings = Strings {
@@ -1903,6 +1953,13 @@ pub const ES: Strings = Strings {
     format_link: "Enlace",
     format_image: "Imagen",
     format_table: "Tabla",
+    table_edit: "Editar tabla",
+    table_row_above: "Insertar fila encima",
+    table_row_below: "Insertar fila debajo",
+    table_column_left: "Insertar columna a la izquierda",
+    table_column_right: "Insertar columna a la derecha",
+    table_delete_row: "Eliminar fila",
+    table_delete_column: "Eliminar columna",
 };
 
 pub const KO: Strings = Strings {
@@ -2099,6 +2156,13 @@ pub const KO: Strings = Strings {
     format_link: "링크",
     format_image: "이미지",
     format_table: "표",
+    table_edit: "표 편집",
+    table_row_above: "위에 행 삽입",
+    table_row_below: "아래에 행 삽입",
+    table_column_left: "왼쪽에 열 삽입",
+    table_column_right: "오른쪽에 열 삽입",
+    table_delete_row: "행 삭제",
+    table_delete_column: "열 삭제",
 };
 
 #[cfg(test)]

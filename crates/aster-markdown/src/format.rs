@@ -410,6 +410,8 @@ pub struct Styles {
     pub code: bool,
     /// Every line of the selection is this kind of list item, or quoted.
     pub block: Option<Block>,
+    /// The selection starts in a table: the table commands can be used.
+    pub table: bool,
 }
 
 impl Styles {
@@ -446,6 +448,7 @@ pub fn styles(text: &Rope, highlighter: Option<&Highlighter>, selection: Selecti
         strike: has(Inline::Strike),
         code: has(Inline::Code),
         block: block_of(text, &range),
+        table: crate::table::in_table(text, highlighter, range.start),
     }
 }
 

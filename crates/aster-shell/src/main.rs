@@ -938,6 +938,13 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_notes_empty(strings.notes_empty.into());
     s.set_notes_show(strings.notes_show.into());
     s.set_notes_hide(strings.notes_hide.into());
+    s.set_table_edit(strings.table_edit.into());
+    s.set_table_row_above(strings.table_row_above.into());
+    s.set_table_row_below(strings.table_row_below.into());
+    s.set_table_column_left(strings.table_column_left.into());
+    s.set_table_column_right(strings.table_column_right.into());
+    s.set_table_delete_row(strings.table_delete_row.into());
+    s.set_table_delete_column(strings.table_delete_column.into());
     ui.set_heading_names(model(
         toolbar::heading_names(strings)
             .into_iter()
@@ -1085,6 +1092,7 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     };
     shell.shown_heading = view.heading;
     shell.shown_styles = view.styles;
+    ui.set_in_table(view.styles.table);
     ui.set_toolbar_items(model(
         toolbar::toolbar(kind, view, shell.language.strings())
             .iter()
@@ -1558,6 +1566,17 @@ fn format_of_menu(code: i32) -> Option<Format> {
         9 => Command::InsertImage,
         10 => Command::InsertTable,
         20..=26 => return Some(Format::Heading((code - 20) as u8)),
+        30..=35 => {
+            use aster_markdown::table::TableEdit;
+            return Some(Format::TableEdit(match code {
+                30 => TableEdit::RowAbove,
+                31 => TableEdit::RowBelow,
+                32 => TableEdit::ColumnLeft,
+                33 => TableEdit::ColumnRight,
+                34 => TableEdit::DeleteRow,
+                _ => TableEdit::DeleteColumn,
+            }));
+        }
         _ => return None,
     };
     format_of(command)

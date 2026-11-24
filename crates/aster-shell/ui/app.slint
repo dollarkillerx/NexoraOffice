@@ -64,6 +64,8 @@ export component AppWindow inherits Window {
     in property <bool> editing;
     // Its source is on screen, so the Format menu can write into it.
     property <bool> formatting: root.editing && root.view-mode != 2;
+    // The caret is in a table: the table's row and column commands apply.
+    in property <bool> in-table;
     in property <bool> can-undo;
     in property <bool> can-redo;
     // 0 while no question is open; see dialog.slint for the kinds.
@@ -572,6 +574,64 @@ export component AppWindow inherits Window {
                 enabled: root.formatting;
                 activated => {
                     root.format(10);
+                }
+            }
+
+            // Rows and columns of the table with the caret; greyed out
+            // elsewhere.
+            Menu {
+                title: Strings.table-edit;
+
+                MenuItem {
+                    title: Strings.table-row-above;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(30);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-row-below;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(31);
+                    }
+                }
+
+                MenuSeparator { }
+
+                MenuItem {
+                    title: Strings.table-column-left;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(32);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-column-right;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(33);
+                    }
+                }
+
+                MenuSeparator { }
+
+                MenuItem {
+                    title: Strings.table-delete-row;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(34);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-delete-column;
+                    enabled: root.formatting && root.in-table;
+                    activated => {
+                        root.format(35);
+                    }
                 }
             }
 

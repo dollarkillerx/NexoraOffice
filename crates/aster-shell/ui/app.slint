@@ -152,6 +152,10 @@ export component AppWindow inherits Window {
     // The active tab is a document that can be saved and undone: a
     // Markdown document or a workbook.
     in property <bool> can-save;
+    // A dialog with a text field is open. The Edit menu's text commands
+    // step aside, so their shortcuts (Cmd+A, Cmd+C ...) reach the field
+    // rather than the document behind it.
+    property <bool> dialog-text: root.prompt-open || root.link-open;
     // Its source is on screen, so the Format menu can write into it.
     property <bool> formatting: root.editing && root.view-mode != 2;
     // The caret is in a table: the table's row and column commands apply.
@@ -523,7 +527,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-undo;
                 shortcut: @keys(Control + Z);
-                enabled: findbar.editing-text || (root.can-save && root.can-undo);
+                enabled: !root.dialog-text && (findbar.editing-text || (root.can-save && root.can-undo));
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(4);
@@ -536,7 +540,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-redo;
                 shortcut: @keys(Control + Shift + Z);
-                enabled: findbar.editing-text || (root.can-save && root.can-redo);
+                enabled: !root.dialog-text && (findbar.editing-text || (root.can-save && root.can-redo));
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(5);
@@ -551,7 +555,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-cut;
                 shortcut: @keys(Control + X);
-                enabled: root.can-save;
+                enabled: !root.dialog-text && root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(1);
@@ -564,7 +568,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-copy;
                 shortcut: @keys(Control + C);
-                enabled: root.can-save;
+                enabled: !root.dialog-text && root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(2);
@@ -577,7 +581,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-paste;
                 shortcut: @keys(Control + V);
-                enabled: root.can-save;
+                enabled: !root.dialog-text && root.can-save;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(3);
@@ -592,7 +596,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-select-all;
                 shortcut: @keys(Control + A);
-                enabled: root.surface-active;
+                enabled: !root.dialog-text && root.surface-active;
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(0);

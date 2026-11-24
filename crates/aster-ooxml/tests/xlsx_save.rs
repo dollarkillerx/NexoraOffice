@@ -857,3 +857,29 @@ fn added_and_deleted_sheets_get_and_lose_their_parts() {
     );
     assert_eq!(contents(&again), contents(&book));
 }
+
+#[test]
+fn a_new_sheet_with_a_resized_column_saves() {
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let added = book.add_sheet("新");
+    book.set_cells(added, vec![(at("A1"), Some(number(0, 1.0)))]);
+    book.sheets[added].columns.set(0, 1, 150.0);
+    let mut changes = Changes {
+        origins: vec![Some(0), Some(1), None],
+        ..Changes::default()
+    };
+    changes.columns.insert((added, 0));
+    let saved = save(source, &book, &changes).unwrap();
+    let sheet = part(&saved, "xl/worksheets/sheet3.xml");
+    assert!(sheet.contains(r#"<cols><col min="1" max="1""#), "{sheet}");
+    assert!(
+        sheet.contains(r#"</cols><sheetData><row r="1">"#),
+        "{sheet}"
+    );
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(
+        again.sheets[2].cell(at("A1")).map(|c| c.value.clone()),
+        Some(Value::Number(1.0))
+    );
+}

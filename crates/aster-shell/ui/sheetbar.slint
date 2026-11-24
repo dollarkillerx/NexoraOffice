@@ -84,8 +84,9 @@ export component SheetBar inherits Rectangle {
     callback add();
     callback rename(int);
     callback delete(int);
-    // The tab the right-click menu is for.
+    // The tab the right-click menu is for, and where it was clicked.
     property <int> menu-for: -1;
+    property <length> menu-x;
     height: Tokens.control-height + 2 * Tokens.space-xs;
     background: Tokens.panel;
 
@@ -148,6 +149,7 @@ export component SheetBar inherits Rectangle {
                         if (root.editable && event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
                             root.selected(index);
                             root.menu-for = index;
+                            root.menu-x = tab.absolute-position.x - root.absolute-position.x + touch.mouse-x;
                             menu.show();
                         }
                     }
@@ -158,7 +160,7 @@ export component SheetBar inherits Rectangle {
 
     // Above the bar: it sits at the bottom of the window.
     menu := PopupWindow {
-        x: Tokens.space-md;
+        x: max(Tokens.space-sm, min(root.menu-x, root.width - self.width - Tokens.space-sm));
         y: -items.preferred-height - Tokens.space-xs;
         width: max(160px, items.preferred-width);
         MenuFrame { }

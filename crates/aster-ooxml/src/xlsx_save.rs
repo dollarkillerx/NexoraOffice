@@ -1016,7 +1016,9 @@ fn rewrite_sheet(
         let (start, end, text) = columns_xml(xml, &p, &sizes.widths, data.start);
         push(&mut ops, start, end, text);
     }
-    ops.sort_by_key(|(start, _, order, _)| (*start, *order));
+    // What is inserted at a place goes before what is replaced from there:
+    // `<cols>` before an empty `<sheetData/>` written out with rows.
+    ops.sort_by_key(|(start, end, order, _)| (*start, end != start, *order));
     let mut out = Vec::with_capacity(bytes.len() + 256);
     out.extend_from_slice(bom);
     let mut at = 0;

@@ -3638,7 +3638,13 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
             _ => "",
         };
         ui.set_viewer(1);
-        ui.set_sheet_names(model(names));
+        // A new model rebuilds the tabs, and a double-click whose first
+        // click switched sheets would land on a new tab: only when the
+        // names change.
+        let shown = ui.get_sheet_names();
+        if shown.row_count() != names.len() || shown.iter().zip(&names).any(|(a, b)| a != *b) {
+            ui.set_sheet_names(model(names));
+        }
         ui.set_sheet_index(current.map_or(-1, |i| i as i32));
         ui.set_cell_address(address.into());
         ui.set_cell_content(content.into());
@@ -3786,6 +3792,8 @@ fn sheet_key_pressed(
         };
         if let Some(command) = command {
             if shell.run(command) {
+                // The pressed buttons follow, as after a toolbar click.
+                refresh_toolbar(ui, shell);
                 after_edit(ui, shell, true);
             }
             return true;

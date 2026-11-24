@@ -248,10 +248,10 @@ fn a_hidden_slide_without_master_shapes() {
     let slide = &presentation.slides[1];
     assert!(slide.hidden);
     assert!(slide.shapes.iter().all(|s| !s.inherited));
-    // The empty title has no text to show; the shape with no frame anywhere
-    // is left out.
+    // The empty title keeps an empty body to type into; the shape with no
+    // frame anywhere is left out.
     assert_eq!(slide.shapes.len(), 1);
-    assert_eq!(slide.shapes[0].text, None);
+    assert!(slide.shapes[0].text.as_ref().unwrap().is_empty());
     assert_eq!(slide.title(), None);
 }
 

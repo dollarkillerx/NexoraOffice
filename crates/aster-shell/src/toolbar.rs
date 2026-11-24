@@ -203,8 +203,51 @@ impl Command {
                     | Command::WrapText
                     | Command::AutoSum
             ),
-            DocKind::Slides | DocKind::Pdf => false,
+            DocKind::Slides => matches!(
+                self,
+                Command::Undo
+                    | Command::Redo
+                    | Command::NewSlide
+                    | Command::InsertTextBox
+                    | Command::InsertShape
+                    | Command::InsertImage
+                    | Command::Bold
+                    | Command::Italic
+                    | Command::Underline
+                    | Command::Strikethrough
+                    | Command::FontSizeDown
+                    | Command::FontSize
+                    | Command::FontSizeUp
+                    | Command::TextColor
+                    | Command::AlignLeft
+                    | Command::AlignCenter
+                    | Command::AlignRight
+                    | Command::BulletList
+                    | Command::NumberedList
+                    | Command::Present
+            ),
+            DocKind::Pdf => false,
         }
+    }
+
+    /// The Slides commands that change text and need some to act on.
+    pub fn formats_slide_text(self) -> bool {
+        matches!(
+            self,
+            Command::Bold
+                | Command::Italic
+                | Command::Underline
+                | Command::Strikethrough
+                | Command::FontSizeDown
+                | Command::FontSize
+                | Command::FontSizeUp
+                | Command::TextColor
+                | Command::AlignLeft
+                | Command::AlignCenter
+                | Command::AlignRight
+                | Command::BulletList
+                | Command::NumberedList
+        )
     }
 }
 
@@ -333,8 +376,15 @@ pub struct ViewState {
     /// Markdown tabs: the styles the selection has, whose buttons show
     /// pressed.
     pub styles: Styles,
-    /// Sheets tabs: how the active cell looks.
+    /// Sheets tabs: how the active cell looks. Slides tabs: how the text
+    /// the buttons act on looks.
     pub cell: CellLook,
+    /// Slides tabs: there is text to format (a shape or text selected), and
+    /// its first paragraph's list: 0 none, 1 bullets, 2 numbers.
+    pub slide_text: bool,
+    pub slide_list: u8,
+    /// Slides tabs: there is a slide to put things on.
+    pub has_slide: bool,
 }
 
 /// How the active cell of a workbook looks, for the toolbar.
@@ -454,6 +504,9 @@ impl Default for ViewState {
             heading: 0,
             styles: Styles::default(),
             cell: CellLook::default(),
+            slide_text: false,
+            slide_list: 0,
+            has_slide: false,
         }
     }
 }
@@ -474,6 +527,8 @@ impl ViewState {
             Command::MergeCells => cell.merged,
             Command::FillColor => cell.filled,
             Command::Borders => cell.bordered,
+            Command::BulletList => self.slide_list == 1,
+            Command::NumberedList => self.slide_list == 2,
             _ => false,
         }
     }
@@ -504,6 +559,18 @@ impl ViewState {
             _ => true,
         }
     }
+
+    /// The same for a Slides tab.
+    fn allows_on_slides(&self, command: Command) -> bool {
+        match command {
+            command if command.formats_slide_text() => self.slide_text,
+            Command::InsertTextBox
+            | Command::InsertShape
+            | Command::InsertImage
+            | Command::Present => self.has_slide,
+            _ => self.allows(command),
+        }
+    }
 }
 
 /// The family name shown in the font field until real font handling exists.
@@ -518,7 +585,12 @@ struct Builder {
 
 impl Builder {
     fn push(&mut self, control: Control, command: Command) -> &mut Self {
-        let enabled = command.is_available(self.kind) && self.view.allows(command);
+        let allowed = if self.kind == DocKind::Slides {
+            self.view.allows_on_slides(command)
+        } else {
+            self.view.allows(command)
+        };
+        let enabled = command.is_available(self.kind) && allowed;
         self.items.push(Item {
             control,
             command: Some(command),
@@ -526,7 +598,8 @@ impl Builder {
             active: enabled
                 && (ViewMode::of(command) == Some(self.view.view_mode)
                     || (self.kind == DocKind::Markdown && self.view.has(command))
-                    || (self.kind == DocKind::Sheets && self.view.cell_has(command))),
+                    || (matches!(self.kind, DocKind::Sheets | DocKind::Slides)
+                        && self.view.cell_has(command))),
             options: Vec::new(),
         });
         self
@@ -772,24 +845,61 @@ pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
                 .icon(Icon::More, Command::More);
         }
         DocKind::Slides => {
+            // New Slide lists the presentation's layouts and Shapes the
+            // shapes it inserts; the shell fills those lists in.
+            let size = view.cell.size;
+            let size = if !view.slide_text {
+                String::new()
+            } else if size.fract() == 0.0 {
+                format!("{size:.0}")
+            } else {
+                format!("{size}")
+            };
             b.history()
                 .sep()
                 .icon(Icon::NewSlide, Command::NewSlide)
-                .icon(Icon::Layout, Command::SlideLayout)
                 .sep()
-                .icon(Icon::Pointer, Command::SelectTool)
                 .icon(Icon::TextBox, Command::InsertTextBox)
                 .icon(Icon::Shapes, Command::InsertShape)
                 .icon(Icon::Image, Command::InsertImage)
-                .icon(Icon::Table, Command::InsertTable)
-                .icon(Icon::Chart, Command::InsertChart)
                 .sep()
-                .font("24")
+                .icon(Icon::Minus, Command::FontSizeDown)
+                .value(size, 32.0, Command::FontSize)
+                .icon(Icon::Plus, Command::FontSizeUp)
                 .sep()
-                .emphasis()
-                .sep()
+                .letter(
+                    "B",
+                    LetterStyle {
+                        bold: true,
+                        ..plain
+                    },
+                    Command::Bold,
+                )
+                .letter(
+                    "I",
+                    LetterStyle {
+                        italic: true,
+                        ..plain
+                    },
+                    Command::Italic,
+                )
+                .letter(
+                    "U",
+                    LetterStyle {
+                        underline: true,
+                        ..plain
+                    },
+                    Command::Underline,
+                )
+                .swatch(None, "A", view.cell.font_color, Command::TextColor);
+            if let Some(item) = b.items.last_mut() {
+                item.options = vec![strings.font_auto.to_owned()];
+            }
+            b.sep()
                 .alignment()
+                .sep()
                 .icon(Icon::BulletList, Command::BulletList)
+                .icon(Icon::NumberedList, Command::NumberedList)
                 .spacer()
                 .icon(Icon::Play, Command::Present);
         }
@@ -890,6 +1000,8 @@ mod tests {
         let busy = ViewState {
             can_undo: true,
             can_redo: true,
+            slide_text: true,
+            has_slide: true,
             ..ViewState::default()
         };
         for kind in DocKind::ALL {
@@ -942,6 +1054,8 @@ mod tests {
         let busy = ViewState {
             can_undo: true,
             can_redo: true,
+            slide_text: true,
+            has_slide: true,
             ..ViewState::default()
         };
         for kind in DocKind::ALL {
@@ -1001,6 +1115,30 @@ mod tests {
                         Command::AlignRight,
                         Command::WrapText,
                         Command::AutoSum
+                    ]
+                ),
+                DocKind::Slides => assert_eq!(
+                    enabled,
+                    [
+                        Command::Undo,
+                        Command::Redo,
+                        Command::NewSlide,
+                        Command::InsertTextBox,
+                        Command::InsertShape,
+                        Command::InsertImage,
+                        Command::FontSizeDown,
+                        Command::FontSize,
+                        Command::FontSizeUp,
+                        Command::Bold,
+                        Command::Italic,
+                        Command::Underline,
+                        Command::TextColor,
+                        Command::AlignLeft,
+                        Command::AlignCenter,
+                        Command::AlignRight,
+                        Command::BulletList,
+                        Command::NumberedList,
+                        Command::Present
                     ]
                 ),
                 _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),

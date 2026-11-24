@@ -97,6 +97,10 @@ pub struct XmlReader<'a> {
     reader: Reader<&'a [u8]>,
     part: &'a str,
     depth: usize,
+    /// The part without a byte order mark: what positions count in.
+    bytes: &'a [u8],
+    /// Where the last element opened began.
+    opened_at: usize,
 }
 
 impl<'a> XmlReader<'a> {
@@ -110,6 +114,8 @@ impl<'a> XmlReader<'a> {
             reader,
             part,
             depth: 0,
+            bytes,
+            opened_at: 0,
         }
     }
 
@@ -117,14 +123,31 @@ impl<'a> XmlReader<'a> {
         self.part
     }
 
+    /// Where reading has got to, in bytes after any byte order mark.
+    pub fn position(&self) -> usize {
+        self.reader.buffer_position() as usize
+    }
+
+    /// Where the element last opened began.
+    pub fn opened_at(&self) -> usize {
+        self.opened_at
+    }
+
+    /// The part's text between two positions.
+    pub fn slice(&self, start: usize, end: usize) -> String {
+        String::from_utf8_lossy(&self.bytes[start.min(end)..end.min(self.bytes.len())]).into_owned()
+    }
+
     pub fn next(&mut self) -> Result<Ev<'a>> {
         loop {
+            let before = self.reader.buffer_position() as usize;
             let event = self
                 .reader
                 .read_event()
                 .map_err(|err| Error::broken(self.part, err))?;
             return Ok(match event {
                 Event::Start(start) => {
+                    self.opened_at = before;
                     self.depth += 1;
                     if self.depth > MAX_DEPTH {
                         return Err(Error::broken(self.part, "elements nested too deeply"));

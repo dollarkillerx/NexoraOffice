@@ -23,8 +23,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aster_slides::{
-    Align, Anchor, DEFAULT_TEXT_POINTS, Fill, Frame, Geometry, Outline, Paragraph, Picture,
-    Presentation, Role, Run, Shape, Slide, Table, TableCell, TableRow, TextBody,
+    Align, Anchor, DEFAULT_TEXT_POINTS, Fill, Frame, Geometry, Layout, LevelLook, Levels as Looks,
+    List, Outline, ParaSource, Paragraph, Picture, Placeholder as SlidePlaceholder, Presentation,
+    Role, Run, RunSource, Shape, ShapeSource, Slide, SlideLook, SlideSource, Table, TableCell,
+    TableRow, TextBody,
 };
 
 use crate::drawingml::{
@@ -68,7 +70,14 @@ pub fn read_package(package: &mut Package) -> Result<Presentation> {
     let mut images = Images::default();
     let mut layouts: HashMap<String, Option<Template>> = HashMap::new();
     let mut masters: HashMap<String, Option<Master>> = HashMap::new();
-    let mut slides = Vec::with_capacity(head.slide_ids.len());
+    // The masters the presentation lists, then those its slides use, and
+    // their layouts in the order each master lists them.
+    let mut master_parts: Vec<String> = head
+        .master_ids
+        .iter()
+        .filter_map(|id| rels.get(id).cloned().flatten())
+        .collect();
+    let mut read_slides = Vec::with_capacity(head.slide_ids.len());
     for id in &head.slide_ids {
         let Some(Some(part)) = rels.get(id) else {
             continue;
@@ -80,44 +89,16 @@ pub fn read_package(package: &mut Package) -> Result<Presentation> {
         let mut slide = template(&bytes, part)?;
         images.attach(package, part, &mut slide)?;
         let layout_part = linked(package, part, "slideLayout")?;
-        if let Some(layout_part) = &layout_part
-            && !layouts.contains_key(layout_part)
-        {
-            let parsed = match package.has(layout_part) {
-                true => {
-                    let mut layout = template(&package.read(layout_part)?, layout_part)?;
-                    images.attach(package, layout_part, &mut layout)?;
-                    Some(layout)
-                }
-                false => None,
-            };
-            layouts.insert(layout_part.clone(), parsed);
-        }
-        let layout = layout_part.as_ref().and_then(|p| layouts[p].as_ref());
+        load_layout(package, &mut images, &mut layouts, layout_part.as_deref())?;
         let master_part = match &layout_part {
             Some(layout_part) => linked(package, layout_part, "slideMaster")?,
             None => None,
         };
         if let Some(master_part) = &master_part
-            && !masters.contains_key(master_part)
+            && !master_parts.contains(master_part)
         {
-            let parsed = match package.has(master_part) {
-                true => {
-                    let mut parsed = master(&package.read(master_part)?, master_part)?;
-                    images.attach(package, master_part, &mut parsed.template)?;
-                    if let Some(theme_part) = linked(package, master_part, "theme")?
-                        && package.has(&theme_part)
-                    {
-                        parsed.theme = read_theme(&package.read(&theme_part)?, &theme_part)
-                            .unwrap_or_default();
-                    }
-                    Some(parsed)
-                }
-                false => None,
-            };
-            masters.insert(master_part.clone(), parsed);
+            master_parts.push(master_part.clone());
         }
-        let master = master_part.as_ref().and_then(|p| masters[p].as_ref());
         let notes = match linked(package, part, "notesSlide")? {
             // Notes that do not parse are left out rather than failing the
             // slide.
@@ -126,19 +107,171 @@ pub fn read_package(package: &mut Package) -> Result<Presentation> {
             }
             _ => None,
         };
-        let context = Context {
-            master,
-            defaults: &head.default_style,
-            table_styles: &table_styles,
+        read_slides.push((part.clone(), slide, layout_part, master_part, notes));
+    }
+    let mut layout_order: Vec<String> = Vec::new();
+    for master_part in &master_parts {
+        if masters.contains_key(master_part) {
+            continue;
+        }
+        let parsed = match package.has(master_part) {
+            true => {
+                let mut parsed = master(&package.read(master_part)?, master_part)?;
+                images.attach(package, master_part, &mut parsed.template)?;
+                if let Some(theme_part) = linked(package, master_part, "theme")?
+                    && package.has(&theme_part)
+                {
+                    parsed.theme =
+                        read_theme(&package.read(&theme_part)?, &theme_part).unwrap_or_default();
+                }
+                let targets: HashMap<String, String> = package
+                    .relationships(master_part)?
+                    .into_iter()
+                    .filter_map(|rel| Some((rel.id, rel.target?)))
+                    .collect();
+                for id in &parsed.layout_ids {
+                    if let Some(target) = targets.get(id)
+                        && !layout_order.contains(target)
+                    {
+                        layout_order.push(target.clone());
+                    }
+                }
+                Some(parsed)
+            }
+            false => None,
         };
-        let mut resolved = resolve_slide(&slide, layout, &context);
-        resolved.notes = notes;
+        masters.insert(master_part.clone(), parsed);
+    }
+    for part in &layout_order {
+        load_layout(package, &mut images, &mut layouts, Some(part))?;
+    }
+    let language = east_asian_language(read_slides.iter().map(|s| &s.1));
+    let language_tag = language.as_deref().unwrap_or("en");
+    let context_for = |master| Context {
+        master,
+        defaults: &head.default_style,
+        table_styles: &table_styles,
+        language: language_tag,
+    };
+    let mut out_layouts = Vec::new();
+    for part in &layout_order {
+        let Some(Some(layout)) = layouts.get(part) else {
+            continue;
+        };
+        let master_part = linked(package, part, "slideMaster")?;
+        let master = master_part.as_ref().and_then(|p| masters.get(p)?.as_ref());
+        let mut slide = resolve_slide(&blank_on(layout), Some(layout), &context_for(master));
+        slide.layout = Some(out_layouts.len());
+        out_layouts.push(Layout {
+            name: layout.name.clone(),
+            part: part.clone(),
+            slide,
+        });
+    }
+    let mut slides = Vec::with_capacity(read_slides.len());
+    for (part, slide, layout_part, master_part, notes) in read_slides {
+        let layout = layout_part.as_ref().and_then(|p| layouts.get(p)?.as_ref());
+        let master = master_part.as_ref().and_then(|p| masters.get(p)?.as_ref());
+        let mut resolved = resolve_slide(&slide, layout, &context_for(master));
+        resolved.notes = notes.clone();
+        resolved.layout = layout_part
+            .as_ref()
+            .and_then(|p| layout_order.iter().position(|l| l == p));
+        let shapes = resolved
+            .shapes
+            .iter()
+            .filter_map(|shape| Some(shape.source.as_ref()?.index))
+            .collect();
+        resolved.source = Some(Arc::new(SlideSource {
+            part,
+            shapes,
+            notes,
+            copy: false,
+        }));
         slides.push(resolved);
     }
     Ok(Presentation {
         size: head.size,
         slides,
+        layouts: out_layouts,
+        east_asian_language: language,
     })
+}
+
+/// Read a layout once.
+fn load_layout(
+    package: &mut Package,
+    images: &mut Images,
+    layouts: &mut HashMap<String, Option<Template>>,
+    part: Option<&str>,
+) -> Result<()> {
+    let Some(part) = part else {
+        return Ok(());
+    };
+    if layouts.contains_key(part) {
+        return Ok(());
+    }
+    let parsed = match package.has(part) {
+        true => {
+            let mut layout = template(&package.read(part)?, part)?;
+            images.attach(package, part, &mut layout)?;
+            Some(layout)
+        }
+        false => None,
+    };
+    layouts.insert(part.to_owned(), parsed);
+    Ok(())
+}
+
+/// A new slide on `layout`: an empty placeholder for each of the layout's,
+/// except the date, footer and slide number, as PowerPoint makes it.
+fn blank_on(layout: &Template) -> Template {
+    let shapes = layout
+        .shapes
+        .iter()
+        .filter_map(|shape| {
+            let ph = shape.placeholder.clone()?;
+            if matches!(ph.kind.as_str(), "dt" | "ftr" | "sldNum") {
+                return None;
+            }
+            let mut raw = RawShape::new(Role::Shape);
+            raw.placeholder = Some(ph);
+            raw.body = Some(RawBody {
+                paragraphs: vec![RawParagraph::default()],
+                ..RawBody::default()
+            });
+            Some(raw)
+        })
+        .collect();
+    Template {
+        shapes,
+        show_master_shapes: true,
+        ..Template::default()
+    }
+}
+
+/// The East Asian language most text of the slides is marked with.
+fn east_asian_language<'a>(slides: impl Iterator<Item = &'a Template>) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for slide in slides {
+        for shape in &slide.shapes {
+            let Some(body) = &shape.body else { continue };
+            for paragraph in &body.paragraphs {
+                for run in &paragraph.runs {
+                    for language in [&run.language, &run.alt_language].into_iter().flatten() {
+                        let lower = language.to_ascii_lowercase();
+                        if ["ja", "zh", "ko"].iter().any(|p| lower.starts_with(p)) {
+                            *counts.entry(language.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(language, _)| language)
 }
 
 /// Picture bytes by part name, read once and shared by every slide that
@@ -206,6 +339,7 @@ fn linked(package: &mut Package, source: &str, kind: &str) -> Result<Option<Stri
 struct Head {
     size: (i64, i64),
     slide_ids: Vec<String>,
+    master_ids: Vec<String>,
     default_style: Levels,
 }
 
@@ -214,6 +348,7 @@ fn presentation(bytes: &[u8], part: &str) -> Result<Head> {
     let mut head = Head {
         size: aster_slides::DEFAULT_SIZE,
         slide_ids: Vec::new(),
+        master_ids: Vec::new(),
         default_style: Levels::default(),
     };
     loop {
@@ -230,6 +365,11 @@ fn presentation(bytes: &[u8], part: &str) -> Result<Head> {
             Ev::Open(tag) if tag.is("sldId") => {
                 if let Some(id) = rel_id(&tag) {
                     head.slide_ids.push(id);
+                }
+            }
+            Ev::Open(tag) if tag.is("sldMasterId") => {
+                if let Some(id) = rel_id(&tag) {
+                    head.master_ids.push(id);
                 }
             }
             Ev::Open(tag) if tag.is("defaultTextStyle") => {
@@ -270,7 +410,17 @@ struct Level {
 #[derive(Clone, Debug, PartialEq)]
 enum Bullet {
     Char(String),
-    Number,
+    /// The scheme and the first number.
+    Number(String, u32),
+}
+
+impl Bullet {
+    fn list(&self) -> List {
+        match self {
+            Bullet::Char(c) => List::Char(c.clone()),
+            Bullet::Number(scheme, start) => List::Number(scheme.clone(), *start),
+        }
+    }
 }
 
 type Levels = [Level; 9];
@@ -281,6 +431,8 @@ struct BodyProps {
     anchor: Option<Anchor>,
     wrap: Option<bool>,
     font_scale: Option<f32>,
+    /// `spAutoFit`: the shape fits its text.
+    grow: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,8 +446,12 @@ struct RawRun {
     color: Option<ColorSpec>,
     latin: Option<String>,
     east_asian: Option<String>,
-    /// `lang`, which picks the theme's East Asian font.
+    /// `lang`, which picks the theme's East Asian font, and `altLang`.
     language: Option<String>,
+    alt_language: Option<String>,
+    /// The run element and its properties element as written.
+    xml: String,
+    props_xml: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -303,7 +459,12 @@ struct RawParagraph {
     level: u8,
     props: Level,
     runs: Vec<RawRun>,
-    end_size: Option<f32>,
+    /// The end mark's properties.
+    end: Option<RawRun>,
+    /// The paragraph, its `pPr` and its `endParaRPr` as written.
+    xml: String,
+    props_xml: String,
+    end_xml: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -362,6 +523,8 @@ struct RawShape {
     /// The picture of a picture fill.
     fill_image: Option<Arc<[u8]>>,
     table: Option<RawTable>,
+    /// For a shape inside a group: child to slide coordinates.
+    group: Option<Transform>,
 }
 
 impl RawShape {
@@ -384,6 +547,7 @@ impl RawShape {
             image: None,
             fill_image: None,
             table: None,
+            group: None,
         }
     }
 
@@ -406,6 +570,8 @@ enum Background {
 /// templates behind it show through.
 #[derive(Debug, Default)]
 struct Template {
+    /// `cSld`'s `name`: a layout's name.
+    name: String,
     shapes: Vec<RawShape>,
     show_master_shapes: bool,
     hidden: bool,
@@ -427,6 +593,8 @@ impl Template {
 #[derive(Debug, Default)]
 struct Master {
     template: Template,
+    /// Relationship ids of its layouts, in order.
+    layout_ids: Vec<String>,
     theme: Theme,
     title: Levels,
     body: Levels,
@@ -445,8 +613,11 @@ fn template(bytes: &[u8], part: &str) -> Result<Template> {
                 out.show_master_shapes = tag.attr_bool("showMasterSp").unwrap_or(true);
                 out.hidden = tag.attr_bool("show") == Some(false);
             }
+            Ev::Open(tag) if tag.is("cSld") => {
+                out.name = tag.attr("name").unwrap_or_default();
+            }
             Ev::Open(tag) if tag.is("spTree") => {
-                shape_tree(&mut reader, Transform::IDENTITY, &mut out.shapes)?;
+                shape_tree(&mut reader, Transform::IDENTITY, false, &mut out.shapes)?;
             }
             Ev::Open(tag) if tag.is("bg") => {
                 each_child(&mut reader, |reader, child| {
@@ -490,6 +661,18 @@ fn master(bytes: &[u8], part: &str) -> Result<Master> {
         template,
         ..Master::default()
     };
+    let mut reader = XmlReader::new(bytes, part);
+    while let Some(list) = reader.find("sldLayoutIdLst")? {
+        let _ = list;
+        each_child(&mut reader, |reader, tag| {
+            if tag.is("sldLayoutId")
+                && let Some(id) = rel_id(&tag)
+            {
+                out.layout_ids.push(id);
+            }
+            reader.skip()
+        })?;
+    }
     let mut reader = XmlReader::new(bytes, part);
     while let Some(_styles) = reader.find("txStyles")? {
         each_child(&mut reader, |reader, tag| {
@@ -606,9 +789,11 @@ fn read_xfrm(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Xfrm> {
 }
 
 /// After the `spTree` or `grpSp` open: the shapes inside, flattened.
+/// `nested` inside a group.
 fn shape_tree(
     reader: &mut XmlReader<'_>,
     transform: Transform,
+    nested: bool,
     out: &mut Vec<RawShape>,
 ) -> Result<()> {
     let mut group = Transform::IDENTITY;
@@ -625,7 +810,7 @@ fn shape_tree(
                     }
                 })?;
             }
-            b"grpSp" => shape_tree(reader, transform.then(group), out)?,
+            b"grpSp" => shape_tree(reader, transform.then(group), true, out)?,
             b"sp" | b"cxnSp" | b"pic" | b"graphicFrame" => {
                 let role = match local.as_slice() {
                     b"pic" => Role::Picture,
@@ -638,6 +823,9 @@ fn shape_tree(
                 }
                 let full = transform.then(group);
                 shape.frame = shape.frame.map(|frame| full.apply(frame));
+                if nested {
+                    shape.group = Some(full);
+                }
                 out.push(shape);
             }
             b"AlternateContent" => {
@@ -648,7 +836,7 @@ fn shape_tree(
                 each_child(reader, |reader, child| {
                     if child.is("Choice") && !done {
                         done = true;
-                        shape_tree(reader, inner, out)
+                        shape_tree(reader, inner, nested, out)
                     } else {
                         reader.skip()
                     }
@@ -828,6 +1016,11 @@ fn text_body(reader: &mut XmlReader<'_>) -> Result<RawBody> {
                 };
                 props.wrap = tag.attr("wrap").map(|wrap| wrap != "none");
                 each_child(reader, |reader, child| {
+                    if child.is("spAutoFit") {
+                        props.grow = Some(true);
+                    } else if child.is("noAutofit") || child.is("normAutofit") {
+                        props.grow = Some(false);
+                    }
                     if child.is("normAutofit") {
                         props.font_scale = Some(
                             child
@@ -902,7 +1095,16 @@ fn level_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Level> {
                         .map(Bullet::Char),
                 )
             }
-            b"buAutoNum" => level.bullet = Some(Some(Bullet::Number)),
+            b"buAutoNum" => {
+                level.bullet = Some(Some(Bullet::Number(
+                    child
+                        .attr("type")
+                        .unwrap_or_else(|| "arabicPeriod".to_owned()),
+                    child
+                        .attr_i64("startAt")
+                        .map_or(1, |n| n.clamp(1, 32_767) as u32),
+                )))
+            }
             _ => {}
         }
         reader.skip()
@@ -924,6 +1126,7 @@ fn run_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<RawRun> {
         underline: tag.attr("u").is_some_and(|u| u != "none"),
         strike: tag.attr("strike").is_some_and(|s| s != "noStrike"),
         language: tag.attr("lang"),
+        alt_language: tag.attr("altLang"),
         ..RawRun::default()
     };
     each_child(reader, |reader, child| match child.local() {
@@ -951,22 +1154,28 @@ fn run_props(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<RawRun> {
 }
 
 fn paragraph(reader: &mut XmlReader<'_>) -> Result<RawParagraph> {
+    let start = reader.opened_at();
     let mut out = RawParagraph::default();
     each_child(reader, |reader, tag| {
+        let at = reader.opened_at();
         match tag.local() {
             b"pPr" => {
                 out.level = tag.attr_i64("lvl").unwrap_or(0).clamp(0, 8) as u8;
                 out.props = level_props(reader, &tag)?;
+                out.props_xml = reader.slice(at, reader.position());
             }
             b"r" | b"fld" | b"br" => {
                 let is_break = tag.is("br");
                 let mut run = RawRun::default();
+                let mut props_xml = String::new();
                 each_child(reader, |reader, child| {
+                    let child_at = reader.opened_at();
                     if child.is("rPr") {
                         run = RawRun {
                             text: std::mem::take(&mut run.text),
                             ..run_props(reader, &child)?
                         };
+                        props_xml = reader.slice(child_at, reader.position());
                         Ok(())
                     } else if child.is("t") {
                         run.text.push_str(&reader.text()?);
@@ -980,13 +1189,21 @@ fn paragraph(reader: &mut XmlReader<'_>) -> Result<RawParagraph> {
                 }
                 // Vertical tabs are PowerPoint's soft line breaks.
                 run.text = run.text.replace('\u{b}', "\n");
+                run.xml = reader.slice(at, reader.position());
+                run.props_xml = props_xml;
                 out.runs.push(run);
             }
-            b"endParaRPr" => out.end_size = run_props(reader, &tag)?.size,
+            b"endParaRPr" => {
+                let mut end = run_props(reader, &tag)?;
+                end.props_xml = reader.slice(at, reader.position());
+                out.end_xml = end.props_xml.clone();
+                out.end = Some(end);
+            }
             _ => reader.skip()?,
         }
         Ok(())
     })?;
+    out.xml = reader.slice(start, reader.position());
     Ok(out)
 }
 
@@ -1273,6 +1490,8 @@ struct Context<'a> {
     master: Option<&'a Master>,
     defaults: &'a Levels,
     table_styles: &'a HashMap<String, TableStyle>,
+    /// The East Asian language for text not marked with one.
+    language: &'a str,
 }
 
 /// Where a slide placeholder's inherited properties come from.
@@ -1445,7 +1664,7 @@ fn resolve_slide(slide: &Template, layout: Option<&Template>, context: &Context<
                     master: None,
                     style: other,
                 };
-                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors) {
+                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors, None) {
                     shape.inherited = true;
                     shapes.push(shape);
                 }
@@ -1458,14 +1677,14 @@ fn resolve_slide(slide: &Template, layout: Option<&Template>, context: &Context<
                     master: None,
                     style: other,
                 };
-                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors) {
+                if let Some(mut shape) = resolve_shape(raw, &sources, context, &colors, None) {
                     shape.inherited = true;
                     shapes.push(shape);
                 }
             }
         }
     }
-    for raw in &slide.shapes {
+    for (index, raw) in slide.shapes.iter().enumerate() {
         let sources = match &raw.placeholder {
             Some(ph) => {
                 let from_layout = layout.and_then(|l| find_on_layout(l, ph));
@@ -1488,7 +1707,7 @@ fn resolve_slide(slide: &Template, layout: Option<&Template>, context: &Context<
                 style: other,
             },
         };
-        if let Some(shape) = resolve_shape(raw, &sources, context, &colors) {
+        if let Some(shape) = resolve_shape(raw, &sources, context, &colors, Some(index as u32)) {
             shapes.push(shape);
         }
     }
@@ -1501,19 +1720,48 @@ fn resolve_slide(slide: &Template, layout: Option<&Template>, context: &Context<
             Background::Ref(reference) => colors.styled_fill(reference),
         })
     });
+    // What a new shape or text box on this slide looks like.
+    let text = text_levels(
+        &[],
+        &TextDefaults {
+            style: other,
+            defaults: context.defaults,
+            color: None,
+            table: None,
+        },
+        &colors,
+        context.language,
+    );
+    let accent = ColorSpec::scheme("accent1");
+    let mut accent_line = accent.clone();
+    accent_line
+        .modifiers
+        .push(crate::drawingml::Modifier::Shade(0.15));
+    let look = SlideLook {
+        accent: colors.color(&accent),
+        accent_line: colors.color(&accent_line),
+        on_accent: colors.color(&ColorSpec::scheme("lt1")),
+        text: Arc::new(text),
+    };
     Slide {
         shapes,
         hidden: slide.hidden,
         background: background.flatten(),
         notes: None,
+        source: None,
+        layout: None,
+        look: Arc::new(look),
     }
 }
 
+/// `index`: the shape's place among the slide part's shapes, for a shape of
+/// the slide itself; `None` for one of its layout or master.
 fn resolve_shape(
     raw: &RawShape,
     sources: &Sources<'_>,
     context: &Context<'_>,
     colors: &Colors<'_>,
+    index: Option<u32>,
 ) -> Option<Shape> {
     let chain = [Some(raw), sources.layout, sources.master];
     let frame = chain.iter().flatten().find_map(|s| s.frame)?;
@@ -1569,6 +1817,8 @@ fn resolve_shape(
                 table: None,
             },
             colors,
+            context.language,
+            index.is_some(),
         )
     });
     let picture = match (&raw.blip, &raw.image) {
@@ -1582,6 +1832,21 @@ fn resolve_shape(
         .table
         .as_ref()
         .map(|table| resolve_table(table, context, colors));
+    let source = index.map(|index| ShapeSource {
+        index,
+        copy: false,
+        frame,
+        group: raw.group.map(|t| [t.scale_x, t.scale_y, t.dx, t.dy]),
+        paragraphs: text
+            .as_ref()
+            .map(|body| {
+                body.paragraphs
+                    .iter()
+                    .filter_map(|p| p.source.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    });
     Some(Shape {
         frame,
         rotation: raw.rotation,
@@ -1595,6 +1860,11 @@ fn resolve_shape(
         picture,
         table,
         inherited: false,
+        placeholder: raw.placeholder.as_ref().map(|ph| SlidePlaceholder {
+            kind: ph.kind.clone(),
+            idx: ph.idx,
+        }),
+        source,
     })
 }
 
@@ -1612,17 +1882,94 @@ struct TextDefaults<'a> {
 /// Text formatting a table style gives its cells: bold, italic, colour.
 type TableText = (Option<bool>, Option<bool>, Option<[u8; 4]>);
 
+/// What each outline level of a body inherits: everything but a
+/// paragraph's own properties, most specific first (the body's list style,
+/// the placeholders it inherits from, a table style's text, the shape
+/// style's text colour, the master's and the presentation's text styles).
+fn text_levels(
+    inherited: &[&Levels],
+    fallback: &TextDefaults<'_>,
+    colors: &Colors<'_>,
+    language: &str,
+) -> Looks {
+    let (table_bold, table_italic, table_color) = fallback.table.unwrap_or_default();
+    std::array::from_fn(|lvl| {
+        let own: Vec<&Level> = inherited.iter().map(|list| &list[lvl]).collect();
+        let mut levels = own.clone();
+        if let Some(style) = fallback.style {
+            levels.push(&style[lvl]);
+        }
+        levels.push(&fallback.defaults[lvl]);
+        let face = |name: Option<String>, fallback_name: &str, language: &str| {
+            name.and_then(|name| colors.theme.typeface(&name, language))
+                .or_else(|| colors.theme.typeface(fallback_name, language))
+        };
+        LevelLook {
+            size: levels
+                .iter()
+                .find_map(|l| l.size)
+                .unwrap_or(DEFAULT_TEXT_POINTS),
+            bold: own
+                .iter()
+                .find_map(|l| l.bold)
+                .or(table_bold)
+                .or_else(|| levels.iter().find_map(|l| l.bold))
+                .unwrap_or(false),
+            italic: own
+                .iter()
+                .find_map(|l| l.italic)
+                .or(table_italic)
+                .or_else(|| levels.iter().find_map(|l| l.italic))
+                .unwrap_or(false),
+            // A shape style's or table style's text colour wins over the
+            // master and presentation text styles, not over the shape's own.
+            color: own
+                .iter()
+                .find_map(|l| l.color.as_ref())
+                .map(|c| colors.color(c))
+                .or(table_color)
+                .or(fallback.color)
+                .or_else(|| {
+                    levels
+                        .iter()
+                        .find_map(|l| l.color.as_ref())
+                        .map(|c| colors.color(c))
+                }),
+            font: face(levels.iter().find_map(|l| l.latin.clone()), "+mn-lt", "en"),
+            east_asian_font: face(
+                levels.iter().find_map(|l| l.east_asian.clone()),
+                "+mn-ea",
+                language,
+            ),
+            align: levels.iter().find_map(|l| l.align).unwrap_or_default(),
+            list: levels
+                .iter()
+                .find_map(|l| l.bullet.clone())
+                .flatten()
+                .map(|b| b.list()),
+            margin: levels.iter().find_map(|l| l.margin).unwrap_or(0).max(0),
+            indent: levels.iter().find_map(|l| l.indent).unwrap_or(0),
+        }
+    })
+}
+
+/// `keep_empty`: an empty body stays (a placeholder of the slide, to type
+/// into); otherwise it is dropped, as PowerPoint shows an empty
+/// placeholder's prompt only while editing.
+#[allow(clippy::too_many_arguments)]
 fn resolve_body(
     body: &RawBody,
     inherited: &[&RawBody],
     fallback: &TextDefaults<'_>,
     colors: &Colors<'_>,
+    language: &str,
+    keep_empty: bool,
 ) -> Option<TextBody> {
-    // An empty placeholder: PowerPoint shows its prompt only while editing.
-    if body
-        .paragraphs
-        .iter()
-        .all(|p| p.runs.iter().all(|r| r.text.is_empty()))
+    if !keep_empty
+        && body
+            .paragraphs
+            .iter()
+            .all(|p| p.runs.iter().all(|r| r.text.is_empty()))
     {
         return None;
     }
@@ -1641,108 +1988,104 @@ fn resolve_body(
     if let Some(wrap) = props.iter().find_map(|p| p.wrap) {
         out.wrap = wrap;
     }
+    out.grow = props.iter().find_map(|p| p.grow).unwrap_or(false);
     out.font_scale = body.props.font_scale.unwrap_or(1.0);
-    let (table_bold, table_italic, table_color) = fallback.table.unwrap_or_default();
+    let lists: Vec<&Levels> = std::iter::once(&body.list)
+        .chain(inherited.iter().map(|b| &b.list))
+        .collect();
+    let levels = text_levels(&lists, fallback, colors, language);
 
-    let mut numbers = [0u32; 9];
     for raw in &body.paragraphs {
         let lvl = usize::from(raw.level);
-        // Most specific first: the shape's own, then the placeholders it
-        // inherits from, then the master's and the presentation's styles.
-        let mut own: Vec<&Level> = vec![&raw.props, &body.list[lvl]];
-        own.extend(inherited.iter().map(|b| &b.list[lvl]));
-        let mut levels = own.clone();
+        let look = &levels[lvl];
+        let own = &raw.props;
+        let size = own.size.unwrap_or(look.size);
+        let bold = own.bold.unwrap_or(look.bold);
+        let italic = own.italic.unwrap_or(look.italic);
+        let color = own.color.as_ref().map(|c| colors.color(c)).or(look.color);
+        // Font names through the whole chain, picked per run's language.
+        let mut chain: Vec<&Level> = vec![own];
+        chain.extend(lists.iter().map(|list| &list[lvl]));
         if let Some(style) = fallback.style {
-            levels.push(&style[lvl]);
+            chain.push(&style[lvl]);
         }
-        levels.push(&fallback.defaults[lvl]);
-        let size = levels
-            .iter()
-            .find_map(|l| l.size)
-            .unwrap_or(DEFAULT_TEXT_POINTS);
-        let bold = own
-            .iter()
-            .find_map(|l| l.bold)
-            .or(table_bold)
-            .or_else(|| levels.iter().find_map(|l| l.bold))
-            .unwrap_or(false);
-        let italic = own
-            .iter()
-            .find_map(|l| l.italic)
-            .or(table_italic)
-            .or_else(|| levels.iter().find_map(|l| l.italic))
-            .unwrap_or(false);
-        // A shape style's or table style's text colour wins over the master
-        // and presentation text styles, not over the shape's own.
-        let color = own
-            .iter()
-            .find_map(|l| l.color.as_ref())
-            .map(|c| colors.color(c))
-            .or(table_color)
-            .or(fallback.color)
-            .or_else(|| {
-                levels
-                    .iter()
-                    .find_map(|l| l.color.as_ref())
-                    .map(|c| colors.color(c))
-            });
-        let latin = levels.iter().find_map(|l| l.latin.clone());
-        let east_asian = levels.iter().find_map(|l| l.east_asian.clone());
-        let align = levels.iter().find_map(|l| l.align).unwrap_or_default();
-        let bullet = levels.iter().find_map(|l| l.bullet.clone()).flatten();
-        let has_text = raw.runs.iter().any(|r| !r.text.trim().is_empty());
-        let bullet = match bullet {
-            _ if !has_text => None,
-            Some(Bullet::Char(c)) => {
-                numbers[lvl] = 0;
-                Some(c)
-            }
-            Some(Bullet::Number) => {
-                numbers[lvl] += 1;
-                Some(format!("{}.", numbers[lvl]))
-            }
-            None => {
-                numbers[lvl] = 0;
-                None
+        chain.push(&fallback.defaults[lvl]);
+        let latin = chain.iter().find_map(|l| l.latin.clone());
+        let east_asian = chain.iter().find_map(|l| l.east_asian.clone());
+        let make_run = |run: &RawRun| {
+            let language = run.language.as_deref().unwrap_or("en");
+            let face =
+                |name: Option<&String>| name.and_then(|name| colors.theme.typeface(name, language));
+            Run {
+                text: run.text.clone(),
+                size: run.size.unwrap_or(size),
+                bold: run.bold.unwrap_or(bold),
+                italic: run.italic.unwrap_or(italic),
+                underline: run.underline,
+                strike: run.strike,
+                color: run.color.as_ref().map(|c| colors.color(c)).or(color),
+                font: face(run.latin.as_ref().or(latin.as_ref()))
+                    .or_else(|| colors.theme.typeface("+mn-lt", language)),
+                east_asian_font: face(run.east_asian.as_ref().or(east_asian.as_ref()))
+                    .or_else(|| colors.theme.typeface("+mn-ea", language)),
+                source: None,
             }
         };
-        // Deeper levels restart their numbering under a new parent.
-        for deeper in numbers.iter_mut().skip(lvl + 1) {
-            *deeper = 0;
-        }
-        out.paragraphs.push(Paragraph {
-            runs: raw
-                .runs
-                .iter()
-                .filter(|run| !run.text.is_empty())
-                .map(|run| {
-                    let language = run.language.as_deref().unwrap_or("en");
-                    let face = |name: Option<&String>| {
-                        name.and_then(|name| colors.theme.typeface(name, language))
-                    };
-                    Run {
-                        text: run.text.clone(),
-                        size: run.size.unwrap_or(size),
-                        bold: run.bold.unwrap_or(bold),
-                        italic: run.italic.unwrap_or(italic),
-                        underline: run.underline,
-                        strike: run.strike,
-                        color: run.color.as_ref().map(|c| colors.color(c)).or(color),
-                        font: face(run.latin.as_ref().or(latin.as_ref()))
-                            .or_else(|| colors.theme.typeface("+mn-lt", language)),
-                        east_asian_font: face(run.east_asian.as_ref().or(east_asian.as_ref()))
-                            .or_else(|| colors.theme.typeface("+mn-ea", language)),
-                    }
-                })
-                .collect(),
-            align,
-            level: raw.level,
-            bullet,
-            margin: levels.iter().find_map(|l| l.margin).unwrap_or(0).max(0),
-            indent: levels.iter().find_map(|l| l.indent).unwrap_or(0),
-            end_size: raw.end_size.unwrap_or(size),
+        let runs: Vec<(Run, &RawRun)> = raw
+            .runs
+            .iter()
+            .filter(|run| !run.text.is_empty())
+            .map(|run| (make_run(run), run))
+            .collect();
+        let end_raw = raw.end.clone().unwrap_or_else(|| RawRun {
+            language: None,
+            ..RawRun::default()
         });
+        let mut end = make_run(&end_raw);
+        end.text.clear();
+        let end_size = end_raw.size.unwrap_or(size);
+        let mut paragraph = Paragraph {
+            runs: runs.iter().map(|(run, _)| run.clone()).collect(),
+            align: own.align.unwrap_or(look.align),
+            level: raw.level,
+            bullet: None,
+            margin: own.margin.map_or(look.margin, |m| m.max(0)),
+            indent: own.indent.unwrap_or(look.indent),
+            end_size,
+            list: match &own.bullet {
+                Some(bullet) => bullet.as_ref().map(Bullet::list),
+                None => look.list.clone(),
+            },
+            end: end.clone(),
+            source: None,
+        };
+        let original = paragraph.clone();
+        for (run, (_, raw_run)) in paragraph.runs.iter_mut().zip(&runs) {
+            run.source = Some(Arc::new(RunSource {
+                xml: raw_run.xml.clone(),
+                props: raw_run.props_xml.clone(),
+                original: run.clone(),
+                own_size: raw_run.size.is_some(),
+                own_bold: raw_run.bold.is_some(),
+                own_italic: raw_run.italic.is_some(),
+                own_color: raw_run.color.is_some(),
+            }));
+        }
+        paragraph.end.source = Some(aster_slides::edit::end_source(&raw.end_xml, &end));
+        paragraph.source = Some(Arc::new(ParaSource {
+            xml: raw.xml.clone(),
+            props: raw.props_xml.clone(),
+            end: raw.end_xml.clone(),
+            original,
+            own_align: own.align.is_some(),
+            own_list: own.bullet.is_some(),
+            own_margin: own.margin.is_some(),
+            own_indent: own.indent.is_some(),
+        }));
+        out.paragraphs.push(paragraph);
     }
+    out.levels = Some(Arc::new(levels));
+    out.renumber();
     Some(out)
 }
 
@@ -1875,6 +2218,8 @@ fn resolve_table(raw: &RawTable, context: &Context<'_>, colors: &Colors<'_>) -> 
                         table: Some(text_style),
                     },
                     colors,
+                    context.language,
+                    false,
                 )
             });
             row.cells.push(TableCell {

@@ -1,5 +1,9 @@
 //! A presentation on screen: a strip of slide thumbnails on the left and the
-//! current slide, fitted, on the right. Read-only.
+//! current slide, fitted, on the right; and the editor of that slide (see
+//! [`editing`]): shapes are selected, moved and resized, text is typed into
+//! text boxes and placeholders, slides are added, copied, moved and
+//! deleted, and every change can be undone. In a slide show the current
+//! slide fills the window on black.
 //!
 //! A slide is drawn in its own colours whatever the theme of the window:
 //! its background, the fills and outlines of its shapes, pictures, tables,
@@ -8,6 +12,8 @@
 //! per size, so moving through the slides and scrolling the strip do not
 //! lay text out again; pictures are decoded once.
 
+mod editing;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,7 +21,9 @@ use aster_slides::{
     Align as SlideAlign, Anchor, EMU_PER_POINT, Fill, Geometry, Outline, Presentation, Role, Shape,
     Slide, Table, TextBody,
 };
+
 use aster_text::{Align, Family, Paragraph, Rules, Shaper, Span, Spec, Style as TextStyle};
+pub use editing::{CaretMove, Cursor, NewShape, Selection, TextFormat, TextLook};
 use vello_cpu::kurbo::{Affine, BezPath, Ellipse, Line, Rect, RoundedRect, Shape as _, Stroke};
 use vello_cpu::peniko::{Color, Fill as FillRule};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
@@ -59,6 +67,11 @@ pub struct SlideStyle {
     pub table: String,
     pub chart: String,
     pub graphic: String,
+    /// Shown in empty placeholders while editing: a title's, a subtitle's,
+    /// any other's.
+    pub prompt_title: String,
+    pub prompt_subtitle: String,
+    pub prompt_text: String,
 }
 
 impl Default for SlideStyle {
@@ -74,6 +87,9 @@ impl Default for SlideStyle {
             table: "Table".to_owned(),
             chart: "Chart".to_owned(),
             graphic: "Graphic".to_owned(),
+            prompt_title: "Click to add title".to_owned(),
+            prompt_subtitle: "Click to add subtitle".to_owned(),
+            prompt_text: "Click to add text".to_owned(),
         }
     }
 }
@@ -84,6 +100,8 @@ struct Drawn {
     strip_scroll: f64,
     size: (u16, u16),
     scale: f32,
+    revision: u64,
+    caret_on: bool,
 }
 
 /// A slide's texts laid out for one page width.
@@ -91,18 +109,38 @@ struct LaidSlide {
     shapes: Vec<LaidShape>,
 }
 
+#[derive(Clone)]
 struct LaidShape {
     /// Index into the slide's shapes.
     index: usize,
     /// Paragraph boxes: position inside the text area (physical pixels from
     /// the shape's top-left) and the laid-out text.
     texts: Vec<(f64, f64, Paragraph)>,
+    /// Where each paragraph of its text is, for the caret and clicks.
+    paras: Vec<LaidPara>,
     label: Option<Paragraph>,
     /// A table's cells.
     cells: Vec<LaidCell>,
+    /// Drawn: it has text, a fill, an outline, a picture or a box.
+    visible: bool,
+}
+
+/// One paragraph of a shape's text, physical pixels from the shape's
+/// top-left.
+#[derive(Clone)]
+struct LaidPara {
+    x: f64,
+    y: f64,
+    /// The room for its lines.
+    width: f64,
+    height: f64,
+    align: SlideAlign,
+    /// `None` for an empty paragraph.
+    laid: Option<Paragraph>,
 }
 
 /// A table cell placed in its table's frame.
+#[derive(Clone)]
 struct LaidCell {
     /// Physical pixels from the frame's top-left.
     rect: Rect,
@@ -132,6 +170,22 @@ pub struct SlideView {
     glyphs: Vec<Glyph>,
     drawn: Option<Drawn>,
     images: ImageCache,
+    // --- Editing (see `editing`) ---
+    selection: Selection,
+    /// A composition not committed yet, and its caret.
+    preedit: Option<(String, Option<(usize, usize)>)>,
+    drag: Option<editing::Drag>,
+    caret_on: bool,
+    ime_area: (f64, f64, f64, f64),
+    history: editing::History,
+    /// Counts every change to what is drawn.
+    revision: u64,
+    /// In a slide show.
+    presenting: bool,
+    /// The thumbnails have the keyboard: keys act on slides, not shapes.
+    strip_focus: bool,
+    /// Where the caret goes up and down from, physical pixels.
+    goal_x: Option<f64>,
 }
 
 impl SlideView {
@@ -156,11 +210,42 @@ impl SlideView {
             glyphs: Vec::new(),
             drawn: None,
             images: ImageCache::default(),
+            selection: Selection::None,
+            preedit: None,
+            drag: None,
+            caret_on: true,
+            ime_area: (0.0, 0.0, 1.0, 1.0),
+            history: editing::History::default(),
+            revision: 0,
+            presenting: false,
+            strip_focus: false,
+            goal_x: None,
         }
     }
 
     pub fn presentation(&self) -> &Arc<Presentation> {
         &self.presentation
+    }
+
+    /// Something drawn changed.
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn set_caret_on(&mut self, on: bool) {
+        self.caret_on = on;
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.preedit.is_some()
+    }
+
+    /// Where the input method's candidate window goes: at the caret.
+    pub fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+        if self.needs_render() {
+            self.render();
+        }
+        self.ime_area
     }
 
     pub fn current(&self) -> usize {
@@ -205,7 +290,7 @@ impl SlideView {
     }
 
     fn shows_strip(&self) -> bool {
-        f64::from(self.width) / self.s() >= STRIP_MIN_WINDOW
+        !self.presenting && f64::from(self.width) / self.s() >= STRIP_MIN_WINDOW
     }
 
     fn strip_width(&self) -> f64 {
@@ -240,8 +325,11 @@ impl SlideView {
         if index == self.current {
             return false;
         }
+        self.leave_text();
+        self.selection = Selection::None;
         self.current = index;
         self.wheel = 0.0;
+        self.touch();
         // Keep its thumbnail in view.
         let pitch = self.thumb_pitch();
         let top = THUMB_GAP * self.s() + pitch * index as f64;
@@ -267,17 +355,22 @@ impl SlideView {
         self.go_to(self.count().saturating_sub(1))
     }
 
-    /// A click (physical pixels): on a thumbnail, shows that slide.
-    pub fn press(&mut self, x: f64, y: f64) -> bool {
+    /// The thumbnail under a point of the strip (physical pixels).
+    fn thumb_at(&self, x: f64, y: f64) -> Option<usize> {
         if x >= self.strip_width() || self.count() == 0 {
-            return false;
+            return None;
         }
         let y = y + self.strip_scroll - THUMB_GAP * self.s() / 2.0;
         let index = (y / self.thumb_pitch()).floor();
-        if index < 0.0 {
-            return false;
-        }
-        self.go_to((index as usize).min(self.count() - 1))
+        (index >= 0.0).then(|| (index as usize).min(self.count() - 1))
+    }
+
+    /// Where a slide dragged in the strip to height `y` would go: the gap
+    /// before slide `n`.
+    fn drop_slot(&self, y: f64) -> usize {
+        let y = y + self.strip_scroll - THUMB_GAP * self.s() / 2.0;
+        let slot = (y / self.thumb_pitch() + 0.5).floor();
+        (slot.max(0.0) as usize).min(self.count())
     }
 
     /// The wheel: over the strip it scrolls the strip, over the slide it
@@ -323,7 +416,11 @@ impl SlideView {
     fn page_rect(&self) -> Rect {
         let (w, h) = self.presentation.size;
         let (w, h) = (w.max(1) as f64, h.max(1) as f64);
-        let margin = MARGIN * self.s();
+        let margin = if self.presenting {
+            0.0
+        } else {
+            MARGIN * self.s()
+        };
         let left = self.strip_width() + margin;
         let avail_w = (f64::from(self.width) - left - margin).max(1.0);
         let avail_h = (f64::from(self.height) - 2.0 * margin).max(1.0);
@@ -344,7 +441,18 @@ impl SlideView {
             strip_scroll: self.strip_scroll,
             size: (self.width, self.height),
             scale: self.scale,
+            revision: self.revision,
+            caret_on: self.caret_on && matches!(self.selection, Selection::Text { .. }),
         }
+    }
+
+    /// Slide `index`'s laid-out text is out of date; `None` for all.
+    fn forget(&mut self, index: Option<usize>) {
+        match index {
+            Some(index) => self.laid.retain(|(i, _), _| *i != index),
+            None => self.laid.clear(),
+        }
+        self.touch();
     }
 
     pub fn render(&mut self) -> &Pixmap {
@@ -361,9 +469,16 @@ impl SlideView {
         self.ctx.set_paint(color(style.background));
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
 
+        if self.presenting {
+            self.ctx.set_paint(color([0, 0, 0, 0xff]));
+            self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
+        }
         if self.count() > 0 {
             let page = self.page_rect();
             self.draw_slide(self.current, page, true);
+            if !self.presenting {
+                self.draw_editing(page);
+            }
         }
 
         if self.shows_strip() {
@@ -403,6 +518,12 @@ impl SlideView {
                     self.ctx.set_stroke(Stroke::new(s.round().max(1.0)));
                     self.ctx.stroke_rect(&rect.inset(s / 2.0));
                 }
+                if selected && self.strip_focus {
+                    let border = (2.0 * s).round();
+                    self.ctx.set_paint(color(style.accent));
+                    self.ctx.set_stroke(Stroke::new(border));
+                    self.ctx.stroke_rect(&rect.inset(-border * 1.5));
+                }
                 let hidden = self.presentation.slides[index].hidden;
                 let number = self.number(index, selected);
                 let x = thumb_x - 8.0 * s - f64::from(number.width());
@@ -415,6 +536,17 @@ impl SlideView {
                         &Line::new((rect.x0, rect.y1), (rect.x1, rect.y0)).to_path(0.1),
                     );
                 }
+            }
+            if let Some(slot) = self.drop_indicator() {
+                // Where a dragged slide would go.
+                let y = THUMB_GAP * s / 2.0 + pitch * slot as f64 - self.strip_scroll;
+                self.ctx.set_paint(color(style.accent));
+                self.ctx.fill_rect(&Rect::new(
+                    thumb_x - 4.0 * s,
+                    y - s,
+                    thumb_x + (THUMB_WIDTH + 4.0) * s,
+                    y + s,
+                ));
             }
             self.ctx.pop_layer();
         }
@@ -462,9 +594,9 @@ impl SlideView {
                 shape.frame.width as f64 * px_per_emu,
                 shape.frame.height as f64 * px_per_emu,
             );
-            let texts = match &shape.text {
+            let (texts, paras) = match &shape.text {
                 Some(body) => lay_out_text(&mut self.shaper, body, width, height, px_per_emu),
-                None => Vec::new(),
+                None => (Vec::new(), Vec::new()),
             };
             let cells = match &shape.table {
                 Some(table) => lay_out_table(&mut self.shaper, table, px_per_emu),
@@ -495,14 +627,18 @@ impl SlideView {
                 || shape.fill.is_some()
                 || shape.line.is_some()
                 || shape.picture.is_some();
-            if !visible {
+            // Shapes of the layout and master are only drawn; the slide's
+            // own are kept for clicks even when there is nothing to draw.
+            if !visible && shape.inherited {
                 continue;
             }
             shapes.push(LaidShape {
                 index: i,
                 texts,
+                paras,
                 label,
                 cells,
+                visible,
             });
         }
         let laid = Arc::new(LaidSlide { shapes });
@@ -551,7 +687,20 @@ impl SlideView {
     }
 
     fn draw_slide(&mut self, index: usize, page: Rect, main: bool) {
-        let laid = self.laid_slide(index, page);
+        let mut laid = self.laid_slide(index, page);
+        // The text being typed into, with its composition.
+        if main
+            && index == self.current
+            && let Some(edited) = self.edited_layout(page)
+        {
+            let mut copy = LaidSlide {
+                shapes: laid.shapes.clone(),
+            };
+            if let Some(slot) = copy.shapes.iter_mut().find(|s| s.index == edited.index) {
+                *slot = edited;
+            }
+            laid = Arc::new(copy);
+        }
         let presentation = self.presentation.clone();
         let slide = &presentation.slides[index];
         let px_per_emu = page.width() / presentation.size.0.max(1) as f64;
@@ -569,7 +718,7 @@ impl SlideView {
         }
         // Hairlines stay visible however small the page.
         let min_line = if main { s.max(1.0) * 0.75 } else { 0.5 };
-        for laid_shape in &laid.shapes {
+        for laid_shape in laid.shapes.iter().filter(|s| s.visible) {
             let shape = &slide.shapes[laid_shape.index];
             let frame = Rect::new(
                 page.x0 + shape.frame.x as f64 * px_per_emu,
@@ -777,14 +926,34 @@ fn lay_out_text(
     width: f64,
     height: f64,
     px_per_emu: f64,
-) -> Vec<(f64, f64, Paragraph)> {
-    let (mut out, used) = lay_out_body(shaper, body, width, px_per_emu);
-    anchor(&mut out, body, height, used, px_per_emu);
-    out
+) -> (Vec<(f64, f64, Paragraph)>, Vec<LaidPara>) {
+    let (mut out, mut paras, used) = lay_out_paragraphs(shaper, body, width, px_per_emu);
+    let shift = anchor_shift(body, height, used, px_per_emu);
+    if shift != 0.0 {
+        for (_, y, _) in &mut out {
+            *y += shift;
+        }
+        for para in &mut paras {
+            para.y += shift;
+        }
+    }
+    (out, paras)
 }
 
-/// Move laid-out paragraphs to the body's vertical anchor in a frame of
+/// How far down a body's text goes for its vertical anchor in a frame of
 /// `height`, `used` being the height of the text.
+fn anchor_shift(body: &TextBody, height: f64, used: f64, px_per_emu: f64) -> f64 {
+    let top = body.insets[1] as f64 * px_per_emu;
+    let bottom = body.insets[3] as f64 * px_per_emu;
+    let room = height - top - bottom;
+    match body.anchor {
+        Anchor::Top => 0.0,
+        Anchor::Middle => (room - used) / 2.0,
+        Anchor::Bottom => room - used,
+    }
+}
+
+/// Move laid-out paragraphs to the body's vertical anchor.
 fn anchor(
     out: &mut [(f64, f64, Paragraph)],
     body: &TextBody,
@@ -792,14 +961,7 @@ fn anchor(
     used: f64,
     px_per_emu: f64,
 ) {
-    let top = body.insets[1] as f64 * px_per_emu;
-    let bottom = body.insets[3] as f64 * px_per_emu;
-    let room = height - top - bottom;
-    let shift = match body.anchor {
-        Anchor::Top => 0.0,
-        Anchor::Middle => (room - used) / 2.0,
-        Anchor::Bottom => room - used,
-    };
+    let shift = anchor_shift(body, height, used, px_per_emu);
     if shift != 0.0 {
         for (_, y, _) in out {
             *y += shift;
@@ -849,10 +1011,24 @@ fn lay_out_body(
     frame_width: f64,
     px_per_emu: f64,
 ) -> (Vec<(f64, f64, Paragraph)>, f64) {
+    let (out, _, used) = lay_out_paragraphs(shaper, body, frame_width, px_per_emu);
+    (out, used)
+}
+
+/// Lay out a body's paragraphs from the top of its text area: the boxes to
+/// draw (bullets and text), where each paragraph is, and the height the
+/// text takes.
+fn lay_out_paragraphs(
+    shaper: &mut Shaper,
+    body: &TextBody,
+    frame_width: f64,
+    px_per_emu: f64,
+) -> (Vec<(f64, f64, Paragraph)>, Vec<LaidPara>, f64) {
     let [left, top, right, _] = body.insets.map(|inset| inset as f64 * px_per_emu);
     let width = frame_width - left - right;
     let points_to_px = EMU_PER_POINT * px_per_emu * f64::from(body.font_scale);
     let mut out: Vec<(f64, f64, Paragraph)> = Vec::new();
+    let mut paras: Vec<LaidPara> = Vec::new();
     let mut y = 0.0;
     for paragraph in &body.paragraphs {
         let margin = paragraph.margin as f64 * px_per_emu;
@@ -861,7 +1037,17 @@ fn lay_out_body(
         let size = (f64::from(paragraph.size()) * points_to_px) as f32;
         if text.is_empty() {
             // An empty line still takes its height.
-            y += f64::from(size * LINE_HEIGHT);
+            let height = f64::from(size * LINE_HEIGHT);
+            let x = left + (margin + indent.min(0.0)).max(0.0).max(margin);
+            paras.push(LaidPara {
+                x,
+                y: top + y,
+                width: (width - (x - left)).max(1.0),
+                height,
+                align: paragraph.align,
+                laid: None,
+            });
+            y += height;
             continue;
         }
         let mut spans = Vec::with_capacity(paragraph.runs.len());
@@ -927,10 +1113,18 @@ fn lay_out_body(
         });
         let x = left + margin;
         let h = f64::from(laid.height());
+        paras.push(LaidPara {
+            x,
+            y: top + y,
+            width: text_width,
+            height: h,
+            align: paragraph.align,
+            laid: Some(laid.clone()),
+        });
         out.push((x, top + y, laid));
         y += h;
     }
-    (out, y)
+    (out, paras, y)
 }
 
 /// Paragraphs laid out from the top of a text area, and the height they
@@ -1110,6 +1304,7 @@ mod tests {
         Arc::new(Presentation {
             size: aster_slides::DEFAULT_SIZE,
             slides,
+            ..Presentation::default()
         })
     }
 
@@ -1143,10 +1338,13 @@ mod tests {
         assert_eq!(view.scroll_range().0, 0.0);
         // A click on the second thumbnail.
         let pitch = view.thumb_pitch();
-        assert!(view.press(100.0, THUMB_GAP * 2.0 + pitch * 1.5));
+        assert!(view.press(100.0, THUMB_GAP * 2.0 + pitch * 1.5, false, 1));
+        view.release();
         assert_eq!(view.current(), 1);
-        // Clicks on the slide itself do nothing.
-        assert!(!view.press(1500.0, 500.0));
+        // A click on the slide takes the keyboard from the thumbnails; on an
+        // empty spot it changes nothing more.
+        assert!(view.press(1500.0, 950.0, false, 1));
+        assert!(!view.press(1500.0, 950.0, false, 1));
         // The wheel over the slide turns pages once it has moved enough.
         assert!(!view.wheel(1500.0, 50.0));
         assert!(view.wheel(1500.0, 200.0));
@@ -1161,7 +1359,7 @@ mod tests {
         view.resize(300, 200, 1.0);
         view.render();
         assert!(!view.next_slide());
-        assert!(!view.press(10.0, 10.0));
+        assert!(!view.press(10.0, 10.0, false, 1));
         assert_eq!(view.text(), "");
         let mut view = SlideView::new(presentation(3));
         // Narrower than the strip needs: only the slide.
@@ -1272,6 +1470,7 @@ mod tests {
         let mut view = SlideView::new(Arc::new(Presentation {
             size: aster_slides::DEFAULT_SIZE,
             slides: vec![slide],
+            ..Presentation::default()
         }));
         view.resize(1600, 1000, 1.0);
         let (x, y) = on_page(&view, 100_000, 6_000_000);
@@ -1304,6 +1503,7 @@ mod tests {
         let mut view = SlideView::new(Arc::new(Presentation {
             size: aster_slides::DEFAULT_SIZE,
             slides: vec![slide],
+            ..Presentation::default()
         }));
         view.resize(1600, 1000, 1.0);
         let (x, y) = on_page(&view, 50_000, 3_000_000);

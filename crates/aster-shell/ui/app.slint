@@ -169,7 +169,9 @@ export component AppWindow inherits Window {
     in property <bool> cell-underline;
     in property <bool> cell-strike;
     // The Format menu's character formats act on a workbook's cells.
-    property <bool> sheet-formatting: root.viewer == 1 && root.can-save;
+    // Workbooks, and text on a slide: the Format menu's bold, italic,
+    // underline and strikethrough act on them through `sheet-format`.
+    property <bool> sheet-formatting: (root.viewer == 1 || (root.viewer == 2 && root.slide-text)) && root.can-save;
     in property <bool> mark-italic;
     in property <bool> mark-strike;
     in property <bool> mark-code;
@@ -246,7 +248,28 @@ export component AppWindow inherits Window {
     // slides.
     in property <string> viewer-note;
     // The current slide's speaker notes, and whether their panel is open.
-    in property <string> slide-notes;
+    in-out property <string> slide-notes;
+    // Slides tabs: there is text to format; a shape is selected; the
+    // pointer's look over the slide (0 default, 1 text, 2 move, 3 to 6
+    // resizing across, down, and the two diagonals).
+    in property <bool> slide-text;
+    in property <bool> slide-shape;
+    in property <int> slide-cursor;
+    // Shift is held while the pointer moves with the button down.
+    out property <bool> drag-shift;
+    // The Slide menu: 0 new slide, 1 duplicate slide, 2 delete slide,
+    // 3 duplicate shape, 4 delete shape, 5 bring to front, 6 send to back,
+    // 7 and 8 list level up and down, 9 start the slide show.
+    callback slide-command(int);
+    // The notes of the current slide were typed into.
+    callback notes-edited(string);
+    // The slide show: its picture, its size, and a key or click in it.
+    in property <bool> presenting;
+    in property <image> show-frame;
+    out property <length> show-width: root.width;
+    out property <length> show-height: root.height;
+    callback show-key(string, bool);
+    callback show-click();
     in-out property <bool> notes-expanded: true;
 
     // Writer and Markdown tabs and the viewers show the custom-drawn surface.
@@ -1101,6 +1124,101 @@ export component AppWindow inherits Window {
                 }
             }
         }
+
+        Menu {
+            title: Strings.menu-slide;
+
+            MenuItem {
+                title: Strings.menu-new-slide;
+                shortcut: @keys(Control + Shift + N);
+                enabled: root.viewer == 2 && root.can-save;
+                activated => {
+                    root.slide-command(0);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-duplicate-slide;
+                enabled: root.viewer == 2 && root.can-save && root.viewer-note == "";
+                activated => {
+                    root.slide-command(1);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-delete-slide;
+                enabled: root.viewer == 2 && root.can-save && root.viewer-note == "";
+                activated => {
+                    root.slide-command(2);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-duplicate-shape;
+                shortcut: @keys(Control + D);
+                enabled: root.viewer == 2 && root.slide-shape;
+                activated => {
+                    root.slide-command(3);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-delete-shape;
+                enabled: root.viewer == 2 && root.slide-shape;
+                activated => {
+                    root.slide-command(4);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-bring-front;
+                shortcut: @keys(Control + Shift + "]");
+                enabled: root.viewer == 2 && root.slide-shape;
+                activated => {
+                    root.slide-command(5);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-send-back;
+                shortcut: @keys(Control + Shift + "[");
+                enabled: root.viewer == 2 && root.slide-shape;
+                activated => {
+                    root.slide-command(6);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-indent-more;
+                enabled: root.viewer == 2 && root.slide-text;
+                activated => {
+                    root.slide-command(7);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-indent-less;
+                enabled: root.viewer == 2 && root.slide-text;
+                activated => {
+                    root.slide-command(8);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-present;
+                shortcut: @keys(Control + Return);
+                enabled: root.viewer == 2 && root.viewer-note == "";
+                activated => {
+                    root.slide-command(9);
+                }
+            }
+        }
     }
 
     VerticalLayout {
@@ -1313,10 +1431,14 @@ export component AppWindow inherits Window {
                         y: parent.height - self.height;
                         width: parent.width;
                         visible: root.viewer == 2 && root.viewer-note == "";
-                        text: root.slide-notes;
+                        text <=> root.slide-notes;
+                        editable: root.can-save;
                         expanded: root.notes-expanded;
                         toggled => {
                             root.notes-expanded = !root.notes-expanded;
+                        }
+                        edited(text) => {
+                            root.notes-edited(text);
                         }
                     }
 
@@ -1354,7 +1476,7 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
+                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();
@@ -1363,14 +1485,17 @@ export component AppWindow inherits Window {
                                         if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
                                             root.pointer-up();
                                         }
+                                        if (event.kind == PointerEventKind.move) {
+                                            root.drag-shift = event.modifiers.shift;
+                                        }
                                     }
                                     changed mouse-x => {
-                                        if (!self.pressed && root.viewer == 1) {
+                                        if (!self.pressed && root.viewer > 0) {
                                             root.pointer-hover(self.mouse-x, self.mouse-y);
                                         }
                                     }
                                     changed mouse-y => {
-                                        if (!self.pressed && root.viewer == 1) {
+                                        if (!self.pressed && root.viewer > 0) {
                                             root.pointer-hover(self.mouse-x, self.mouse-y);
                                         }
                                     }
@@ -1728,6 +1853,36 @@ export component AppWindow inherits Window {
         }
         cancel => {
             root.dialog-cancel();
+        }
+    }
+
+    // The slide show: the slide on black over the whole window. Keys and
+    // clicks move through it; Esc leaves.
+    if root.presenting: Rectangle {
+        background: black;
+        show-scope := FocusScope {
+            init => {
+                self.focus();
+            }
+            key-pressed(event) => {
+                root.show-key(event.text, event.modifiers.shift);
+                return accept;
+            }
+            Image {
+                source: root.show-frame;
+                width: 100%;
+                height: 100%;
+                preferred-width: 0px;
+                preferred-height: 0px;
+                image-fit: fill;
+            }
+            TouchArea {
+                mouse-cursor: MouseCursor.none;
+                clicked => {
+                    show-scope.focus();
+                    root.show-click();
+                }
+            }
         }
     }
 

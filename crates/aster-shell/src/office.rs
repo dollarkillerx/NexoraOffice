@@ -1,6 +1,6 @@
 //! Excel and PowerPoint files in tabs: reading them on a worker thread,
-//! calculating formulas after the workbook is on screen, and the read-only
-//! views' colours and keys.
+//! calculating formulas after the workbook is on screen, editing and saving
+//! workbooks and presentations, and the views' colours and keys.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -51,7 +51,8 @@ pub fn kind_of(path: &Path) -> Option<DocKind> {
 pub enum Loaded {
     /// The workbook and the file's bytes, which saving starts from.
     Workbook(Workbook, Arc<Vec<u8>>),
-    Presentation(Presentation),
+    /// The presentation and the file's bytes, which saving starts from.
+    Presentation(Presentation, Arc<Vec<u8>>),
 }
 
 #[derive(Debug)]
@@ -98,10 +99,12 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     }
     let bytes = std::fs::read(path).map_err(LoadError::Io)?;
     match kind_of(path) {
-        Some(DocKind::Slides) => Pptx
-            .read(bytes)
-            .map(Loaded::Presentation)
-            .map_err(LoadError::Format),
+        Some(DocKind::Slides) => {
+            let source = Arc::new(bytes.clone());
+            Pptx.read(bytes)
+                .map(|presentation| Loaded::Presentation(presentation, source))
+                .map_err(LoadError::Format)
+        }
         _ => {
             let source = Arc::new(bytes.clone());
             Xlsx.read(bytes)
@@ -2447,26 +2450,97 @@ fn this_year() -> i64 {
     aster_sheets::date_parts(days as f64 + 25_569.0, false).map_or(2026, |p| i64::from(p[0]))
 }
 
+/// A presentation in a tab: the editor, the file it came from and where it
+/// is saved.
 pub struct SlidesTab {
     pub view: SlideView,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+    /// The file as first read (or the blank template): every save starts
+    /// from it, comparing the presentation with what was read.
+    pub source: Arc<Vec<u8>>,
+    pub saving: bool,
+}
+
+/// What a save of a presentation writes.
+pub struct SlideSave {
+    pub source: Arc<Vec<u8>>,
+    pub presentation: Arc<Presentation>,
+    depth: usize,
+}
+
+impl SlideSave {
+    /// The file's bytes as they would be saved now.
+    pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        aster_ooxml::pptx_save::save((*self.source).clone(), &self.presentation)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Make the file and write it in place of `path` in one step. Runs on a
+    /// worker thread.
+    pub fn write(&self, path: &Path) -> Result<(), String> {
+        let bytes = self.bytes()?;
+        aster_storage::write_atomically(path, &bytes).map_err(|err| err.to_string())
+    }
 }
 
 impl SlidesTab {
     pub fn new(
         presentation: Presentation,
-        path: PathBuf,
+        source: Arc<Vec<u8>>,
+        path: Option<PathBuf>,
         tokens: &theme::Tokens,
         strings: &Strings,
     ) -> Self {
         let mut view = SlideView::new(Arc::new(presentation));
         view.set_style(slide_style(tokens, strings));
-        Self { view, path }
+        Self {
+            view,
+            path,
+            source,
+            saving: false,
+        }
     }
 
     pub fn restyle(&mut self, tokens: &theme::Tokens, strings: &Strings) {
         self.view.set_style(slide_style(tokens, strings));
     }
+
+    pub fn is_modified(&self) -> bool {
+        self.view.is_modified()
+    }
+
+    /// What to write, unless a save is running.
+    pub fn begin_save(&mut self) -> Option<SlideSave> {
+        if self.saving {
+            return None;
+        }
+        self.saving = true;
+        Some(SlideSave {
+            source: self.source.clone(),
+            presentation: self.view.presentation().clone(),
+            depth: self.view.depth(),
+        })
+    }
+
+    /// A save has finished: on success the state it wrote counts as saved.
+    pub fn finish_save(&mut self, job: &SlideSave, path: &Path, ok: bool) {
+        self.saving = false;
+        if ok {
+            self.path = Some(path.to_owned());
+            self.view.mark_saved_at(job.depth);
+        }
+    }
+}
+
+/// A new presentation, with its layouts named in the interface language.
+pub fn blank_presentation(strings: &Strings) -> Vec<u8> {
+    aster_ooxml::pptx_save::blank::presentation(&[
+        strings.layout_title,
+        strings.layout_content,
+        strings.layout_section,
+        strings.layout_title_only,
+        strings.layout_blank,
+    ])
 }
 
 fn opaque(color: theme::Rgba, under: theme::Rgba) -> [u8; 4] {
@@ -2500,6 +2574,9 @@ pub fn slide_style(tokens: &theme::Tokens, strings: &Strings) -> SlideStyle {
         table: strings.shape_table.to_owned(),
         chart: strings.shape_chart.to_owned(),
         graphic: strings.shape_graphic.to_owned(),
+        prompt_title: strings.prompt_title.to_owned(),
+        prompt_subtitle: strings.prompt_subtitle.to_owned(),
+        prompt_text: strings.prompt_text.to_owned(),
     }
 }
 

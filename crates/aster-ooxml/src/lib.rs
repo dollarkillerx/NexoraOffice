@@ -14,9 +14,11 @@ pub mod drawingml;
 pub mod error;
 pub mod package;
 pub mod pptx;
+pub mod pptx_save;
 pub mod xlsx;
 pub mod xlsx_save;
 mod xml;
+pub mod xml_edit;
 
 pub use error::{Error, ErrorKind, Result};
 pub use package::{Kind, Limits, Package};

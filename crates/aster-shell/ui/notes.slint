@@ -1,13 +1,16 @@
-// The speaker notes of the current slide, under a Slides tab: read-only,
-// and folded down to its header with the chevron or a click on the header.
+// The speaker notes of the current slide, under a Slides tab: typed into
+// directly (the input method included), and folded down to its header with
+// the chevron or a click on the header.
 
 import { Tokens, Strings, Icons } from "tokens.slint";
 import { IconButton } from "widgets.slint";
 
 export component NotesPanel inherits Rectangle {
-    in property <string> text;
+    in-out property <string> text;
+    in property <bool> editable;
     in property <bool> expanded: true;
     callback toggled();
+    callback edited(string);
     property <length> header-height: Tokens.control-height + 2 * Tokens.space-xs;
     property <length> body-height: 120px;
     height: root.expanded ? self.header-height + self.body-height : self.header-height;
@@ -61,16 +64,41 @@ export component NotesPanel inherits Rectangle {
         y: root.header-height;
         height: root.body-height;
         width: parent.width;
-        content-height: body.preferred-height;
+        content-height: max(body.preferred-height, root.body-height);
         body := VerticalLayout {
             padding-left: Tokens.space-md;
             padding-right: Tokens.space-md;
             padding-bottom: Tokens.space-sm;
-            Text {
+            if !root.editable: Text {
                 text: root.text != "" ? root.text : Strings.notes-empty;
                 color: root.text != "" ? Tokens.text : Tokens.text-tertiary;
                 font-size: Tokens.font-md;
                 wrap: word-wrap;
+            }
+            if root.editable: Rectangle {
+                min-height: root.body-height - Tokens.space-sm;
+                if root.text == "": Text {
+                    x: 0;
+                    y: 0;
+                    text: Strings.notes-placeholder;
+                    color: Tokens.text-tertiary;
+                    font-size: Tokens.font-md;
+                }
+                TextInput {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: max(self.preferred-height, parent.height);
+                    text <=> root.text;
+                    single-line: false;
+                    wrap: word-wrap;
+                    color: Tokens.text;
+                    font-size: Tokens.font-md;
+                    selection-background-color: Tokens.accent-soft;
+                    edited => {
+                        root.edited(self.text);
+                    }
+                }
             }
         }
     }

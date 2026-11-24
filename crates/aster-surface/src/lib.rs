@@ -86,40 +86,6 @@ macro_rules! surface {
 surface!(TextSurface);
 surface!(TextView);
 
-/// Read-only views take no text input; scrolling is vertical.
-macro_rules! viewer {
-    ($type:ty, $scroll:expr) => {
-        impl Surface for $type {
-            fn resize(&mut self, width: u16, height: u16, scale: f32) {
-                <$type>::resize(self, width, height, scale)
-            }
-            fn size(&self) -> (u16, u16, f32) {
-                <$type>::size(self)
-            }
-            fn set_caret_on(&mut self, _on: bool) {}
-            fn render(&mut self) -> &Pixmap {
-                <$type>::render(self)
-            }
-            fn scroll_by(&mut self, delta: f64) -> bool {
-                #[allow(clippy::redundant_closure_call)]
-                ($scroll)(self, delta)
-            }
-            fn scroll_range(&mut self) -> (f64, f64) {
-                <$type>::scroll_range(self)
-            }
-            fn is_composing(&self) -> bool {
-                false
-            }
-            fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
-                (0.0, 0.0, 0.0, 0.0)
-            }
-            fn text(&self) -> String {
-                <$type>::text(self)
-            }
-        }
-    };
-}
-
 impl Surface for sheet_view::SheetView {
     fn resize(&mut self, width: u16, height: u16, scale: f32) {
         sheet_view::SheetView::resize(self, width, height, scale)
@@ -149,10 +115,33 @@ impl Surface for sheet_view::SheetView {
         sheet_view::SheetView::text(self)
     }
 }
-viewer!(
-    slide_view::SlideView,
-    |view: &mut slide_view::SlideView, delta| {
-        let x = f64::from(view.size().0);
-        view.wheel(x, delta)
+impl Surface for slide_view::SlideView {
+    fn resize(&mut self, width: u16, height: u16, scale: f32) {
+        slide_view::SlideView::resize(self, width, height, scale)
     }
-);
+    fn size(&self) -> (u16, u16, f32) {
+        slide_view::SlideView::size(self)
+    }
+    fn set_caret_on(&mut self, on: bool) {
+        slide_view::SlideView::set_caret_on(self, on)
+    }
+    fn render(&mut self) -> &Pixmap {
+        slide_view::SlideView::render(self)
+    }
+    fn scroll_by(&mut self, delta: f64) -> bool {
+        let x = f64::from(self.size().0);
+        self.wheel(x, delta)
+    }
+    fn scroll_range(&mut self) -> (f64, f64) {
+        slide_view::SlideView::scroll_range(self)
+    }
+    fn is_composing(&self) -> bool {
+        slide_view::SlideView::is_composing(self)
+    }
+    fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+        slide_view::SlideView::ime_cursor_area(self)
+    }
+    fn text(&self) -> String {
+        slide_view::SlideView::text(self)
+    }
+}

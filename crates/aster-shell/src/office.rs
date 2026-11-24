@@ -6,12 +6,13 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 use aster_ooxml::{ErrorKind, FormatCodec, Pptx, Xlsx};
 use aster_sheets::input::{self, Reading};
 use aster_sheets::{
-    CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, DateOrder, Edit, Workbook,
+    CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder, Edit, Workbook,
 };
 use aster_slides::Presentation;
 use aster_surface::sheet_view::{Direction, SheetKey, SheetStyle, SheetView};
@@ -100,13 +101,148 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
 }
 
 /// Where a workbook's calculation stands.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Calc {
-    /// Running on a worker thread; cancelled when the tab closes.
-    Running(Cancel),
+    /// Running on the tab's worker thread.
+    Running,
     /// Done: how many formulas there are.
     Done(usize),
     Failed(String),
+}
+
+/// What the calculation thread sends back.
+#[derive(Debug)]
+pub enum CalcMessage {
+    Done(CalcUpdate),
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub struct CalcUpdate {
+    /// Every formula's result.
+    pub results: Vec<Computed>,
+    pub formulas: usize,
+    /// Formulas in a circular reference: they show 0, as in Excel.
+    pub circular: Vec<(usize, CellRef)>,
+    /// How many batches of edits this calculation took in; 0 for the one
+    /// when the file was opened.
+    pub generation: u64,
+}
+
+/// A thread that keeps the formula engine of one workbook. It calculates
+/// everything once, then only what each batch of edits affects; a new batch
+/// cancels a calculation still running, which then carries on with the new
+/// edits too.
+pub struct CalcWorker {
+    jobs: Option<Sender<Vec<Edit>>>,
+    current: Arc<Mutex<Cancel>>,
+    sent: u64,
+}
+
+impl CalcWorker {
+    pub fn spawn(workbook: Arc<Workbook>, send: impl Fn(CalcMessage) + Send + 'static) -> Self {
+        let (jobs, receiver) = mpsc::channel();
+        let current = Arc::new(Mutex::new(Cancel::new()));
+        let shared = current.clone();
+        std::thread::spawn(move || calculate_loop(workbook, receiver, shared, send));
+        Self {
+            jobs: Some(jobs),
+            current,
+            sent: 0,
+        }
+    }
+
+    /// Hand the engine changed cells. Returns the generation that includes
+    /// them.
+    pub fn edit(&mut self, edits: Vec<Edit>) -> u64 {
+        if edits.is_empty() {
+            return self.sent;
+        }
+        if let Some(jobs) = &self.jobs
+            && jobs.send(edits).is_ok()
+        {
+            self.sent += 1;
+            if let Ok(current) = self.current.lock() {
+                current.cancel();
+            }
+        }
+        self.sent
+    }
+
+    /// The latest generation handed over.
+    pub fn sent(&self) -> u64 {
+        self.sent
+    }
+}
+
+impl Drop for CalcWorker {
+    fn drop(&mut self) {
+        // The thread ends at its next look at the queue.
+        self.jobs = None;
+        if let Ok(current) = self.current.lock() {
+            current.cancel();
+        }
+    }
+}
+
+fn calculate_loop(
+    workbook: Arc<Workbook>,
+    jobs: Receiver<Vec<Edit>>,
+    current: Arc<Mutex<Cancel>>,
+    send: impl Fn(CalcMessage),
+) {
+    let mut engine = match aster_calc::Formualizer::load(&workbook) {
+        Ok(engine) => engine,
+        Err(error) => return send(CalcMessage::Failed(error.to_string())),
+    };
+    // Shared with the view until now: let go, so the view's first edit
+    // does not copy the workbook.
+    drop(workbook);
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut generation = 0u64;
+    let mut first = true;
+    let mut again = false;
+    loop {
+        if !first && !again {
+            match jobs.recv() {
+                Ok(batch) => {
+                    edits.extend(batch);
+                    generation += 1;
+                }
+                Err(_) => return,
+            }
+        }
+        loop {
+            match jobs.try_recv() {
+                Ok(batch) => {
+                    edits.extend(batch);
+                    generation += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        let cancel = Cancel::new();
+        if let Ok(mut slot) = current.lock() {
+            *slot = cancel.clone();
+        }
+        let outcome = engine.apply(&edits, &cancel);
+        // The edits are in the engine whatever happened to the calculation.
+        edits.clear();
+        first = false;
+        again = false;
+        match outcome {
+            Ok(results) => send(CalcMessage::Done(CalcUpdate {
+                formulas: results.len(),
+                results,
+                circular: engine.circular().to_vec(),
+                generation,
+            })),
+            // New edits came, or the tab closed: look at the queue again.
+            Err(CalcError::Cancelled) => again = true,
+            Err(CalcError::Engine(error)) => send(CalcMessage::Failed(error)),
+        }
+    }
 }
 
 /// Undo and redo, one step per entry, paste or clear.
@@ -152,6 +288,9 @@ pub struct SheetTab {
     pub view: SheetView,
     pub path: Option<PathBuf>,
     pub calc: Calc,
+    pub worker: Option<CalcWorker>,
+    /// Formulas in a circular reference at the last calculation.
+    pub circular: Vec<(usize, CellRef)>,
     pub history: History,
     /// Cells changed since the file was read or saved: what saving
     /// rewrites.
@@ -170,6 +309,8 @@ impl SheetTab {
             view,
             path,
             calc: Calc::Done(0),
+            worker: None,
+            circular: Vec::new(),
             history,
             dirty: BTreeSet::new(),
             formulas_changed: false,
@@ -182,6 +323,47 @@ impl SheetTab {
 
     pub fn is_modified(&self) -> bool {
         self.history.is_modified()
+    }
+
+    /// Start the calculation thread on the workbook as it is now.
+    pub fn start_calc(&mut self, send: impl Fn(CalcMessage) + Send + 'static) {
+        let workbook = self.view.workbook().clone();
+        self.worker = Some(CalcWorker::spawn(workbook, send));
+        self.calc = Calc::Running;
+    }
+
+    /// Have changed cells calculated with what depends on them.
+    pub fn recalc(&mut self, changes: &[Change]) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Some(worker) = &mut self.worker {
+            worker.edit(edits(changes));
+            self.calc = Calc::Running;
+        }
+    }
+
+    /// Results from the calculation thread. Values that changed because of
+    /// an edit are saved with the file; those of the first calculation only
+    /// when something else changes them, so an unchanged formula keeps the
+    /// result the file was saved with.
+    pub fn take_calc(&mut self, message: CalcMessage) {
+        match message {
+            CalcMessage::Done(update) => {
+                let changed = self.view.workbook_mut().apply_results(&update.results);
+                if update.generation > 0 {
+                    self.dirty.extend(changed);
+                }
+                self.circular = update.circular;
+                let latest = self.worker.as_ref().map_or(0, CalcWorker::sent);
+                self.calc = if update.generation >= latest {
+                    Calc::Done(update.formulas)
+                } else {
+                    Calc::Running
+                };
+            }
+            CalcMessage::Failed(reason) => self.calc = Calc::Failed(reason),
+        }
     }
 
     /// How a date typed into the active cell is read: in the order of its
@@ -347,14 +529,6 @@ fn this_year() -> i64 {
     aster_sheets::date_parts(days as f64 + 25_569.0, false).map_or(2026, |p| i64::from(p[0]))
 }
 
-impl Drop for SheetTab {
-    fn drop(&mut self) {
-        if let Calc::Running(cancel) = &self.calc {
-            cancel.cancel();
-        }
-    }
-}
-
 pub struct SlidesTab {
     pub view: SlideView,
     pub path: PathBuf,
@@ -375,22 +549,6 @@ impl SlidesTab {
     pub fn restyle(&mut self, tokens: &theme::Tokens, strings: &Strings) {
         self.view.set_style(slide_style(tokens, strings));
     }
-}
-
-/// Calculate every formula of `workbook` and return a copy with the results
-/// and how many formulas there are. Runs on a worker thread.
-pub fn calculate(workbook: &Workbook, cancel: &Cancel) -> Result<(Workbook, usize), CalcError> {
-    let formulas = workbook.formulas().count();
-    if formulas == 0 {
-        return Ok((workbook.clone(), 0));
-    }
-    let mut engine = aster_calc::Formualizer::load(workbook)?;
-    let results = engine.apply(&[], cancel)?;
-    if cancel.is_cancelled() {
-        return Err(CalcError::Cancelled);
-    }
-    let (updated, _) = workbook.with_results(&results);
-    Ok((updated, formulas))
 }
 
 fn opaque(color: theme::Rgba, under: theme::Rgba) -> [u8; 4] {
@@ -534,16 +692,50 @@ mod tests {
     }
 
     #[test]
-    fn calculating_an_empty_workbook_needs_no_engine() {
-        let workbook = Workbook {
-            sheets: vec![aster_sheets::Sheet::empty(
-                "Sheet1",
-                aster_sheets::SheetKind::Worksheet,
-            )],
-            ..Workbook::default()
+    fn the_worker_calculates_edits_and_reports_cycles() {
+        use aster_surface::cell_editor::EditMode;
+
+        let mut tab = tab();
+        let (send, receive) = mpsc::channel();
+        tab.start_calc(move |message| {
+            let _ = send.send(message);
+        });
+        let wait = |tab: &mut SheetTab| {
+            let message = receive
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a result");
+            tab.take_calc(message);
         };
-        let (_, formulas) = calculate(&workbook, &Cancel::new()).unwrap();
-        assert_eq!(formulas, 0);
+        wait(&mut tab);
+        assert_eq!(tab.calc, Calc::Done(0));
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            let changes = tab.commit("en");
+            tab.recalc(&changes);
+        };
+        enter(&mut tab, "B1", "=A1+A2*10");
+        assert_eq!(tab.calc, Calc::Running);
+        wait(&mut tab);
+        assert_eq!(value(&tab, "B1"), Some(aster_sheets::Value::Number(21.0)));
+        assert!(tab.dirty.contains(&(0, at("B1"))));
+        enter(&mut tab, "A1", "5");
+        enter(&mut tab, "C1", "=C2");
+        enter(&mut tab, "C2", "=C1");
+        // Batches sent while one is being calculated are taken together.
+        while tab.calc == Calc::Running {
+            wait(&mut tab);
+        }
+        assert_eq!(value(&tab, "B1"), Some(aster_sheets::Value::Number(25.0)));
+        assert_eq!(tab.circular, [(0, at("C1")), (0, at("C2"))]);
+        assert_eq!(value(&tab, "C2"), Some(aster_sheets::Value::Number(0.0)));
+        // Undo goes through the engine too.
+        let changes = tab.undo();
+        tab.recalc(&changes);
+        while tab.calc == Calc::Running {
+            wait(&mut tab);
+        }
+        assert!(tab.circular.is_empty());
     }
 
     fn tab() -> SheetTab {

@@ -24,13 +24,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aster_markdown::format::Styles;
 use aster_markdown::{DecodeError, Rope, SavePoint, TextFormat};
 use aster_platform::dialogs::{self, FileType};
-use aster_sheets::Cancel;
 use aster_shell::cli::{self, Options};
 use aster_shell::files::{self, Dropped, LoadError};
 use aster_shell::i18n::{self, Language};
@@ -1233,14 +1231,25 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_zoom(SharedString::new());
             ui.set_zoom_enabled(false);
             ui.set_status_format("XLSX".into());
-            let notice = match &tab.calc {
-                office::Calc::Running(_) => strings.calc_running.to_owned(),
+            let mut notice = match &tab.calc {
+                office::Calc::Running => strings.calc_running.to_owned(),
                 office::Calc::Done(0) => String::new(),
                 office::Calc::Done(count) => {
                     i18n::fill(strings.calc_done, "count", &group_digits(*count))
                 }
                 office::Calc::Failed(reason) => i18n::fill(strings.calc_failed, "reason", reason),
             };
+            // Excel shows 0 in a circular reference and says where it is.
+            if let Some(&(sheet, at)) = tab.circular.first() {
+                let name = tab
+                    .view
+                    .workbook()
+                    .sheets
+                    .get(sheet)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                notice = i18n::fill(strings.calc_circular, "cell", &format!("{name}!{at}"));
+            }
             ui.set_status_notice(notice.into());
         }
         Some(Content::Slides(_)) => {
@@ -2559,48 +2568,29 @@ fn finish_office_load(
     }
 }
 
-/// Calculate a workbook's formulas on a worker thread. Until the results
-/// arrive the grid shows the values saved in the file.
+/// Start a workbook's calculation thread. Until the first results arrive
+/// the grid shows the values saved in the file.
 fn start_calc(ui: &AppWindow, shell: &mut Shell, id: TabId) {
     let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
         return;
     };
-    let workbook = tab.view.workbook().clone();
-    if workbook.formulas().next().is_none() {
-        return;
-    }
-    let cancel = Cancel::new();
-    tab.calc = office::Calc::Running(cancel.clone());
     let weak = ui.as_weak();
-    std::thread::spawn(move || {
-        let result = office::calculate(&workbook, &cancel);
+    tab.start_calc(move |message| {
         let _ = weak.upgrade_in_event_loop(move |ui| {
             deliver(
                 ui,
-                Box::new(move |ui, shell| finish_calc(ui, shell, id, result)),
+                Box::new(move |ui, shell| finish_calc(ui, shell, id, message)),
             );
         });
     });
 }
 
-fn finish_calc(
-    ui: &AppWindow,
-    shell: &mut Shell,
-    id: TabId,
-    result: Result<(aster_sheets::Workbook, usize), aster_sheets::CalcError>,
-) {
+fn finish_calc(ui: &AppWindow, shell: &mut Shell, id: TabId, message: office::CalcMessage) {
     // The tab may have been closed meanwhile.
     let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
         return;
     };
-    tab.calc = match result {
-        Ok((workbook, formulas)) => {
-            tab.view.set_workbook(Arc::new(workbook));
-            office::Calc::Done(formulas)
-        }
-        Err(aster_sheets::CalcError::Cancelled) => office::Calc::Done(0),
-        Err(err) => office::Calc::Failed(err.to_string()),
-    };
+    tab.take_calc(message);
     if shell.tabs.active_id() == Some(id) {
         refresh_viewer(ui, shell);
         refresh_status(ui, shell);
@@ -2659,6 +2649,9 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
 /// After cells changed (or only the selection moved, with no changes):
 /// bring the formula bar, the status bar and the frame up to date.
 fn after_sheet_change(ui: &AppWindow, shell: &mut Shell, changes: Vec<aster_sheets::Change>) {
+    if let Some(tab) = shell.active_sheet() {
+        tab.recalc(&changes);
+    }
     if !changes.is_empty() && shell.sync_modified() {
         refresh_tabs(ui, shell);
     }

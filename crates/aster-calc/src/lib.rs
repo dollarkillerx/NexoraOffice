@@ -25,6 +25,8 @@ pub struct Formualizer {
     sheets: Vec<String>,
     formulas: Vec<(usize, CellRef)>,
     date_system: DateSystem,
+    /// Formulas found in a circular reference at the last calculation.
+    circular: Vec<(usize, CellRef)>,
 }
 
 fn engine_error(error: impl std::fmt::Display) -> CalcError {
@@ -102,7 +104,13 @@ impl Formualizer {
             sheets,
             formulas,
             date_system,
+            circular: Vec::new(),
         })
+    }
+
+    /// Formulas in a circular reference at the last calculation.
+    pub fn circular(&self) -> &[(usize, CellRef)] {
+        &self.circular
     }
 
     fn sheet_name(&self, index: usize) -> Result<&str, CalcError> {
@@ -175,11 +183,24 @@ impl CalcEngine for Formualizer {
         }
         outcome.map_err(engine_error)?;
         let mut out = Vec::with_capacity(self.formulas.len());
+        self.circular.clear();
         for &(sheet, at) in &self.formulas {
             let name = &self.sheets[sheet];
             let Some(value) = self.engine.get_value(name, at.row + 1, at.col + 1) else {
                 continue;
             };
+            // Excel shows 0 in a circular reference and warns about it.
+            if let LiteralValue::Error(error) = &value
+                && error.kind == ExcelErrorKind::Circ
+            {
+                self.circular.push((sheet, at));
+                out.push(Computed {
+                    sheet,
+                    at,
+                    value: Value::Number(0.0),
+                });
+                continue;
+            }
             if let Some(value) = self.result(value) {
                 out.push(Computed { sheet, at, value });
             }
@@ -362,5 +383,85 @@ mod tests {
             Value::Number((n - 1.0) * n / 2.0 + n)
         );
         assert!(started.elapsed().as_secs() < 30);
+    }
+
+    #[test]
+    fn edits_recalculate_what_depends_on_them_and_cycles_show_zero() {
+        let mut sheet = SheetBuilder::new("連鎖", SheetKind::Worksheet);
+        sheet.push(0, Cell::new(0, Value::Number(1.0)));
+        for row in 1..2_000u32 {
+            sheet.push(row, formula(0, &format!("A{row}+1"), Value::Empty));
+        }
+        let book = Workbook {
+            sheets: vec![sheet.finish()],
+            ..Workbook::default()
+        };
+        let mut engine = Formualizer::load(&book).unwrap();
+        let last = |results: &[Computed]| {
+            results
+                .iter()
+                .find(|c| c.at.row == 1_999)
+                .map(|c| c.value.clone())
+        };
+        let results = engine.apply(&[], &Cancel::new()).unwrap();
+        assert_eq!(last(&results), Some(Value::Number(2_000.0)));
+        let results = engine
+            .apply(
+                &[Edit::Value {
+                    sheet: 0,
+                    at: CellRef::new(0, 0),
+                    value: Value::Number(10.0),
+                }],
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(last(&results), Some(Value::Number(2_009.0)));
+        // Two formulas that refer to each other.
+        let cycle = [
+            Edit::Formula {
+                sheet: 0,
+                at: CellRef::new(0, 1),
+                formula: "B2+1".into(),
+            },
+            Edit::Formula {
+                sheet: 0,
+                at: CellRef::new(1, 1),
+                formula: "B1+1".into(),
+            },
+        ];
+        let results = engine.apply(&cycle, &Cancel::new()).unwrap();
+        assert_eq!(
+            engine.circular(),
+            [(0, CellRef::new(0, 1)), (0, CellRef::new(1, 1))]
+        );
+        let b2 = results.iter().find(|c| c.at == CellRef::new(1, 1)).unwrap();
+        assert_eq!(b2.value, Value::Number(0.0));
+        // A value in place of one of them breaks the cycle.
+        let results = engine
+            .apply(
+                &[Edit::Value {
+                    sheet: 0,
+                    at: CellRef::new(0, 1),
+                    value: Value::Number(3.0),
+                }],
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert!(engine.circular().is_empty());
+        let b2 = results.iter().find(|c| c.at == CellRef::new(1, 1)).unwrap();
+        assert_eq!(b2.value, Value::Number(4.0));
+        // An emptied cell counts as 0.
+        let results = engine
+            .apply(
+                &[Edit::Value {
+                    sheet: 0,
+                    at: CellRef::new(0, 1),
+                    value: Value::Empty,
+                }],
+                &Cancel::new(),
+            )
+            .unwrap();
+        let b2 = results.iter().find(|c| c.at == CellRef::new(1, 1)).unwrap();
+        assert_eq!(b2.value, Value::Number(1.0));
     }
 }

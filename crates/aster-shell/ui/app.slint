@@ -103,6 +103,9 @@ export component AppWindow inherits Window {
 
     // The tab in front is a document that can be edited, saved and undone.
     in property <bool> editing;
+    // The active tab is a document that can be saved and undone: a
+    // Markdown document or a workbook.
+    in property <bool> can-save;
     // Its source is on screen, so the Format menu can write into it.
     property <bool> formatting: root.editing && root.view-mode != 2;
     // The caret is in a table: the table's row and column commands apply.
@@ -352,7 +355,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-save;
                 shortcut: @keys(Control + S);
-                enabled: root.editing;
+                enabled: root.can-save;
                 activated => {
                     root.file-save();
                 }
@@ -361,7 +364,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-save-as;
                 shortcut: @keys(Control + Shift + S);
-                enabled: root.editing;
+                enabled: root.can-save;
                 activated => {
                     root.file-save-as();
                 }
@@ -400,7 +403,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-undo;
                 shortcut: @keys(Control + Z);
-                enabled: findbar.editing-text || (root.editing && root.can-undo);
+                enabled: findbar.editing-text || (root.can-save && root.can-undo);
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(4);
@@ -413,7 +416,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-redo;
                 shortcut: @keys(Control + Shift + Z);
-                enabled: findbar.editing-text || (root.editing && root.can-redo);
+                enabled: findbar.editing-text || (root.can-save && root.can-redo);
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(5);

@@ -1146,6 +1146,7 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
         }
     }
     ui.set_editing(shell.active_markdown().is_some());
+    ui.set_can_save(shell.active_markdown().is_some() || shell.active_sheet().is_some());
     agent::refresh(ui, shell);
     refresh_viewer(ui, shell);
     refresh_toolbar(ui, shell);
@@ -1205,10 +1206,13 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
         kind.map_or(strings.start, |kind| strings.kind_label(kind))
             .into(),
     );
-    let viewing = shell.active_sheet().is_some() || shell.active_slides().is_some();
+    // Workbooks can be edited and saved now; presentations are still read
+    // only.
+    let read_only = shell.active_slides().is_some();
     ui.set_status_note(
         match kind {
-            _ if viewing => strings.read_only_note,
+            _ if read_only => strings.read_only_note,
+            Some(DocKind::Sheets) if shell.active_sheet().is_some() => "",
             Some(DocKind::Writer) => strings.plain_text_note,
             Some(DocKind::Markdown) => strings.markdown_note,
             Some(_) => strings.placeholder_view,

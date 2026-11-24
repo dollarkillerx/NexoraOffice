@@ -389,7 +389,7 @@ fn drop_attribute(tag: &str, name: &str) -> String {
 
 /// Every start tag in `element` with the attributes in `names` passed
 /// through `change` (`None` keeps the value).
-fn map_attributes(
+pub(super) fn map_attributes(
     element: &str,
     names: &[&str],
     change: impl Fn(&str) -> Option<String>,
@@ -418,7 +418,7 @@ fn map_attributes(
 
 /// `element` with the text of every element named in `names` (local
 /// names) passed through `change`.
-fn map_texts(element: &str, names: &[&str], change: impl Fn(&str) -> String) -> String {
+pub(super) fn map_texts(element: &str, names: &[&str], change: impl Fn(&str) -> String) -> String {
     let mut reader = Reader::from_reader(element.as_bytes());
     reader.config_mut().check_end_names = false;
     // Where the content of a wanted element starts.

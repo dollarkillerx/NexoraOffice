@@ -197,7 +197,7 @@ fn adjust_reference(first: End, last: Option<End>, lines: &Lines) -> String {
     }
 }
 
-fn is_name_byte(b: u8) -> bool {
+pub(crate) fn is_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b >= 0x80
 }
 

@@ -754,3 +754,106 @@ fn what_would_not_follow_the_lines_is_named() {
     let book = Xlsx.read(g4()).unwrap();
     assert!(book.sheets[0].structure_blocker.is_some());
 }
+
+#[test]
+fn renaming_a_sheet_renames_it_everywhere() {
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    for cell in book.rename_sheet(0, "Q1 数据") {
+        changes.cells.insert(cell);
+        changes.edited.insert(cell);
+    }
+    changes.formulas_changed = true;
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from([
+            "xl/workbook.xml".to_owned(),
+            "xl/worksheets/sheet2.xml".to_owned()
+        ])
+    );
+    let names = part(&saved, "xl/workbook.xml");
+    assert!(
+        names.contains(r#"<sheet name="Q1 数据" sheetId="1" r:id="rId1"/>"#),
+        "{names}"
+    );
+    assert!(
+        names.contains(r#"<definedName name="区域">'Q1 数据'!$A$2:$A$4</definedName>"#),
+        "{names}"
+    );
+    let other = part(&saved, "xl/worksheets/sheet2.xml");
+    assert!(other.contains("<f>'Q1 数据'!A4*2</f>"), "{other}");
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(again.sheets[0].name, "Q1 数据");
+    assert_eq!(contents(&again), contents(&book));
+}
+
+#[test]
+fn added_and_deleted_sheets_get_and_lose_their_parts() {
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    // 数据 goes; a new sheet comes after 汇总 with a number and a formula.
+    for cell in book.delete_sheet(0) {
+        changes.cells.insert(cell);
+        changes.edited.insert(cell);
+    }
+    let added = book.add_sheet("Sheet3");
+    book.set_cells(
+        added,
+        vec![
+            (at("A1"), Some(number(0, 4.0))),
+            (
+                at("B2"),
+                Some(Cell {
+                    formula: Some("汇总!A1+A1".into()),
+                    ..Cell::new(1, Value::Text("新".into()))
+                }),
+            ),
+        ],
+    );
+    changes.formulas_changed = true;
+    changes.origins = vec![Some(1), None];
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let names = part(&saved, "xl/workbook.xml");
+    assert!(
+        names.contains(r#"<sheets><sheet name="汇总" sheetId="2" r:id="rId2"/><sheet name="Sheet3" sheetId="3" r:id="rId3"/></sheets>"#),
+        "{names}"
+    );
+    // The name on 数据 went; the other lost its sheet.
+    assert!(
+        names.contains(
+            r#"<definedNames><definedName name="区域">#REF!</definedName></definedNames>"#
+        ),
+        "{names}"
+    );
+    let rels = part(&saved, "xl/_rels/workbook.xml.rels");
+    assert!(!rels.contains("sheet1.xml"), "{rels}");
+    assert!(
+        rels.contains(r#"Id="rId3""#) && rels.contains(r#"Target="worksheets/sheet3.xml""#),
+        "{rels}"
+    );
+    let types = part(&saved, "[Content_Types].xml");
+    assert!(
+        types.contains(r#"PartName="/xl/worksheets/sheet3.xml""#),
+        "{types}"
+    );
+    let mut package = Package::open(saved.clone()).unwrap();
+    assert!(!package.has("xl/worksheets/sheet1.xml"));
+    assert!(package.has("xl/worksheets/sheet3.xml"));
+    let new_sheet = String::from_utf8(package.read("xl/worksheets/sheet3.xml").unwrap()).unwrap();
+    assert!(new_sheet.starts_with("<?xml"), "{new_sheet}");
+    let other = part(&saved, "xl/worksheets/sheet2.xml");
+    assert!(other.contains("<f>#REF!*2</f>"), "{other}");
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(
+        again
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["汇总", "Sheet3"]
+    );
+    assert_eq!(contents(&again), contents(&book));
+}

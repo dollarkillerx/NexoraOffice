@@ -311,6 +311,42 @@ pub struct Step {
     added: Vec<aster_sheets::CellStyle>,
     /// Rows or columns inserted or deleted.
     lines: Option<Box<Restructure>>,
+    /// A sheet added, renamed or deleted.
+    sheets: Option<Box<SheetStep>>,
+}
+
+/// What happened to a sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SheetChange {
+    Added(usize),
+    Renamed(usize),
+    Deleted(usize),
+}
+
+/// A sheet added, renamed or deleted: the sheets before and after, the
+/// cells whose formulas changed with it (counted as after it), and for a
+/// deletion what saving had to write on the sheet then, and which sheet of
+/// the file it was.
+#[derive(Debug, Clone)]
+struct SheetStep {
+    change: SheetChange,
+    before: Vec<aster_sheets::Sheet>,
+    after: Vec<aster_sheets::Sheet>,
+    formulas: Vec<(usize, CellRef)>,
+    marks: Marks,
+    origin: Option<usize>,
+    /// Which file the origin is of: saving makes a new one.
+    file: u64,
+}
+
+/// What saving must write on one sheet, as kept by a deletion.
+#[derive(Debug, Clone, Default)]
+struct Marks {
+    dirty: Vec<CellRef>,
+    edited: Vec<CellRef>,
+    merges: bool,
+    columns: Vec<u32>,
+    rows: Vec<u32>,
 }
 
 /// Rows or columns inserted or deleted: the sheets before and after, and
@@ -332,6 +368,11 @@ pub enum Refusal {
     Holds(String),
     /// Inserting would push filled cells off the sheet.
     Full,
+    /// The only visible worksheet cannot be deleted.
+    LastSheet,
+    /// The sheet holds something deleting it would leave broken (an Excel
+    /// table, a pivot table): its name in the file.
+    SheetHolds(String),
 }
 
 impl History {
@@ -340,6 +381,7 @@ impl History {
             && step.merges.is_empty()
             && step.sizes.is_empty()
             && step.lines.is_none()
+            && step.sheets.is_none()
         {
             return;
         }
@@ -417,8 +459,15 @@ pub struct SheetTab {
     /// Columns and rows resized since then: sheet and index.
     pub columns_changed: BTreeSet<(usize, u32)>,
     pub rows_changed: BTreeSet<(usize, u32)>,
-    /// Rows and columns inserted and deleted since then, in order.
+    /// Rows and columns inserted and deleted since then, in order, by the
+    /// file's sheet numbers.
     pub structure: Vec<(usize, Lines)>,
+    /// For each sheet, its number in the file as last read or saved;
+    /// `None` for a sheet added since.
+    pub origins: Vec<Option<usize>>,
+    /// How many times the file was saved here: sheet numbers of an older
+    /// one mean nothing in the new one.
+    file: u64,
     /// Why the last insert or delete of rows or columns was refused, shown
     /// until the next change.
     pub refusal: Option<Refusal>,
@@ -444,6 +493,7 @@ impl SheetTab {
         tokens: &theme::Tokens,
     ) -> Self {
         let view_styles = workbook.styles.len();
+        let sheet_count = workbook.sheets.len();
         let mut view = SheetView::new(Arc::new(workbook));
         view.set_style(sheet_style(tokens));
         let mut history = History::default();
@@ -462,6 +512,8 @@ impl SheetTab {
             columns_changed: BTreeSet::new(),
             rows_changed: BTreeSet::new(),
             structure: Vec::new(),
+            origins: (0..sheet_count).map(Some).collect(),
+            file: 0,
             refusal: None,
             resizing: None,
             file_styles: view_styles,
@@ -743,6 +795,7 @@ impl SheetTab {
             styles_before,
             added: Vec::new(),
             lines: None,
+            sheets: None,
         });
         changes
     }
@@ -787,6 +840,7 @@ impl SheetTab {
                 columns: self.columns_changed.clone(),
                 rows: self.rows_changed.clone(),
                 structure: self.structure.clone(),
+                origins: self.origins.clone(),
             },
             depth: self.history.depth(),
         })
@@ -817,6 +871,15 @@ impl SheetTab {
         let moved_since = self.structure.len() > job.changes.structure.len();
         self.structure
             .drain(..job.changes.structure.len().min(self.structure.len()));
+        // The written file has the job's sheets in the job's order. Sheets
+        // cannot change while a save runs, so they are the ones here now.
+        let renumber = |file: usize| job.changes.origins.iter().position(|o| *o == Some(file));
+        self.structure = std::mem::take(&mut self.structure)
+            .into_iter()
+            .filter_map(|(file, lines)| Some((renumber(file)?, lines)))
+            .collect();
+        self.origins = (0..self.view.workbook().sheets.len()).map(Some).collect();
+        self.file += 1;
         for cell in job.changes.cells.iter().filter(|_| !moved_since) {
             // A cell is still to be written if it changed again since.
             let now = self
@@ -866,6 +929,9 @@ impl SheetTab {
             }
             self.reload_calc();
         }
+        if let Some(step) = &step.sheets {
+            self.undo_sheets(step);
+        }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
         step.added = self.drop_styles(step.styles_before);
@@ -902,6 +968,9 @@ impl SheetTab {
                 self.restored(change.sheet, change.lines);
             }
             self.reload_calc();
+        }
+        if let Some(step) = &step.sheets {
+            self.redo_sheets(step);
         }
         self.note(&step.changes);
         self.show(&step.changes);
@@ -1015,7 +1084,9 @@ impl SheetTab {
         }
         self.formulas_changed = true;
         self.merges_changed.insert(sheet);
-        self.structure.push((sheet, lines));
+        if let Some(Some(file)) = self.origins.get(sheet) {
+            self.structure.push((*file, lines));
+        }
     }
 
     /// Deleted lines came back (undo of a delete, redo of an insert has
@@ -1051,6 +1122,287 @@ impl SheetTab {
             &mut self.rows_changed
         };
         resized.extend(custom.into_iter().map(|i| (sheet, i)));
+    }
+
+    /// Add an empty worksheet after the others and show it. One undo step.
+    pub fn add_sheet(&mut self, base: &str) -> Option<usize> {
+        if self.saving {
+            return None;
+        }
+        self.view.cancel_edit();
+        let before = self.view.workbook().sheets.clone();
+        let name = self.view.workbook().new_sheet_name(base);
+        let index = self.view.workbook_mut().add_sheet(&name);
+        self.view.sheet_inserted(index);
+        self.origins.insert(index, None);
+        self.shift_marks(index, true);
+        self.sheet_step(
+            SheetChange::Added(index),
+            before,
+            Vec::new(),
+            Marks::default(),
+            None,
+        );
+        self.view.set_sheet(index);
+        Some(index)
+    }
+
+    /// Whether sheet `index` could be called `name`.
+    pub fn check_sheet_name(
+        &self,
+        index: usize,
+        name: &str,
+    ) -> Result<(), aster_sheets::NameProblem> {
+        self.view.workbook().check_sheet_name(name, Some(index))
+    }
+
+    /// Rename sheet `index`; formulas that name it follow. One undo step.
+    pub fn rename_sheet(
+        &mut self,
+        index: usize,
+        name: &str,
+    ) -> Result<(), aster_sheets::NameProblem> {
+        self.check_sheet_name(index, name)?;
+        if self.saving
+            || self
+                .view
+                .workbook()
+                .sheets
+                .get(index)
+                .is_none_or(|s| s.name == name)
+        {
+            return Ok(());
+        }
+        self.view.cancel_edit();
+        let before = self.view.workbook().sheets.clone();
+        let formulas = self.view.workbook_mut().rename_sheet(index, name);
+        self.mark_formulas(&formulas);
+        self.sheet_step(
+            SheetChange::Renamed(index),
+            before,
+            formulas,
+            Marks::default(),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Delete sheet `index`; references to it become `#REF!`. One undo
+    /// step: undo brings it back as it was.
+    pub fn delete_sheet(&mut self, index: usize) -> Result<(), Refusal> {
+        let workbook = self.view.workbook();
+        let Some(sheet) = workbook.sheets.get(index) else {
+            return Ok(());
+        };
+        if let Some(holds) = &sheet.delete_blocker {
+            return Err(Refusal::SheetHolds(holds.clone()));
+        }
+        let visible_worksheets = workbook
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                *i != index && !s.hidden && s.kind == aster_sheets::SheetKind::Worksheet
+            })
+            .count();
+        if visible_worksheets == 0 {
+            return Err(Refusal::LastSheet);
+        }
+        if self.saving {
+            return Ok(());
+        }
+        self.view.cancel_edit();
+        let before = self.view.workbook().sheets.clone();
+        let marks = self.take_marks(index);
+        let origin = self.origins.remove(index);
+        self.shift_marks(index, false);
+        let formulas = self.view.workbook_mut().delete_sheet(index);
+        self.view.sheet_removed(index);
+        self.mark_formulas(&formulas);
+        self.sheet_step(SheetChange::Deleted(index), before, formulas, marks, origin);
+        let count = self.view.workbook().sheets.len();
+        self.show_sheet(index.min(count - 1));
+        Ok(())
+    }
+
+    fn sheet_step(
+        &mut self,
+        change: SheetChange,
+        before: Vec<aster_sheets::Sheet>,
+        formulas: Vec<(usize, CellRef)>,
+        marks: Marks,
+        origin: Option<usize>,
+    ) {
+        self.formulas_changed = true;
+        self.refusal = None;
+        let after = self.view.workbook().sheets.clone();
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            sheets: Some(Box::new(SheetStep {
+                change,
+                before,
+                after,
+                formulas,
+                marks,
+                origin,
+                file: self.file,
+            })),
+            ..Step::default()
+        });
+        self.reload_calc();
+    }
+
+    fn undo_sheets(&mut self, step: &SheetStep) {
+        self.view.workbook_mut().sheets = step.before.clone();
+        match step.change {
+            SheetChange::Added(index) => {
+                self.view.sheet_removed(index);
+                self.take_marks(index);
+                self.origins.remove(index);
+                self.shift_marks(index, false);
+                self.show_sheet(index.saturating_sub(1));
+            }
+            SheetChange::Renamed(index) => {
+                self.mark_formulas(&step.formulas);
+                self.show_sheet(index);
+            }
+            SheetChange::Deleted(index) => {
+                // The formulas that lost the sheet, where they are again.
+                let formulas: Vec<(usize, CellRef)> = step
+                    .formulas
+                    .iter()
+                    .map(|&(s, at)| (if s >= index { s + 1 } else { s }, at))
+                    .collect();
+                self.view.sheet_inserted(index);
+                self.shift_marks(index, true);
+                // The file still has it, unless it was saved without it:
+                // then it is written out whole as a new sheet.
+                let origin = step.origin.filter(|_| step.file == self.file);
+                self.origins.insert(index, origin);
+                if origin.is_some() {
+                    self.put_marks(index, &step.marks);
+                }
+                self.mark_formulas(&formulas);
+                self.show_sheet(index);
+            }
+        }
+        self.formulas_changed = true;
+        self.reload_calc();
+    }
+
+    fn redo_sheets(&mut self, step: &SheetStep) {
+        self.view.workbook_mut().sheets = step.after.clone();
+        match step.change {
+            SheetChange::Added(index) => {
+                self.view.sheet_inserted(index);
+                self.origins.insert(index, None);
+                self.shift_marks(index, true);
+                self.show_sheet(index);
+            }
+            SheetChange::Renamed(index) => {
+                self.mark_formulas(&step.formulas);
+                self.show_sheet(index);
+            }
+            SheetChange::Deleted(index) => {
+                self.view.sheet_removed(index);
+                self.take_marks(index);
+                self.origins.remove(index);
+                self.shift_marks(index, false);
+                self.mark_formulas(&step.formulas);
+                let count = self.view.workbook().sheets.len();
+                self.show_sheet(index.min(count - 1));
+            }
+        }
+        self.formulas_changed = true;
+        self.reload_calc();
+    }
+
+    fn show_sheet(&mut self, index: usize) {
+        if !self.view.set_sheet(index) {
+            // The same number, another sheet: its first cell.
+            self.view.select(CellRef::new(0, 0));
+        }
+    }
+
+    fn mark_formulas(&mut self, cells: &[(usize, CellRef)]) {
+        self.dirty.extend(cells.iter().copied());
+        self.edited.extend(cells.iter().copied());
+    }
+
+    /// Sheets from `index` on move one up (a sheet came in there) or down
+    /// (the sheet there went; take its marks first).
+    fn shift_marks(&mut self, index: usize, inserted: bool) {
+        let shift = |s: usize| -> usize {
+            if s < index {
+                s
+            } else if inserted {
+                s + 1
+            } else {
+                s - 1
+            }
+        };
+        let cells = |set: &mut BTreeSet<(usize, CellRef)>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .map(|(s, at)| (shift(s), at))
+                .collect();
+        };
+        cells(&mut self.dirty);
+        cells(&mut self.edited);
+        let lines = |set: &mut BTreeSet<(usize, u32)>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .map(|(s, i)| (shift(s), i))
+                .collect();
+        };
+        lines(&mut self.columns_changed);
+        lines(&mut self.rows_changed);
+        self.merges_changed = std::mem::take(&mut self.merges_changed)
+            .into_iter()
+            .map(shift)
+            .collect();
+    }
+
+    /// Take away what saving had to write on sheet `index`.
+    fn take_marks(&mut self, index: usize) -> Marks {
+        let mut marks = Marks::default();
+        let cells = |set: &mut BTreeSet<(usize, CellRef)>| -> Vec<CellRef> {
+            let taken: Vec<CellRef> = set
+                .iter()
+                .filter(|(s, _)| *s == index)
+                .map(|&(_, at)| at)
+                .collect();
+            set.retain(|(s, _)| *s != index);
+            taken
+        };
+        marks.dirty = cells(&mut self.dirty);
+        marks.edited = cells(&mut self.edited);
+        let lines = |set: &mut BTreeSet<(usize, u32)>| -> Vec<u32> {
+            let taken: Vec<u32> = set
+                .iter()
+                .filter(|(s, _)| *s == index)
+                .map(|&(_, i)| i)
+                .collect();
+            set.retain(|(s, _)| *s != index);
+            taken
+        };
+        marks.columns = lines(&mut self.columns_changed);
+        marks.rows = lines(&mut self.rows_changed);
+        marks.merges = self.merges_changed.remove(&index);
+        marks
+    }
+
+    fn put_marks(&mut self, index: usize, marks: &Marks) {
+        self.dirty.extend(marks.dirty.iter().map(|&at| (index, at)));
+        self.edited
+            .extend(marks.edited.iter().map(|&at| (index, at)));
+        self.columns_changed
+            .extend(marks.columns.iter().map(|&i| (index, i)));
+        self.rows_changed
+            .extend(marks.rows.iter().map(|&i| (index, i)));
+        if marks.merges {
+            self.merges_changed.insert(index);
+        }
     }
 
     /// The calculation thread starts again from the workbook as it is.
@@ -1132,6 +1484,7 @@ impl SheetTab {
             styles_before,
             added: Vec::new(),
             lines: None,
+            sheets: None,
         });
         true
     }
@@ -1247,6 +1600,7 @@ impl SheetTab {
             styles_before,
             added: Vec::new(),
             lines: None,
+            sheets: None,
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -1386,6 +1740,18 @@ pub fn number_format(index: usize, language: &str) -> StyleEdit {
 
 /// A new workbook with one sheet, its default font the one Excel uses for
 /// the interface language (it sets the column width unit).
+/// The name new sheets are numbered after, as Excel names them in each
+/// language.
+pub fn sheet_base(language: &str) -> &'static str {
+    match language {
+        "zh-Hant" => "工作表",
+        "fr" => "Feuil",
+        "de" => "Tabelle",
+        "es" => "Hoja",
+        _ => "Sheet",
+    }
+}
+
 pub fn blank_workbook(language: &str) -> Vec<u8> {
     let font = match language {
         "zh-Hans" => "等线",
@@ -1394,7 +1760,7 @@ pub fn blank_workbook(language: &str) -> Vec<u8> {
         "ko" => "맑은 고딕",
         _ => "Calibri",
     };
-    aster_ooxml::xlsx_save::blank("Sheet1", font)
+    aster_ooxml::xlsx_save::blank(&format!("{}1", sheet_base(language)), font)
 }
 
 /// The engine's edits for cell changes.
@@ -1857,6 +2223,115 @@ mod tests {
         tab.undo();
         assert!(tab.view.sheet().unwrap().cell(at("B3")).is_some());
         assert!(tab.view.sheet().unwrap().cell(at("C9")).is_none());
+    }
+
+    #[test]
+    fn sheets_are_added_renamed_and_deleted_with_undo_and_save() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("工作表.xlsx");
+        std::fs::write(&file, blank_workbook("fr")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("fr");
+        };
+        let names = |tab: &SheetTab| -> Vec<String> {
+            tab.view
+                .workbook()
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let save = |tab: &mut SheetTab| {
+            let job = tab.begin_save().unwrap();
+            let written = job.write(&file).unwrap();
+            tab.finish_save(&job, &file, Some(written));
+        };
+        enter(&mut tab, "A1", "3");
+        // A new sheet, shown, with a formula on the first.
+        assert_eq!(tab.add_sheet(sheet_base("fr")), Some(1));
+        assert_eq!(names(&tab), ["Feuil1", "Feuil2"]);
+        assert_eq!(tab.view.sheet_index(), 1);
+        enter(&mut tab, "B2", "=Feuil1!A1*2");
+        assert_eq!(
+            tab.rename_sheet(0, "Feuil2"),
+            Err(aster_sheets::NameProblem::Taken)
+        );
+        tab.rename_sheet(0, "Données 2026").unwrap();
+        let formula = |tab: &SheetTab, sheet: usize, cell: &str| {
+            tab.view.workbook().sheets[sheet]
+                .cell(at(cell))
+                .and_then(|c| c.formula.clone())
+        };
+        assert_eq!(
+            formula(&tab, 1, "B2").as_deref(),
+            Some("'Données 2026'!A1*2")
+        );
+        tab.undo();
+        assert_eq!(names(&tab), ["Feuil1", "Feuil2"]);
+        assert_eq!(formula(&tab, 1, "B2").as_deref(), Some("Feuil1!A1*2"));
+        tab.redo();
+        save(&mut tab);
+        assert!(!tab.is_modified());
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(
+            again
+                .sheets
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Données 2026", "Feuil2"]
+        );
+        let cell = again.sheets[1].cell(at("B2")).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("'Données 2026'!A1*2"));
+
+        // Deleting the first: the formula loses it; the last one stays.
+        tab.delete_sheet(0).unwrap();
+        assert_eq!(names(&tab), ["Feuil2"]);
+        assert_eq!(formula(&tab, 0, "B2").as_deref(), Some("#REF!*2"));
+        assert_eq!(tab.delete_sheet(0), Err(Refusal::LastSheet));
+        save(&mut tab);
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(again.sheets.len(), 1);
+        // Undone after the save, the sheet comes back whole, as a new one.
+        tab.undo();
+        assert_eq!(names(&tab), ["Données 2026", "Feuil2"]);
+        assert_eq!(tab.origins, [None, Some(0)]);
+        save(&mut tab);
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(
+            again
+                .sheets
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Données 2026", "Feuil2"]
+        );
+        assert_eq!(
+            again.sheets[0].cell(at("A1")).map(|c| c.value.clone()),
+            Some(aster_sheets::Value::Number(3.0))
+        );
+        assert_eq!(
+            again.sheets[1]
+                .cell(at("B2"))
+                .and_then(|c| c.formula.clone())
+                .as_deref(),
+            Some("'Données 2026'!A1*2")
+        );
     }
 
     #[test]

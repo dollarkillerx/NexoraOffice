@@ -1,8 +1,11 @@
 // The chrome of a Sheets tab around the grid the Rust side draws: the
 // formula bar above it (the selected cell's address and content) and the
 // sheet tabs below it. Read-only: the formula bar shows, it does not edit.
+// The tabs add, rename (double-click or the right-click menu) and delete
+// sheets when the workbook can be edited.
 
-import { Tokens } from "tokens.slint";
+import { Tokens, Icons, Strings } from "tokens.slint";
+import { IconButton, MenuFrame, MenuRow } from "widgets.slint";
 
 export component FormulaBar inherits Rectangle {
     in property <string> address;
@@ -75,7 +78,14 @@ export component FormulaBar inherits Rectangle {
 export component SheetBar inherits Rectangle {
     in property <[string]> names;
     in property <int> current;
+    // Sheets can be added, renamed and deleted.
+    in property <bool> editable;
     callback selected(int);
+    callback add();
+    callback rename(int);
+    callback delete(int);
+    // The tab the right-click menu is for.
+    property <int> menu-for: -1;
     height: Tokens.control-height + 2 * Tokens.space-xs;
     background: Tokens.panel;
 
@@ -85,9 +95,22 @@ export component SheetBar inherits Rectangle {
         background: Tokens.hairline;
     }
 
+    add-button := IconButton {
+        x: parent.width - self.width - Tokens.space-sm;
+        y: (parent.height - self.height) / 2;
+        visible: root.editable;
+        icon: Icons.plus;
+        size: Tokens.control-height - 4px;
+        accessible-role: button;
+        accessible-label: Strings.sheet-add;
+        clicked => {
+            root.add();
+        }
+    }
+
     Flickable {
         x: Tokens.space-sm;
-        width: parent.width - 2 * Tokens.space-sm;
+        width: parent.width - 2 * Tokens.space-sm - (root.editable ? add-button.width + Tokens.space-sm : 0px);
         content-width: max(self.width, tabs.preferred-width);
         tabs := HorizontalLayout {
             alignment: start;
@@ -116,6 +139,45 @@ export component SheetBar inherits Rectangle {
                     clicked => {
                         root.selected(index);
                     }
+                    double-clicked => {
+                        if (root.editable) {
+                            root.rename(index);
+                        }
+                    }
+                    pointer-event(event) => {
+                        if (root.editable && event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                            root.selected(index);
+                            root.menu-for = index;
+                            menu.show();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Above the bar: it sits at the bottom of the window.
+    menu := PopupWindow {
+        x: Tokens.space-md;
+        y: -items.preferred-height - Tokens.space-xs;
+        width: max(160px, items.preferred-width);
+        MenuFrame { }
+
+        items := VerticalLayout {
+            padding: Tokens.space-xs + 2px;
+            spacing: 1px;
+            MenuRow {
+                text: Strings.sheet-rename;
+                clicked => {
+                    root.rename(root.menu-for);
+                }
+            }
+
+            MenuRow {
+                text: Strings.sheet-delete;
+                enabled: root.names.length > 1;
+                clicked => {
+                    root.delete(root.menu-for);
                 }
             }
         }

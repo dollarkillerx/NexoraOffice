@@ -484,8 +484,33 @@ impl SheetView {
     }
 
     fn place_mut(&mut self) -> &mut Place {
+        let sheets = self.workbook.sheets.len().max(1);
+        if self.places.len() < sheets {
+            self.places.resize(sheets, Place::default());
+        }
         let index = self.sheet.min(self.places.len() - 1);
         &mut self.places[index]
+    }
+
+    /// A sheet came in at `index`: it starts at its first cell, the others
+    /// keep where they were.
+    pub fn sheet_inserted(&mut self, index: usize) {
+        self.places
+            .insert(index.min(self.places.len()), Place::default());
+        self.cells.clear();
+        self.revision += 1;
+    }
+
+    /// The sheet at `index` went.
+    pub fn sheet_removed(&mut self, index: usize) {
+        if index < self.places.len() && self.places.len() > 1 {
+            self.places.remove(index);
+        }
+        if self.sheet >= self.workbook.sheets.len() {
+            self.sheet = self.workbook.sheets.len().saturating_sub(1);
+        }
+        self.cells.clear();
+        self.revision += 1;
     }
 
     pub fn set_style(&mut self, style: SheetStyle) {

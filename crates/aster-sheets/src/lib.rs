@@ -25,6 +25,7 @@ pub mod formula;
 pub mod input;
 pub mod model;
 pub mod restyle;
+pub mod sheets;
 pub mod structure;
 pub mod style;
 
@@ -39,4 +40,5 @@ pub use model::{
     Value, Workbook,
 };
 pub use restyle::StyleEdit;
+pub use sheets::NameProblem;
 pub use style::{Borders, CellStyle, Font, HAlign, Line, LineStyle, Rgba, VAlign};

@@ -134,6 +134,9 @@ pub struct Sheet {
     /// table, a chart over its cells): its relationship kind. `None` when
     /// the sheet can be restructured.
     pub structure_blocker: Option<String>,
+    /// Something deleting the sheet would leave broken (an Excel table
+    /// others may name, a pivot table): its relationship kind.
+    pub delete_blocker: Option<String>,
 }
 
 impl Sheet {
@@ -376,6 +379,7 @@ impl SheetBuilder {
             row_styles: self.row_styles,
             pictures: self.pictures,
             structure_blocker: None,
+            delete_blocker: None,
         }
     }
 }

@@ -201,6 +201,17 @@ impl Package {
         replaced: &HashMap<String, Vec<u8>>,
         removed: &HashSet<String>,
     ) -> Result<Vec<u8>> {
+        self.rewrite_adding(replaced, removed, &[])
+    }
+
+    /// [`Package::rewrite`], with new parts after the others: package
+    /// names without a leading slash, compressed.
+    pub fn rewrite_adding(
+        &mut self,
+        replaced: &HashMap<String, Vec<u8>>,
+        removed: &HashSet<String>,
+        added: &[(String, Vec<u8>)],
+    ) -> Result<Vec<u8>> {
         let broken = |err: zip::result::ZipError| Error::Broken(format!("writing: {err}"));
         let mut out = ZipWriter::new(Cursor::new(Vec::new()));
         for i in 0..self.archive.len() {
@@ -229,6 +240,16 @@ impl Package {
                         .map_err(|err| Error::Broken(format!("writing: {err}")))?;
                 }
             }
+        }
+        for (name, bytes) in added {
+            if self.has(name) {
+                continue;
+            }
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            out.start_file(name.as_str(), options).map_err(broken)?;
+            out.write_all(bytes)
+                .map_err(|err| Error::Broken(format!("writing: {err}")))?;
         }
         Ok(out.finish().map_err(broken)?.into_inner())
     }

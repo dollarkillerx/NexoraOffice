@@ -32,6 +32,7 @@ use crate::error::{Error, Result};
 use crate::package::{Kind, Package};
 use crate::xlsx::{shared_strings, workbook_entries};
 
+mod sheets;
 pub(crate) mod structure;
 
 /// What changed since the workbook was read.
@@ -55,6 +56,11 @@ pub struct Changes {
     /// sheet and the lines. The cells, sizes and merged areas above are
     /// where they are after all of them.
     pub structure: Vec<(usize, aster_sheets::structure::Lines)>,
+    /// For each sheet of the workbook, its index in the file read; `None`
+    /// for one added since. Empty when no sheet was added or deleted.
+    /// Every other field counts sheets by the workbook's order, except
+    /// `structure`, which counts them as the file does.
+    pub origins: Vec<Option<usize>>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -101,9 +107,25 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         }
         None => Strings::Inline,
     };
+    let plan = sheets::Plan {
+        origins: if changes.origins.is_empty() {
+            (0..workbook.sheets.len()).map(Some).collect()
+        } else {
+            changes.origins.clone()
+        },
+        file_names: entries.sheets.iter().map(|e| e.name.clone()).collect(),
+        names: workbook.sheets.iter().map(|s| s.name.clone()).collect(),
+    };
 
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
     let mut removed: HashSet<String> = HashSet::new();
+    let mut added: Vec<(String, Vec<u8>)> = Vec::new();
+    // New sheets: their index in the workbook and their part.
+    let mut new_sheets: Vec<(usize, String)> = Vec::new();
+    let folder = main
+        .rsplit_once('/')
+        .map_or(String::new(), |(dir, _)| format!("{dir}/"));
+    let mut next_part = 1;
     // Column widths count in the Normal font's digit width.
     let normal = workbook
         .styles
@@ -111,14 +133,49 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         .map(|style| (*style.font).clone())
         .unwrap_or_default();
     let digit = crate::xlsx::digit_width(&normal);
-    for (index, entry) in entries.sheets.iter().enumerate() {
-        let Some(sheet) = workbook.sheets.get(index) else {
-            continue;
-        };
+    for (index, sheet) in workbook.sheets.iter().enumerate() {
         if sheet.kind != SheetKind::Worksheet {
             continue;
         }
-        let cells: BTreeMap<CellRef, Mode> = changes
+        let Some(file_index) = plan.origins.get(index).copied().flatten() else {
+            // A new sheet: every cell, from an empty worksheet.
+            let part = loop {
+                let part = format!("{folder}worksheets/sheet{next_part}.xml");
+                next_part += 1;
+                if !package.has(&part) {
+                    break part;
+                }
+            };
+            let cells: BTreeMap<CellRef, Mode> = sheet
+                .rows()
+                .iter()
+                .flat_map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|c| (CellRef::new(row.index, c.col), Mode::Full))
+                })
+                .collect();
+            let sizes = sizes_of(sheet, index, changes, digit);
+            let empty = format!("<worksheet xmlns=\"{MAIN}\"><sheetData/></worksheet>");
+            let bytes = rewrite_sheet(
+                empty.as_bytes(),
+                &part,
+                sheet,
+                &cells,
+                Some(sheet.merges.as_slice()),
+                &sizes,
+                &mut strings,
+            )?;
+            let mut bytes = bytes;
+            bytes.splice(0..0, XML_DECLARATION.bytes());
+            added.push((part.clone(), bytes));
+            new_sheets.push((index, part));
+            continue;
+        };
+        let Some(entry) = entries.sheets.get(file_index) else {
+            continue;
+        };
+        let mut cells: BTreeMap<CellRef, Mode> = changes
             .cells
             .range((index, CellRef::new(0, 0))..=(index, CellRef::new(MAX_ROWS, MAX_COLUMNS)))
             .map(|&(_, at)| {
@@ -133,10 +190,9 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         let moves: Vec<aster_sheets::structure::Lines> = changes
             .structure
             .iter()
-            .filter(|(sheet, _)| *sheet == index)
+            .filter(|(sheet, _)| *sheet == file_index)
             .map(|(_, lines)| *lines)
             .collect();
-        let mut cells = cells;
         if !moves.is_empty() {
             // Formulas were moved with their cells: each is written out
             // whole, out of any shared group.
@@ -171,13 +227,89 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         replaced.insert(key(&part), rewritten);
     }
 
-    // Defined names (print areas, filters, named ranges) follow the lines.
-    if !changes.structure.is_empty() {
-        let names: Vec<String> = entries.sheets.iter().map(|e| e.name.clone()).collect();
+    // Defined names (print areas, filters, named ranges) follow the lines,
+    // then the sheets.
+    if !changes.structure.is_empty() || plan.changed() {
         let mut bytes = package.read(&main)?;
         for (index, lines) in &changes.structure {
-            if let Some(target) = names.get(*index) {
-                bytes = structure::move_names(&bytes, &names, target, std::slice::from_ref(lines));
+            if let Some(target) = plan.file_names.get(*index) {
+                bytes = structure::move_names(
+                    &bytes,
+                    &plan.file_names,
+                    target,
+                    std::slice::from_ref(lines),
+                );
+            }
+        }
+        if plan.changed() {
+            let rels_part = crate::package::rels_name(&main);
+            let mut rels_bytes = package.read(&rels_part)?;
+            let types = "[Content_Types].xml";
+            let mut types_bytes = package.read(types)?;
+            // New sheets: a relationship, a content type, an entry.
+            let first = sheets::free_rel_number(&rels_bytes);
+            let kind = sheets::worksheet_type(&rels_bytes);
+            let mut ids = Vec::new();
+            let mut items = String::new();
+            let mut overrides = String::new();
+            for (number, (index, part)) in (first..).zip(&new_sheets) {
+                let id = format!("rId{number}");
+                let relative = part.strip_prefix(&folder).unwrap_or(part);
+                items.push_str(&format!(
+                    "<Relationship Id=\"{id}\" Type=\"{kind}\" Target=\"{relative}\"/>"
+                ));
+                overrides.push_str(&format!(
+                    "<Override PartName=\"/{part}\" ContentType=\"{WORKSHEET_TYPE}\"/>"
+                ));
+                ids.push((*index, id));
+            }
+            if !items.is_empty() {
+                rels_bytes = sheets::append_to_root(&rels_bytes, &items);
+                types_bytes = sheets::append_to_root(&types_bytes, &overrides);
+            }
+            // Deleted sheets: their part, its relationships, its entries.
+            for f in plan.deleted() {
+                let Some(entry) = entries.sheets.get(f) else {
+                    continue;
+                };
+                if let Some(edited) =
+                    remove_element(&rels_bytes, &rels_part, "Relationship", |attr| {
+                        attr("Id").as_deref() == Some(entry.rel.as_str())
+                    })?
+                {
+                    rels_bytes = edited;
+                }
+                if let Some(part) = target(&entry.rel) {
+                    let name = format!("/{part}");
+                    if let Some(edited) = remove_element(&types_bytes, types, "Override", |attr| {
+                        attr("PartName").is_some_and(|n| n.eq_ignore_ascii_case(&name))
+                    })? {
+                        types_bytes = edited;
+                    }
+                    removed.insert(key(&part));
+                    removed.insert(key(&crate::package::rels_name(&part)));
+                    replaced.remove(&key(&part));
+                }
+            }
+            bytes = sheets::workbook_xml(&bytes, &plan, &ids);
+            replaced.insert(key(&rels_part), rels_bytes);
+            replaced.insert(key(types), types_bytes);
+            // Charts plot cells by sheet name; Excel lists the sheets in
+            // the document properties.
+            for name in package.part_names() {
+                let lower = name.to_ascii_lowercase();
+                let chart = lower.contains("/charts/chart") && lower.ends_with(".xml");
+                if (chart || lower == "docprops/app.xml") && !removed.contains(&key(&name)) {
+                    let bytes = package.read(&name)?;
+                    let edited = if chart {
+                        sheets::chart_xml(&bytes, &plan)
+                    } else {
+                        sheets::app_xml(&bytes, &plan)
+                    };
+                    if let Some(edited) = edited {
+                        replaced.insert(key(&name), edited);
+                    }
+                }
             }
         }
         replaced.insert(key(&main), bytes);
@@ -204,7 +336,7 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         replaced.insert(key(part), shared.append(&bytes, part)?);
     }
 
-    if (changes.formulas_changed || !changes.structure.is_empty())
+    if (changes.formulas_changed || !changes.structure.is_empty() || plan.changed())
         && let Some(chain) = rels
             .iter()
             .find(|rel| rel.kind == "calcChain")
@@ -212,14 +344,14 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
     {
         removed.insert(key(&chain));
         let rels_part = crate::package::rels_name(&main);
-        let bytes = package.read(&rels_part)?;
+        let bytes = current(&mut package, &replaced, &rels_part)?;
         if let Some(edited) = remove_element(&bytes, &rels_part, "Relationship", |attr| {
             attr("Type").is_some_and(|kind| kind.ends_with("/calcChain"))
         })? {
             replaced.insert(key(&rels_part), edited);
         }
         let types = "[Content_Types].xml";
-        let bytes = package.read(types)?;
+        let bytes = current(&mut package, &replaced, types)?;
         let chain_name = format!("/{chain}");
         if let Some(edited) = remove_element(&bytes, types, "Override", |attr| {
             attr("PartName").is_some_and(|name| name.eq_ignore_ascii_case(&chain_name))
@@ -227,7 +359,24 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             replaced.insert(key(types), edited);
         }
     }
-    package.rewrite(&replaced, &removed)
+    package.rewrite_adding(&replaced, &removed, &added)
+}
+
+const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const WORKSHEET_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const XML_DECLARATION: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+
+/// A part as this save has it so far.
+fn current(
+    package: &mut Package,
+    replaced: &HashMap<String, Vec<u8>>,
+    part: &str,
+) -> Result<Vec<u8>> {
+    match replaced.get(&key(part)) {
+        Some(bytes) => Ok(bytes.clone()),
+        None => package.read(part),
+    }
 }
 
 fn key(part: &str) -> String {

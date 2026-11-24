@@ -110,6 +110,11 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
                     .find(|kind| !RESTRUCTURABLE.contains(kind))
                     .map(str::to_owned)
                     .or_else(|| crate::xlsx_save::structure::blocker(&bytes));
+                sheet.delete_blocker = rels
+                    .iter()
+                    .map(|rel| rel.kind.as_str())
+                    .find(|kind| ["table", "pivotTable"].contains(kind))
+                    .map(str::to_owned);
                 sheet
             }
             "chartsheet" => {

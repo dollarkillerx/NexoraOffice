@@ -309,6 +309,10 @@ export component AppWindow inherits Window {
     // Wheel movement across and down, and where the pointer is across.
     callback scrolled(length, length, length);
     callback sheet-selected(int);
+    // Of the sheet tabs, counted as shown.
+    callback sheet-add();
+    callback sheet-rename(int);
+    callback sheet-delete(int);
     callback preview-scrolled(length);
     // The scroll bars: scroll the source or the preview to an offset.
     callback scroll-to(length);
@@ -1155,8 +1159,20 @@ export component AppWindow inherits Window {
                         visible: root.viewer == 1;
                         names: root.sheet-names;
                         current: root.sheet-index;
+                        editable: root.can-save;
                         selected(index) => {
                             root.sheet-selected(index);
+                            scope.focus();
+                        }
+                        add => {
+                            root.sheet-add();
+                            scope.focus();
+                        }
+                        rename(index) => {
+                            root.sheet-rename(index);
+                        }
+                        delete(index) => {
+                            root.sheet-delete(index);
                             scope.focus();
                         }
                     }

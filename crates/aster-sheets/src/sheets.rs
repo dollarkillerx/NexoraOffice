@@ -1,0 +1,361 @@
+//! Sheets added, renamed and deleted, with the formulas that name them.
+
+use crate::address::CellRef;
+use crate::model::{Sheet, SheetKind, Workbook};
+use crate::structure::is_name_byte;
+
+/// Why a name cannot be a sheet's, as Excel checks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameProblem {
+    Empty,
+    /// More than 31 characters.
+    TooLong,
+    /// One of `: \ / ? * [ ]`, or `'` at either end.
+    Character(char),
+    /// Another sheet has it (case does not count).
+    Taken,
+    /// `History`, which Excel keeps for itself.
+    Reserved,
+}
+
+/// The longest sheet name Excel takes.
+pub const MAX_NAME: usize = 31;
+
+/// Whether `name` must be quoted in a formula: anything but letters,
+/// digits, `_` and `.` (any non-ASCII character counts as a letter, as in
+/// Excel), a leading digit, or a name that reads as a cell or a range end.
+pub fn needs_quotes(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.is_empty()
+        || !bytes.iter().all(|&b| is_name_byte(b))
+        || bytes[0].is_ascii_digit()
+        || looks_like_reference(name)
+        || name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+}
+
+fn looks_like_reference(name: &str) -> bool {
+    // A1 style: up to three letters then digits.
+    let letters = name.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let digits = &name[letters..];
+    let a1 = (1..=3).contains(&letters)
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit());
+    // R1C1 style.
+    let upper = name.to_ascii_uppercase();
+    let r1c1 = upper.starts_with('R')
+        && upper[1..].split('C').count() <= 2
+        && upper[1..].bytes().all(|b| b.is_ascii_digit() || b == b'C');
+    a1 || r1c1
+}
+
+/// `name` as a formula writes it before `!`.
+pub fn qualifier(name: &str) -> String {
+    if needs_quotes(name) {
+        format!("'{}'", name.replace('\'', "''"))
+    } else {
+        name.to_owned()
+    }
+}
+
+/// `formula` with references to sheet `from` going to `to` instead, or,
+/// with `to` `None`, to a sheet that is gone: then each such reference is
+/// `#REF!`. Unqualified references and other workbooks' sheets stay.
+pub fn retarget(formula: &str, from: &str, to: Option<&str>) -> String {
+    let bytes = formula.as_bytes();
+    let mut out = String::with_capacity(formula.len() + 8);
+    let mut i = 0;
+    let same = |name: &str| name.eq_ignore_ascii_case(from);
+    // After a qualifier of `from` when deleting: skip the reference itself.
+    let skip_reference = |i: &mut usize| {
+        let take = |i: &mut usize| {
+            while *i < bytes.len() && (is_name_byte(bytes[*i]) || bytes[*i] == b'$') {
+                *i += 1;
+            }
+        };
+        take(i);
+        if bytes.get(*i) == Some(&b':') {
+            *i += 1;
+            take(i);
+        }
+    };
+    while i < bytes.len() {
+        let b = bytes[i];
+        let external = i > 0 && bytes[i - 1] == b']';
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&formula[start..i]);
+            continue;
+        }
+        if b == b'[' {
+            let end = formula[i..].find(']').map_or(bytes.len(), |at| i + at + 1);
+            out.push_str(&formula[i..end]);
+            i = end;
+            continue;
+        }
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            let mut name = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        name.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                let len = formula[i..].chars().next().map_or(1, char::len_utf8);
+                name.push_str(&formula[i..i + len]);
+                i += len;
+            }
+            if bytes.get(i) == Some(&b'!') && !external && same(&name) {
+                i += 1;
+                match to {
+                    Some(to) => {
+                        out.push_str(&qualifier(to));
+                        out.push('!');
+                    }
+                    None => {
+                        skip_reference(&mut i);
+                        out.push_str("#REF!");
+                    }
+                }
+            } else {
+                out.push_str(&formula[start..i]);
+            }
+            continue;
+        }
+        if is_name_byte(b) {
+            let start = i;
+            let preceded = start > 0 && is_name_byte(bytes[start - 1]);
+            let mut end = i;
+            while end < bytes.len() && is_name_byte(bytes[end]) {
+                end += 1;
+            }
+            let word = &formula[start..end];
+            i = end;
+            if bytes.get(end) == Some(&b'!') && !preceded && !external && same(word) {
+                i += 1;
+                match to {
+                    Some(to) => {
+                        out.push_str(&qualifier(to));
+                        out.push('!');
+                    }
+                    None => {
+                        skip_reference(&mut i);
+                        out.push_str("#REF!");
+                    }
+                }
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        let len = formula[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&formula[i..i + len]);
+        i += len;
+    }
+    out
+}
+
+impl Workbook {
+    /// Whether `name` can be the name of sheet `except` (or of a new sheet
+    /// with `None`).
+    pub fn check_sheet_name(&self, name: &str, except: Option<usize>) -> Result<(), NameProblem> {
+        if name.is_empty() {
+            return Err(NameProblem::Empty);
+        }
+        if name.chars().count() > MAX_NAME {
+            return Err(NameProblem::TooLong);
+        }
+        if let Some(c) = name.chars().find(|c| ":\\/?*[]".contains(*c)) {
+            return Err(NameProblem::Character(c));
+        }
+        if name.starts_with('\'') || name.ends_with('\'') {
+            return Err(NameProblem::Character('\''));
+        }
+        if name.eq_ignore_ascii_case("History") {
+            return Err(NameProblem::Reserved);
+        }
+        let taken = self
+            .sheets
+            .iter()
+            .enumerate()
+            .any(|(i, s)| Some(i) != except && s.name.to_lowercase() == name.to_lowercase());
+        if taken {
+            return Err(NameProblem::Taken);
+        }
+        Ok(())
+    }
+
+    /// `base` and the first number from the sheet count up that no sheet
+    /// has: `Sheet4` in a workbook of three.
+    pub fn new_sheet_name(&self, base: &str) -> String {
+        (self.sheets.len() + 1..)
+            .map(|n| format!("{base}{n}"))
+            .find(|name| self.check_sheet_name(name, None).is_ok())
+            .unwrap_or_else(|| base.to_owned())
+    }
+
+    /// Add an empty worksheet at the end, sized as the first worksheet is.
+    /// Returns its index.
+    pub fn add_sheet(&mut self, name: &str) -> usize {
+        let mut sheet = Sheet::empty(name, SheetKind::Worksheet);
+        if let Some(first) = self.sheets.iter().find(|s| s.kind == SheetKind::Worksheet) {
+            sheet.columns =
+                crate::axis::Axis::new(first.columns.default_size(), first.columns.count());
+            sheet.row_sizes =
+                crate::axis::Axis::new(first.row_sizes.default_size(), first.row_sizes.count());
+        }
+        self.sheets.push(sheet);
+        self.sheets.len() - 1
+    }
+
+    /// Give sheet `index` a new name; formulas that name it follow. Returns
+    /// the cells whose formulas changed.
+    pub fn rename_sheet(&mut self, index: usize, name: &str) -> Vec<(usize, CellRef)> {
+        let Some(old) = self.sheets.get(index).map(|s| s.name.clone()) else {
+            return Vec::new();
+        };
+        let changed = self.retarget_all(&old, Some(name));
+        self.sheets[index].name = name.to_owned();
+        changed
+    }
+
+    /// Take sheet `index` away; references to it become `#REF!`. Returns
+    /// the cells whose formulas changed, by their sheets' new indices. The
+    /// active sheet stays the one it was, or the one after a deleted one.
+    pub fn delete_sheet(&mut self, index: usize) -> Vec<(usize, CellRef)> {
+        if index >= self.sheets.len() {
+            return Vec::new();
+        }
+        let sheet = self.sheets.remove(index);
+        if self.active_sheet > index || self.active_sheet >= self.sheets.len() {
+            self.active_sheet = self.active_sheet.saturating_sub(1);
+        }
+        self.retarget_all(&sheet.name, None)
+    }
+
+    fn retarget_all(&mut self, from: &str, to: Option<&str>) -> Vec<(usize, CellRef)> {
+        let mut changed = Vec::new();
+        for (index, sheet) in self.sheets.iter_mut().enumerate() {
+            let mut touched = false;
+            for row in sheet.rows_mut().iter_mut() {
+                for cell in &mut row.cells {
+                    let Some(formula) = &cell.formula else {
+                        continue;
+                    };
+                    let moved = retarget(formula, from, to);
+                    if moved != **formula {
+                        cell.formula = Some(moved.into());
+                        changed.push((index, CellRef::new(row.index, cell.col)));
+                        touched = true;
+                    }
+                }
+            }
+            if touched {
+                sheet.refresh();
+            }
+        }
+        changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Cell, SheetBuilder, Value};
+
+    fn book() -> Workbook {
+        let mut first = SheetBuilder::new("数据", SheetKind::Worksheet);
+        first.push(0, Cell::new(0, Value::Number(1.0)));
+        let mut second = SheetBuilder::new("Sheet2", SheetKind::Worksheet);
+        let mut cell = Cell::new(0, Value::Number(2.0));
+        cell.formula = Some("数据!A1*2+SUM('数据'!A1:B2)+\"数据!A1\"+[1]数据!A1".into());
+        second.push(0, cell);
+        Workbook {
+            sheets: vec![first.finish(), second.finish()],
+            ..Workbook::default()
+        }
+    }
+
+    #[test]
+    fn names_are_checked_as_excel_does() {
+        let book = book();
+        assert_eq!(book.check_sheet_name("", None), Err(NameProblem::Empty));
+        assert_eq!(
+            book.check_sheet_name("a/b", None),
+            Err(NameProblem::Character('/'))
+        );
+        assert_eq!(
+            book.check_sheet_name("'x", None),
+            Err(NameProblem::Character('\''))
+        );
+        assert_eq!(
+            book.check_sheet_name(&"長".repeat(32), None),
+            Err(NameProblem::TooLong)
+        );
+        assert_eq!(
+            book.check_sheet_name("sheet2", None),
+            Err(NameProblem::Taken)
+        );
+        assert_eq!(book.check_sheet_name("sheet2", Some(1)), Ok(()));
+        assert_eq!(
+            book.check_sheet_name("history", None),
+            Err(NameProblem::Reserved)
+        );
+        assert_eq!(book.new_sheet_name("Sheet"), "Sheet3");
+    }
+
+    #[test]
+    fn formulas_follow_a_rename_and_lose_a_deleted_sheet() {
+        let mut book = book();
+        let changed = book.rename_sheet(0, "Q1 数据");
+        assert_eq!(changed, [(1, CellRef::new(0, 0))]);
+        let formula = |book: &Workbook, sheet: usize| {
+            book.sheets[sheet]
+                .cell(CellRef::new(0, 0))
+                .unwrap()
+                .formula
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(
+            &*formula(&book, 1),
+            "'Q1 数据'!A1*2+SUM('Q1 数据'!A1:B2)+\"数据!A1\"+[1]数据!A1"
+        );
+        book.rename_sheet(0, "A1");
+        assert_eq!(
+            &*formula(&book, 1),
+            "'A1'!A1*2+SUM('A1'!A1:B2)+\"数据!A1\"+[1]数据!A1"
+        );
+        let changed = book.delete_sheet(0);
+        assert_eq!(changed, [(0, CellRef::new(0, 0))]);
+        assert_eq!(
+            &*formula(&book, 0),
+            "#REF!*2+SUM(#REF!)+\"数据!A1\"+[1]数据!A1"
+        );
+        assert_eq!(book.sheets.len(), 1);
+        let added = book.add_sheet("Sheet3");
+        assert_eq!(added, 1);
+        assert_eq!(
+            book.check_sheet_name("sheet3", None),
+            Err(NameProblem::Taken)
+        );
+    }
+}

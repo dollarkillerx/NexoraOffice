@@ -1029,6 +1029,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_insert_columns(strings.menu_insert_columns.into());
     s.set_menu_delete_rows(strings.menu_delete_rows.into());
     s.set_menu_delete_columns(strings.menu_delete_columns.into());
+    s.set_sheet_add(strings.sheet_add.into());
+    s.set_sheet_rename(strings.sheet_rename.into());
+    s.set_sheet_delete(strings.sheet_delete.into());
     s.set_menu_find(strings.menu_find.into());
     s.set_menu_find_next(strings.menu_find_next.into());
     s.set_menu_find_previous(strings.menu_find_previous.into());
@@ -1466,6 +1469,10 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     notice = i18n::fill(strings.lines_refused, "what", what);
                 }
                 Some(office::Refusal::Full) => notice = strings.lines_full.to_owned(),
+                Some(office::Refusal::LastSheet) => notice = strings.sheet_last.to_owned(),
+                Some(office::Refusal::SheetHolds(what)) => {
+                    notice = i18n::fill(strings.sheet_holds, "what", what);
+                }
                 None => {}
             }
             ui.set_status_notice(notice.into());
@@ -3235,6 +3242,22 @@ enum Prompt {
     GoTo(TabId),
     /// A new name for this file or folder.
     Rename(PathBuf),
+    /// A new name for a sheet of this workbook.
+    RenameSheet(TabId, usize),
+}
+
+/// Why a sheet cannot have the name typed.
+fn sheet_name_problem(strings: &i18n::Strings, problem: &aster_sheets::NameProblem) -> String {
+    use aster_sheets::NameProblem;
+    match problem {
+        NameProblem::Empty => strings.sheet_name_empty.to_owned(),
+        NameProblem::TooLong => strings.sheet_name_long.to_owned(),
+        NameProblem::Character(c) => {
+            i18n::fill(strings.sheet_name_character, "char", &c.to_string())
+        }
+        NameProblem::Taken => strings.sheet_name_taken.to_owned(),
+        NameProblem::Reserved => strings.sheet_name_reserved.to_owned(),
+    }
 }
 
 /// Ask for one line of text.
@@ -4935,6 +4958,26 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Some(Prompt::Rename(from)) => rename_entry(&ui, shell, from),
+            Some(Prompt::RenameSheet(id, index)) => {
+                let strings = shell.language.strings();
+                let typed = ui.get_prompt_text().trim().to_owned();
+                let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+                    hide_prompt(&ui, shell);
+                    return;
+                };
+                match tab.rename_sheet(index, &typed) {
+                    Ok(()) => {
+                        hide_prompt(&ui, shell);
+                        if shell.sync_modified() {
+                            refresh_tabs(&ui, shell);
+                        }
+                        after_sheet_change(&ui, shell, Vec::new());
+                    }
+                    Err(problem) => {
+                        ui.set_prompt_problem(sheet_name_problem(strings, &problem).into());
+                    }
+                }
+            }
             None => hide_prompt(&ui, shell),
         }
     }));
@@ -5359,6 +5402,69 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         after_edit(&ui, shell, false);
     }));
 
+    ui.on_sheet_add(handler!(|ui, shell| {
+        let base = office::sheet_base(shell.language.tag());
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        if tab.view.is_editing() {
+            let language = shell.language.tag();
+            if let Some(tab) = shell.active_sheet() {
+                let changes = tab.commit(language);
+                tab.recalc(&changes);
+            }
+        }
+        if let Some(tab) = shell.active_sheet() {
+            tab.add_sheet(base);
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, Vec::new());
+    }));
+    ui.on_sheet_rename(handler!(|ui, shell, shown| {
+        let Some(id) = shell.tabs.active_id() else {
+            return;
+        };
+        let strings = shell.language.strings();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let visible = tab.view.visible_sheets();
+        let Some(&index) = usize::try_from(shown).ok().and_then(|i| visible.get(i)) else {
+            return;
+        };
+        let name = tab.view.workbook().sheets[index].name.clone();
+        show_prompt(
+            &ui,
+            shell,
+            Prompt::RenameSheet(id, index),
+            strings.sheet_rename_title.to_owned(),
+            strings.sheet_name_label.to_owned(),
+            name,
+        );
+    }));
+    ui.on_sheet_delete(handler!(|ui, shell, shown| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        let visible = tab.view.visible_sheets();
+        let Some(&index) = usize::try_from(shown).ok().and_then(|i| visible.get(i)) else {
+            return;
+        };
+        tab.refusal = tab.delete_sheet(index).err();
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
     ui.on_sheet_lines(handler!(|ui, shell, columns, insert| {
         let language = shell.language.tag();
         let Some(tab) = shell.active_sheet() else {

@@ -638,13 +638,12 @@ impl Shell {
     }
 
     /// Write each workbook with unsaved changes to its recovery record, as
-    /// saving would write it, at most every few seconds: the whole workbook
-    /// is made again each time, on the writer thread. A record goes once
+    /// saving would write it, at most every few seconds (more seldom for a
+    /// workbook that takes long to make): the whole workbook is made again
+    /// each time, on the writer thread. A record goes once
     /// its workbook has no unsaved changes. Called after edits and by a
     /// timer, which writes what changed since the last time.
     fn sync_sheet_records(&mut self) {
-        /// The least time between two writes of one workbook's record.
-        const EVERY: std::time::Duration = std::time::Duration::from_secs(2);
         let ids: Vec<TabId> = self.contents.keys().copied().collect();
         for id in ids {
             let Some(Content::Sheet(tab)) = self.contents.get(&id) else {
@@ -665,9 +664,10 @@ impl Shell {
                 continue;
             }
             let version = tab.history.version();
+            let every = tab.record_every();
             match tab.recorded {
                 Some((done, _)) if done == version && tab.record.is_some() => continue,
-                Some((_, at)) if at.elapsed() < EVERY => continue,
+                Some((_, at)) if at.elapsed() < every => continue,
                 _ => {}
             }
             let contents = Contents::maybe(tab.snapshot());

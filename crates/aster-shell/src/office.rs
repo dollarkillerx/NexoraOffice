@@ -545,6 +545,9 @@ pub struct SheetTab {
     pub record: Option<u64>,
     /// The history version last written to the record, and when.
     pub recorded: Option<(u64, std::time::Instant)>,
+    /// How long making the last record took, in milliseconds, set on the
+    /// writer thread: a large workbook is written less often.
+    pub record_cost: Arc<std::sync::atomic::AtomicU64>,
     /// What the file held when it was last read or saved.
     pub disk: Option<aster_storage::Fingerprint>,
 }
@@ -592,6 +595,7 @@ impl SheetTab {
             find: SheetFind::default(),
             record: None,
             recorded: None,
+            record_cost: Arc::default(),
             disk,
         }
     }
@@ -1100,7 +1104,23 @@ impl SheetTab {
         let source = self.source.clone();
         let workbook = self.view.workbook().clone();
         let changes = self.save_changes();
-        move || aster_ooxml::xlsx_save::save((*source).clone(), &workbook, &changes).ok()
+        let cost = self.record_cost.clone();
+        move || {
+            let started = std::time::Instant::now();
+            let made = aster_ooxml::xlsx_save::save((*source).clone(), &workbook, &changes).ok();
+            let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            cost.store(took, std::sync::atomic::Ordering::Relaxed);
+            made
+        }
+    }
+
+    /// The least time between two writes of this workbook's record: five
+    /// times what the last one took, and never under two seconds, so the
+    /// writer thread is busy a fifth of the time at most.
+    pub fn record_every(&self) -> std::time::Duration {
+        let cost = self.record_cost.load(std::sync::atomic::Ordering::Relaxed);
+        std::time::Duration::from_millis(cost.saturating_mul(5))
+            .max(std::time::Duration::from_secs(2))
     }
 
     /// The workbook came back from a recovery record: it has changes the
@@ -2957,6 +2977,23 @@ mod tests {
         tab.undo();
         assert_eq!(names(&tab), ["Sheet1", "Sheet2", "Sheet3"]);
         assert_eq!(tab.view.sheet_index(), 0);
+    }
+
+    #[test]
+    fn a_slow_record_is_written_less_often() {
+        let tab = tab();
+        assert_eq!(tab.record_every(), std::time::Duration::from_secs(2));
+        tab.record_cost
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tab.record_every(), std::time::Duration::from_secs(2));
+        tab.record_cost
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tab.record_every(), std::time::Duration::from_secs(5));
+        // Making a record says how long it took.
+        tab.record_cost
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = (tab.snapshot())();
+        assert!(tab.record_cost.load(std::sync::atomic::Ordering::Relaxed) < 1_000);
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub enum Reply {
         status: u16,
         body: String,
     },
+    /// A 302 to `location`.
+    Redirect {
+        location: String,
+    },
 }
 
 impl Reply {
@@ -166,6 +170,12 @@ fn write_reply(mut stream: TcpStream, reply: Reply) -> std::io::Result<()> {
                 stream,
                 "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
+            )?;
+        }
+        Reply::Redirect { location } => {
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )?;
         }
     }

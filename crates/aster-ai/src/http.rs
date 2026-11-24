@@ -58,6 +58,11 @@ pub(crate) fn agent() -> Agent {
         // Error statuses are read like any response, for the provider's
         // message in the body.
         .http_status_as_error(false)
+        // A redirect would carry the request, API key headers included, to
+        // whatever host it names (ureq drops only `Authorization` across
+        // hosts, not `x-api-key`). Provider APIs do not redirect, so a 3xx
+        // is reported as the error it is.
+        .max_redirects(0)
         .user_agent(concat!("AsterOffice/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()

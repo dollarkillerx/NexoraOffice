@@ -448,6 +448,23 @@ fn calls_left_by_a_stopped_turn_are_answered_first() {
 }
 
 #[test]
+fn a_redirect_is_not_followed_with_the_key() {
+    let elsewhere = MockServer::start(vec![Reply::stream(anthropic(
+        &[Block::Text("should not be asked")],
+        "end_turn",
+    ))]);
+    let server = MockServer::start(vec![Reply::Redirect {
+        location: format!("{}/v1/messages", elsewhere.base),
+    }]);
+    let provider = anthropic_provider(&server);
+    let turn = run_turn(&*provider, hello(), &never, &AgentOptions::default());
+
+    assert!(turn.result.is_err(), "{:?}", turn.result);
+    assert_eq!(server.requests().len(), 1);
+    assert!(elsewhere.requests().is_empty());
+}
+
+#[test]
 fn a_refused_key_is_an_auth_error() {
     let server = MockServer::start(vec![Reply::Status {
         status: 401,

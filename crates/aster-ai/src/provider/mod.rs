@@ -240,7 +240,8 @@ pub trait Provider: Send + Sync {
 }
 
 /// A provider for `config`, with its API key if it has one. The key is
-/// kept in memory only and sent only to `config.base_url`.
+/// kept in memory only and sent only to `config.base_url`: redirects are not
+/// followed.
 pub fn connect(config: ProviderConfig, api_key: Option<String>) -> Box<dyn Provider> {
     let api_key = api_key.filter(|key| !key.trim().is_empty());
     match config.kind {

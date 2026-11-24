@@ -670,7 +670,7 @@ impl Shell {
                 Some((_, at)) if at.elapsed() < EVERY => continue,
                 _ => {}
             }
-            let contents = Contents::later(tab.snapshot());
+            let contents = Contents::maybe(tab.snapshot());
             match tab.record {
                 Some(key) => {
                     let meta = info.to_meta();

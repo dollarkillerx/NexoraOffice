@@ -1094,14 +1094,13 @@ impl SheetTab {
     }
 
     /// The workbook as saving now would write it, made later on another
-    /// thread: for the recovery record. Empty if it cannot be made.
-    pub fn snapshot(&self) -> impl FnOnce() -> Vec<u8> + Send + 'static {
+    /// thread: for the recovery record. `None` if it cannot be made, so the
+    /// record keeps the last one that could.
+    pub fn snapshot(&self) -> impl FnOnce() -> Option<Vec<u8>> + Send + 'static {
         let source = self.source.clone();
         let workbook = self.view.workbook().clone();
         let changes = self.save_changes();
-        move || {
-            aster_ooxml::xlsx_save::save((*source).clone(), &workbook, &changes).unwrap_or_default()
-        }
+        move || aster_ooxml::xlsx_save::save((*source).clone(), &workbook, &changes).ok()
     }
 
     /// The workbook came back from a recovery record: it has changes the

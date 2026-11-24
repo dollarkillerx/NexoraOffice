@@ -27,6 +27,9 @@ pub type RecordKey = u64;
 pub enum Contents {
     Bytes(Vec<u8>),
     Later(Box<dyn FnOnce() -> Vec<u8> + Send>),
+    /// Made later, and it may come out as nothing: then nothing is
+    /// written, and the record keeps the document it had.
+    Maybe(Box<dyn FnOnce() -> Option<Vec<u8>> + Send>),
 }
 
 impl Contents {
@@ -34,10 +37,17 @@ impl Contents {
         Contents::Later(Box::new(produce))
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    /// A document that cannot always be made, such as a workbook saved
+    /// into bytes: when making it fails, the last good one stays.
+    pub fn maybe(produce: impl FnOnce() -> Option<Vec<u8>> + Send + 'static) -> Self {
+        Contents::Maybe(Box::new(produce))
+    }
+
+    fn into_bytes(self) -> Option<Vec<u8>> {
         match self {
-            Contents::Bytes(bytes) => bytes,
-            Contents::Later(produce) => produce(),
+            Contents::Bytes(bytes) => Some(bytes),
+            Contents::Later(produce) => Some(produce()),
+            Contents::Maybe(produce) => produce(),
         }
     }
 }
@@ -210,11 +220,18 @@ impl Drop for RecordWriter {
     }
 }
 
+/// A record asked for and not opened yet: the record found at start-up it
+/// takes over, if any, and the named values it gets.
+type Waiting = (Option<FoundRecord>, Vec<(String, Vec<u8>)>);
+
 struct Worker {
     root: RecoveryRoot,
     events: Box<dyn Fn(Event) + Send>,
     records: HashMap<RecordKey, (OwnedRecord, Journal)>,
     failed: HashSet<RecordKey>,
+    /// Records asked for whose document could not be made yet: what they
+    /// would be opened with. The first checkpoint that makes one opens it.
+    waiting: HashMap<RecordKey, Waiting>,
 }
 
 impl Worker {
@@ -224,6 +241,7 @@ impl Worker {
             events,
             records: HashMap::new(),
             failed: HashSet::new(),
+            waiting: HashMap::new(),
         }
     }
 
@@ -314,6 +332,13 @@ impl Worker {
                     let _ = record.discard();
                 }
                 self.failed.remove(&key);
+                self.waiting.remove(&key);
+                let Some(document) = document.into_bytes() else {
+                    // Nothing to write yet: opened by the first checkpoint
+                    // that has a document.
+                    self.waiting.insert(key, (found, meta));
+                    return;
+                };
                 let record = match found {
                     Some(found) => Ok(found.adopt()),
                     None => self.root.create(),
@@ -322,7 +347,7 @@ impl Worker {
                     let mut journal = record.open_journal().map_err(|err| err.to_string())?;
                     journal
                         .replace_meta(meta.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
-                        .and_then(|()| journal.checkpoint(&document.into_bytes()))
+                        .and_then(|()| journal.checkpoint(&document))
                         .map_err(|err| err.to_string())?;
                     Ok((record, journal))
                 });
@@ -336,13 +361,29 @@ impl Worker {
                 }
             }
             Request::Checkpoint { key, document } => {
+                if let Some((found, meta)) = self.waiting.remove(&key) {
+                    self.handle(Request::Open {
+                        key,
+                        found,
+                        meta,
+                        document,
+                    });
+                    return;
+                }
+                // A document that could not be made leaves the last one.
                 if let Some((_, journal)) = self.records.get_mut(&key)
-                    && let Err(err) = journal.checkpoint(&document.into_bytes())
+                    && let Some(document) = document.into_bytes()
+                    && let Err(err) = journal.checkpoint(&document)
                 {
                     self.fail(key, err.to_string());
                 }
             }
             Request::Meta { key, set, remove } => {
+                if let Some((_, meta)) = self.waiting.get_mut(&key) {
+                    meta.retain(|(k, _)| !remove.contains(k) && !set.iter().any(|(s, _)| s == k));
+                    meta.extend(set);
+                    return;
+                }
                 if let Some((_, journal)) = self.records.get_mut(&key) {
                     let result = journal
                         .set_meta(set.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
@@ -354,6 +395,9 @@ impl Worker {
             }
             Request::Discard { key } => {
                 self.failed.remove(&key);
+                if let Some((Some(found), _)) = self.waiting.remove(&key) {
+                    let _ = found.discard();
+                }
                 if let Some((record, journal)) = self.records.remove(&key) {
                     // The database must be closed before its files can go.
                     drop(journal);
@@ -412,6 +456,27 @@ mod tests {
         assert_eq!(replay.commands[9], b"edit 9");
         let last = events.lock().unwrap().last().cloned();
         assert_eq!(last, Some(Event::Committed { key: 1, rev: 10 }));
+    }
+
+    #[test]
+    fn a_document_that_cannot_be_made_leaves_the_last_good_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, _) = start(dir.path());
+        // Nothing the first time: no record until there is a document.
+        writer.open(7, meta("帳簿"), Contents::maybe(|| None));
+        writer.set_meta(7, meta("帳簿 2"), Vec::new());
+        writer.flush();
+        assert!(RecoveryRoot::new(dir.path()).scan().unwrap().is_empty());
+        writer.checkpoint(7, Contents::maybe(|| Some(b"good".to_vec())));
+        // A checkpoint that fails keeps the good one.
+        writer.checkpoint(7, Contents::maybe(|| None));
+        writer.flush();
+        drop(writer);
+        let found = RecoveryRoot::new(dir.path()).scan().unwrap();
+        assert_eq!(found.len(), 1);
+        let journal = found[0].open_journal().unwrap();
+        assert_eq!(journal.meta().unwrap()["title"], "帳簿 2".as_bytes());
+        assert_eq!(journal.replay().unwrap().checkpoint, b"good");
     }
 
     #[test]

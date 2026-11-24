@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use crate::address::CellRef;
 use crate::calc::Computed;
+use crate::format::Format;
 use crate::input::{Entry, Look};
 use crate::model::{Cell, Sheet, Value, Workbook};
+use crate::style::CellStyle;
 
 /// One cell before and after a change. `None` is no cell at all.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,19 +82,49 @@ impl Sheet {
     }
 }
 
+/// The built-in number format Excel gives a typed entry: dates 14, date
+/// and time 22, times 20 (21 with seconds), percentages 9 (10 with
+/// decimals), grouped numbers 3 (4 with decimals).
+fn builtin_for(look: Look, value: &Value) -> Option<u32> {
+    let Value::Number(n) = value else {
+        return None;
+    };
+    let fraction = |x: f64| (x - x.round()).abs() > 1e-9;
+    Some(match look {
+        Look::Plain => return None,
+        Look::Percent if fraction(n * 100.0) => 10,
+        Look::Percent => 9,
+        Look::Grouped if fraction(*n) => 4,
+        Look::Grouped => 3,
+        Look::Date => 14,
+        Look::DateTime => 22,
+        Look::Time if fraction(n * 1440.0) => 21,
+        Look::Time => 20,
+    })
+}
+
 impl Workbook {
-    /// The cell an entry makes at `at`: the cell keeps its format, or takes
-    /// one that suits the entry (a date format for a date) when its own is
-    /// General and the workbook already has such a format with the same
-    /// look otherwise. `None` for a cleared cell that shows nothing.
-    pub fn entry_cell(&self, sheet: usize, at: CellRef, entry: Entry, look: Look) -> Option<Cell> {
+    /// The cell an entry makes at `at`. The cell keeps its number format,
+    /// unless that is General and the entry looks like a date, time,
+    /// percentage or grouped number: then it takes a fitting format, as
+    /// Excel does: one the workbook already has with the same font, fill,
+    /// borders and alignment, else a new style made from its own with
+    /// Excel's built-in format for it. `None` for a cleared cell that shows
+    /// nothing.
+    pub fn entry_cell(
+        &mut self,
+        sheet: usize,
+        at: CellRef,
+        entry: Entry,
+        look: Look,
+    ) -> Option<Cell> {
         let current = self.sheets.get(sheet).map_or(0, |s| s.style_at(at));
-        let style = self.style_for(current, look);
         let (value, formula) = match entry {
             Entry::Empty => (Value::Empty, None),
             Entry::Value(value) => (value, None),
             Entry::Formula(text) => (Value::Empty, Some(Arc::from(text))),
         };
+        let style = self.style_for(current, look, &value);
         let cell = Cell {
             col: at.col,
             value,
@@ -105,36 +137,62 @@ impl Workbook {
         Some(cell)
     }
 
-    /// A style index for an entry that looks like `look` in a cell of
-    /// style `current`.
-    fn style_for(&self, current: u32, look: Look) -> u32 {
+    /// A style index for an entry with `value` that looks like `look` in a
+    /// cell of style `current`; may add a style.
+    fn style_for(&mut self, current: u32, look: Look, value: &Value) -> u32 {
         let base = self.style(current);
-        if look == Look::Plain || base.format.code() != "General" && !base.format.code().is_empty()
-        {
+        let code = base.format.code();
+        if look == Look::Plain || code != "General" && !code.is_empty() {
             return current;
         }
+        let Some(id) = builtin_for(look, value) else {
+            return current;
+        };
+        let decimals = matches!(id, 4 | 10);
+        let seconds = id == 21;
         let fits = |code: &str, is_date: bool, ordered: bool| match look {
-            Look::Percent => code.contains('%'),
-            Look::Grouped => code.contains("#,##0") && !code.contains('%'),
+            Look::Percent => code.contains('%') && code.contains('.') == decimals,
+            Look::Grouped => {
+                code.contains("#,##0") && !code.contains('%') && code.contains('.') == decimals
+            }
             Look::Date => is_date && ordered && !code.contains('h'),
-            Look::Time => is_date && !ordered && code.contains('h'),
+            Look::Time => {
+                is_date && !ordered && code.contains('h') && code.contains('s') == seconds
+            }
             Look::DateTime => is_date && ordered && code.contains('h'),
             Look::Plain => false,
         };
-        self.styles
-            .iter()
-            .position(|style| {
-                let format = &style.format;
-                fits(
-                    format.code(),
-                    format.is_date(),
-                    format.date_order().is_some(),
-                ) && style.font == base.font
-                    && style.fill == base.fill
-                    && style.borders == base.borders
-                    && style.align == base.align
-            })
-            .map_or(current, |i| i as u32)
+        let same_look = |style: &CellStyle| {
+            style.font == base.font
+                && style.fill == base.fill
+                && style.borders == base.borders
+                && style.align == base.align
+                && style.valign == base.valign
+                && style.wrap == base.wrap
+                && style.indent == base.indent
+        };
+        if let Some(found) = self.styles.iter().position(|style| {
+            let format = &style.format;
+            fits(
+                format.code(),
+                format.is_date(),
+                format.date_order().is_some(),
+            ) && same_look(style)
+        }) {
+            return found as u32;
+        }
+        // A workbook without cell formats has nothing to copy one from.
+        if self.styles.is_empty() {
+            return current;
+        }
+        let made = CellStyle {
+            format: Arc::new(Format::builtin(id)),
+            format_id: id,
+            xf: base.xf.or(Some(0)),
+            ..base
+        };
+        self.styles.push(made);
+        (self.styles.len() - 1) as u32
     }
 
     /// Put cells in place on one sheet and return the changes made, with
@@ -270,13 +328,13 @@ mod tests {
 
     #[test]
     fn entries_keep_or_take_a_format() {
-        let book = workbook();
+        let mut book = workbook();
         let reading = Reading {
             order: DateOrder::Ymd,
             date1904: false,
             this_year: 2026,
         };
-        let entry = |text: &str, cell: &str| {
+        let mut entry = |text: &str, cell: &str| {
             let (entry, look) = read(text, &reading);
             book.entry_cell(0, at(cell), entry, look)
         };
@@ -286,18 +344,50 @@ mod tests {
             (date.style, date.value.clone()),
             (2, Value::Number(46350.0))
         );
-        assert_eq!(book.display(&date).unwrap().text, "2026/11/24");
-        assert_eq!(entry("50%", "B2").unwrap().style, 3);
-        // No grouped format in this book: General stays.
-        assert_eq!(entry("1,000", "B2").unwrap().style, 0);
+        assert_eq!(entry("12.5%", "B2").unwrap().style, 3);
+        // No format without decimals in this book: one is added, made from
+        // the cell's own with Excel's built-in 0%.
+        assert_eq!(entry("50%", "B2").unwrap().style, 4);
+        assert_eq!(entry("1,000", "B2").unwrap().style, 5);
+        // Added once, then found.
+        assert_eq!(entry("2,000", "C9").unwrap().style, 5);
+        assert_eq!(entry("1,000.5", "B2").unwrap().style, 6);
+        assert_eq!(entry("9:30", "B2").unwrap().style, 7);
+        assert_eq!(entry("9:30:15", "B2").unwrap().style, 8);
         // A cell with its own format keeps it.
         assert_eq!(entry("2026/11/24", "A5").unwrap().style, 1);
+        // Text and plain numbers keep General.
+        assert_eq!(entry("1000", "B2").map(|c| c.style), Some(0));
         let formula = entry("=sum(a1:a3)", "B3").unwrap();
         assert_eq!(formula.formula.as_deref(), Some("SUM(A1:A3)"));
         assert!(entry("", "B3").is_none());
         // A cleared cell with a format keeps the format.
         let kept = entry("", "A5").unwrap();
         assert!(kept.is_blank() && kept.style == 1);
+        let added: Vec<(u32, Option<u32>)> = book.styles[4..]
+            .iter()
+            .map(|s| (s.format_id, s.xf))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                (9, Some(0)),
+                (3, Some(0)),
+                (4, Some(0)),
+                (20, Some(0)),
+                (21, Some(0))
+            ]
+        );
+        assert_eq!(book.style(4).format.number(0.5, false), "50%");
+        assert_eq!(book.style(6).format.number(1000.5, false), "1,000.50");
+        // A workbook without cell formats gets none.
+        let mut bare = Workbook {
+            sheets: book.sheets.clone(),
+            ..Workbook::default()
+        };
+        let (entry, look) = read("2026/11/24", &reading);
+        assert_eq!(bare.entry_cell(0, at("B2"), entry, look).unwrap().style, 0);
+        assert!(bare.styles.is_empty());
     }
 
     #[test]

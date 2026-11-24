@@ -158,6 +158,13 @@ pub struct CellStyle {
     /// Solid background colour, or the main colour of a pattern or gradient.
     pub fill: Option<Rgba>,
     pub borders: Arc<Borders>,
+    /// The number format's id in the file (`numFmtId`): a built-in one
+    /// below 164, the workbook's own above.
+    pub format_id: u32,
+    /// The cell format (`xf`) in the file this style is written as; a style
+    /// added for a typed date or percentage copies the one it was made
+    /// from, with its own number format.
+    pub xf: Option<u32>,
 }
 
 impl Default for CellStyle {
@@ -171,6 +178,8 @@ impl Default for CellStyle {
             font: Arc::new(Font::default()),
             fill: None,
             borders: Arc::new(Borders::default()),
+            format_id: 0,
+            xf: None,
         }
     }
 }

@@ -323,3 +323,58 @@ fn a_blank_workbook_opens_takes_entries_and_saves() {
             .contains(r#"count="1" uniqueCount="1"><si><t>表</t></si></sst>"#)
     );
 }
+
+#[test]
+fn typed_dates_and_percentages_add_the_formats_they_need() {
+    use aster_sheets::input::{Reading, read};
+
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let reading = Reading {
+        order: aster_sheets::DateOrder::Ymd,
+        date1904: false,
+        this_year: 2026,
+    };
+    let mut changes = Changes::default();
+    for (cell, text) in [
+        ("G2", "2026/11/24"),
+        ("G3", "50%"),
+        ("G4", "2026/12/1"),
+        ("G5", "12.5%"),
+    ] {
+        let (entry, look) = read(text, &reading);
+        let made = book.entry_cell(0, at(cell), entry, look);
+        edit(&mut book, &mut changes, vec![(cell, made)]);
+    }
+    // Two formats added (a date without borders, a whole percentage); the
+    // second date reuses the first, 12.5% the book's own 0.00%.
+    assert_eq!(book.styles.len(), 7);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from([
+            "xl/styles.xml".to_owned(),
+            "xl/worksheets/sheet1.xml".to_owned()
+        ])
+    );
+    let styles = part(&saved, "xl/styles.xml");
+    let before = part(&source, "xl/styles.xml");
+    let added = r#"<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"><alignment vertical="center"/></xf><xf numFmtId="9" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"><alignment vertical="center"/></xf>"#;
+    let expected = before
+        .replace(r#"<cellXfs count="5">"#, r#"<cellXfs count="7">"#)
+        .replace("  </cellXfs>", &format!("  {added}</cellXfs>"));
+    assert_eq!(styles, expected);
+    let again = Xlsx.read(saved).unwrap();
+    let shown = |c: &str| {
+        again
+            .display(again.sheets[0].cell(at(c)).unwrap())
+            .unwrap()
+            .text
+    };
+    assert_eq!(shown("G2"), "2026/11/24");
+    assert_eq!(shown("G4"), "2026/12/1");
+    assert_eq!(shown("G3"), "50%");
+    assert_eq!(shown("G5"), "12.50%");
+    // Saved once, the formats are the file's own: saving again adds none.
+    assert_eq!(again.styles.len(), 7);
+}

@@ -11,6 +11,11 @@
 //!   element byte for byte, only its `<v>` is new;
 //! - new text goes to the end of `sharedStrings.xml` (inline strings when the
 //!   workbook has no shared strings part, so no part has to be added);
+//! - a date, time, percentage or grouped number typed into a General cell
+//!   takes a fitting format, as in Excel; when the workbook had none, a
+//!   copy of the cell's `<xf>` with Excel's built-in number format for it
+//!   goes to the end of `cellXfs` in `styles.xml`, nothing else there
+//!   changes;
 //! - `calcChain.xml`, Excel's record of the order it last calculated in,
 //!   is removed when formulas were added or removed, with its relationship
 //!   and its content type, as Excel itself does when it finds one that no
@@ -95,6 +100,20 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         let bytes = package.read(&part)?;
         let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, &mut strings)?;
         replaced.insert(key(&part), rewritten);
+    }
+
+    // Styles added for typed dates and percentages go to the end of the
+    // cell formats.
+    if let Some(part) = rels
+        .iter()
+        .find(|rel| rel.kind == "styles")
+        .and_then(|rel| rel.target.clone())
+        .filter(|part| package.has(part))
+    {
+        let bytes = package.read(&part)?;
+        if let Some(edited) = append_formats(&bytes, &part, workbook)? {
+            replaced.insert(key(&part), edited);
+        }
     }
 
     if let (Some(part), Strings::Shared(shared)) = (&strings_part, &strings)
@@ -750,6 +769,93 @@ fn rewrite_sheet(
     }
     out.extend_from_slice(&xml[at..]);
     Ok(out)
+}
+
+// --- Cell formats ---
+
+/// `styles.xml` with an `<xf>` for every style of `workbook` past the ones
+/// it has: a copy of the format the style was made from, with the style's
+/// number format. `None` when there is nothing to add.
+fn append_formats(bytes: &[u8], part: &str, workbook: &Workbook) -> Result<Option<Vec<u8>>> {
+    let (bom, xml) = split_bom(bytes);
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().check_end_names = false;
+    let mut open: Option<(usize, usize)> = None;
+    let mut close: Option<usize> = None;
+    let mut xfs: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut xf_start = 0usize;
+    loop {
+        let before = reader.buffer_position() as usize;
+        let event = reader.read_event().map_err(|e| Error::broken(part, e))?;
+        let after = reader.buffer_position() as usize;
+        match event {
+            Event::Start(e) if open.is_none() && local(&e) == "cellXfs" => {
+                open = Some((before, after));
+                depth = 0;
+            }
+            Event::Empty(e) if open.is_none() && local(&e) == "cellXfs" => {
+                open = Some((before, after));
+                break;
+            }
+            Event::Start(e) if open.is_some() && close.is_none() => {
+                if depth == 0 && local(&e) == "xf" {
+                    xf_start = before;
+                }
+                depth += 1;
+            }
+            Event::Empty(e) if open.is_some() && close.is_none() => {
+                if depth == 0 && local(&e) == "xf" {
+                    xfs.push((before, after));
+                }
+            }
+            Event::End(e) if open.is_some() && close.is_none() => {
+                if depth == 0 && e.local_name().as_ref() == "cellXfs" {
+                    close = Some(before);
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 && e.local_name().as_ref() == "xf" {
+                    xfs.push((xf_start, after));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let (Some((start, open_end)), Some(close)) = (open, close) else {
+        return Ok(None);
+    };
+    if workbook.styles.len() <= xfs.len() || xfs.is_empty() {
+        return Ok(None);
+    }
+    let mut added = String::new();
+    for style in &workbook.styles[xfs.len()..] {
+        let base = style.xf.map_or(0, |i| i as usize).min(xfs.len() - 1);
+        let (from, to) = xfs[base];
+        let element = String::from_utf8_lossy(&xml[from..to]).into_owned();
+        // The start tag ends at the first '>' outside quotes; attribute
+        // values do not hold '>' unescaped.
+        let tag_end = element.find('>').map_or(element.len(), |i| i + 1);
+        let tag = set_attribute(
+            &element[..tag_end],
+            "numFmtId",
+            &style.format_id.to_string(),
+        );
+        let tag = set_attribute(&tag, "applyNumberFormat", "1");
+        added.push_str(&tag);
+        added.push_str(&element[tag_end..]);
+    }
+    let tag = String::from_utf8_lossy(&xml[start..open_end]).into_owned();
+    let tag = set_attribute(&tag, "count", &workbook.styles.len().to_string());
+    let mut out = Vec::with_capacity(bytes.len() + added.len() + 16);
+    out.extend_from_slice(bom);
+    out.extend_from_slice(&xml[..start]);
+    out.extend_from_slice(tag.as_bytes());
+    out.extend_from_slice(&xml[open_end..close]);
+    out.extend_from_slice(added.as_bytes());
+    out.extend_from_slice(&xml[close..]);
+    Ok(Some(out))
 }
 
 // --- Small edits of other parts ---

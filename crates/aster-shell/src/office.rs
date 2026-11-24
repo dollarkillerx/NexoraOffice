@@ -441,7 +441,7 @@ impl SheetTab {
         };
         let sheet = self.view.sheet_index();
         let (entry, look) = input::read(&text, &reading);
-        let cell = self.view.workbook().entry_cell(sheet, at, entry, look);
+        let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
         let changes = self.view.workbook_mut().set_cells(sheet, vec![(at, cell)]);
         self.record(changes)
     }
@@ -553,7 +553,6 @@ impl SheetTab {
                 return Vec::new();
             }
             let reading = self.reading(language);
-            let workbook = self.view.workbook().clone();
             let mut cells = Vec::new();
             let mut width = 0;
             for (r, row) in rows.iter().enumerate() {
@@ -564,7 +563,8 @@ impl SheetTab {
                         continue;
                     }
                     let (entry, look) = input::read(field, &reading);
-                    cells.push((at, workbook.entry_cell(sheet, at, entry, look)));
+                    let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
+                    cells.push((at, cell));
                 }
             }
             changes.extend(self.view.workbook_mut().set_cells(sheet, cells));

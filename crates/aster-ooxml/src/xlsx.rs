@@ -329,7 +329,8 @@ fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<(Vec<CellStyle>, Fo
     let styles = parts
         .xfs
         .iter()
-        .map(|xf| {
+        .enumerate()
+        .map(|(index, xf)| {
             let format = formats
                 .entry(xf.format)
                 .or_insert_with(|| {
@@ -341,6 +342,8 @@ fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<(Vec<CellStyle>, Fo
                 .clone();
             CellStyle {
                 format,
+                format_id: xf.format,
+                xf: Some(index as u32),
                 align: xf.align,
                 valign: xf.valign,
                 wrap: xf.wrap,

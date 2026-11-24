@@ -1042,6 +1042,11 @@ impl SheetView {
             return &self.pixmap;
         }
         self.drawn = Some(self.state());
+        // Typing a date may have added a style.
+        if self.decorated.len() != self.workbook.styles.len() {
+            self.decorated = decorations(&self.workbook);
+            self.any_decorated = self.decorated.contains(&true);
+        }
         let workbook = self.workbook.clone();
         let s = self.s();
         let (w, h) = (f64::from(self.width), f64::from(self.height));

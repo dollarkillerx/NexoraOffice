@@ -177,6 +177,14 @@ pub enum Action {
     LineEnd {
         select: bool,
     },
+    /// Cmd+Up: the start of the text.
+    TextStart {
+        select: bool,
+    },
+    /// Cmd+Down: the end of the text.
+    TextEnd {
+        select: bool,
+    },
     SelectAll,
 }
 
@@ -635,6 +643,10 @@ impl TextSurface {
             Action::LineStart { select: true } => drv.select_to_line_start(),
             Action::LineEnd { select: false } => drv.move_to_line_end(),
             Action::LineEnd { select: true } => drv.select_to_line_end(),
+            Action::TextStart { select: false } => drv.move_to_text_start(),
+            Action::TextStart { select: true } => drv.select_to_text_start(),
+            Action::TextEnd { select: false } => drv.move_to_text_end(),
+            Action::TextEnd { select: true } => drv.select_to_text_end(),
             Action::SelectAll => drv.select_all(),
         }
         self.caret_on = true;

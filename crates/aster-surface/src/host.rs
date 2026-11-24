@@ -80,10 +80,18 @@ pub fn decode_key(text: &str, shift: bool, primary: bool, alt: bool) -> Option<A
             });
         }
         if is(Key::UpArrow) {
-            return Some(Action::Up { select: shift });
+            return Some(if primary {
+                Action::TextStart { select: shift }
+            } else {
+                Action::Up { select: shift }
+            });
         }
         if is(Key::DownArrow) {
-            return Some(Action::Down { select: shift });
+            return Some(if primary {
+                Action::TextEnd { select: shift }
+            } else {
+                Action::Down { select: shift }
+            });
         }
         if is(Key::Home) {
             return Some(Action::LineStart { select: shift });
@@ -242,6 +250,18 @@ mod tests {
         assert_eq!(
             decode_key(&key(Key::RightArrow), false, true, false),
             Some(Action::LineEnd { select: false })
+        );
+        assert_eq!(
+            decode_key(&key(Key::UpArrow), false, true, false),
+            Some(Action::TextStart { select: false })
+        );
+        assert_eq!(
+            decode_key(&key(Key::DownArrow), true, true, false),
+            Some(Action::TextEnd { select: true })
+        );
+        assert_eq!(
+            decode_key(&key(Key::DownArrow), true, false, false),
+            Some(Action::Down { select: true })
         );
     }
 

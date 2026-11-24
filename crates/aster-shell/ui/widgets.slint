@@ -294,3 +294,58 @@ export component TextButton inherits Rectangle {
         }
     }
 }
+
+// A vertical scroll bar over the right edge of a pane: shows where the view
+// is, and takes the pointer. Dragging the thumb scrolls with it; a press on
+// the track above or below it scrolls a page that way. Lengths are logical.
+export component ScrollBar inherits Rectangle {
+    // How far the view is scrolled, and how far it can go.
+    in property <length> offset;
+    in property <length> maximum;
+    // The height of the view: one page.
+    in property <length> page;
+    // Asks for the view to be scrolled to this offset (not yet clamped).
+    callback scroll-to(length);
+
+    property <length> track: self.height - 2 * Tokens.space-xs;
+    property <length> thumb: max(32px, self.track * (root.page / (root.page + root.maximum)));
+    property <length> thumb-y: Tokens.space-xs + (self.track - self.thumb) * (root.offset / max(1px, root.maximum));
+    // Where in the thumb the pointer took hold.
+    property <length> grab;
+    property <bool> dragging;
+    property <bool> lit: touch.has-hover || root.dragging;
+    width: 14px;
+
+    touch := TouchArea {
+        mouse-cursor: default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                if (self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb) {
+                    root.grab = self.mouse-y - root.thumb-y;
+                    root.dragging = true;
+                } else {
+                    root.dragging = false;
+                    root.scroll-to(self.mouse-y < root.thumb-y ? root.offset - root.page : root.offset + root.page);
+                }
+            }
+            if (event.kind == PointerEventKind.up) {
+                root.dragging = false;
+            }
+        }
+        moved => {
+            if (self.pressed && root.dragging && root.track > root.thumb) {
+                root.scroll-to((self.mouse-y - root.grab - Tokens.space-xs) / (root.track - root.thumb) * root.maximum);
+            }
+        }
+    }
+
+    Rectangle {
+        x: parent.width - self.width - 3px;
+        y: root.thumb-y;
+        width: root.lit ? 9px : 6px;
+        height: root.thumb;
+        border-radius: self.width / 2;
+        background: root.lit ? Tokens.text-tertiary : Tokens.text-disabled;
+        animate width { duration: 120ms; }
+    }
+}

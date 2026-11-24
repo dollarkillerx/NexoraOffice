@@ -12,6 +12,7 @@ members = [
     "crates/aster-storage",
     "crates/aster-surface",
     "crates/aster-text",
+    "crates/aster-tools",
     "crates/aster-workspace",
     "spikes/g1-ime",
     "spikes/g2-frame",
@@ -45,6 +46,7 @@ aster-slides = { path = "crates/aster-slides" }
 aster-storage = { path = "crates/aster-storage" }
 aster-surface = { path = "crates/aster-surface" }
 aster-text = { path = "crates/aster-text" }
+aster-tools = { path = "crates/aster-tools" }
 aster-workspace = { path = "crates/aster-workspace" }
 slint = { version = "~1.19.0", default-features = false, features = [
     "std",
@@ -78,6 +80,8 @@ tempfile = "3.27"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Native open and save dialogs on all three systems.
 rfd = "~0.18.0"
+# JSON for the tool layer, MCP and the AI providers' wire formats.
+serde_json = "1.0.150"
 # CommonMark and GitHub extensions. Without its HTML writer and command line.
 pulldown-cmark = { version = "~0.13.6", default-features = false }
 # The text of large documents. Only `\n` ends a line: files are normalised to

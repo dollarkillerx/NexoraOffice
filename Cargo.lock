@@ -436,6 +436,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-tools"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "aster-workspace"
 version = "0.0.1"
 dependencies = [

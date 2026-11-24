@@ -13,7 +13,7 @@ import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
-import { Hairline } from "widgets.slint";
+import { Hairline, ScrollBar } from "widgets.slint";
 import { FindBar } from "findbar.slint";
 import { FormulaBar, SheetBar } from "sheetbar.slint";
 import { NotesPanel } from "notes.slint";
@@ -200,6 +200,9 @@ export component AppWindow inherits Window {
     callback scrolled(length, length, length);
     callback sheet-selected(int);
     callback preview-scrolled(length);
+    // The scroll bars: scroll the source or the preview to an offset.
+    callback scroll-to(length);
+    callback preview-scroll-to(length);
     callback find-query-edited(string);
     callback find-replacement-edited(string);
     callback find-next();
@@ -950,16 +953,15 @@ export component AppWindow inherits Window {
                                 wrap: word-wrap;
                             }
 
-                            // Shows where the view is in the document. Not draggable yet.
-                            if root.scroll-max > 0 && root.view-mode != 2: Rectangle {
-                                property <length> track: parent.height - 2 * Tokens.space-xs;
-                                property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.scroll-max)));
-                                x: parent.width - self.width - 3px;
-                                y: Tokens.space-xs + (self.track - self.thumb) * (root.scroll-offset / root.scroll-max);
-                                width: 6px;
-                                height: self.thumb;
-                                border-radius: 3px;
-                                background: Tokens.text-disabled;
+                            if root.scroll-max > 0 && root.view-mode != 2: ScrollBar {
+                                x: parent.width - self.width;
+                                height: parent.height;
+                                offset: root.scroll-offset;
+                                maximum: root.scroll-max;
+                                page: parent.height;
+                                scroll-to(offset) => {
+                                    root.scroll-to(offset);
+                                }
                             }
                         }
 
@@ -1032,15 +1034,15 @@ export component AppWindow inherits Window {
                                 wrap: word-wrap;
                             }
 
-                            if root.preview-scroll-max > 0: Rectangle {
-                                property <length> track: parent.height - 2 * Tokens.space-xs;
-                                property <length> thumb: max(32px, self.track * (parent.height / (parent.height + root.preview-scroll-max)));
-                                x: parent.width - self.width - 3px;
-                                y: Tokens.space-xs + (self.track - self.thumb) * (root.preview-scroll-offset / root.preview-scroll-max);
-                                width: 6px;
-                                height: self.thumb;
-                                border-radius: 3px;
-                                background: Tokens.text-disabled;
+                            if root.preview-scroll-max > 0: ScrollBar {
+                                x: parent.width - self.width;
+                                height: parent.height;
+                                offset: root.preview-scroll-offset;
+                                maximum: root.preview-scroll-max;
+                                page: parent.height;
+                                scroll-to(offset) => {
+                                    root.preview-scroll-to(offset);
+                                }
                             }
                         }
                     }

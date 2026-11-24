@@ -1064,6 +1064,8 @@ impl TextView {
             Action::Down { select } => (select, self.vertical(true)),
             Action::LineStart { select } => (select, self.line_edge(false)),
             Action::LineEnd { select } => (select, self.line_edge(true)),
+            Action::TextStart { select } => (select, (0, false, false)),
+            Action::TextEnd { select } => (select, (self.text.len_bytes(), false, false)),
             Action::SelectAll => {
                 self.anchor = 0;
                 self.focus = self.text.len_bytes();

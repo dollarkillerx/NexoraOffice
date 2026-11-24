@@ -1611,6 +1611,14 @@ fn preview_key(editor: &mut MarkdownEditor, text: &str, shift: bool, primary: bo
     let line = 40.0 * scale.max(1.0);
     let page = (view - line).max(line);
     if primary {
+        if is(Key::UpArrow) {
+            editor.scroll_preview_to(0.0);
+            return true;
+        }
+        if is(Key::DownArrow) {
+            editor.scroll_preview_to(f64::MAX);
+            return true;
+        }
         return match key.to_ascii_lowercase() {
             'a' => {
                 editor.preview.select_all();
@@ -3083,6 +3091,25 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(surface) = shell.active_surface()
             && surface.scroll_by(-f64::from(delta) * scale)
+        {
+            present(&ui, shell);
+        }
+    }));
+
+    ui.on_scroll_to(handler!(|ui, shell, offset| {
+        let scale = f64::from(ui.window().scale_factor());
+        if let Some(surface) = shell.active_surface() {
+            let (current, _) = surface.scroll_range();
+            if surface.scroll_by(f64::from(offset) * scale - current) {
+                present(&ui, shell);
+            }
+        }
+    }));
+
+    ui.on_preview_scroll_to(handler!(|ui, shell, offset| {
+        let scale = f64::from(ui.window().scale_factor());
+        if let Some(editor) = shell.active_markdown()
+            && editor.scroll_preview_to(f64::from(offset) * scale)
         {
             present(&ui, shell);
         }

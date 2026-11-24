@@ -96,6 +96,82 @@ impl Axis {
         }
     }
 
+    /// Insert `count` lines of the default size before line `at`; lines
+    /// pushed past the end are lost. Inserting inside a run of one size
+    /// makes the new lines that size too, as Excel does.
+    pub fn insert(&mut self, at: u32, count: u32) {
+        if count == 0 || at >= self.count {
+            return;
+        }
+        let limit = self.count;
+        let mut spans = Vec::with_capacity(self.spans.len());
+        for span in self.spans.drain(..) {
+            let (start, end) = if span.end <= at {
+                (span.start, span.end)
+            } else if span.start >= at {
+                (
+                    span.start.saturating_add(count),
+                    span.end.saturating_add(count),
+                )
+            } else {
+                (span.start, span.end.saturating_add(count))
+            };
+            let end = end.min(limit);
+            if start < end {
+                spans.push(Span {
+                    start,
+                    end,
+                    size: span.size,
+                });
+            }
+        }
+        self.spans = spans;
+        self.reindex();
+    }
+
+    /// Remove lines `at..at + count`; the lines after move up.
+    pub fn remove(&mut self, at: u32, count: u32) {
+        if count == 0 || at >= self.count {
+            return;
+        }
+        let end_removed = at.saturating_add(count);
+        let mut spans = Vec::with_capacity(self.spans.len());
+        for span in self.spans.drain(..) {
+            let shrink = |i: u32| {
+                if i <= at {
+                    i
+                } else if i >= end_removed {
+                    i - count
+                } else {
+                    at
+                }
+            };
+            let (start, end) = (shrink(span.start), shrink(span.end));
+            if start < end {
+                // Runs that now touch and have one size are merged.
+                if let Some(last) = spans.last_mut()
+                    && let Span {
+                        end: last_end,
+                        size,
+                        ..
+                    } = last
+                    && *last_end == start
+                    && *size == span.size
+                {
+                    *last_end = end;
+                    continue;
+                }
+                spans.push(Span {
+                    start,
+                    end,
+                    size: span.size,
+                });
+            }
+        }
+        self.spans = spans;
+        self.reindex();
+    }
+
     fn reindex(&mut self) {
         self.starts.clear();
         let mut offset = 0.0;
@@ -229,6 +305,33 @@ impl Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_go_in_and_come_out() {
+        let mut axis = Axis::new(20.0, 100);
+        axis.set(2, 3, 40.0);
+        axis.set(10, 13, 5.0);
+        axis.insert(11, 2);
+        assert_eq!(axis.size(2), 40.0);
+        // Inserted inside a run: the run grows.
+        assert_eq!(
+            (axis.size(10), axis.size(12), axis.size(14), axis.size(15)),
+            (5.0, 5.0, 5.0, 20.0)
+        );
+        axis.insert(0, 1);
+        assert_eq!((axis.size(2), axis.size(3)), (20.0, 40.0));
+        axis.remove(3, 1);
+        assert_eq!(axis.size(3), 20.0);
+        assert_eq!(axis.size(10), 5.0);
+        axis.remove(5, 100);
+        assert_eq!(axis.size(10), 20.0);
+        assert_eq!(axis.offset(10), 200.0);
+        // Lines pushed off the end are lost.
+        let mut axis = Axis::new(20.0, 10);
+        axis.set(9, 10, 1.0);
+        axis.insert(5, 3);
+        assert_eq!(axis.size(9), 20.0);
+    }
 
     fn brute_offset(sizes: &[f64], index: u32) -> f64 {
         sizes[..index as usize].iter().sum()

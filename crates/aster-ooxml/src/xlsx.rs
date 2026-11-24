@@ -70,6 +70,7 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
         date1904: entries.date1904,
         active_sheet: 0,
     };
+    let mut charts: Vec<String> = Vec::new();
     for entry in entries.sheets {
         let (kind, target) = match rels.get(&entry.rel) {
             Some((kind, Some(target))) if package.has(target) => (kind.as_str(), target.clone()),
@@ -91,20 +92,35 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
                     digit,
                 };
                 let (mut builder, drawing) = worksheet(&bytes, &target, entry.name, &context)?;
-                if let Some(drawing) = drawing {
-                    let rels = package.relationships(&target)?;
-                    if let Some(part) = rels
-                        .into_iter()
+                let rels = package.relationships(&target)?;
+                if let Some(drawing) = drawing
+                    && let Some(part) = rels
+                        .iter()
                         .find(|rel| rel.id == drawing)
-                        .and_then(|rel| rel.target)
+                        .and_then(|rel| rel.target.clone())
                         .filter(|part| package.has(part))
-                    {
-                        builder.pictures = pictures(package, &part)?;
+                {
+                    builder.pictures = pictures(package, &part)?;
+                    charts.extend(linked_charts(package, &part)?);
+                }
+                let mut sheet = builder.finish();
+                sheet.structure_blocker = rels
+                    .iter()
+                    .map(|rel| rel.kind.as_str())
+                    .find(|kind| !RESTRUCTURABLE.contains(kind))
+                    .map(str::to_owned)
+                    .or_else(|| crate::xlsx_save::structure::blocker(&bytes));
+                sheet
+            }
+            "chartsheet" => {
+                // Its chart may plot any sheet's cells.
+                for rel in package.relationships(&target)? {
+                    if let Some(part) = rel.target.filter(|part| package.has(part)) {
+                        charts.extend(linked_charts(package, &part)?);
                     }
                 }
-                builder.finish()
+                Sheet::empty(entry.name, SheetKind::Chart)
             }
-            "chartsheet" => Sheet::empty(entry.name, SheetKind::Chart),
             _ => Sheet::empty(entry.name, SheetKind::Other),
         };
         let mut sheet = sheet;
@@ -113,6 +129,28 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
     }
     if workbook.sheets.is_empty() {
         return Err(Error::broken(&main, "no sheets"));
+    }
+    // Pivot tables read ranges of their own; charts plot cells by
+    // reference. Neither follows inserted and deleted lines yet.
+    let pivots = rels
+        .values()
+        .any(|(kind, _)| kind == "pivotCacheDefinition");
+    let mut chart_text = String::new();
+    for part in charts {
+        if let Ok(bytes) = package.read(&part) {
+            chart_text.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    for sheet in &mut workbook.sheets {
+        if sheet.structure_blocker.is_some() || sheet.kind != SheetKind::Worksheet {
+            continue;
+        }
+        let quoted = format!("'{}'!", sheet.name.replace('\'', "''"));
+        if pivots {
+            sheet.structure_blocker = Some("pivotCacheDefinition".to_owned());
+        } else if chart_text.contains(&format!("{}!", sheet.name)) || chart_text.contains(&quoted) {
+            sheet.structure_blocker = Some("chart".to_owned());
+        }
     }
     workbook.active_sheet = entries.active.min(workbook.sheets.len() - 1);
     workbook.styles = styles;
@@ -860,6 +898,21 @@ fn read_cell(
         style,
         formula,
     }))
+}
+
+/// What a worksheet may be linked to and still have rows and columns
+/// inserted and deleted: its drawing's anchors are moved, hyperlinks are
+/// cell references in the sheet itself.
+const RESTRUCTURABLE: [&str; 4] = ["drawing", "printerSettings", "hyperlink", "image"];
+
+/// The chart parts a drawing (or a chart sheet's drawing) shows.
+fn linked_charts(package: &mut Package, drawing: &str) -> Result<Vec<String>> {
+    Ok(package
+        .relationships(drawing)?
+        .into_iter()
+        .filter(|rel| rel.kind == "chart" || rel.kind == "drawing")
+        .filter_map(|rel| rel.target)
+        .collect())
 }
 
 /// A cell position in a drawing: `<xdr:from>` or `<xdr:to>`.

@@ -1025,6 +1025,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_copy(strings.menu_copy.into());
     s.set_menu_paste(strings.menu_paste.into());
     s.set_menu_select_all(strings.menu_select_all.into());
+    s.set_menu_insert_rows(strings.menu_insert_rows.into());
+    s.set_menu_insert_columns(strings.menu_insert_columns.into());
+    s.set_menu_delete_rows(strings.menu_delete_rows.into());
+    s.set_menu_delete_columns(strings.menu_delete_columns.into());
     s.set_menu_find(strings.menu_find.into());
     s.set_menu_find_next(strings.menu_find_next.into());
     s.set_menu_find_previous(strings.menu_find_previous.into());
@@ -1456,6 +1460,13 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
                 notice = i18n::fill(strings.calc_circular, "cell", &format!("{name}!{at}"));
+            }
+            match &tab.refusal {
+                Some(office::Refusal::Holds(what)) => {
+                    notice = i18n::fill(strings.lines_refused, "what", what);
+                }
+                Some(office::Refusal::Full) => notice = strings.lines_full.to_owned(),
+                None => {}
             }
             ui.set_status_notice(notice.into());
         }
@@ -5346,6 +5357,24 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             _ => return,
         }
         after_edit(&ui, shell, false);
+    }));
+
+    ui.on_sheet_lines(handler!(|ui, shell, columns, insert| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        tab.refusal = tab.change_lines(columns, insert).err();
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
     }));
 
     // --- Find and replace ---

@@ -25,6 +25,7 @@ pub mod formula;
 pub mod input;
 pub mod model;
 pub mod restyle;
+pub mod structure;
 pub mod style;
 
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};

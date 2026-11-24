@@ -560,3 +560,197 @@ fn resized_columns_and_rows_are_written_where_they_belong() {
     assert_eq!(s.row_sizes.size(30), 40.0);
     assert_eq!(s.cell(at("C3")), book.sheets[0].cell(at("C3")));
 }
+
+/// Two sheets: 数据 with formulas, a merged area, a conditional format,
+/// validations and a page break; 汇总 with formulas on 数据; names for a
+/// range and 数据's print area.
+fn linked() -> Vec<u8> {
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let workbook = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="数据" sheetId="1" r:id="rId1"/><sheet name="汇总" sheetId="2" r:id="rId2"/></sheets><definedNames><definedName name="区域">数据!$A$2:$A$4</definedName><definedName name="_xlnm.Print_Area" localSheetId="0">数据!$A$1:$C$5</definedName></definedNames></workbook>"#
+    );
+    let data = format!(
+        r#"<worksheet xmlns="{MAIN}"><dimension ref="A1:C5"/><sheetViews><sheetView workbookViewId="0"><selection activeCell="B4" sqref="B4"/></sheetView></sheetViews><cols><col min="2" max="3" width="20" customWidth="1"/></cols><sheetData><row r="1" spans="1:3"><c r="A1"><v>1</v></c><c r="B1"><v>10</v></c></row><row r="2" ht="30" customHeight="1"><c r="A2"><v>2</v></c><c r="C2"><v>20</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="4"><c r="A4"><f>SUM(A1:A3)</f><v>6</v></c><c r="B4" t="str"><f>A3&amp;"x"</f><v>3x</v></c></row><row r="5"><c r="A5"><v>5</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="B3:C3"/></mergeCells><conditionalFormatting sqref="A1:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>A1&gt;$A$4</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="whole" sqref="C1:C5"><formula1>0</formula1><formula2>$A$5</formula2></dataValidation><dataValidation type="list" sqref="A2"><formula1>$A$1:$A$3</formula1></dataValidation></dataValidations><rowBreaks count="1" manualBreakCount="1"><brk id="3" max="16383" man="1"/></rowBreaks></worksheet>"#
+    );
+    let summary = format!(
+        r#"<worksheet xmlns="{MAIN}"><sheetData><row r="1"><c r="A1"><f>数据!A4*2</f><v>12</v></c><c r="B1"><f>SUM(数据!A1:A5)</f><v>11</v></c></row></sheetData></worksheet>"#
+    );
+    let types = format!(
+        r#"{CONTENT_TYPES_HEAD}<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
+    );
+    package(&[
+        ("[Content_Types].xml", types.as_bytes()),
+        ("_rels/.rels", root_rels("xl/workbook.xml").as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "worksheet", "worksheets/sheet2.xml"),
+            ])
+            .as_bytes(),
+        ),
+        ("xl/worksheets/sheet1.xml", data.as_bytes()),
+        ("xl/worksheets/sheet2.xml", summary.as_bytes()),
+    ])
+}
+
+/// Move lines in the model as the shell does, and say so to the saver.
+fn restructure(book: &mut Workbook, changes: &mut Changes, lines: aster_sheets::structure::Lines) {
+    for cell in book.restructure(0, &lines) {
+        changes.cells.insert(cell);
+        changes.edited.insert(cell);
+    }
+    changes.formulas_changed = true;
+    changes.merges.insert(0);
+    changes.structure.push((0, lines));
+}
+
+/// Every cell's value and formula, by sheet.
+fn contents(book: &Workbook) -> Vec<Vec<(CellRef, Value, Option<String>)>> {
+    book.sheets
+        .iter()
+        .map(|sheet| {
+            sheet
+                .rows()
+                .iter()
+                .flat_map(|row| {
+                    row.cells.iter().map(move |c| {
+                        (
+                            CellRef::new(row.index, c.col),
+                            c.value.clone(),
+                            c.formula.as_deref().map(str::to_owned),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn deleting_a_row_moves_cells_ranges_names_and_other_sheets_formulas() {
+    use aster_sheets::structure::Lines;
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    assert_eq!(book.sheets[0].structure_blocker, None);
+    let mut changes = Changes::default();
+    let lines = Lines {
+        columns: false,
+        at: 1,
+        count: 1,
+        insert: false,
+    };
+    restructure(&mut book, &mut changes, lines);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    // Row 2 went; the rows after it keep their bytes under new numbers.
+    assert!(
+        sheet.contains(r#"<row r="1" spans="1:3"><c r="A1"><v>1</v></c>"#),
+        "{sheet}"
+    );
+    assert!(!sheet.contains("<v>20</v>"), "{sheet}");
+    assert!(
+        sheet.contains(r#"<row r="2"><c r="A2"><v>3</v></c></row>"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains("<f>SUM(A1:A2)</f>"), "{sheet}");
+    assert!(sheet.contains("<f>A2&amp;&quot;x&quot;</f>"), "{sheet}");
+    assert!(
+        sheet.contains(r#"<row r="4"><c r="A4"><v>5</v></c></row>"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains(r#"<dimension ref="A1:C4"/>"#), "{sheet}");
+    assert!(
+        sheet.contains(r#"<selection activeCell="B3" sqref="B3"/>"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains(r#"<mergeCell ref="B2:C2"/>"#), "{sheet}");
+    assert!(
+        sheet.contains(r#"<conditionalFormatting sqref="A1:A4">"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains("<formula>A1&gt;$A$3</formula>"), "{sheet}");
+    // The validation of A2 went with it.
+    assert!(sheet.contains(r#"<dataValidations count="1"><dataValidation type="whole" sqref="C1:C4"><formula1>0</formula1><formula2>$A$4</formula2></dataValidation></dataValidations>"#), "{sheet}");
+    assert!(
+        sheet.contains(r#"<brk id="2" max="16383" man="1"/>"#),
+        "{sheet}"
+    );
+    let other = part(&saved, "xl/worksheets/sheet2.xml");
+    assert!(other.contains("<f>数据!A3*2</f>"), "{other}");
+    assert!(other.contains("<f>SUM(数据!A1:A4)</f>"), "{other}");
+    let names = part(&saved, "xl/workbook.xml");
+    assert!(
+        names.contains(r#"<definedName name="区域">数据!$A$2:$A$3</definedName>"#),
+        "{names}"
+    );
+    assert!(
+        names.contains(r#"localSheetId="0">数据!$A$1:$C$4</definedName>"#),
+        "{names}"
+    );
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(contents(&again), contents(&book));
+    assert_eq!(again.sheets[0].merges, book.sheets[0].merges);
+}
+
+#[test]
+fn inserting_columns_and_taking_them_out_again() {
+    use aster_sheets::structure::Lines;
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    let lines = Lines {
+        columns: true,
+        at: 1,
+        count: 2,
+        insert: true,
+    };
+    restructure(&mut book, &mut changes, lines);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    // The widths move with their columns; spans would be wrong and go.
+    assert!(
+        sheet.contains(r#"<cols><col min="4" max="5" width="20" customWidth="1"/></cols>"#),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains(r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><v>10</v></c></row>"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains(r#"<mergeCell ref="D3:E3"/>"#), "{sheet}");
+    assert!(sheet.contains(r#"sqref="E1:E5""#), "{sheet}");
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(contents(&again), contents(&book));
+    assert_eq!(
+        again.sheets[0].columns.size(3),
+        book.sheets[0].columns.size(3)
+    );
+    assert_eq!(
+        again.sheets[0].columns.size(1),
+        book.sheets[0].columns.size(1)
+    );
+
+    // Deleting them again, as undo does, gives the cells back where they were.
+    let first = Xlsx.read(source.clone()).unwrap();
+    let back = Lines {
+        insert: false,
+        ..lines
+    };
+    restructure(&mut book, &mut changes, back);
+    let saved = save(source, &book, &changes).unwrap();
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(contents(&again), contents(&first));
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(
+        sheet.contains(r#"<cols><col min="2" max="3" width="20" customWidth="1"/></cols>"#),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn what_would_not_follow_the_lines_is_named() {
+    // G4's sheet has a table and comments.
+    let book = Xlsx.read(g4()).unwrap();
+    assert!(book.sheets[0].structure_blocker.is_some());
+}

@@ -32,6 +32,8 @@ use crate::error::{Error, Result};
 use crate::package::{Kind, Package};
 use crate::xlsx::{shared_strings, workbook_entries};
 
+pub(crate) mod structure;
+
 /// What changed since the workbook was read.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
@@ -49,6 +51,10 @@ pub struct Changes {
     /// Columns and rows resized: sheet and index.
     pub columns: BTreeSet<(usize, u32)>,
     pub rows: BTreeSet<(usize, u32)>,
+    /// Rows and columns inserted and deleted, in the order they were: the
+    /// sheet and the lines. The cells, sizes and merged areas above are
+    /// where they are after all of them.
+    pub structure: Vec<(usize, aster_sheets::structure::Lines)>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -124,9 +130,23 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                 (at, mode)
             })
             .collect();
-        let merges = changes
-            .merges
-            .contains(&index)
+        let moves: Vec<aster_sheets::structure::Lines> = changes
+            .structure
+            .iter()
+            .filter(|(sheet, _)| *sheet == index)
+            .map(|(_, lines)| *lines)
+            .collect();
+        let mut cells = cells;
+        if !moves.is_empty() {
+            // Formulas were moved with their cells: each is written out
+            // whole, out of any shared group.
+            for row in sheet.rows() {
+                for cell in row.cells.iter().filter(|c| c.formula.is_some()) {
+                    cells.insert(CellRef::new(row.index, cell.col), Mode::Full);
+                }
+            }
+        }
+        let merges = (changes.merges.contains(&index) || !moves.is_empty())
             .then_some(sheet.merges.as_slice());
         let sizes = sizes_of(sheet, index, changes, digit);
         if cells.is_empty() && merges.is_none() && sizes.is_empty() {
@@ -135,9 +155,32 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         let Some(part) = target(&entry.rel).filter(|part| package.has(part)) else {
             continue;
         };
-        let bytes = package.read(&part)?;
+        let mut bytes = package.read(&part)?;
+        if !moves.is_empty() {
+            bytes = structure::restructure_sheet(&bytes, &part, &entry.name, &moves)?;
+            for rel in package.relationships(&part)? {
+                if rel.kind == "drawing"
+                    && let Some(drawing) = rel.target.filter(|d| package.has(d))
+                {
+                    let moved = structure::move_anchors(&package.read(&drawing)?, &moves);
+                    replaced.insert(key(&drawing), moved);
+                }
+            }
+        }
         let rewritten = rewrite_sheet(&bytes, &part, sheet, &cells, merges, &sizes, &mut strings)?;
         replaced.insert(key(&part), rewritten);
+    }
+
+    // Defined names (print areas, filters, named ranges) follow the lines.
+    if !changes.structure.is_empty() {
+        let names: Vec<String> = entries.sheets.iter().map(|e| e.name.clone()).collect();
+        let mut bytes = package.read(&main)?;
+        for (index, lines) in &changes.structure {
+            if let Some(target) = names.get(*index) {
+                bytes = structure::move_names(&bytes, &names, target, std::slice::from_ref(lines));
+            }
+        }
+        replaced.insert(key(&main), bytes);
     }
 
     // Styles added for typed dates and percentages go to the end of the
@@ -161,7 +204,7 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         replaced.insert(key(part), shared.append(&bytes, part)?);
     }
 
-    if changes.formulas_changed
+    if (changes.formulas_changed || !changes.structure.is_empty())
         && let Some(chain) = rels
             .iter()
             .find(|rel| rel.kind == "calcChain")

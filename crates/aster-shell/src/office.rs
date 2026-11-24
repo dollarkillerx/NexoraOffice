@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use aster_ooxml::{ErrorKind, FormatCodec, Pptx, Xlsx};
 use aster_sheets::input::{self, Reading};
-use aster_sheets::{HAlign, StyleEdit};
+use aster_sheets::structure::Lines;
+use aster_sheets::{HAlign, MAX_COLUMNS, MAX_ROWS, StyleEdit};
 use aster_surface::cell_editor::EditMode;
 
 use crate::toolbar::{CellLook, Command, font_size_step};
@@ -140,8 +141,15 @@ pub struct CalcUpdate {
 /// everything once, then only what each batch of edits affects; a new batch
 /// cancels a calculation still running, which then carries on with the new
 /// edits too.
+/// A batch for the calculation thread: changed cells, or the whole
+/// workbook again after its cells moved.
+enum Job {
+    Edits(Vec<Edit>),
+    Reload(Arc<Workbook>),
+}
+
 pub struct CalcWorker {
-    jobs: Option<Sender<Vec<Edit>>>,
+    jobs: Option<Sender<Job>>,
     current: Arc<Mutex<Cancel>>,
     sent: u64,
 }
@@ -165,8 +173,17 @@ impl CalcWorker {
         if edits.is_empty() {
             return self.sent;
         }
+        self.send(Job::Edits(edits))
+    }
+
+    /// Rows or columns moved: the engine starts again from `workbook`.
+    pub fn reload(&mut self, workbook: Arc<Workbook>) -> u64 {
+        self.send(Job::Reload(workbook))
+    }
+
+    fn send(&mut self, job: Job) -> u64 {
         if let Some(jobs) = &self.jobs
-            && jobs.send(edits).is_ok()
+            && jobs.send(job).is_ok()
         {
             self.sent += 1;
             if let Ok(current) = self.current.lock() {
@@ -194,7 +211,7 @@ impl Drop for CalcWorker {
 
 fn calculate_loop(
     workbook: Arc<Workbook>,
-    jobs: Receiver<Vec<Edit>>,
+    jobs: Receiver<Job>,
     current: Arc<Mutex<Cancel>>,
     send: impl Fn(CalcMessage),
 ) {
@@ -209,11 +226,22 @@ fn calculate_loop(
     let mut generation = 0u64;
     let mut first = true;
     let mut again = false;
+    let mut reload: Option<Arc<Workbook>> = None;
+    fn take(job: Job, edits: &mut Vec<Edit>, reload: &mut Option<Arc<Workbook>>) {
+        match job {
+            Job::Edits(batch) => edits.extend(batch),
+            // The workbook holds every edit before it.
+            Job::Reload(workbook) => {
+                edits.clear();
+                *reload = Some(workbook);
+            }
+        }
+    }
     loop {
         if !first && !again {
             match jobs.recv() {
-                Ok(batch) => {
-                    edits.extend(batch);
+                Ok(job) => {
+                    take(job, &mut edits, &mut reload);
                     generation += 1;
                 }
                 Err(_) => return,
@@ -221,12 +249,18 @@ fn calculate_loop(
         }
         loop {
             match jobs.try_recv() {
-                Ok(batch) => {
-                    edits.extend(batch);
+                Ok(job) => {
+                    take(job, &mut edits, &mut reload);
                     generation += 1;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if let Some(workbook) = reload.take() {
+            match aster_calc::Formualizer::load(&workbook) {
+                Ok(fresh) => engine = fresh,
+                Err(error) => return send(CalcMessage::Failed(error.to_string())),
             }
         }
         let cancel = Cancel::new();
@@ -264,7 +298,7 @@ pub struct History {
 
 /// One entry, paste or clear: its cell changes, and the cell formats it
 /// added (a date format for a typed date), which go with it on undo.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Step {
     pub changes: Vec<Change>,
     /// Merged areas changed: sheet, before, after.
@@ -275,11 +309,38 @@ pub struct Step {
     styles_before: usize,
     /// The styles undo took away, put back by redo.
     added: Vec<aster_sheets::CellStyle>,
+    /// Rows or columns inserted or deleted.
+    lines: Option<Box<Restructure>>,
+}
+
+/// Rows or columns inserted or deleted: the sheets before and after, and
+/// the cells of other sheets whose formulas changed with them.
+#[derive(Debug, Clone)]
+struct Restructure {
+    sheet: usize,
+    lines: Lines,
+    before: Vec<aster_sheets::Sheet>,
+    after: Vec<aster_sheets::Sheet>,
+    others: Vec<(usize, CellRef)>,
+}
+
+/// Why rows or columns cannot be inserted or deleted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The sheet holds something that would not follow (a table, a pivot
+    /// table, a chart's data, comments ...); its name in the file.
+    Holds(String),
+    /// Inserting would push filled cells off the sheet.
+    Full,
 }
 
 impl History {
     fn push(&mut self, step: Step) {
-        if step.changes.is_empty() && step.merges.is_empty() && step.sizes.is_empty() {
+        if step.changes.is_empty()
+            && step.merges.is_empty()
+            && step.sizes.is_empty()
+            && step.lines.is_none()
+        {
             return;
         }
         if self.saved.is_some_and(|saved| saved > self.undo.len()) {
@@ -356,6 +417,11 @@ pub struct SheetTab {
     /// Columns and rows resized since then: sheet and index.
     pub columns_changed: BTreeSet<(usize, u32)>,
     pub rows_changed: BTreeSet<(usize, u32)>,
+    /// Rows and columns inserted and deleted since then, in order.
+    pub structure: Vec<(usize, Lines)>,
+    /// Why the last insert or delete of rows or columns was refused, shown
+    /// until the next change.
+    pub refusal: Option<Refusal>,
     /// A column or row being dragged, its size before, and how far the
     /// pointer was from its edge when the drag started.
     resizing: Option<(Resize, f64, f64)>,
@@ -395,6 +461,8 @@ impl SheetTab {
             merges_changed: BTreeSet::new(),
             columns_changed: BTreeSet::new(),
             rows_changed: BTreeSet::new(),
+            structure: Vec::new(),
+            refusal: None,
             resizing: None,
             file_styles: view_styles,
             source,
@@ -674,6 +742,7 @@ impl SheetTab {
             sizes: Vec::new(),
             styles_before,
             added: Vec::new(),
+            lines: None,
         });
         changes
     }
@@ -690,6 +759,9 @@ impl SheetTab {
 
     /// Remember which cells saving must write.
     fn note(&mut self, changes: &[Change]) {
+        if !changes.is_empty() {
+            self.refusal = None;
+        }
         for change in changes {
             self.dirty.insert((change.sheet, change.at));
             self.edited.insert((change.sheet, change.at));
@@ -714,6 +786,7 @@ impl SheetTab {
                 merges: self.merges_changed.clone(),
                 columns: self.columns_changed.clone(),
                 rows: self.rows_changed.clone(),
+                structure: self.structure.clone(),
             },
             depth: self.history.depth(),
         })
@@ -739,7 +812,12 @@ impl SheetTab {
         }
         self.file_styles = self.file_styles.max(written_styles.len());
         let unchanged_since = self.history.depth() == job.depth;
-        for cell in &job.changes.cells {
+        // What moved since the save started was not written; cells written
+        // were where they are now only if nothing moved since.
+        let moved_since = self.structure.len() > job.changes.structure.len();
+        self.structure
+            .drain(..job.changes.structure.len().min(self.structure.len()));
+        for cell in job.changes.cells.iter().filter(|_| !moved_since) {
             // A cell is still to be written if it changed again since.
             let now = self
                 .view
@@ -776,6 +854,18 @@ impl SheetTab {
         for &(sheet, resize, before, _) in &step.sizes {
             self.set_size(sheet, resize, before);
         }
+        if let Some(change) = &step.lines {
+            self.view.workbook_mut().sheets = change.before.clone();
+            let back = Lines {
+                insert: !change.lines.insert,
+                ..change.lines
+            };
+            self.moved(change.sheet, back, &change.others);
+            if back.insert {
+                self.restored(change.sheet, change.lines);
+            }
+            self.reload_calc();
+        }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
         step.added = self.drop_styles(step.styles_before);
@@ -805,11 +895,170 @@ impl SheetTab {
         for &(sheet, resize, _, after) in &step.sizes {
             self.set_size(sheet, resize, after);
         }
+        if let Some(change) = &step.lines {
+            self.view.workbook_mut().sheets = change.after.clone();
+            self.moved(change.sheet, change.lines, &change.others);
+            if change.lines.insert {
+                self.restored(change.sheet, change.lines);
+            }
+            self.reload_calc();
+        }
         self.note(&step.changes);
         self.show(&step.changes);
         let applied = step.changes.clone();
         self.history.undo.push(step);
         applied
+    }
+
+    /// Insert or delete rows or columns of the active sheet: those the
+    /// selection spans. Formulas everywhere follow the cells. One undo step.
+    pub fn change_lines(&mut self, columns: bool, insert: bool) -> Result<(), Refusal> {
+        let sheet = self.view.sheet_index();
+        let range = self.view.selection();
+        let Some(current) = self.view.sheet() else {
+            return Ok(());
+        };
+        if let Some(holds) = &current.structure_blocker {
+            return Err(Refusal::Holds(holds.clone()));
+        }
+        let lines = if columns {
+            Lines {
+                columns,
+                at: range.first.col,
+                count: range.cols(),
+                insert,
+            }
+        } else {
+            Lines {
+                columns,
+                at: range.first.row,
+                count: range.rows(),
+                insert,
+            }
+        };
+        if insert {
+            let limit = if columns { MAX_COLUMNS } else { MAX_ROWS };
+            let pushed_off = current.rows().iter().any(|row| {
+                if columns {
+                    row.cells
+                        .iter()
+                        .any(|c| c.col >= limit - lines.count && !c.is_blank())
+                } else {
+                    row.index >= limit - lines.count && row.cells.iter().any(|c| !c.is_blank())
+                }
+            });
+            if pushed_off {
+                return Err(Refusal::Full);
+            }
+        }
+        self.view.cancel_edit();
+        let before = self.view.workbook().sheets.clone();
+        let others = self.view.workbook_mut().restructure(sheet, &lines);
+        let after = self.view.workbook().sheets.clone();
+        self.moved(sheet, lines, &others);
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            lines: Some(Box::new(Restructure {
+                sheet,
+                lines,
+                before,
+                after,
+                others,
+            })),
+            ..Step::default()
+        });
+        self.reload_calc();
+        Ok(())
+    }
+
+    /// Lines moved on `sheet`: what saving must write moves with them.
+    fn moved(&mut self, sheet: usize, lines: Lines, others: &[(usize, CellRef)]) {
+        let shift = |at: CellRef| -> Option<CellRef> {
+            if lines.columns {
+                Some(CellRef::new(at.row, lines.moved(at.col)?))
+            } else {
+                Some(CellRef::new(lines.moved(at.row)?, at.col))
+            }
+        };
+        let remap = |set: &mut BTreeSet<(usize, CellRef)>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .filter_map(|(s, at)| {
+                    if s == sheet {
+                        Some((s, shift(at)?))
+                    } else {
+                        Some((s, at))
+                    }
+                })
+                .collect();
+        };
+        remap(&mut self.dirty);
+        remap(&mut self.edited);
+        let resized = if lines.columns {
+            &mut self.columns_changed
+        } else {
+            &mut self.rows_changed
+        };
+        *resized = std::mem::take(resized)
+            .into_iter()
+            .filter_map(|(s, i)| {
+                if s == sheet {
+                    Some((s, lines.moved(i)?))
+                } else {
+                    Some((s, i))
+                }
+            })
+            .collect();
+        for &cell in others {
+            self.dirty.insert(cell);
+            self.edited.insert(cell);
+        }
+        self.formulas_changed = true;
+        self.merges_changed.insert(sheet);
+        self.structure.push((sheet, lines));
+    }
+
+    /// Deleted lines came back (undo of a delete, redo of an insert has
+    /// none): their cells and sizes are written again, the file lost them.
+    fn restored(&mut self, sheet: usize, lines: Lines) {
+        let Some(target) = self.view.workbook().sheets.get(sheet) else {
+            return;
+        };
+        let span = lines.at..lines.at + lines.count;
+        let mut cells = Vec::new();
+        for row in target.rows() {
+            for cell in &row.cells {
+                let line = if lines.columns { cell.col } else { row.index };
+                if span.contains(&line) {
+                    cells.push((sheet, CellRef::new(row.index, cell.col)));
+                }
+            }
+        }
+        let axis = if lines.columns {
+            &target.columns
+        } else {
+            &target.row_sizes
+        };
+        let custom: Vec<u32> = span
+            .clone()
+            .filter(|&i| axis.size(i) != axis.default_size())
+            .collect();
+        self.dirty.extend(cells.iter().copied());
+        self.edited.extend(cells);
+        let resized = if lines.columns {
+            &mut self.columns_changed
+        } else {
+            &mut self.rows_changed
+        };
+        resized.extend(custom.into_iter().map(|i| (sheet, i)));
+    }
+
+    /// The calculation thread starts again from the workbook as it is.
+    fn reload_calc(&mut self) {
+        if let Some(worker) = &mut self.worker {
+            worker.reload(self.view.workbook().clone());
+            self.calc = Calc::Running;
+        }
     }
 
     fn set_size(&mut self, sheet: usize, resize: Resize, size: f64) {
@@ -882,6 +1131,7 @@ impl SheetTab {
             sizes: vec![(sheet, resize, before, after)],
             styles_before,
             added: Vec::new(),
+            lines: None,
         });
         true
     }
@@ -996,6 +1246,7 @@ impl SheetTab {
             sizes: Vec::new(),
             styles_before,
             added: Vec::new(),
+            lines: None,
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -1395,6 +1646,18 @@ mod tests {
             wait(&mut tab);
         }
         assert!(tab.circular.is_empty());
+        // Rows inserted: the engine starts again from the moved cells, and
+        // an edit after that reaches the formula where it is now.
+        tab.view.select(at("A1"));
+        tab.change_lines(false, true).unwrap();
+        while tab.calc == Calc::Running {
+            wait(&mut tab);
+        }
+        enter(&mut tab, "A2", "7");
+        while tab.calc == Calc::Running {
+            wait(&mut tab);
+        }
+        assert_eq!(value(&tab, "B2"), Some(aster_sheets::Value::Number(27.0)));
     }
 
     fn tab() -> SheetTab {
@@ -1594,6 +1857,89 @@ mod tests {
         tab.undo();
         assert!(tab.view.sheet().unwrap().cell(at("B3")).is_some());
         assert!(tab.view.sheet().unwrap().cell(at("C9")).is_none());
+    }
+
+    #[test]
+    fn rows_and_columns_go_in_and_out_with_undo_and_save() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("行列.xlsx");
+        std::fs::write(&file, aster_ooxml::xlsx_save::blank("Sheet1", "Calibri")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let enter = |tab: &mut SheetTab, cell: &str, text: &str| {
+            tab.view.select(at(cell));
+            tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+            tab.commit("en");
+        };
+        enter(&mut tab, "A1", "1");
+        enter(&mut tab, "A2", "2");
+        enter(&mut tab, "A3", "=SUM(A1:A2)");
+        tab.view.workbook_mut().sheets[0].row_sizes.set(1, 2, 40.0);
+        tab.rows_changed.insert((0, 1));
+        let formula = |tab: &SheetTab, cell: &str| {
+            tab.view
+                .sheet()
+                .unwrap()
+                .cell(at(cell))
+                .and_then(|c| c.formula.clone())
+        };
+
+        // Two rows above row 2: the sum follows its cells.
+        tab.view.select(at("B2"));
+        tab.view.extend_to(at("C3"));
+        tab.change_lines(false, true).unwrap();
+        assert_eq!(formula(&tab, "A5").as_deref(), Some("SUM(A1:A4)"));
+        assert_eq!(value(&tab, "A4"), Some(aster_sheets::Value::Number(2.0)));
+        assert!(tab.dirty.contains(&(0, at("A4"))) && !tab.dirty.contains(&(0, at("A2"))));
+        assert!(tab.rows_changed.contains(&(0, 3)));
+        assert_eq!(tab.view.sheet().unwrap().row_sizes.size(3), 40.0);
+
+        // Undo puts it back; redo does it again.
+        tab.undo();
+        assert_eq!(formula(&tab, "A3").as_deref(), Some("SUM(A1:A2)"));
+        assert!(tab.view.sheet().unwrap().cell(at("A5")).is_none());
+        tab.redo();
+        assert_eq!(formula(&tab, "A5").as_deref(), Some("SUM(A1:A4)"));
+
+        // Then the first column goes: the sum's column with it.
+        tab.view.select(at("A1"));
+        tab.change_lines(true, false).unwrap();
+        assert!(tab.view.sheet().unwrap().cell(at("A5")).is_none());
+        tab.undo();
+        assert_eq!(formula(&tab, "A5").as_deref(), Some("SUM(A1:A4)"));
+        assert_eq!(tab.structure.len(), 5);
+
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        assert!(tab.structure.is_empty() && !tab.is_modified());
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        let cell = |c: &str| again.sheets[0].cell(at(c)).cloned();
+        assert_eq!(
+            cell("A5").and_then(|c| c.formula).as_deref(),
+            Some("SUM(A1:A4)")
+        );
+        assert_eq!(
+            cell("A4").map(|c| c.value),
+            Some(aster_sheets::Value::Number(2.0))
+        );
+        assert!(cell("A2").is_none());
+        assert_eq!(again.sheets[0].row_sizes.size(3), 40.0);
+
+        // A sheet holding what would not follow says so and stays as it is.
+        tab.view.workbook_mut().sheets[0].structure_blocker = Some("table".into());
+        assert_eq!(
+            tab.change_lines(false, false),
+            Err(Refusal::Holds("table".into()))
+        );
+        assert_eq!(formula(&tab, "A5").as_deref(), Some("SUM(A1:A4)"));
     }
 
     #[test]

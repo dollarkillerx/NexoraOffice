@@ -129,6 +129,11 @@ pub struct Sheet {
     pub row_styles: Vec<(u32, u32)>,
     /// In drawing order.
     pub pictures: Vec<Picture>,
+    /// Something on or about the sheet that inserting or deleting rows and
+    /// columns cannot keep right yet (an Excel table, comments, a pivot
+    /// table, a chart over its cells): its relationship kind. `None` when
+    /// the sheet can be restructured.
+    pub structure_blocker: Option<String>,
 }
 
 impl Sheet {
@@ -370,6 +375,7 @@ impl SheetBuilder {
             column_styles: self.column_styles,
             row_styles: self.row_styles,
             pictures: self.pictures,
+            structure_blocker: None,
         }
     }
 }

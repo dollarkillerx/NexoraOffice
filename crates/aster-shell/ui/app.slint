@@ -280,6 +280,8 @@ export component AppWindow inherits Window {
     callback edit-copy();
     callback edit-paste();
     callback edit-select-all();
+    // Insert (or delete) the columns (or rows) the selection spans.
+    callback sheet-lines(/* columns */ bool, /* insert */ bool);
     callback dialog-save();
     callback dialog-discard();
     callback dialog-cancel();
@@ -584,6 +586,41 @@ export component AppWindow inherits Window {
                     } else {
                         root.edit-select-all();
                     }
+                }
+            }
+
+            MenuSeparator { }
+
+            // Rows and columns of a workbook: those the selection spans.
+            MenuItem {
+                title: Strings.menu-insert-rows;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-lines(false, true);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-insert-columns;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-lines(true, true);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-delete-rows;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-lines(false, false);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-delete-columns;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-lines(true, false);
                 }
             }
 

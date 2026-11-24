@@ -328,6 +328,8 @@ enum SheetChange {
     Added(usize),
     Renamed(usize),
     Deleted(usize),
+    /// From one place to another.
+    Moved(usize, usize),
 }
 
 /// A sheet added, renamed or deleted: the sheets before and after, the
@@ -337,8 +339,8 @@ enum SheetChange {
 #[derive(Debug, Clone)]
 struct SheetStep {
     change: SheetChange,
-    before: Vec<aster_sheets::Sheet>,
-    after: Vec<aster_sheets::Sheet>,
+    before: Book,
+    after: Book,
     formulas: Vec<(usize, CellRef)>,
     marks: Marks,
     origin: Option<usize>,
@@ -386,11 +388,19 @@ const MAX_FOUND: usize = 100_000;
 struct Restructure {
     sheet: usize,
     lines: Lines,
-    before: Vec<aster_sheets::Sheet>,
-    after: Vec<aster_sheets::Sheet>,
+    before: Book,
+    after: Book,
     others: Vec<(usize, CellRef)>,
     /// What inserted lines took from the line before them.
     inherited: aster_sheets::structure::Inherited,
+}
+
+/// The sheets and the defined names, as undo puts them back after rows,
+/// columns or sheets changed.
+#[derive(Debug, Clone)]
+struct Book {
+    sheets: Vec<aster_sheets::Sheet>,
+    names: Vec<aster_sheets::model::DefinedName>,
 }
 
 /// Why rows or columns cannot be inserted or deleted here.
@@ -1175,7 +1185,7 @@ impl SheetTab {
             self.set_size(sheet, resize, before);
         }
         if let Some(change) = &step.lines {
-            self.view.workbook_mut().sheets = change.before.clone();
+            self.put_book(&change.before);
             let back = Lines {
                 insert: !change.lines.insert,
                 ..change.lines
@@ -1221,7 +1231,7 @@ impl SheetTab {
             self.set_size(sheet, resize, after);
         }
         if let Some(change) = &step.lines {
-            self.view.workbook_mut().sheets = change.after.clone();
+            self.put_book(&change.after);
             self.moved(change.sheet, change.lines, &change.others);
             self.mark_inherited(change.sheet, change.lines, &change.inherited);
             if change.lines.insert {
@@ -1282,10 +1292,10 @@ impl SheetTab {
             }
         }
         self.view.cancel_edit();
-        let before = self.view.workbook().sheets.clone();
+        let before = self.book();
         let others = self.view.workbook_mut().restructure(sheet, &lines);
         let inherited = self.view.workbook_mut().inherit_format(sheet, &lines);
-        let after = self.view.workbook().sheets.clone();
+        let after = self.book();
         self.moved(sheet, lines, &others);
         self.mark_inherited(sheet, lines, &inherited);
         self.history.push(Step {
@@ -1530,7 +1540,7 @@ impl SheetTab {
             return None;
         }
         self.view.cancel_edit();
-        let before = self.view.workbook().sheets.clone();
+        let before = self.book();
         let name = self.view.workbook().new_sheet_name(base);
         let index = self.view.workbook_mut().add_sheet(&name);
         self.view.sheet_inserted(index);
@@ -1574,7 +1584,7 @@ impl SheetTab {
             return Ok(());
         }
         self.view.cancel_edit();
-        let before = self.view.workbook().sheets.clone();
+        let before = self.book();
         let formulas = self.view.workbook_mut().rename_sheet(index, name);
         self.mark_formulas(&formulas);
         self.sheet_step(
@@ -1612,7 +1622,7 @@ impl SheetTab {
             return Ok(());
         }
         self.view.cancel_edit();
-        let before = self.view.workbook().sheets.clone();
+        let before = self.book();
         let marks = self.take_marks(index);
         let origin = self.origins.remove(index);
         self.shift_marks(index, false);
@@ -1625,17 +1635,52 @@ impl SheetTab {
         Ok(())
     }
 
+    /// Move sheet `from` to place `to`, as dragging its tab does. One undo
+    /// step.
+    pub fn move_sheet(&mut self, from: usize, to: usize) -> bool {
+        let count = self.view.workbook().sheets.len();
+        if self.saving || from == to || from >= count || to >= count {
+            return false;
+        }
+        self.view.cancel_edit();
+        let before = self.book();
+        self.view.workbook_mut().move_sheet(from, to);
+        self.relocate(from, to);
+        self.sheet_step(
+            SheetChange::Moved(from, to),
+            before,
+            Vec::new(),
+            Marks::default(),
+            None,
+        );
+        self.show_sheet(to);
+        true
+    }
+
+    /// The sheet at `from` went to `to`: what saving must write on it, its
+    /// number in the file and its place in the view go with it.
+    fn relocate(&mut self, from: usize, to: usize) {
+        let marks = self.take_marks(from);
+        self.shift_marks(from, false);
+        self.shift_marks(to, true);
+        self.put_marks(to, &marks);
+        let origin = self.origins.remove(from);
+        self.origins.insert(to, origin);
+        self.view.sheet_removed(from);
+        self.view.sheet_inserted(to);
+    }
+
     fn sheet_step(
         &mut self,
         change: SheetChange,
-        before: Vec<aster_sheets::Sheet>,
+        before: Book,
         formulas: Vec<(usize, CellRef)>,
         marks: Marks,
         origin: Option<usize>,
     ) {
         self.formulas_changed = true;
         self.refusal = None;
-        let after = self.view.workbook().sheets.clone();
+        let after = self.book();
         self.history.push(Step {
             styles_before: self.view.workbook().styles.len(),
             sheets: Some(Box::new(SheetStep {
@@ -1653,7 +1698,7 @@ impl SheetTab {
     }
 
     fn undo_sheets(&mut self, step: &SheetStep) {
-        self.view.workbook_mut().sheets = step.before.clone();
+        self.put_book(&step.before);
         match step.change {
             SheetChange::Added(index) => {
                 self.view.sheet_removed(index);
@@ -1665,6 +1710,10 @@ impl SheetTab {
             SheetChange::Renamed(index) => {
                 self.mark_formulas(&step.formulas);
                 self.show_sheet(index);
+            }
+            SheetChange::Moved(from, to) => {
+                self.relocate(to, from);
+                self.show_sheet(from);
             }
             SheetChange::Deleted(index) => {
                 // The formulas that lost the sheet, where they are again.
@@ -1691,7 +1740,7 @@ impl SheetTab {
     }
 
     fn redo_sheets(&mut self, step: &SheetStep) {
-        self.view.workbook_mut().sheets = step.after.clone();
+        self.put_book(&step.after);
         match step.change {
             SheetChange::Added(index) => {
                 self.view.sheet_inserted(index);
@@ -1702,6 +1751,10 @@ impl SheetTab {
             SheetChange::Renamed(index) => {
                 self.mark_formulas(&step.formulas);
                 self.show_sheet(index);
+            }
+            SheetChange::Moved(from, to) => {
+                self.relocate(from, to);
+                self.show_sheet(to);
             }
             SheetChange::Deleted(index) => {
                 self.view.sheet_removed(index);
@@ -1820,6 +1873,20 @@ impl SheetTab {
                 .iter()
                 .map(|&(columns, i)| (index, columns, i)),
         );
+    }
+
+    fn book(&self) -> Book {
+        let workbook = self.view.workbook();
+        Book {
+            sheets: workbook.sheets.clone(),
+            names: workbook.names.clone(),
+        }
+    }
+
+    fn put_book(&mut self, book: &Book) {
+        let workbook = self.view.workbook_mut();
+        workbook.sheets = book.sheets.clone();
+        workbook.names = book.names.clone();
     }
 
     /// The calculation thread starts again from the workbook as it is.
@@ -2832,6 +2899,65 @@ mod tests {
                 .as_deref(),
             Some("'Données 2026'!A1*2")
         );
+    }
+
+    #[test]
+    fn a_sheet_moved_by_its_tab_saves_in_its_new_place() {
+        use aster_surface::cell_editor::EditMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("順番.xlsx");
+        std::fs::write(&file, blank_workbook("en")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let save = |tab: &mut SheetTab| {
+            let job = tab.begin_save().unwrap();
+            let written = job.write(&file).unwrap();
+            tab.finish_save(&job, &file, Some(written));
+        };
+        tab.add_sheet("Sheet");
+        tab.add_sheet("Sheet");
+        save(&mut tab);
+        // An entry not saved yet on the first sheet, which then goes last.
+        tab.show_sheet(0);
+        tab.view.select(at("A1"));
+        tab.view.begin_edit(EditMode::Enter, Some("first".into()));
+        tab.commit("en");
+        assert!(tab.move_sheet(0, 2));
+        let names = |tab: &SheetTab| -> Vec<String> {
+            tab.view
+                .workbook()
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&tab), ["Sheet2", "Sheet3", "Sheet1"]);
+        assert_eq!(tab.view.sheet_index(), 2);
+        assert!(tab.dirty.contains(&(2, at("A1"))));
+        save(&mut tab);
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(
+            again
+                .sheets
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Sheet2", "Sheet3", "Sheet1"]
+        );
+        assert_eq!(
+            again.sheets[2].cell(at("A1")).map(|c| c.value.clone()),
+            Some(aster_sheets::Value::Text("first".into()))
+        );
+        // Undo puts it back first.
+        tab.undo();
+        assert_eq!(names(&tab), ["Sheet1", "Sheet2", "Sheet3"]);
+        assert_eq!(tab.view.sheet_index(), 0);
     }
 
     #[test]

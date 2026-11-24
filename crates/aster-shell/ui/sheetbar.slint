@@ -1,8 +1,8 @@
 // The chrome of a Sheets tab around the grid the Rust side draws: the
 // formula bar above it (the selected cell's address and content) and the
 // sheet tabs below it. Read-only: the formula bar shows, it does not edit.
-// The tabs add, rename (double-click or the right-click menu) and delete
-// sheets when the workbook can be edited.
+// The tabs add, rename (double-click or the right-click menu), delete and
+// reorder (drag) sheets when the workbook can be edited.
 
 import { Tokens, Icons, Strings } from "tokens.slint";
 import { IconButton, MenuFrame, MenuRow } from "widgets.slint";
@@ -84,6 +84,15 @@ export component SheetBar inherits Rectangle {
     callback add();
     callback rename(int);
     callback delete(int);
+    // A tab was dragged from one place to another (as shown).
+    callback moved(int, int);
+    // A tab being dragged, where the pointer is along the tabs, and the tab
+    // it would land on.
+    property <int> drag-from: -1;
+    property <length> drag-x;
+    property <int> drop-index: -1;
+    // The press that ends now was a drag, not a click.
+    property <bool> was-dragged;
     // The tab the right-click menu is for, and where it was clicked.
     property <int> menu-for: -1;
     property <length> menu-x;
@@ -120,6 +129,12 @@ export component SheetBar inherits Rectangle {
             padding-bottom: Tokens.space-xs;
             for name[index] in root.names: tab := Rectangle {
                 property <bool> active: index == root.current;
+                property <bool> drop-here: root.drag-from >= 0 && root.drag-x >= self.x && root.drag-x < self.x + self.width;
+                changed drop-here => {
+                    if (self.drop-here) {
+                        root.drop-index = index;
+                    }
+                }
                 height: Tokens.control-height;
                 border-radius: Tokens.radius-sm;
                 background: self.active ? Tokens.surface : touch.has-hover ? Tokens.hover : transparent;
@@ -136,9 +151,25 @@ export component SheetBar inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+                // Where the dragged tab would go: before this one, or after it.
+                if tab.drop-here && root.drag-from != index: Rectangle {
+                    x: index < root.drag-from ? 0px : parent.width - self.width;
+                    width: 2px;
+                    background: Tokens.accent;
+                }
+
                 touch := TouchArea {
                     clicked => {
-                        root.selected(index);
+                        if (!root.was-dragged) {
+                            root.selected(index);
+                        }
+                    }
+                    moved => {
+                        if (self.pressed && root.editable && abs(self.mouse-x - self.pressed-x) > 8px) {
+                            root.was-dragged = true;
+                            root.drag-from = index;
+                            root.drag-x = tab.x + self.mouse-x;
+                        }
                     }
                     double-clicked => {
                         if (root.editable) {
@@ -146,6 +177,16 @@ export component SheetBar inherits Rectangle {
                         }
                     }
                     pointer-event(event) => {
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                            root.was-dragged = false;
+                        }
+                        if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up && root.drag-from == index) {
+                            if (root.drop-index >= 0 && root.drop-index != index) {
+                                root.moved(index, root.drop-index);
+                            }
+                            root.drag-from = -1;
+                            root.drop-index = -1;
+                        }
                         if (root.editable && event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
                             root.selected(index);
                             root.menu-for = index;

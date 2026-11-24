@@ -5755,6 +5755,32 @@ fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             name,
         );
     }));
+    ui.on_sheet_move(handler!(|ui, shell, from, to| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        // The tabs count the shown sheets; hidden ones keep their places.
+        let visible = tab.view.visible_sheets();
+        let index = |shown: i32| {
+            usize::try_from(shown)
+                .ok()
+                .and_then(|i| visible.get(i).copied())
+        };
+        if let (Some(from), Some(to)) = (index(from), index(to)) {
+            tab.move_sheet(from, to);
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
     ui.on_sheet_delete(handler!(|ui, shell, shown| {
         let language = shell.language.tag();
         let Some(tab) = shell.active_sheet() else {

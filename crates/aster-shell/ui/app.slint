@@ -328,6 +328,7 @@ export component AppWindow inherits Window {
     callback sheet-add();
     callback sheet-rename(int);
     callback sheet-delete(int);
+    callback sheet-move(int, int);
     callback preview-scrolled(length);
     // The scroll bars: scroll the source or the preview to an offset.
     callback scroll-to(length);
@@ -1257,6 +1258,10 @@ export component AppWindow inherits Window {
                         }
                         delete(index) => {
                             root.sheet-delete(index);
+                            scope.focus();
+                        }
+                        moved(from, to) => {
+                            root.sheet-move(from, to);
                             scope.focus();
                         }
                     }

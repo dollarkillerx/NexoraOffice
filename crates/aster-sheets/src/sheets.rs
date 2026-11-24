@@ -260,6 +260,24 @@ impl Workbook {
         self.retarget_all(&sheet.name, None)
     }
 
+    /// Move sheet `from` to place `to` among the sheets. Formulas name
+    /// sheets, so they stay as they are; names that belong to a sheet keep
+    /// to it.
+    pub fn move_sheet(&mut self, from: usize, to: usize) {
+        if from >= self.sheets.len() || to >= self.sheets.len() || from == to {
+            return;
+        }
+        let sheet = self.sheets.remove(from);
+        self.sheets.insert(to, sheet);
+        let place = |i: usize| moved_index(i, from, to);
+        for name in &mut self.names {
+            if let Some(local) = &mut name.local {
+                *local = place(*local);
+            }
+        }
+        self.active_sheet = place(self.active_sheet);
+    }
+
     fn retarget_all(&mut self, from: &str, to: Option<&str>) -> Vec<(usize, CellRef)> {
         for name in &mut self.names {
             name.formula = retarget(&name.formula, from, to);
@@ -285,6 +303,19 @@ impl Workbook {
             }
         }
         changed
+    }
+}
+
+/// Where sheet `i` is after the sheet at `from` moved to `to`.
+pub fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
     }
 }
 
@@ -329,6 +360,30 @@ mod tests {
         assert_eq!(book.names[1].local, Some(0));
         book.delete_sheet(0);
         assert_eq!(book.names.len(), 1);
+    }
+
+    #[test]
+    fn a_moved_sheet_keeps_its_names() {
+        use crate::model::DefinedName;
+        let mut book = book();
+        book.add_sheet("Sheet3");
+        book.names = vec![DefinedName {
+            name: "Mine".into(),
+            local: Some(0),
+            formula: "数据!$A$1".into(),
+        }];
+        book.move_sheet(0, 2);
+        let names: Vec<&str> = book.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Sheet2", "Sheet3", "数据"]);
+        assert_eq!(book.names[0].local, Some(2));
+        assert_eq!(
+            (0..3).map(|i| moved_index(i, 0, 2)).collect::<Vec<_>>(),
+            [2, 0, 1]
+        );
+        assert_eq!(
+            (0..3).map(|i| moved_index(i, 2, 0)).collect::<Vec<_>>(),
+            [1, 2, 0]
+        );
     }
 
     #[test]

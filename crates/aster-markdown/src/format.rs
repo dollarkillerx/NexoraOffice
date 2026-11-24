@@ -1585,7 +1585,9 @@ pub fn backspace_pair(text: &Rope, selection: Selection, pending: Option<usize>)
 /// `[x]` and `[x]` or `[X]` becomes `[ ]`. The text keeps its length, so
 /// the selection stays where it is. `None` when there is no task box there.
 pub fn toggle_task(text: &Rope, item: usize, selection: Selection) -> Option<Edit> {
-    if item >= text.len_bytes() {
+    // The offset comes from a link in the preview, which a document can
+    // also write by hand: it must be a character boundary to be an item.
+    if item >= text.len_bytes() || floor(text, item) != item {
         return None;
     }
     let line = text.byte_to_line(item);
@@ -1595,7 +1597,9 @@ pub fn toggle_task(text: &Rope, item: usize, selection: Selection) -> Option<Edi
         text.len_bytes()
     };
     // The box follows the item's marker on its first line.
-    let rest = slice(text, item..end.min(item + 64));
+    // At most 64 bytes, cut back to a character boundary (a line of Chinese
+    // or Japanese is longer than that and would be cut inside a character).
+    let rest = slice(text, item..floor(text, end.min(item + 64)));
     let marker = rest.trim_start_matches([' ', '>']);
     let skipped = rest.len() - marker.len();
     let after = marker.strip_prefix(['-', '*', '+']).or_else(|| {
@@ -1964,6 +1968,11 @@ mod tests {
         assert_eq!(apply("- 普通\n", 0), None);
         assert_eq!(apply("-[ ] 没有空格\n", 0), None);
         assert_eq!(apply("- [ ]", 99), None);
+        // A long line of Chinese: 64 bytes in falls inside a character.
+        let long = format!("- [ ] {}\n", "买".repeat(40));
+        assert!(apply(&long, 0).unwrap().starts_with("- [x] 买"));
+        // An offset inside a character, as a hand-written link could give.
+        assert_eq!(apply("买\n- [ ] 菜\n", 1), None);
     }
 
     #[test]

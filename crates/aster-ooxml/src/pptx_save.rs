@@ -326,9 +326,13 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
     };
 
     // The slides as the file lists them.
-    let list = find_all(&pres, "sldIdLst").into_iter().next();
+    let list = main_list(&pres);
     let entries: Vec<(String, Option<String>, u32)> = find_all(&pres, "sldId")
         .iter()
+        .filter(|span| {
+            list.as_ref()
+                .is_some_and(|l| span.start >= l.start && span.end <= l.end)
+        })
         .map(|span| {
             let xml = pres[span.start..span.end].to_owned();
             let rel = rel_id(&xml);
@@ -358,6 +362,10 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
 
     // Each slide in order: its entry in the list.
     let mut items: Vec<String> = Vec::new();
+    // For each slide of the output: its number in the list, whether it
+    // came from the file as itself, and its part.
+    let mut order: Vec<(u32, bool)> = Vec::new();
+    let mut written_parts: Vec<String> = Vec::new();
     for slide in &presentation.slides {
         match slide.source.as_deref() {
             Some(source) if !source.copy => {
@@ -399,12 +407,20 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
                     )?;
                 }
                 rels.store(&mut parts);
+                written_parts.push(part.clone());
                 match entry {
-                    Some(entry) => items.push(entry),
+                    Some(entry) => {
+                        let number = attribute(&entry, "id")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        order.push((number, true));
+                        items.push(entry);
+                    }
                     None => {
                         // Read but not listed: list it again.
                         let id = pres_rels.add(&kinds.of("slide"), &relative(&main, &part));
                         items.push(new_entry(&pres, next_number, &id));
+                        order.push((next_number, false));
                         next_number += 1;
                     }
                 }
@@ -479,12 +495,16 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
                 rels.store(&mut parts);
                 let id = pres_rels.add(&kinds.of("slide"), &relative(&main, &part));
                 items.push(new_entry(&pres, next_number, &id));
+                order.push((next_number, false));
+                written_parts.push(part.clone());
                 next_number += 1;
             }
         }
     }
 
     // Slides deleted: their parts, notes, relationships and entries.
+    let mut deleted_parts: HashSet<String> = HashSet::new();
+    let mut deleted_ids: HashSet<String> = HashSet::new();
     for (xml, part, _) in &entries {
         let Some(part) = part else { continue };
         if kept.contains(part) {
@@ -501,15 +521,19 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
         parts.remove(part);
         parts.remove(&rels_name(part));
         types.remove_override(part);
+        deleted_parts.insert(part.clone());
         if let Some(id) = rel_id(xml) {
             pres_rels.remove_id(&id);
+            deleted_ids.insert(id);
         }
     }
+    drop_from_custom_shows(&mut pres, &deleted_ids);
+    drop_links_to(&mut parts, &written_parts, &deleted_parts)?;
 
     // The list of slides, if it changed.
     let old: Vec<&String> = entries.iter().map(|e| &e.0).collect();
     if items.iter().collect::<Vec<_>>() != old {
-        let span = find_all(&pres, "sldIdLst").into_iter().next().or(list);
+        let span = main_list(&pres).or(list);
         match span {
             Some(span) => {
                 let element = &pres[span.start..span.end];
@@ -545,6 +569,7 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
             }
             None => {}
         }
+        follow_in_sections(&mut pres, &order);
     }
     let pres_bytes = [pres_bom.as_slice(), pres.as_bytes()].concat();
     if pres_bytes != parts.package.read(&main)? {
@@ -616,6 +641,152 @@ fn insert_after_any(text: &mut String, after: &[&str], xml: &str) {
         .next_back()
         .unwrap_or_else(|| inner(root).0);
     text.insert_str(root_start + at, xml);
+}
+
+/// The list of slides itself: the first `sldIdLst` that is not inside an
+/// extension (those hold the sections' lists).
+fn main_list(pres: &str) -> Option<Span> {
+    let extensions = find_all(pres, "extLst");
+    find_all(pres, "sldIdLst").into_iter().find(|l| {
+        !extensions
+            .iter()
+            .any(|e| l.start >= e.start && l.end <= e.end)
+    })
+}
+
+/// The content of a list element (`<p14:sldIdLst>`) replaced by `items`.
+fn with_items(element: &str, items: &str) -> String {
+    let (open, close) = inner(element);
+    if open == close {
+        if items.is_empty() {
+            element.to_owned()
+        } else {
+            format!(
+                "{}>{items}</{}>",
+                &element[..open - 2],
+                crate::xml_edit::qualified_name(element)
+            )
+        }
+    } else {
+        format!("{}{items}{}", &element[..open], &element[close..])
+    }
+}
+
+/// Sections list the slides in the new order: a slide from the file stays
+/// in its section unless that would put it before an earlier one; a new or
+/// copied slide joins the section before it.
+fn follow_in_sections(pres: &mut String, order: &[(u32, bool)]) {
+    let sections = find_all(pres, "section");
+    if sections.is_empty() {
+        return;
+    }
+    let mut section_of: HashMap<u32, usize> = HashMap::new();
+    for (index, span) in sections.iter().enumerate() {
+        let xml = &pres[span.start..span.end];
+        for list in find_all(xml, "sldIdLst") {
+            for item in find_all(&xml[list.start..list.end], "sldId") {
+                let item = &xml[list.start..list.end][item.start..item.end];
+                if let Some(number) = attribute(item, "id").and_then(|v| v.parse().ok()) {
+                    section_of.entry(number).or_insert(index);
+                }
+            }
+        }
+    }
+    let mut assigned: Vec<Vec<u32>> = vec![Vec::new(); sections.len()];
+    let mut current = 0;
+    for (number, from_file) in order {
+        if let Some(&s) = section_of.get(number).filter(|_| *from_file)
+            && s >= current
+        {
+            current = s;
+        }
+        assigned[current].push(*number);
+    }
+    for (index, span) in sections.iter().enumerate().rev() {
+        let xml = &pres[span.start..span.end];
+        let Some(list) = find_all(xml, "sldIdLst").into_iter().next() else {
+            continue;
+        };
+        let element = &xml[list.start..list.end];
+        let existing: Vec<u32> = find_all(element, "sldId")
+            .iter()
+            .filter_map(|i| attribute(&element[i.start..i.end], "id")?.parse().ok())
+            .collect();
+        if existing == assigned[index] {
+            continue;
+        }
+        let prefix = prefix_of(element);
+        let items: String = assigned[index]
+            .iter()
+            .map(|n| format!("<{prefix}sldId id=\"{n}\"/>"))
+            .collect();
+        let new = with_items(element, &items);
+        pres.replace_range(span.start + list.start..span.start + list.end, &new);
+    }
+}
+
+/// Custom shows no longer name deleted slides.
+fn drop_from_custom_shows(pres: &mut String, deleted: &HashSet<String>) {
+    if deleted.is_empty() {
+        return;
+    }
+    let mut remove: Vec<(usize, usize)> = Vec::new();
+    for show in find_all(pres, "custShowLst") {
+        let xml = &pres[show.start..show.end];
+        for item in find_all(xml, "sld") {
+            let element = &xml[item.start..item.end];
+            if rel_id(element).is_some_and(|id| deleted.contains(&id)) {
+                remove.push((show.start + item.start, show.start + item.end));
+            }
+        }
+    }
+    for (start, end) in remove.into_iter().rev() {
+        pres.replace_range(start..end, "");
+    }
+}
+
+/// Slides written here lose their links to slides deleted: the
+/// relationship and the `hlinkClick` or `hlinkHover` that used it.
+fn drop_links_to(parts: &mut Parts, written: &[String], deleted: &HashSet<String>) -> Result<()> {
+    if deleted.is_empty() {
+        return Ok(());
+    }
+    for part in written {
+        let mut rels = Rels::load(parts, part)?;
+        let ids: Vec<String> = find_all(&rels.text, "Relationship")
+            .iter()
+            .filter_map(|span| {
+                let xml = &rels.text[span.start..span.end];
+                let kind = attribute(xml, "Type")?;
+                let target = attribute(xml, "Target")?;
+                (kind.ends_with("/slide") && deleted.contains(&resolve(part, &target)))
+                    .then(|| attribute(xml, "Id"))
+                    .flatten()
+            })
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        for id in &ids {
+            rels.remove_id(id);
+        }
+        rels.store(parts);
+        let (bom, mut xml) = text_of(&parts.get(part)?);
+        let mut spans: Vec<Span> = find_all(&xml, "hlinkClick");
+        spans.extend(find_all(&xml, "hlinkHover"));
+        spans.sort_by_key(|s| s.start);
+        let mut changed = false;
+        for span in spans.into_iter().rev() {
+            if rel_id(&xml[span.start..span.end]).is_some_and(|id| ids.contains(&id)) {
+                xml.replace_range(span.start..span.end, "");
+                changed = true;
+            }
+        }
+        if changed {
+            parts.put(part, [bom.as_slice(), xml.as_bytes()].concat());
+        }
+    }
+    Ok(())
 }
 
 /// A `sldId` entry like the file's others.

@@ -436,3 +436,211 @@ fn new_slides_have_a_paragraph_in_every_text_body() {
         assert!(bodies > 0, "{part} has text bodies");
     }
 }
+
+/// The file with one part's text replaced.
+fn with_part(bytes: &[u8], part: &str, edit: impl Fn(String) -> String) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts(bytes) {
+        let data = if name == part {
+            edit(String::from_utf8(data).unwrap()).into_bytes()
+        } else {
+            data
+        };
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&data).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// A file of four slides with distinct titles.
+fn four_slides() -> Vec<u8> {
+    let source = blank::presentation(&NAMES);
+    let mut presentation = read(&source);
+    type_into(&mut presentation, 0, "ctrTitle", "One");
+    for (n, title) in [(3, "Two"), (3, "Three"), (3, "Four")] {
+        let mut slide = presentation.layouts[n].slide.clone();
+        let shape = slide
+            .shapes
+            .iter_mut()
+            .find(|s| s.role == Role::Title)
+            .unwrap();
+        shape
+            .text
+            .as_mut()
+            .unwrap()
+            .insert(TextPos::default(), title);
+        presentation.slides.push(slide);
+    }
+    let saved = save(source, &presentation).unwrap();
+    let again = read(&saved);
+    assert_eq!(again.slides.len(), 4);
+    assert_eq!(title_of(&again, 3), "Four");
+    saved
+}
+
+/// The numbers in the slide list, and in each section's list.
+fn slide_numbers(pres: &str) -> Vec<u32> {
+    let end = pres.find("<p:extLst>").unwrap_or(pres.len());
+    numbers(&pres[..end], "<p:sldId ")
+}
+
+fn section_numbers(pres: &str) -> Vec<Vec<u32>> {
+    pres.split("<p14:section ")
+        .skip(1)
+        .map(|chunk| numbers(chunk.split("</p14:section>").next().unwrap(), "<p14:sldId "))
+        .collect()
+}
+
+fn numbers(xml: &str, open: &str) -> Vec<u32> {
+    xml.split(open)
+        .skip(1)
+        .map(|chunk| {
+            let rest = chunk.split("id=\"").nth(1).unwrap();
+            rest[..rest.find('"').unwrap()].parse().unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn sections_follow_deleted_added_copied_and_moved_slides() {
+    let four = four_slides();
+    let ids = slide_numbers(&text(&four, "ppt/presentation.xml"));
+    assert_eq!(ids.len(), 4);
+    let sections = format!(
+        concat!(
+            "<p:extLst><p:ext uri=\"{{521415D9-36F7-43E2-AB2F-B90AF26B5E84}}\">",
+            "<p14:sectionLst xmlns:p14=\"http://schemas.microsoft.com/office/powerpoint/2010/main\">",
+            "<p14:section name=\"A\" id=\"{{00000000-0000-0000-0000-00000000000A}}\"><p14:sldIdLst>",
+            "<p14:sldId id=\"{}\"/><p14:sldId id=\"{}\"/></p14:sldIdLst></p14:section>",
+            "<p14:section name=\"B\" id=\"{{00000000-0000-0000-0000-00000000000B}}\"><p14:sldIdLst>",
+            "<p14:sldId id=\"{}\"/><p14:sldId id=\"{}\"/></p14:sldIdLst></p14:section>",
+            "<p14:section name=\"C\" id=\"{{00000000-0000-0000-0000-00000000000C}}\"><p14:sldIdLst/></p14:section>",
+            "</p14:sectionLst></p:ext></p:extLst>"
+        ),
+        ids[0], ids[1], ids[2], ids[3]
+    );
+    let input = with_part(&four, "ppt/presentation.xml", |pres| {
+        assert!(!pres.contains("<p:extLst>"), "{pres}");
+        pres.replace("</p:presentation>", &format!("{sections}</p:presentation>"))
+    });
+    // Unchanged: presentation.xml stays as it is.
+    let mut presentation = read(&input);
+    assert_eq!(presentation.slides.len(), 4);
+    let same = save(input.clone(), &presentation).unwrap();
+    assert!(changed(&input, &same).is_empty());
+    assert_eq!(
+        text(&same, "ppt/presentation.xml"),
+        text(&input, "ppt/presentation.xml")
+    );
+    // Delete slide 2, add one after slide 1, copy slide 3 to the end and
+    // move the last original slide to the front.
+    presentation.slides.remove(1);
+    let added = presentation.layouts[1].slide.clone();
+    presentation.slides.insert(1, added);
+    let mut copy = presentation.slides[3].clone();
+    let mut info = (**copy.source.as_ref().unwrap()).clone();
+    info.copy = true;
+    copy.source = Some(Arc::new(info));
+    presentation.slides.push(copy);
+    let last = presentation.slides.remove(3);
+    presentation.slides.insert(0, last);
+    let saved = save(input.clone(), &presentation).unwrap();
+    let pres = text(&saved, "ppt/presentation.xml");
+    let order = slide_numbers(&pres);
+    assert_eq!(order.len(), 5, "{pres}");
+    let lists = section_numbers(&pres);
+    assert_eq!(lists.len(), 3, "{pres}");
+    assert!(lists[2].is_empty(), "{pres}");
+    assert_eq!(lists.concat(), order, "{pres}");
+    let mut sorted = order.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5);
+    assert!(!lists.concat().contains(&ids[1]));
+    for name in ["A", "B", "C"] {
+        let id = format!("name=\"{name}\" id=\"{{00000000-0000-0000-0000-00000000000{name}}}\"");
+        assert!(pres.contains(&id), "{pres}");
+    }
+    assert!(pres.contains("<p14:sldIdLst/>"), "{pres}");
+    assert_eq!(read(&saved).slides.len(), 5);
+}
+
+#[test]
+fn deleting_a_slide_drops_it_from_custom_shows() {
+    let four = four_slides();
+    let rels = text(&four, "ppt/_rels/presentation.xml.rels");
+    let pres = text(&four, "ppt/presentation.xml");
+    let sld_ids: Vec<String> = pres
+        .split("<p:sldId ")
+        .skip(1)
+        .map(|chunk| {
+            let rest = chunk.split("r:id=\"").nth(1).unwrap();
+            rest[..rest.find('"').unwrap()].to_owned()
+        })
+        .collect();
+    assert!(sld_ids.len() >= 2);
+    assert!(rels.contains(&format!("Id=\"{}\"", sld_ids[1])));
+    let show = format!(
+        "<p:custShowLst><p:custShow name=\"Short\" id=\"0\"><p:sldLst><p:sld r:id=\"{}\"/><p:sld r:id=\"{}\"/></p:sldLst></p:custShow></p:custShowLst>",
+        sld_ids[0], sld_ids[1]
+    );
+    let input = with_part(&four, "ppt/presentation.xml", |pres| {
+        // After the slide list, before the slide size.
+        pres.replace("</p:sldIdLst>", &format!("</p:sldIdLst>{show}"))
+    });
+    let mut presentation = read(&input);
+    presentation.slides.remove(1);
+    let saved = save(input, &presentation).unwrap();
+    let pres = text(&saved, "ppt/presentation.xml");
+    let rels = text(&saved, "ppt/_rels/presentation.xml.rels");
+    assert!(pres.contains("<p:custShow "), "{pres}");
+    assert!(
+        pres.contains(&format!("<p:sld r:id=\"{}\"/>", sld_ids[0])),
+        "{pres}"
+    );
+    assert!(
+        !pres.contains(&format!("<p:sld r:id=\"{}\"/>", sld_ids[1])),
+        "{pres}"
+    );
+    for chunk in pres.split("r:id=\"").skip(1) {
+        let id = &chunk[..chunk.find('"').unwrap()];
+        assert!(rels.contains(&format!("Id=\"{id}\"")), "{id} in {rels}");
+    }
+    assert_eq!(read(&saved).slides.len(), 3);
+}
+
+#[test]
+fn links_to_a_deleted_slide_go_with_it() {
+    let four = four_slides();
+    let input = with_part(&four, "ppt/slides/slide1.xml", |xml| {
+        let at = xml.find("<a:rPr ").unwrap();
+        let end = at + xml[at..].find("/>").unwrap();
+        format!(
+            "{}><a:hlinkClick r:id=\"rId99\" action=\"ppaction://hlinksldjump\"/></a:rPr>{}",
+            &xml[..end],
+            &xml[end + 2..]
+        )
+    });
+    let input = with_part(&input, "ppt/slides/_rels/slide1.xml.rels", |rels| {
+        rels.replace(
+            "</Relationships>",
+            "<Relationship Id=\"rId99\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slide2.xml\"/></Relationships>",
+        )
+    });
+    let mut presentation = read(&input);
+    assert_eq!(
+        presentation.slides[1].source.as_ref().unwrap().part,
+        "ppt/slides/slide2.xml"
+    );
+    presentation.slides.remove(1);
+    let saved = save(input, &presentation).unwrap();
+    let rels = text(&saved, "ppt/slides/_rels/slide1.xml.rels");
+    let xml = text(&saved, "ppt/slides/slide1.xml");
+    assert!(!rels.contains("rId99"), "{rels}");
+    assert!(!xml.contains("rId99"), "{xml}");
+    assert!(!xml.contains("hlinkClick"), "{xml}");
+    assert_eq!(read(&saved).slides.len(), 3);
+}

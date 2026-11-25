@@ -6691,7 +6691,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         // A PDF copies the selected text, if there is any.
         if let Some(tab) = shell.active_pdf() {
-            let text = tab.view.selected_text();
+            // The same rules as for titles: no bidirectional, zero-width or
+            // separator characters on the clipboard.
+            let text = aster_pdf::clean::lines(&tab.view.selected_text());
             if !text.is_empty() {
                 ui.invoke_copy_to_clipboard(text.into());
             }

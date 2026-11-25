@@ -18,6 +18,7 @@
 
 pub mod check;
 pub mod child;
+pub mod clean;
 pub mod find;
 pub mod fonts;
 pub mod inflate;

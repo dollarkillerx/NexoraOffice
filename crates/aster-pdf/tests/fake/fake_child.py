@@ -40,7 +40,10 @@ def request():
         return tag, None
     if tag == b"Q":
         search, case, start, found, n = struct.unpack("<QBIII", read(21))
-        return tag, (search, case, start, found, read(n))
+        query = read(n)
+        (skips,) = struct.unpack("<I", read(4))
+        skip = [struct.unpack("<I", read(4))[0] for _ in range(skips)]
+        return tag, (search, case, start, found, query, skip)
     raise SystemExit("unknown request %r" % tag)
 
 
@@ -238,7 +241,7 @@ elif mode == "find_flood":
 elif mode == "find_hang":
     # The first child hangs on page 0; the next is asked to go on at page 1
     # and does.
-    search, case, start, found, query = wait_for(b"Q", False)
+    search, case, start, found, query, _skip = wait_for(b"Q", False)
     if start == 0:
         working(2, search, 0); out.flush()
         time.sleep(30)

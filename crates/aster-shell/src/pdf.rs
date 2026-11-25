@@ -615,11 +615,17 @@ impl PdfTab {
                 true
             }
             Event::FindDone {
-                search, truncated, ..
+                search,
+                total,
+                truncated,
             } => {
                 if search == self.find.search {
                     self.find.busy = false;
-                    self.find.truncated = truncated;
+                    // "More than n found" only when the hit limit was reached:
+                    // a search that gave up on pages whose text cannot be read
+                    // is also truncated, but shows just what it found.
+                    self.find.truncated =
+                        truncated && total >= aster_pdf::Limits::default().max_find_hits;
                 }
                 false
             }

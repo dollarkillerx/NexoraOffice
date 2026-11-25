@@ -1718,3 +1718,190 @@ fn text_outline_and_search_steps_are_timed_like_pages() {
     ));
     wait_until("the hanging child is still there", 5, || !alive(pid));
 }
+
+// Pages whose text blows the child's memory, as in a reviewer's file: many
+// pages that share one content stream of millions of glyphs.
+
+/// `bad` pages sharing one huge text content stream, then `good` ordinary
+/// pages that say "Page <n> needle".
+fn heavy_document(bad: usize, good: usize, glyphs: usize) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let tree = b.reserve();
+    let font = b.add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let mut huge = b"BT /F1 6 Tf 0 50 Td (".to_vec();
+    huge.extend(std::iter::repeat_n(b'a', glyphs));
+    huge.extend_from_slice(b") Tj ET");
+    let shared = b.stream("/Filter /FlateDecode", &builder::deflate(&huge));
+    let resources = format!("/Resources << /Font << /F1 {font} 0 R >> >>");
+    let mut kids = String::new();
+    for _ in 0..bad {
+        let page = b.add(format!(
+            "<< /Type /Page /Parent {tree} 0 R /MediaBox [0 0 300 100] {resources} \
+             /Contents {shared} 0 R >>"
+        ));
+        kids.push_str(&format!("{page} 0 R "));
+    }
+    for n in 0..good {
+        let content = b.stream(
+            "",
+            format!("BT /F1 24 Tf 20 50 Td (Page {n} needle) Tj ET").as_bytes(),
+        );
+        let page = b.add(format!(
+            "<< /Type /Page /Parent {tree} 0 R /MediaBox [0 0 300 100] {resources} \
+             /Contents {content} 0 R >>"
+        ));
+        kids.push_str(&format!("{page} 0 R "));
+    }
+    b.set(
+        tree,
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", bad + good),
+    );
+    b.set(catalog, format!("<< /Type /Catalog /Pages {tree} 0 R >>"));
+    b.finish(catalog)
+}
+
+fn small_memory() -> Limits {
+    Limits {
+        max_memory_bytes: 160 << 20,
+        page_time: Duration::from_secs(20),
+        ..Limits::default()
+    }
+}
+
+/// Children seen while `done` is false: the distinct process ids of the
+/// worker's child, polled while events are read.
+fn children_until(
+    worker: &Worker,
+    events: &Receiver<Event>,
+    pids: &mut std::collections::BTreeSet<u32>,
+    mut done: impl FnMut(&Event) -> bool,
+) -> Vec<Event> {
+    let mut all = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        pids.insert(worker.child_id());
+        match events.recv_timeout(Duration::from_millis(5)) {
+            Ok(event) => {
+                let end = done(&event);
+                all.push(event);
+                if end {
+                    return all;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return all,
+        }
+        assert!(Instant::now() < deadline, "no end within two minutes");
+    }
+}
+
+fn heavy(bad: usize, good: usize) -> (Worker, Receiver<Event>, tempfile::TempDir) {
+    let (worker, events, dir) = open(&heavy_document(bad, good, 6_000_000), small_memory());
+    assert!(matches!(next(&events), Event::Opened(info) if info.pages.len() == bad + good));
+    (worker, events, dir)
+}
+
+/// Run search `id` to its end (or to the worker's end). Returns what it
+/// found and how it ended, or `None` for `Stopped`.
+fn search_to_the_end(
+    worker: &Worker,
+    events: &Receiver<Event>,
+    pids: &mut std::collections::BTreeSet<u32>,
+    id: u64,
+) -> Option<SearchResults> {
+    worker.find(id, "needle".into(), false);
+    let all = children_until(worker, events, pids, |e| {
+        matches!(e, Event::Stopped) || is_done(id)(e)
+    });
+    if all.iter().any(|e| matches!(e, Event::Stopped)) {
+        return None;
+    }
+    Some(search_results(&all, id))
+}
+
+#[test]
+fn pages_whose_text_kills_the_child_are_skipped_by_later_searches() {
+    // Pages 0 and 1 kill the child; 2 to 5 are fine.
+    let (worker, events, _dir) = heavy(2, 4);
+    let mut pids = std::collections::BTreeSet::new();
+    let began = Instant::now();
+    let (hits, end) = search_to_the_end(&worker, &events, &mut pids, 1).unwrap();
+    assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [2, 3, 4, 5]);
+    assert_eq!(end, Some((4, false)));
+    // The first and one new child for each page that killed one.
+    assert_eq!(pids.len(), 3, "{pids:?}");
+    // Incremental search: five more, none ends a child.
+    for id in 2..7 {
+        let (hits, end) = search_to_the_end(&worker, &events, &mut pids, id).unwrap();
+        assert_eq!(hits.len(), 4, "search {id}");
+        assert_eq!(end, Some((4, false)));
+    }
+    assert_eq!(pids.len(), 3, "a later search killed a child: {pids:?}");
+    assert!(began.elapsed() < Duration::from_secs(30));
+
+    // The text of a page known to be broken is empty at once, and nothing
+    // is started for it.
+    let pid = worker.child_id();
+    worker.want_text(vec![1, 0, 3]);
+    let mut texts = Vec::new();
+    while texts.len() < 3 {
+        if let Event::Text(t) = next(&events) {
+            texts.push(t);
+        }
+    }
+    for t in &texts {
+        assert_eq!(t.text.is_empty(), t.page < 2, "page {}", t.page);
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.page == 3 && t.text.contains("needle"))
+    );
+    assert_eq!(worker.child_id(), pid);
+    quiet(&events);
+}
+
+#[test]
+fn a_search_gives_up_after_a_few_pages_that_end_children() {
+    let (worker, events, _dir) = heavy(40, 4);
+    let mut pids = std::collections::BTreeSet::new();
+    let (hits, end) = search_to_the_end(&worker, &events, &mut pids, 1).unwrap();
+    assert!(hits.is_empty());
+    // Marked: it did not look at every page.
+    assert_eq!(end, Some((0, true)));
+    assert!((3..=4).contains(&pids.len()), "{pids:?}");
+}
+
+#[test]
+fn a_document_whose_text_keeps_killing_children_ends_in_stopped_though_pages_render() {
+    let (worker, events, _dir) = heavy(40, 4);
+    let mut pids = std::collections::BTreeSet::new();
+    let began = Instant::now();
+    let mut stopped = false;
+    for id in 1..=10 {
+        // Pages render in between: it must not start the count over.
+        worker.want(vec![(41, 0.5)]);
+        let all = children_until(&worker, &events, &mut pids, |e| {
+            matches!(e, Event::Page(_) | Event::Stopped)
+        });
+        if matches!(all.last(), Some(Event::Stopped)) {
+            stopped = true;
+            break;
+        }
+        if search_to_the_end(&worker, &events, &mut pids, id).is_none() {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "never stopped; {} children", pids.len());
+
+    assert!(pids.len() <= 10, "{pids:?}");
+    assert!(began.elapsed() < Duration::from_secs(60));
+    // Nothing starts again.
+    worker.find(99, "needle".into(), false);
+    worker.want_text(vec![41]);
+    worker.want(vec![(42, 1.0)]);
+    worker.want_outline();
+    quiet(&events);
+}

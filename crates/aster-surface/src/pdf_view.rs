@@ -139,6 +139,8 @@ struct TextPage {
     boxes: Vec<Option<[f32; 4]>>,
     used: u64,
     any: bool,
+    /// Which arrival of the layer this is (for the cached marks).
+    id: u64,
 }
 
 impl TextPage {
@@ -176,24 +178,113 @@ fn box_distance(b: &[f32; 4], x: f64, y: f64) -> (u8, f64) {
     }
 }
 
-/// Join boxes in reading order into one rectangle per run on a line.
-fn merge_boxes(boxes: impl Iterator<Item = [f32; 4]>) -> Vec<[f32; 4]> {
-    let mut out: Vec<[f32; 4]> = Vec::new();
+/// Most cells of one coverage mask, and most cells along one side.
+const MASK_CELLS: f64 = 1_048_576.0;
+const MASK_SIDE: f64 = 8192.0;
+
+/// What a coverage mask was built from: when it still equals what is wanted
+/// the mask is drawn again as it is.
+#[derive(Clone, Copy, PartialEq)]
+struct MaskKey {
+    /// The text layer (or the search hits) the boxes came from.
+    source: u64,
+    /// Which characters (selection) or which hit (current hit).
+    extra: (usize, usize),
+    size: (u16, u16),
+    paint: Rgba8,
+}
+
+/// The marks of one kind on one page as a translucent picture, one cell or
+/// more per device pixel (fewer on very large pages): drawing it costs the
+/// same however many boxes made it.
+struct Mask {
+    key: MaskKey,
+    pixmap: Option<Arc<Pixmap>>,
+}
+
+/// Size of the mask of a page that is `rw` by `rh` device pixels.
+fn mask_size(rw: f64, rh: f64) -> (u16, u16) {
+    let rw = rw.max(1.0);
+    let rh = rh.max(1.0);
+    let f = (MASK_CELLS / (rw * rh))
+        .sqrt()
+        .min(MASK_SIDE / rw.max(rh))
+        .min(1.0);
+    (
+        (rw * f).round().max(1.0) as u16,
+        (rh * f).round().max(1.0) as u16,
+    )
+}
+
+/// The union of `boxes` (points from the page's corner, `k` device pixels
+/// per point, as `Rect`s of the cell grid scaled by `fx`, `fy`) as a
+/// translucent picture of `paint`. Work is O(boxes + cells): every box is
+/// four additions to a difference grid, however large it is.
+fn build_mask(
+    boxes: impl Iterator<Item = [f32; 4]>,
+    k: (f64, f64),
+    size: (u16, u16),
+    paint: Rgba8,
+) -> Option<Arc<Pixmap>> {
+    let (mw, mh) = (usize::from(size.0), usize::from(size.1));
+    let stride = mw + 1;
+    let mut grid = vec![0_i32; stride * (mh + 1)];
+    let mut any = false;
     for b in boxes {
-        if let Some(last) = out.last_mut() {
-            let h = (last[3] - last[1]).min(b[3] - b[1]);
-            let overlap = last[3].min(b[3]) - last[1].max(b[1]);
-            if h > 0.0 && overlap >= 0.5 * h && b[0] <= last[2] + 0.6 * h && b[2] >= last[0] {
-                last[0] = last[0].min(b[0]);
-                last[1] = last[1].min(b[1]);
-                last[2] = last[2].max(b[2]);
-                last[3] = last[3].max(b[3]);
-                continue;
-            }
+        if !(b[2] > b[0] && b[3] > b[1]) {
+            continue;
         }
-        out.push(b);
+        let cell =
+            |v: f32, k: f64, max: usize| (f64::from(v) * k).round().clamp(0.0, max as f64) as usize;
+        let (x0, y0) = (cell(b[0], k.0, mw), cell(b[1], k.1, mh));
+        let (mut x1, mut y1) = (cell(b[2], k.0, mw), cell(b[3], k.1, mh));
+        // A box thinner than a cell still shows.
+        if x1 <= x0 && x0 < mw {
+            x1 = x0 + 1;
+        }
+        if y1 <= y0 && y0 < mh {
+            y1 = y0 + 1;
+        }
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        any = true;
+        grid[y0 * stride + x0] = grid[y0 * stride + x0].wrapping_add(1);
+        grid[y0 * stride + x1] = grid[y0 * stride + x1].wrapping_sub(1);
+        grid[y1 * stride + x0] = grid[y1 * stride + x0].wrapping_sub(1);
+        grid[y1 * stride + x1] = grid[y1 * stride + x1].wrapping_add(1);
     }
-    out
+    if !any {
+        return None;
+    }
+    let a = u32::from(paint[3]);
+    let premul = |c: u8| (u32::from(c) * a / 255) as u8;
+    let on = PremulRgba8 {
+        r: premul(paint[0]),
+        g: premul(paint[1]),
+        b: premul(paint[2]),
+        a: paint[3],
+    };
+    let off = PremulRgba8 {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+    let mut pixels = Vec::with_capacity(mw * mh);
+    // Running sums: `above[x]` is the count of the row above.
+    let mut above = vec![0_i32; mw];
+    for y in 0..mh {
+        let mut left = 0_i32;
+        for (x, up) in above.iter_mut().enumerate() {
+            left = left.wrapping_add(grid[y * stride + x]);
+            *up = up.wrapping_add(left);
+            pixels.push(if *up > 0 { on } else { off });
+        }
+    }
+    Some(Arc::new(Pixmap::from_parts_with_opacity(
+        pixels, size.0, size.1, true,
+    )))
 }
 
 /// A rendering of a page, and the scale (pixels per point) it was made at.
@@ -294,6 +385,12 @@ pub struct PdfView {
     /// Per page: indexes into `finds`.
     find_pages: HashMap<usize, Vec<usize>>,
     current_hit: Option<usize>,
+    /// Bumped whenever the hits change.
+    finds_id: u64,
+    /// Bumped on every layer that arrives.
+    text_ids: u64,
+    /// Per page and kind (0 hits, 1 current hit, 2 selection).
+    masks: HashMap<(usize, u8), Mask>,
 }
 
 impl PdfView {
@@ -352,6 +449,9 @@ impl PdfView {
             finds: Vec::new(),
             find_pages: HashMap::new(),
             current_hit: None,
+            finds_id: 0,
+            text_ids: 0,
+            masks: HashMap::new(),
         };
         view.lay_out();
         view
@@ -514,11 +614,13 @@ impl PdfView {
             .collect();
         self.clock += 1;
         let any = boxes.iter().any(Option::is_some);
+        self.text_ids += 1;
         let entry = TextPage {
             chars,
             boxes,
             used: self.clock,
             any,
+            id: self.text_ids,
         };
         if entry.bytes() > self.text_budget {
             self.text_refused.insert(page);
@@ -823,6 +925,7 @@ impl PdfView {
                 .push(self.finds.len());
             self.finds.push(hit);
         }
+        self.finds_id += 1;
         self.version += 1;
     }
 
@@ -833,6 +936,7 @@ impl PdfView {
         self.finds.clear();
         self.find_pages.clear();
         self.current_hit = None;
+        self.finds_id += 1;
     }
 
     /// Number of search hits kept.
@@ -883,36 +987,17 @@ impl PdfView {
         (self.scroll_x, self.scroll_y) != before
     }
 
-    /// Selection and search hits of one page, over the page's pixels.
+    /// Selection and search hits of one page, over the page's pixels: one
+    /// translucent picture per kind, however many boxes there are.
     fn draw_marks(&mut self, index: usize, rect: Rect, style: &PdfStyle) {
-        let selected = self.sel.is_some_and(|(a, b)| (a.0..=b.0).contains(&index));
-        let found = self.find_pages.contains_key(&index);
-        if !selected && !found {
-            return;
-        }
+        let size = mask_size(rect.width(), rect.height());
         let k = self.text_scale(index);
-        let to_rect = |b: &[f32; 4]| {
-            Rect::new(
-                rect.x0 + f64::from(b[0]) * k,
-                rect.y0 + f64::from(b[1]) * k,
-                rect.x0 + f64::from(b[2]) * k,
-                rect.y0 + f64::from(b[3]) * k,
-            )
-            .intersect(rect)
-        };
-        let mut plain: Vec<Rect> = Vec::new();
-        let mut strong: Vec<Rect> = Vec::new();
-        if let Some(list) = self.find_pages.get(&index) {
-            for &n in list {
-                let target = if Some(n) == self.current_hit {
-                    &mut strong
-                } else {
-                    &mut plain
-                };
-                target.extend(self.finds[n].boxes.iter().map(to_rect));
-            }
-        }
-        let mut chosen: Vec<Rect> = Vec::new();
+        let k = (
+            k * f64::from(size.0) / rect.width().max(1.0),
+            k * f64::from(size.1) / rect.height().max(1.0),
+        );
+        // The selected characters of this page, and which layer they are in.
+        let mut selection = None;
         if let (Some((a, b)), Some(layer)) = (self.sel, self.text.get(&index))
             && (a.0..=b.0).contains(&index)
             && !layer.chars.is_empty()
@@ -921,18 +1006,57 @@ impl PdfView {
             let lo = if index == a.0 { a.1 } else { 0 };
             let hi = if index == b.0 { b.1.min(last) } else { last };
             if lo <= hi {
-                let boxes = layer.boxes[lo..=hi].iter().flatten().copied();
-                chosen.extend(merge_boxes(boxes).iter().map(to_rect));
+                selection = Some((lo, hi, layer.id));
             }
         }
-        for (rects, paint) in [
-            (plain, style.hit),
-            (strong, style.current_hit),
-            (chosen, style.selection),
-        ] {
-            self.ctx.set_paint(color(paint));
-            for r in rects.iter().filter(|r| r.width() > 0.0 && r.height() > 0.0) {
-                self.ctx.fill_rect(r);
+        let hits = self.find_pages.get(&index);
+        for kind in 0..3_u8 {
+            let (source, extra, paint) = match kind {
+                0 if hits.is_some() => (self.finds_id, (usize::MAX, 0), style.hit),
+                1 if hits.is_some() && self.current_hit.is_some() => (
+                    self.finds_id,
+                    (self.current_hit.unwrap_or(0), 1),
+                    style.current_hit,
+                ),
+                2 if let Some((lo, hi, id)) = selection => (id, (lo, hi), style.selection),
+                _ => {
+                    self.masks.remove(&(index, kind));
+                    continue;
+                }
+            };
+            let key = MaskKey {
+                source,
+                extra,
+                size,
+                paint,
+            };
+            if self.masks.get(&(index, kind)).is_none_or(|m| m.key != key) {
+                let pixmap = match kind {
+                    2 => selection.and_then(|(lo, hi, _)| {
+                        let layer = self.text.get(&index)?;
+                        build_mask(
+                            layer.boxes[lo..=hi].iter().flatten().copied(),
+                            k,
+                            size,
+                            paint,
+                        )
+                    }),
+                    _ => {
+                        let current = self.current_hit;
+                        let boxes = hits.into_iter().flatten().filter_map(|&n| {
+                            ((Some(n) == current) == (kind == 1)).then_some(&self.finds[n])
+                        });
+                        build_mask(boxes.flat_map(|h| h.boxes.iter().copied()), k, size, paint)
+                    }
+                };
+                self.masks.insert((index, kind), Mask { key, pixmap });
+            }
+            if let Some(pixmap) = self
+                .masks
+                .get(&(index, kind))
+                .and_then(|m| m.pixmap.clone())
+            {
+                draw_image(&mut self.ctx, &pixmap, rect, None, Affine::IDENTITY);
             }
         }
     }
@@ -1540,7 +1664,9 @@ impl PdfView {
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
 
         let hairline = s.round().max(1.0);
-        for index in self.visible() {
+        let visible = self.visible();
+        self.masks.retain(|(page, _), _| visible.contains(page));
+        for index in visible {
             let rect = self.page_rect(index);
             // A thin edge, so white pages stand out from a light background.
             self.ctx.set_paint(color(style.hairline));

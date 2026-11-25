@@ -462,3 +462,93 @@ fn clamped_pages_map_boxes_through_the_factor() {
     assert_eq!(px(p, 720.0, 300.0), [255, 255, 255]);
     assert_eq!(px(p, 700.0, 274.0), [255, 255, 255]);
 }
+
+/// Glyphs that alternate between the top and the bottom half of the page, so
+/// no two neighbours merge.
+fn halves(n: usize) -> TextLayer {
+    let boxes = (0..n)
+        .map(|i| {
+            Some(if i % 2 == 0 {
+                [0.0, 0.0, 400.0, 140.0]
+            } else {
+                [0.0, 160.0, 400.0, 300.0]
+            })
+        })
+        .collect();
+    TextLayer {
+        text: "a".repeat(n),
+        boxes,
+    }
+}
+
+#[test]
+fn marks_cost_the_same_however_many_boxes_make_them() {
+    let mut view = PdfView::new(vec![(400.0, 300.0); 2]);
+    view.resize(2880, 1800, 2.0);
+    view.set_zoom(Zoom::Percent(100.0));
+    assert!(view.set_text(0, halves(100_000)));
+    let _ = view.render();
+    let white = [255, 255, 255];
+    // A middle of the page's top half, under the page's top-left corner at
+    // about (x0, 48) in a 2880-wide window.
+    let probe = |view: &mut PdfView| {
+        let t = std::time::Instant::now();
+        let p = view.render().clone();
+        (t.elapsed(), p)
+    };
+    assert!(view.select_all());
+    let (_, p) = probe(&mut view);
+    let (x, y) = (1440.0, 48.0 + 2.0 * 70.0);
+    assert_ne!(px(&p, x, y), white, "the selection is drawn");
+    // The gap between the halves is not covered.
+    assert_eq!(px(&p, x, 48.0 + 2.0 * 150.0), white);
+    // Frames after the first reuse the picture.
+    let mut slowest = std::time::Duration::ZERO;
+    for _ in 0..5 {
+        view.scroll_by(1.0);
+        slowest = slowest.max(probe(&mut view).0);
+    }
+    view.clear_selection();
+    let marks: Vec<FindMark> = (0..10_000)
+        .map(|i| FindMark {
+            page: 0,
+            boxes: vec![if i % 2 == 0 {
+                [0.0, 0.0, 400.0, 140.0]
+            } else {
+                [0.0, 160.0, 400.0, 300.0]
+            }],
+        })
+        .collect();
+    view.set_find_hits(marks);
+    view.set_current_hit(Some(0));
+    for _ in 0..5 {
+        view.scroll_by(1.0);
+        slowest = slowest.max(probe(&mut view).0);
+    }
+    // Unoptimised test builds are slow; the old cost was whole seconds per
+    // frame, so this still tells the two apart.
+    assert!(
+        slowest < std::time::Duration::from_millis(500),
+        "frames took {slowest:?}"
+    );
+}
+
+#[test]
+fn marks_of_a_huge_page_stay_bounded() {
+    // 14 400 x 14 400 points at 800 %: far over the mask's cell cap.
+    let mut view = PdfView::new(vec![(14_400.0, 14_400.0)]);
+    view.resize(800, 600, 1.0);
+    view.set_zoom(Zoom::Percent(800.0));
+    let boxes = vec![Some([0.0, 0.0, 14_400.0, 14_400.0]); 1000];
+    assert!(view.set_text(
+        0,
+        TextLayer {
+            text: "a".repeat(1000),
+            boxes
+        }
+    ));
+    assert!(view.select_all());
+    let _ = view.render();
+    let p = view.render();
+    assert_ne!(px(p, 400.0, 300.0), [255, 255, 255]);
+}

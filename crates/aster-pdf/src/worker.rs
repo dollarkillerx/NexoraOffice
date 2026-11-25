@@ -71,6 +71,13 @@ impl Program {
 /// Times a child is started again after it ended with pages to render. The
 /// count starts over after a page has been drawn.
 const MAX_RESTARTS: u32 = 8;
+/// Children that ended in a text, the outline or a page of a search, in all:
+/// a page drawn does not start the count over (a document whose text keeps
+/// killing children ends in [`Event::Stopped`]).
+const MAX_STEP_KILLS: u32 = 8;
+/// Pages that end children in one search before it is given up (its end is
+/// reported as truncated).
+const MAX_FIND_FAILURES: usize = 3;
 /// How often the supervisor looks at the clock.
 const TICK: Duration = Duration::from_millis(100);
 /// Children alive at once, and how long one stays in the background.
@@ -647,11 +654,13 @@ impl Ledger {
 }
 
 /// A search as the ledger knows it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SearchState {
     id: u64,
     /// The first page it may look at.
     start: usize,
+    /// Pages it does not look at, ascending: they end children.
+    skip: Vec<usize>,
     /// The last page it began on.
     stepped: Option<usize>,
     /// Matches reported, with those of a child before.
@@ -663,7 +672,11 @@ struct SearchState {
 impl SearchState {
     /// The next page it would look at.
     fn next(&self) -> usize {
-        self.stepped.map_or(self.start, |p| p + 1)
+        let mut next = self.stepped.map_or(self.start, |p| p + 1);
+        while self.skip.binary_search(&next).is_ok() {
+            next += 1;
+        }
+        next
     }
 }
 
@@ -746,11 +759,14 @@ impl Ledger {
     }
 
     /// A search is started (written to the child): the one before it ends.
-    fn find_start(&mut self, id: u64, start: usize, found: usize) {
+    fn find_start(&mut self, id: u64, start: usize, found: usize, mut skip: Vec<usize>) {
         self.find_cancel();
+        skip.sort_unstable();
+        skip.dedup();
         self.find = Some(SearchState {
             id,
             start,
+            skip,
             stepped: None,
             total: found,
             finished: false,
@@ -955,6 +971,7 @@ enum FindCommand {
         match_case: bool,
         start_page: usize,
         found: usize,
+        skip: Vec<usize>,
     },
     Cancel,
 }
@@ -1000,11 +1017,19 @@ struct FindState {
     next: usize,
     /// Matches reported.
     total: usize,
+    /// Pages of this search that ended a child.
+    failures: usize,
 }
 
 impl FindState {
-    fn command(&self) -> FindCommand {
+    /// The request for a child: the pages known to end children (ahead of
+    /// `next`, ascending, within what a request may name) are skipped.
+    fn command(&self, broken: &HashSet<usize>) -> FindCommand {
+        let mut skip: Vec<usize> = broken.iter().copied().filter(|p| *p >= self.next).collect();
+        skip.sort_unstable();
+        skip.truncate(child::MAX_WANTED_TEXT);
         FindCommand::Start {
+            skip,
             search: self.search,
             query: self.query.clone(),
             match_case: self.match_case,
@@ -1296,7 +1321,10 @@ impl Supervisor {
         let mut wanted: Vec<(usize, f32)> = Vec::new();
         let mut broken: HashSet<usize> = HashSet::new();
         // Pages whose text ended a child; their text is empty.
+        // Pages whose text or search step ended a child, too.
         let mut broken_text: HashSet<usize> = HashSet::new();
+        // Children ended in a text, the outline or a search: never reset.
+        let mut step_kills = 0u32;
         // Texts asked for and not delivered, the outline likewise, and the
         // search that goes on.
         let mut text_open: Vec<usize> = Vec::new();
@@ -1406,10 +1434,11 @@ impl Supervisor {
                             match_case,
                             next: 0,
                             total: 0,
+                            failures: 0,
                         };
                         match &mut running {
                             Some(r) if r.opened => {
-                                r.outbox.put_find(state.command());
+                                r.outbox.put_find(state.command(&broken_text));
                             }
                             Some(_) => {}
                             None => pending = pending || (opened.is_some() && suspended.is_none()),
@@ -1488,7 +1517,7 @@ impl Supervisor {
                                     });
                                     find = None;
                                 } else {
-                                    r.outbox.put_find(state.command());
+                                    r.outbox.put_find(state.command(&broken_text));
                                 }
                             }
                         }
@@ -1606,6 +1635,7 @@ impl Supervisor {
                     // the text is empty, there is no outline, the page of
                     // the search is skipped.
                     if !misbehaved && let Some((step, _)) = r.working {
+                        step_kills += 1;
                         match step {
                             Step::Text(page) => {
                                 broken_text.insert(page);
@@ -1620,14 +1650,30 @@ impl Supervisor {
                                 (self.events)(Event::Outline(Vec::new()));
                             }
                             Step::Find { search, page } => {
+                                // Later searches skip it too.
+                                broken_text.insert(page);
+                                text_open.retain(|p| *p != page);
+                                let mut give_up = false;
                                 if let Some(state) = find.as_mut().filter(|f| f.search == search) {
                                     state.next = state.next.max(page + 1);
+                                    state.failures += 1;
+                                    give_up = state.failures >= MAX_FIND_FAILURES;
+                                }
+                                if give_up && let Some(state) = find.take() {
+                                    (self.events)(Event::FindDone {
+                                        search: state.search,
+                                        total: state.total,
+                                        truncated: true,
+                                    });
                                 }
                             }
                         }
                     }
                     restarts += 1;
-                    if restarts > MAX_RESTARTS || misbehaved_count > MAX_RESTARTS {
+                    if restarts > MAX_RESTARTS
+                        || misbehaved_count > MAX_RESTARTS
+                        || step_kills > MAX_STEP_KILLS
+                    {
                         (self.events)(Event::Stopped);
                         return;
                     }
@@ -1721,14 +1767,16 @@ fn write_requests(mut input: ChildStdin, start: ToChild, outbox: &Outbox, ledger
                         match_case,
                         start_page,
                         found,
+                        skip,
                     }) => {
-                        ledger().find_start(search, start_page, found);
+                        ledger().find_start(search, start_page, found, skip.clone());
                         break ToChild::Find {
                             search,
                             query,
                             match_case,
                             start_page,
                             found,
+                            skip,
                         };
                     }
                     Some(FindCommand::Cancel) => {

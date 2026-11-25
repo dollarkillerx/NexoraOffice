@@ -18,8 +18,10 @@ use hayro::hayro_interpret::hayro_syntax::object::{
 
 use crate::{Document, OutlineItem, Target};
 
-/// Work a document may cost in name-tree lookups, over all its items.
+/// Work a document may cost reading its name tree, once per outline.
 const NAME_TREE_BUDGET: usize = 2_000_000;
+/// The most names kept from the name tree.
+const MAX_NAMES: usize = 1_000_000;
 /// What visiting one name-tree node costs against that budget.
 const NODE_COST: usize = 16;
 
@@ -48,6 +50,8 @@ impl Document {
             catalog,
             page_index,
             budget: NAME_TREE_BUDGET,
+            dests: None,
+            tree: None,
         };
 
         let max_items = self.limits.max_outline_items;
@@ -114,6 +118,10 @@ struct Resolver<'a, 'd> {
     page_index: HashMap<ObjectIdentifier, usize>,
     /// Name-tree work left.
     budget: usize,
+    /// The catalog's `/Dests` dictionary, once looked for.
+    dests: Option<Option<Dict<'a>>>,
+    /// The names of the `/Names /Dests` tree, once read.
+    tree: Option<HashMap<Vec<u8>, Object<'a>>>,
 }
 
 impl<'a> Resolver<'a, '_> {
@@ -215,26 +223,41 @@ impl<'a> Resolver<'a, '_> {
     }
 
     /// A named destination: the catalog's `/Dests` dictionary, then its
-    /// `/Names /Dests` name tree.
+    /// `/Names /Dests` name tree. Both are read at most once per outline.
     fn named(&mut self, name: &[u8]) -> Option<Object<'a>> {
-        if let Some(dests) = self.catalog.get::<Dict<'a>>(b"Dests")
+        let catalog = &self.catalog;
+        let dests = self
+            .dests
+            .get_or_insert_with(|| catalog.get::<Dict<'a>>(b"Dests"));
+        if let Some(dests) = dests
             && let Some(value) = dests.get::<Object<'a>>(name)
         {
             return Some(value);
         }
-        let root = self
-            .catalog
-            .get::<Dict<'a>>(b"Names")?
-            .get::<Dict<'a>>(b"Dests")?;
-        self.name_tree(root, name)
+        if self.tree.is_none() {
+            let tree = self.read_name_tree();
+            self.tree = Some(tree);
+        }
+        self.tree.as_ref()?.get(name).cloned()
     }
 
-    fn name_tree(&mut self, root: Dict<'a>, key: &[u8]) -> Option<Object<'a>> {
+    /// Every name of the `/Names /Dests` name tree, first one wins, read in
+    /// document order and stopped when the work budget or the entry cap runs
+    /// out. Cycles in the tree end; a node is read once.
+    fn read_name_tree(&mut self) -> HashMap<Vec<u8>, Object<'a>> {
+        let mut found: HashMap<Vec<u8>, Object<'a>> = HashMap::new();
+        let Some(root) = self
+            .catalog
+            .get::<Dict<'a>>(b"Names")
+            .and_then(|names| names.get::<Dict<'a>>(b"Dests"))
+        else {
+            return found;
+        };
         let mut stack = vec![root];
         let mut seen: HashSet<ObjectIdentifier> = HashSet::new();
         while let Some(node) = stack.pop() {
             if self.budget < NODE_COST {
-                return None;
+                break;
             }
             self.budget -= NODE_COST;
             if let Some(id) = node.obj_id()
@@ -244,38 +267,29 @@ impl<'a> Resolver<'a, '_> {
             }
             if let Some(names) = node.get::<Array<'a>>(b"Names") {
                 let mut pairs = names.flex_iter();
-                while self.budget > 0 {
+                while self.budget > 0 && found.len() < MAX_NAMES {
                     self.budget -= 1;
                     let Some(candidate) = pairs.next::<PdfString<'a>>() else {
                         break;
                     };
-                    let value = pairs.next::<Object<'a>>();
-                    if candidate.as_bytes() == key {
-                        return value;
+                    if let Some(value) = pairs.next::<Object<'a>>() {
+                        found.entry(candidate.as_bytes().to_vec()).or_insert(value);
                     }
                 }
             } else if let Some(kids) = node.get::<Array<'a>>(b"Kids") {
                 let mut children = Vec::new();
                 for kid in kids.iter::<Dict<'a>>() {
                     if self.budget == 0 {
-                        return None;
+                        break;
                     }
                     self.budget -= 1;
-                    if let Some(limits) = kid.get::<Array<'a>>(b"Limits") {
-                        let mut ends = limits.iter::<PdfString<'a>>();
-                        if let (Some(low), Some(high)) = (ends.next(), ends.next())
-                            && (key < low.as_bytes() || key > high.as_bytes())
-                        {
-                            continue;
-                        }
-                    }
                     children.push(kid);
                 }
                 // First kid first.
                 stack.extend(children.into_iter().rev());
             }
         }
-        None
+        found
     }
 }
 
@@ -283,7 +297,11 @@ impl<'a> Resolver<'a, '_> {
 /// mark, or PDFDocEncoding. Control characters are dropped and at most `max`
 /// characters kept.
 fn decode_text(bytes: &[u8], max: usize) -> String {
-    let keep = |c: &char| !c.is_control();
+    let text: String = decode_raw(bytes);
+    crate::clean::line(&text).chars().take(max).collect()
+}
+
+fn decode_raw(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units = rest
             .as_chunks::<2>()
@@ -292,8 +310,6 @@ fn decode_text(bytes: &[u8], max: usize) -> String {
             .map(|pair| u16::from_be_bytes(*pair));
         char::decode_utf16(units)
             .map(|r| r.unwrap_or('\u{FFFD}'))
-            .filter(keep)
-            .take(max)
             .collect()
     } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let units = rest
@@ -303,21 +319,13 @@ fn decode_text(bytes: &[u8], max: usize) -> String {
             .map(|pair| u16::from_le_bytes(*pair));
         char::decode_utf16(units)
             .map(|r| r.unwrap_or('\u{FFFD}'))
-            .filter(keep)
-            .take(max)
             .collect()
     } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        String::from_utf8_lossy(rest)
-            .chars()
-            .filter(keep)
-            .take(max)
-            .collect()
+        String::from_utf8_lossy(rest).chars().collect()
     } else {
         bytes
             .iter()
             .filter_map(|byte| pdf_doc_char(*byte))
-            .filter(keep)
-            .take(max)
             .collect()
     }
 }
@@ -786,5 +794,113 @@ mod tests {
         assert_eq!(decode_text(b"abc", 2), "ab");
         assert_eq!(decode_text(&[0x18, 0x9F, 0xA0], 10), "\u{2D8}\u{20AC}");
         assert_eq!(decode_text(&[0xFE, 0xFF, 0x00, 0x41, 0x00], 10), "A");
+    }
+
+    /// 10 000 bookmarks, each naming `/dN`; `extra` is the catalog's part
+    /// holding the destinations. Returns the targets.
+    fn many_named(extra: impl FnOnce(&mut Builder, usize, usize) -> String) -> Vec<OutlineItem> {
+        let bytes = outline_pdf("", |b, p1, p2| {
+            let items: Vec<(String, String)> = (0..10_000)
+                .map(|i| (format!("(b{i})"), format!("/Dest (d{:06})", i * 49)))
+                .collect();
+            let outline = flat(b, &items);
+            let more = extra(b, p1, p2);
+            format!("{outline} {more}")
+        });
+        let start = std::time::Instant::now();
+        let items = outline_of(bytes);
+        let took = start.elapsed();
+        assert!(took.as_secs() < 5, "took {took:?}");
+        assert_eq!(items.len(), 10_000);
+        items
+    }
+
+    fn page_of(index: usize) -> usize {
+        index % 2
+    }
+
+    #[test]
+    fn ten_thousand_named_destinations_in_a_huge_dests_dictionary() {
+        let items = many_named(|_, p1, p2| {
+            let mut dests = String::from("/Dests << ");
+            for i in 0..500_000 {
+                let page = if i % 2 == 0 { p1 } else { p2 };
+                dests.push_str(&format!("/d{i:06} [{page} 0 R /Fit] "));
+            }
+            dests.push_str(">>");
+            dests
+        });
+        for i in [0, 1, 777, 9_999] {
+            let page = page_of(i * 49);
+            assert_eq!(items[i].target, Some(Target { page, top: None }), "{i}");
+        }
+    }
+
+    #[test]
+    fn ten_thousand_named_destinations_in_a_huge_name_tree() {
+        let items = many_named(|b, p1, p2| {
+            let mut leaves = Vec::new();
+            for leaf in 0..50 {
+                let mut names = String::new();
+                for i in leaf * 10_000..(leaf + 1) * 10_000 {
+                    let page = if i % 2 == 0 { p1 } else { p2 };
+                    names.push_str(&format!("(d{i:06}) [{page} 0 R /Fit] "));
+                }
+                let low = leaf * 10_000;
+                let high = (leaf + 1) * 10_000 - 1;
+                leaves.push(b.add(format!(
+                    "<< /Limits [(d{low:06}) (d{high:06})] /Names [{names}] >>"
+                )));
+            }
+            let kids: Vec<String> = leaves.iter().map(|l| format!("{l} 0 R")).collect();
+            let tree = b.add(format!("<< /Kids [{}] >>", kids.join(" ")));
+            format!("/Names << /Dests {tree} 0 R >>")
+        });
+        for i in [0, 1, 777, 9_999] {
+            let page = page_of(i * 49);
+            assert_eq!(items[i].target, Some(Target { page, top: None }), "{i}");
+        }
+    }
+
+    #[test]
+    fn the_work_budget_stops_a_pathological_name_tree() {
+        // 200 000 one-name leaves: more nodes than the budget pays for.
+        let bytes = outline_pdf("", |b, p1, _| {
+            let items = flat(
+                b,
+                &[
+                    ("(first)".into(), "/Dest (n000000)".into()),
+                    ("(last)".into(), "/Dest (n199999)".into()),
+                ],
+            );
+            let leaves: Vec<String> = (0..200_000)
+                .map(|i| {
+                    let leaf = b.add(format!("<< /Names [(n{i:06}) [{p1} 0 R /Fit]] >>"));
+                    format!("{leaf} 0 R")
+                })
+                .collect();
+            let tree = b.add(format!("<< /Kids [{}] >>", leaves.join(" ")));
+            format!("{items} /Names << /Dests {tree} 0 R >>")
+        });
+        let start = std::time::Instant::now();
+        let items = outline_of(bytes);
+        assert!(start.elapsed().as_secs() < 10);
+        assert_eq!(items[0].target, Some(Target { page: 0, top: None }));
+        assert_eq!(items[1].target, None);
+    }
+
+    #[test]
+    fn titles_lose_bidirectional_zero_width_and_separator_characters() {
+        let bytes = outline_pdf("", |b, _, _| {
+            flat(
+                b,
+                &[(
+                    utf16("a\u{202E}b\u{2066}c\u{200B}d\u{2028}e\u{2029}f\u{FEFF}g\u{AD}h"),
+                    String::new(),
+                )],
+            )
+        });
+        assert_eq!(outline_of(bytes)[0].title, "abcdefgh");
+        assert_eq!(decode_text(b"x\xADy", 10), "xy");
     }
 }

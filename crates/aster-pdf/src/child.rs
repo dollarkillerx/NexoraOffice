@@ -49,6 +49,7 @@
 //! kills a child that does (see `worker::Ledger`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -287,6 +288,8 @@ struct Search {
     next: usize,
     /// Matches reported so far.
     total: usize,
+    /// Pages not to look at (the parent knows they kill children).
+    skip: HashSet<usize>,
 }
 
 /// What the child has been asked for and not yet done.
@@ -323,6 +326,7 @@ impl<'d> Job<'d> {
                 match_case,
                 start_page,
                 found,
+                skip,
             } => {
                 self.search = Some(Search {
                     id: search,
@@ -330,6 +334,7 @@ impl<'d> Job<'d> {
                     match_case,
                     next: start_page,
                     total: found,
+                    skip: skip.into_iter().collect(),
                 });
             }
             ToChild::CancelFind => self.search = None,
@@ -422,6 +427,9 @@ impl<'d> Job<'d> {
         let max_hits = self.limits.max_find_hits;
         let search = self.search.as_mut()?;
         let id = search.id;
+        while search.skip.contains(&search.next) {
+            search.next += 1;
+        }
         if search.next >= pages || search.total >= max_hits {
             let done = FromChild::FindDone {
                 search: id,
@@ -549,12 +557,15 @@ pub enum ToChild {
     WantOutline,
     /// Search for `query` from `start_page` on; replaces a running search.
     /// `found` matches have been reported already (by a child that ended).
+    /// The pages in `skip` (at most [`MAX_WANTED_TEXT`], ascending) are not
+    /// looked at: they are known to end children.
     Find {
         search: u64,
         query: String,
         match_case: bool,
         start_page: usize,
         found: usize,
+        skip: Vec<usize>,
     },
     /// Stop the running search.
     CancelFind,
@@ -959,6 +970,7 @@ pub fn write_request(out: &mut impl Write, frame: &ToChild) -> io::Result<()> {
             match_case,
             start_page,
             found,
+            skip,
         } => {
             buffer.push(b'Q');
             buffer.extend_from_slice(&search.to_le_bytes());
@@ -967,6 +979,10 @@ pub fn write_request(out: &mut impl Write, frame: &ToChild) -> io::Result<()> {
             buffer.extend_from_slice(&u32_of(*found)?.to_le_bytes());
             buffer.extend_from_slice(&u32_of(query.len())?.to_le_bytes());
             buffer.extend_from_slice(query.as_bytes());
+            buffer.extend_from_slice(&u32_of(skip.len())?.to_le_bytes());
+            for page in skip {
+                buffer.extend_from_slice(&u32_of(*page)?.to_le_bytes());
+            }
         }
         ToChild::CancelFind => buffer.push(b'C'),
     }
@@ -1103,12 +1119,21 @@ pub fn read_frame_with(input: &mut impl Read, max_query_chars: usize) -> io::Res
             if query.chars().count() > max_query_chars {
                 return Err(bad());
             }
+            let count = read_u32(input)? as usize;
+            if count > MAX_WANTED_TEXT {
+                return Err(bad());
+            }
+            let mut skip = Vec::with_capacity(count);
+            for _ in 0..count {
+                skip.push(read_u32(input)? as usize);
+            }
             Ok(ToChild::Find {
                 search,
                 query,
                 match_case,
                 start_page,
                 found,
+                skip,
             })
         }
         b'C' => Ok(ToChild::CancelFind),
@@ -1341,18 +1366,16 @@ pub fn read_answer_with(
     }
 }
 
-/// Page text without control characters: those other than a line break
-/// become spaces, so that the boxes stay where they are.
+/// Page text without unwanted characters (controls, bidirectional and
+/// zero-width characters, separators; see [`crate::clean`]): those other than
+/// a line break become spaces, so that the boxes stay where they are.
 pub fn clean_text(text: &mut String) {
-    let bad = |c: char| c.is_control() && c != '\n';
-    if text.chars().any(bad) {
-        *text = text.chars().map(|c| if bad(c) { ' ' } else { c }).collect();
-    }
+    crate::clean::lines_in_place(text);
 }
 
-/// A title without control characters.
+/// A title without unwanted characters.
 pub fn clean_title(title: &str) -> String {
-    title.chars().filter(|c| !c.is_control()).collect()
+    crate::clean::line(title)
 }
 
 fn error_code(error: OpenError) -> [u8; 2] {
@@ -1484,6 +1507,7 @@ mod tests {
                 match_case: true,
                 start_page: 9,
                 found: 4,
+                skip: vec![11, 40],
             },
             ToChild::CancelFind,
         ];
@@ -1776,6 +1800,32 @@ mod tests {
         assert_eq!(got.boxes.len(), chars as usize);
         assert!(!got.text.chars().any(|c| c.is_control() && c != '\n'));
         assert_eq!(got.text, "a b c\nd e f [31m");
+    }
+
+    #[test]
+    fn text_without_bidirectional_zero_width_and_separator_characters() {
+        let text = "a\u{202E}b\u{200B}c\u{2028}d\u{FEFF}e\u{2066}f\ng";
+        let chars = text.chars().count() as u32;
+        let wire = text_frame(1, text, chars, &vec![None; chars as usize]);
+        let FromChild::Text(got) = read(&wire).unwrap() else {
+            panic!("not a text");
+        };
+        assert_eq!(got.text, "a b c d e f\ng");
+        assert_eq!(got.text.chars().count(), chars as usize);
+        assert_eq!(got.boxes.len(), chars as usize);
+    }
+
+    #[test]
+    fn titles_lose_bidirectional_zero_width_and_separator_characters() {
+        let mut wire = vec![b'L'];
+        wire.extend(u32s(&[1]));
+        let title = "g\u{202E}p\u{200B}e\u{2066}\u{2028}!\u{FEFF}";
+        wire.extend(outline_item(0, 0, title.as_bytes(), &[]));
+        let FromChild::Outline(items) = read(&wire).unwrap() else {
+            panic!("not an outline");
+        };
+        assert_eq!(items[0].title, "gpe!");
+        assert_eq!(clean_title("x\u{202D}y"), "xy");
     }
 
     fn outline_item(depth: u16, flags: u8, title: &[u8], rest: &[u8]) -> Vec<u8> {

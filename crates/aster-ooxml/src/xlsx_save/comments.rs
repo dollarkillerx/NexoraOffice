@@ -350,7 +350,7 @@ fn boxes(bytes: &[u8], comments: &BTreeMap<CellRef, Comment>, block: u32) -> Vec
     }
     out.push_str(&text[at..]);
     // Shape ids go on from the largest the drawing has.
-    let mut next = text
+    let first_id = text
         .match_indices("_x0000_s")
         .filter_map(|(i, m)| {
             let digits: String = text[i + m.len()..]
@@ -363,7 +363,12 @@ fn boxes(bytes: &[u8], comments: &BTreeMap<CellRef, Comment>, block: u32) -> Vec
         .unwrap_or(block * 1024)
         + 1;
     let mut new = String::new();
-    for cell in comments.keys().filter(|cell| !has.contains(cell)) {
+    for (n, cell) in comments
+        .keys()
+        .filter(|cell| !has.contains(cell))
+        .enumerate()
+    {
+        let next = first_id + n as u32;
         let (row, col) = (cell.row, cell.col);
         new.push_str(&format!(
             r##"<v:shape id="_x0000_s{next}" type="#_x0000_t202" style="position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:108pt;height:59.25pt;z-index:{z};visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto"><v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/><v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox><x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>{left}, 15, {top}, 2, {right}, 15, {bottom}, 16</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>{row}</x:Row><x:Column>{col}</x:Column></x:ClientData></v:shape>"##,
@@ -373,7 +378,6 @@ fn boxes(bytes: &[u8], comments: &BTreeMap<CellRef, Comment>, block: u32) -> Vec
             right = col + 3,
             bottom = row + 3,
         ));
-        next += 1;
     }
     if !new.is_empty() {
         let close = out.rfind("</xml>").unwrap_or(out.len());

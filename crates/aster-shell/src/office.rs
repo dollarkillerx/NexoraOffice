@@ -3841,7 +3841,7 @@ mod tests {
         assert_eq!(names(&tab), [copy_name.clone(), name.clone()]);
         assert_eq!(tab.view.sheet_index(), 0, "the copy is shown");
         tab.undo();
-        assert_eq!(names(&tab), [name.clone()]);
+        assert_eq!(names(&tab), std::slice::from_ref(&name));
         tab.redo();
         assert_eq!(names(&tab), [copy_name.clone(), name.clone()]);
         let job = tab.begin_save().unwrap();

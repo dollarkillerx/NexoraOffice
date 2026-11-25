@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aster_sheets::chart::DrawnChart;
 use aster_sheets::cond::{Conditional, Effect, ExprEngine, NoEngine};
 use aster_sheets::{
     Anchor, Cell, CellRange, CellRef, DisplayKind, HAlign, Line, LineStyle, MAX_COLUMNS, MAX_ROWS,
@@ -22,6 +23,7 @@ use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
 use crate::cell_editor::{CellEditor, EditMode};
+use crate::chart_draw::{self, ChartStyle, ChartTexts};
 use crate::cond_icons::draw_icon;
 use crate::picture::{ImageCache, draw_image};
 use crate::preview::draw_text;
@@ -214,7 +216,36 @@ pub struct SheetView {
     expr: Option<Box<dyn ExprEngine + Send>>,
     /// The effects on the pane being drawn.
     effects: HashMap<CellRef, Arc<Effect>>,
+    /// Charts with the values of their cells, by sheet and picture.
+    charts: HashMap<(usize, usize), Arc<DrawnChart>>,
+    /// Charts drawn, by sheet, picture and size; the pixels are drawn at
+    /// the chart's place as long as nothing changes.
+    chart_pixels: HashMap<(usize, usize, u16, u16, u32), Arc<Pixmap>>,
+    chart_pixel_bytes: usize,
+    chart_resources: Resources,
+    chart_words: ChartWords,
 }
+
+/// The words a chart writes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartWords {
+    /// A series with no name, `{n}` for its number.
+    pub series: String,
+    /// The note on a chart with parts that are not drawn.
+    pub not_shown: String,
+}
+
+impl Default for ChartWords {
+    fn default() -> Self {
+        Self {
+            series: "Series {n}".to_owned(),
+            not_shown: "Part of this chart is not shown".to_owned(),
+        }
+    }
+}
+
+/// Drawn charts kept at most, bytes.
+const CHART_PIXEL_LIMIT: usize = 192 << 20;
 
 /// A cell's text, laid out.
 struct Laid {
@@ -304,6 +335,11 @@ impl SheetView {
             cond: Conditional::new(),
             expr: None,
             effects: HashMap::new(),
+            charts: HashMap::new(),
+            chart_pixels: HashMap::new(),
+            chart_pixel_bytes: 0,
+            chart_resources: Resources::new(),
+            chart_words: ChartWords::default(),
         };
         view.decorated = decorations(&view.workbook);
         view.any_decorated = view.decorated.contains(&true);
@@ -346,6 +382,9 @@ impl SheetView {
     fn cells_changed(&mut self) {
         self.cells.clear();
         self.cond.clear();
+        self.charts.clear();
+        self.chart_pixels.clear();
+        self.chart_pixel_bytes = 0;
         if let Some(engine) = &mut self.expr {
             engine.invalidate();
         }
@@ -562,9 +601,21 @@ impl SheetView {
         self.revision += 1;
     }
 
+    /// The words charts write, in the interface language.
+    pub fn set_chart_words(&mut self, words: ChartWords) {
+        if words != self.chart_words {
+            self.chart_words = words;
+            self.chart_pixels.clear();
+            self.chart_pixel_bytes = 0;
+            self.revision += 1;
+        }
+    }
+
     pub fn set_style(&mut self, style: SheetStyle) {
         if style != self.style {
             self.style = style;
+            self.chart_pixels.clear();
+            self.chart_pixel_bytes = 0;
             self.cells.clear();
             self.headers.clear();
             self.hashes = None;
@@ -1992,7 +2043,7 @@ impl SheetView {
 
         // Pictures float over the cells; each is drawn in the pane its top
         // left corner is fastened in.
-        for picture in &sheet.pictures {
+        for (index, picture) in sheet.pictures.iter().enumerate() {
             let anchor = match picture.placement {
                 Placement::TwoCell { from, .. } | Placement::OneCell { from, .. } => from.cell,
                 Placement::Absolute { .. } => CellRef::new(u32::MAX, u32::MAX),
@@ -2031,7 +2082,11 @@ impl SheetView {
             if rect.width() < 1.0 || rect.height() < 1.0 || rect.intersect(clip).is_zero_area() {
                 continue;
             }
-            self.draw_picture(picture, rect);
+            if picture.chart.is_some() {
+                self.draw_chart(workbook, index, picture, rect);
+            } else {
+                self.draw_picture(picture, rect);
+            }
         }
         self.ctx.pop_layer();
     }
@@ -2172,8 +2227,58 @@ impl SheetView {
         self.ctx.pop_layer();
     }
 
-    /// A picture, or for one that cannot be shown (a chart, a format not
-    /// read) a frame with its name.
+    /// A chart, drawn from the values its cells have now. It is drawn into
+    /// a pixmap once, for its size, and the pixmap put at its place.
+    fn draw_chart(&mut self, workbook: &Workbook, index: usize, picture: &Picture, rect: Rect) {
+        let Some(chart) = &picture.chart else {
+            return;
+        };
+        let (w, h) = (
+            rect.width().round().clamp(1.0, chart_draw::MAX_SIDE),
+            rect.height().round().clamp(1.0, chart_draw::MAX_SIDE),
+        );
+        let size = (w as u16, h as u16);
+        let key = (self.sheet, index, size.0, size.1, self.scale.to_bits());
+        if !self.chart_pixels.contains_key(&key) {
+            let drawn = self
+                .charts
+                .entry((self.sheet, index))
+                .or_insert_with(|| Arc::new(workbook.resolve_chart(chart)))
+                .clone();
+            let style = ChartStyle {
+                background: self.style.background,
+                text: self.style.text,
+                label: self.style.header_text,
+                grid: self.style.grid,
+            };
+            let words = self.chart_words.clone();
+            let pixels = chart_draw::render_chart(
+                &mut self.shaper,
+                &mut self.chart_resources,
+                &drawn,
+                size,
+                self.scale,
+                &style,
+                &ChartTexts {
+                    series: &words.series,
+                    not_shown: &words.not_shown,
+                },
+            );
+            let bytes = usize::from(size.0) * usize::from(size.1) * 4;
+            if self.chart_pixel_bytes + bytes > CHART_PIXEL_LIMIT {
+                self.chart_pixels.clear();
+                self.chart_pixel_bytes = 0;
+            }
+            self.chart_pixel_bytes += bytes;
+            self.chart_pixels.insert(key, Arc::new(pixels));
+        }
+        if let Some(pixels) = self.chart_pixels.get(&key) {
+            draw_image(&mut self.ctx, pixels, rect, None, Affine::IDENTITY);
+        }
+    }
+
+    /// A picture, or for one that cannot be shown (a format not read) a
+    /// frame with its name.
     fn draw_picture(&mut self, picture: &Picture, rect: Rect) {
         let s = self.s();
         let style = self.style;
@@ -2531,7 +2636,7 @@ fn readable_line(line: Option<Rgba>, style: &SheetStyle) -> Rgba8 {
     }
 }
 
-fn lay_out(
+pub(crate) fn lay_out(
     shaper: &mut Shaper,
     text: &str,
     base: TextStyle,
@@ -2553,6 +2658,8 @@ fn lay_out(
     })
 }
 
+#[cfg(test)]
+mod chart_tests;
 #[cfg(test)]
 mod cond_tests;
 
@@ -2848,6 +2955,7 @@ mod tests {
             },
             image: Some(Arc::from(png)),
             name: "图片 1".into(),
+            chart: None,
         });
         sheet.pictures.push(Picture {
             placement: Placement::OneCell {
@@ -2861,6 +2969,7 @@ mod tests {
             },
             image: None,
             name: "グラフ".into(),
+            chart: None,
         });
         let mut view = SheetView::new(Arc::new(Workbook {
             sheets: vec![sheet.finish()],

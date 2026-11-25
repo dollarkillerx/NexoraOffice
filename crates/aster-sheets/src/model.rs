@@ -79,14 +79,16 @@ pub enum Placement {
     },
 }
 
-/// A picture on a sheet. The image is the file's own bytes (PNG, JPEG or
-/// something else), decoded when it is drawn.
+/// A picture or chart on a sheet. The image is the file's own bytes (PNG,
+/// JPEG or something else), decoded when it is drawn.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Picture {
     pub placement: Placement,
     pub image: Option<Arc<[u8]>>,
     /// The name the file gives it, such as `Picture 1`.
     pub name: String,
+    /// For a chart: what it plots. Saving keeps the chart part as it is.
+    pub chart: Option<Arc<crate::chart::Chart>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

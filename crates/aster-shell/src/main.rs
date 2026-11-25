@@ -463,7 +463,8 @@ impl Shell {
                 let source = office::blank_workbook(self.language.tag());
                 // Our own template: it always reads.
                 if let Ok(workbook) = aster_ooxml::xlsx::read(source.clone()) {
-                    let tab = SheetTab::new(workbook, Arc::new(source), None, &self.tokens);
+                    let mut tab = SheetTab::new(workbook, Arc::new(source), None, &self.tokens);
+                    tab.set_words(self.language.strings());
                     self.contents.insert(id, Content::Sheet(Box::new(tab)));
                 }
             }
@@ -576,7 +577,8 @@ impl Shell {
         let content = match loaded {
             office::Loaded::Workbook(workbook, source) => {
                 let id = self.tabs.open(DocKind::Sheets, title);
-                let tab = SheetTab::new(workbook, source, Some(path), &self.tokens);
+                let mut tab = SheetTab::new(workbook, source, Some(path), &self.tokens);
+                tab.set_words(self.language.strings());
                 self.contents.insert(id, Content::Sheet(Box::new(tab)));
                 return id;
             }
@@ -720,6 +722,7 @@ impl Shell {
             tab.record = Some(key);
             tab.recorded = Some((tab.history.version(), std::time::Instant::now()));
         }
+        tab.set_words(self.language.strings());
         self.contents.insert(id, Content::Sheet(Box::new(tab)));
         self.sync_modified();
         Some(id)
@@ -923,7 +926,7 @@ impl Shell {
             match content {
                 Content::Writer(view) => view.restyle(&self.tokens),
                 Content::Markdown(editor) => editor.restyle(&self.tokens),
-                Content::Sheet(tab) => tab.restyle(&self.tokens),
+                Content::Sheet(tab) => tab.restyle(&self.tokens, strings),
                 Content::Slides(tab) => tab.restyle(&self.tokens, strings),
                 Content::Pdf(tab) => tab.restyle(&self.tokens),
             }

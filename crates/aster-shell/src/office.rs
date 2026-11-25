@@ -719,8 +719,18 @@ impl SheetTab {
         }
     }
 
-    pub fn restyle(&mut self, tokens: &theme::Tokens) {
+    pub fn restyle(&mut self, tokens: &theme::Tokens, strings: &Strings) {
         self.view.set_style(sheet_style(tokens));
+        self.set_words(strings);
+    }
+
+    /// The words charts write, in the interface language.
+    pub fn set_words(&mut self, strings: &Strings) {
+        self.view
+            .set_chart_words(aster_surface::sheet_view::ChartWords {
+                series: strings.chart_series.to_owned(),
+                not_shown: strings.chart_partial.to_owned(),
+            });
     }
 
     pub fn is_modified(&self) -> bool {

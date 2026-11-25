@@ -10,6 +10,7 @@
 //! Each format is a [`FormatCodec`]: bytes in, model out. Saving will be its
 //! other half, writing back untouched parts as they were read.
 
+pub mod chart;
 pub mod drawingml;
 pub mod error;
 pub mod package;

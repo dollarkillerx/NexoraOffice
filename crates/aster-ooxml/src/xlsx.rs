@@ -19,6 +19,7 @@ use aster_sheets::{
 
 mod cond;
 
+use crate::chart;
 use crate::drawingml::{Theme, parse_hex, read_theme};
 use crate::error::{Error, Result};
 use crate::package::{Kind, Package};
@@ -117,7 +118,7 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
                         .and_then(|rel| rel.target.clone())
                         .filter(|part| package.has(part))
                 {
-                    builder.pictures = pictures(package, &part)?;
+                    builder.pictures = pictures(package, &part, &theme)?;
                     charts.extend(linked_charts(package, &part)?);
                 }
                 // Notes, then threaded comments over the notes Excel
@@ -1328,6 +1329,8 @@ struct Content {
     found: bool,
     name: String,
     embed: Option<String>,
+    /// The relationship id of a chart part.
+    chart: Option<String>,
 }
 
 fn read_content(reader: &mut XmlReader<'_>, tag: &Tag<'_>, content: &mut Content) -> Result<()> {
@@ -1345,6 +1348,8 @@ fn read_content(reader: &mut XmlReader<'_>, tag: &Tag<'_>, content: &mut Content
                             content.name = child.attr("name").unwrap_or_default();
                         } else if child.is("blip") {
                             content.embed = child.attr("embed");
+                        } else if child.is("chart") && content.chart.is_none() {
+                            content.chart = child.attr("id");
                         }
                         depth += 1;
                     }
@@ -1368,12 +1373,12 @@ fn read_content(reader: &mut XmlReader<'_>, tag: &Tag<'_>, content: &mut Content
 }
 
 /// Pictures (and the frames of charts) of a drawing part.
-fn pictures(package: &mut Package, part: &str) -> Result<Vec<Picture>> {
+fn pictures(package: &mut Package, part: &str, theme: &Theme) -> Result<Vec<Picture>> {
     let bytes = package.read(part)?;
-    let rels: HashMap<String, String> = package
+    let rels: HashMap<String, (String, String)> = package
         .relationships(part)?
         .into_iter()
-        .filter_map(|rel| Some((rel.id, rel.target?)))
+        .filter_map(|rel| Some((rel.id, (rel.kind, rel.target?))))
         .collect();
     let mut found: Vec<(Placement, Content)> = Vec::new();
     let mut reader = XmlReader::new(&bytes, part);
@@ -1438,15 +1443,39 @@ fn pictures(package: &mut Package, part: &str) -> Result<Vec<Picture>> {
         }
     }
     let mut out = Vec::with_capacity(found.len());
+    // Charts parsed once each, however many frames show them.
+    let mut charts: HashMap<String, Arc<aster_sheets::chart::Chart>> = HashMap::new();
     for (placement, content) in found {
         let image = match content.embed.and_then(|id| rels.get(&id).cloned()) {
-            Some(target) if package.has(&target) => Some(Arc::from(package.read(&target)?)),
+            Some((_, target)) if package.has(&target) => Some(Arc::from(package.read(&target)?)),
+            _ => None,
+        };
+        let chart = match content.chart.and_then(|id| rels.get(&id).cloned()) {
+            Some((kind, target)) if kind == "chart" && package.has(&target) => {
+                match charts.get(&target) {
+                    Some(chart) => Some(chart.clone()),
+                    None => {
+                        // A part that does not read still shows as a chart
+                        // that says so.
+                        let chart = Arc::new(match package.read(&target) {
+                            Ok(bytes) => chart::read_chart(&bytes, &target, theme),
+                            Err(_) => aster_sheets::chart::Chart {
+                                not_shown: vec!["chart part".to_owned()],
+                                ..Default::default()
+                            },
+                        });
+                        charts.insert(target, chart.clone());
+                        Some(chart)
+                    }
+                }
+            }
             _ => None,
         };
         out.push(Picture {
             placement,
             image,
             name: content.name,
+            chart,
         });
     }
     Ok(out)

@@ -1,5 +1,7 @@
 //! Sheets added, renamed and deleted, with the formulas that name them.
 
+use std::sync::Arc;
+
 use crate::address::CellRef;
 use crate::model::{Sheet, SheetKind, Workbook};
 use crate::structure::is_name_byte;
@@ -241,7 +243,7 @@ impl Workbook {
     /// Put a copy of worksheet `from` into place `to` (the copy's index)
     /// under `name`. Its cells, formats, merged areas, sizes, frozen panes,
     /// filter, notes and list rules are copied; formulas in it that name the
-    /// original sheet name the copy. Pictures and charts are not copied.
+    /// original sheet name the copy. Pictures, charts and conditional formats are not copied.
     /// Returns the copy's index, or `None` for a sheet that is not a
     /// worksheet or a name that is not allowed.
     pub fn copy_sheet(&mut self, from: usize, to: usize, name: &str) -> Option<usize> {
@@ -277,9 +279,9 @@ impl Workbook {
                 *formula = retarget(formula, &old, Some(name));
             }
         }
-        for format in &mut copy.cond_formats {
-            format.map_formulas(|formula| retarget(formula, &old, Some(name)));
-        }
+        // A copy is written as a new sheet, which has no conditional
+        // formats in the file; it does not show any either.
+        copy.cond_formats.clear();
         if touched {
             copy.refresh();
         }
@@ -372,6 +374,12 @@ impl Workbook {
             }
             for format in &mut sheet.cond_formats {
                 format.map_formulas(|formula| retarget(formula, from, to));
+            }
+            // Charts plot cells by sheet name.
+            for picture in &mut sheet.pictures {
+                if let Some(chart) = &mut picture.chart {
+                    Arc::make_mut(chart).retarget(from, to);
+                }
             }
             if touched {
                 sheet.refresh();

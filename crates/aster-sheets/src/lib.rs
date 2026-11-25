@@ -18,6 +18,7 @@
 pub mod address;
 pub mod axis;
 pub mod calc;
+pub mod chart;
 pub mod clipboard;
 pub mod comment;
 pub mod cond;

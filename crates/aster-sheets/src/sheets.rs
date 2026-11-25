@@ -226,6 +226,75 @@ impl Workbook {
         self.sheets.len() - 1
     }
 
+    /// The name Excel gives a copy of sheet `index`: `Sheet1 (2)`, the
+    /// first number from 2 up that no sheet has, cut to fit.
+    pub fn copy_sheet_name(&self, index: usize) -> Option<String> {
+        let base = self.sheets.get(index)?.name.clone();
+        (2..).find_map(|n| {
+            let suffix = format!(" ({n})");
+            let room = MAX_NAME.saturating_sub(suffix.chars().count());
+            let name: String = base.chars().take(room).chain(suffix.chars()).collect();
+            self.check_sheet_name(&name, None).ok().map(|()| name)
+        })
+    }
+
+    /// Put a copy of worksheet `from` into place `to` (the copy's index)
+    /// under `name`. Its cells, formats, merged areas, sizes, frozen panes,
+    /// filter, notes and list rules are copied; formulas in it that name the
+    /// original sheet name the copy. Pictures and charts are not copied.
+    /// Returns the copy's index, or `None` for a sheet that is not a
+    /// worksheet or a name that is not allowed.
+    pub fn copy_sheet(&mut self, from: usize, to: usize, name: &str) -> Option<usize> {
+        if self.check_sheet_name(name, None).is_err() {
+            return None;
+        }
+        let source = self.sheets.get(from)?;
+        if source.kind != SheetKind::Worksheet {
+            return None;
+        }
+        let old = source.name.clone();
+        let mut copy = source.clone();
+        copy.name = name.to_owned();
+        copy.hidden = false;
+        copy.pictures.clear();
+        copy.structure_blocker = None;
+        copy.delete_blocker = None;
+        let mut touched = false;
+        for row in copy.rows_mut().iter_mut() {
+            for cell in &mut row.cells {
+                let Some(formula) = &cell.formula else {
+                    continue;
+                };
+                let moved = retarget(formula, &old, Some(name));
+                if moved != **formula {
+                    cell.formula = Some(moved.into());
+                    touched = true;
+                }
+            }
+        }
+        for rule in &mut copy.validations {
+            if let crate::validation::ListSource::Formula(formula) = &mut rule.source {
+                *formula = retarget(formula, &old, Some(name));
+            }
+        }
+        if touched {
+            copy.refresh();
+        }
+        let to = to.min(self.sheets.len());
+        self.sheets.insert(to, copy);
+        for name in &mut self.names {
+            if let Some(local) = &mut name.local
+                && *local >= to
+            {
+                *local += 1;
+            }
+        }
+        if self.active_sheet >= to {
+            self.active_sheet += 1;
+        }
+        Some(to)
+    }
+
     /// Give sheet `index` a new name; formulas that name it follow. Returns
     /// the cells whose formulas changed.
     pub fn rename_sheet(&mut self, index: usize, name: &str) -> Vec<(usize, CellRef)> {
@@ -335,6 +404,74 @@ mod tests {
             sheets: vec![first.finish(), second.finish()],
             ..Workbook::default()
         }
+    }
+
+    #[test]
+    fn a_copy_names_itself_and_its_formulas_point_to_its_own_cells() {
+        let mut book = book();
+        // 数据 gets a formula on itself, one without a sheet name, a note.
+        let mut own = Cell::new(1, Value::Number(2.0));
+        own.formula = Some("数据!A1*2+A1".into());
+        let mut sheet =
+            std::mem::replace(&mut book.sheets[0], Sheet::empty("", SheetKind::Worksheet));
+        let mut builder = SheetBuilder::new("数据", SheetKind::Worksheet);
+        for row in sheet.rows() {
+            for cell in &row.cells {
+                builder.push(row.index, cell.clone());
+            }
+        }
+        builder.push(0, own);
+        builder.comments.insert(
+            CellRef::new(0, 0),
+            crate::comment::Comment::note("我", "备注"),
+        );
+        builder.columns.set(2, 3, 200.0);
+        builder.merge(crate::address::CellRange::parse("D1:E2").unwrap());
+        sheet = builder.finish();
+        book.sheets[0] = sheet;
+        book.names.push(crate::model::DefinedName {
+            name: "Mine".into(),
+            local: Some(1),
+            formula: "Sheet2!$A$1".into(),
+        });
+        book.active_sheet = 1;
+        assert_eq!(book.copy_sheet_name(0).as_deref(), Some("数据 (2)"));
+        // Copied in front of Sheet2.
+        let index = book.copy_sheet(0, 1, "数据 (2)").unwrap();
+        assert_eq!(index, 1);
+        let names: Vec<&str> = book.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["数据", "数据 (2)", "Sheet2"]);
+        let copy = &book.sheets[1];
+        let formula = |s: &Sheet, a: &str| {
+            s.cell(CellRef::parse(a).unwrap())
+                .and_then(|c| c.formula.clone())
+                .map(|f| f.to_string())
+        };
+        assert_eq!(formula(copy, "B1").as_deref(), Some("'数据 (2)'!A1*2+A1"));
+        assert_eq!(
+            formula(&book.sheets[0], "B1").as_deref(),
+            Some("数据!A1*2+A1")
+        );
+        assert_eq!(copy.comments.len(), 1);
+        assert_eq!(copy.columns.size(2), 200.0);
+        assert_eq!(copy.merges.len(), 1);
+        // The other sheet still points to the original; names that belong to
+        // a sheet keep to theirs, and so does the active sheet.
+        assert!(
+            formula(&book.sheets[2], "A1")
+                .unwrap()
+                .starts_with("数据!A1*2")
+        );
+        assert_eq!(book.names[0].local, Some(2));
+        assert_eq!(book.active_sheet, 2);
+        // A second copy is numbered on, and long names are cut to fit.
+        assert_eq!(book.copy_sheet_name(0).as_deref(), Some("数据 (3)"));
+        book.sheets[0].name = "x".repeat(31);
+        let long = book.copy_sheet_name(0).unwrap();
+        assert_eq!(long.chars().count(), 31);
+        assert!(long.ends_with(" (2)"));
+        // Not a name that is taken, and not a chart.
+        assert_eq!(book.copy_sheet(0, 0, "sheet2"), None);
     }
 
     #[test]

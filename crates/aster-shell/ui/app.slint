@@ -16,6 +16,7 @@ import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { LinkDialog } from "link_dialog.slint";
 import { PromptDialog } from "prompt_dialog.slint";
+import { CopyDialog } from "copy_dialog.slint";
 import { EncodingDialog } from "encoding_dialog.slint";
 import { RecoveryDialog } from "recovery.slint";
 import { Hairline, ScrollBar, MenuFrame } from "widgets.slint";
@@ -391,6 +392,16 @@ export component AppWindow inherits Window {
     callback sheet-rename(int);
     callback sheet-delete(int);
     callback sheet-move(int, int);
+    // "Move or Copy" for a sheet tab, and its dialog.
+    callback sheet-move-copy(int);
+    in property <bool> copy-open;
+    in property <string> copy-title;
+    in property <string> copy-label;
+    in property <[string]> copy-places;
+    in-out property <int> copy-selected;
+    in-out property <bool> copy-make-copy;
+    callback copy-accept();
+    callback copy-cancel();
     callback preview-scrolled(length);
     // The scroll bars: scroll the source or the preview to an offset.
     callback scroll-to(length);
@@ -1515,6 +1526,9 @@ export component AppWindow inherits Window {
                             root.sheet-delete(index);
                             scope.focus();
                         }
+                        move-copy(index) => {
+                            root.sheet-move-copy(index);
+                        }
                         moved(from, to) => {
                             root.sheet-move(from, to);
                             scope.focus();
@@ -1977,6 +1991,20 @@ export component AppWindow inherits Window {
         }
         dismissed => {
             root.encoding-cancel();
+        }
+    }
+
+    if root.copy-open: CopyDialog {
+        title: root.copy-title;
+        label: root.copy-label;
+        places: root.copy-places;
+        selected <=> root.copy-selected;
+        copy <=> root.copy-make-copy;
+        confirmed => {
+            root.copy-accept();
+        }
+        dismissed => {
+            root.copy-cancel();
         }
     }
 

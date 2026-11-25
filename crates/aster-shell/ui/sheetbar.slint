@@ -84,6 +84,7 @@ export component SheetBar inherits Rectangle {
     callback add();
     callback rename(int);
     callback delete(int);
+    callback move-copy(int);
     // A tab was dragged from one place to another (as shown).
     callback moved(int, int);
     // A tab being dragged, where the pointer is along the tabs, and the tab
@@ -213,6 +214,13 @@ export component SheetBar inherits Rectangle {
                 text: Strings.sheet-rename;
                 clicked => {
                     root.rename(root.menu-for);
+                }
+            }
+
+            MenuRow {
+                text: Strings.sheet-move-copy;
+                clicked => {
+                    root.move-copy(root.menu-for);
                 }
             }
 

@@ -1755,6 +1755,80 @@ impl SheetTab {
         Some(index)
     }
 
+    /// Put a copy of worksheet `from` before sheet `before` (at the end
+    /// with `None`), named as Excel names it (`Sheet1 (2)`), and show it.
+    /// One undo step. Saving writes the copy as a new sheet, whole.
+    pub fn copy_sheet(&mut self, from: usize, before: Option<usize>) -> Option<usize> {
+        if self.saving {
+            return None;
+        }
+        let workbook = self.view.workbook();
+        let name = workbook.copy_sheet_name(from)?;
+        let to = before.unwrap_or(workbook.sheets.len());
+        self.view.cancel_edit();
+        let book = self.book();
+        let index = self.view.workbook_mut().copy_sheet(from, to, &name)?;
+        self.view.sheet_inserted(index);
+        self.origins.insert(index, None);
+        self.shift_marks(index, true);
+        self.mark_new_sheet(index);
+        self.sheet_step(
+            SheetChange::Added(index),
+            book,
+            Vec::new(),
+            Marks::default(),
+            None,
+        );
+        self.view.set_sheet(index);
+        Some(index)
+    }
+
+    /// Move sheet `from` to stand before sheet `before` (at the end with
+    /// `None`), as the "Move or Copy" dialog does.
+    pub fn move_sheet_before(&mut self, from: usize, before: Option<usize>) -> bool {
+        let count = self.view.workbook().sheets.len();
+        let to = match before {
+            None => count.saturating_sub(1),
+            Some(before) if before > from => before - 1,
+            Some(before) => before,
+        };
+        self.move_sheet(from, to)
+    }
+
+    /// A sheet that is new in the file: what saving writes on it beyond
+    /// its cells (widths, heights, formats of whole lines, notes).
+    fn mark_new_sheet(&mut self, index: usize) {
+        const LIMIT: u32 = 200_000;
+        let Some(sheet) = self.view.workbook().sheets.get(index) else {
+            return;
+        };
+        let spans = |axis: &aster_sheets::Axis| -> Vec<u32> {
+            axis.runs()
+                .flat_map(|(first, end, _)| first..end.min(first.saturating_add(LIMIT)))
+                .collect()
+        };
+        let columns = spans(&sheet.columns);
+        let rows = spans(&sheet.row_sizes);
+        let column_formats: Vec<u32> = sheet
+            .column_styles
+            .iter()
+            .flat_map(|&(first, last, _)| first..=last.min(first.saturating_add(LIMIT)))
+            .collect();
+        let row_formats: Vec<u32> = sheet.row_styles.iter().map(|&(row, _)| row).collect();
+        let noted = !sheet.comments.is_empty();
+        self.columns_changed
+            .extend(columns.into_iter().map(|c| (index, c)));
+        self.rows_changed
+            .extend(rows.into_iter().map(|r| (index, r)));
+        self.line_formats_changed
+            .extend(column_formats.into_iter().map(|c| (index, true, c)));
+        self.line_formats_changed
+            .extend(row_formats.into_iter().map(|r| (index, false, r)));
+        if noted {
+            self.comments_changed.insert(index);
+        }
+    }
+
     /// Whether sheet `index` could be called `name`.
     pub fn check_sheet_name(
         &self,
@@ -1944,6 +2018,8 @@ impl SheetTab {
                 self.view.sheet_inserted(index);
                 self.origins.insert(index, None);
                 self.shift_marks(index, true);
+                // A copy has sizes and formats of its own to write.
+                self.mark_new_sheet(index);
                 self.show_sheet(index);
             }
             SheetChange::Renamed(index) => {
@@ -3706,6 +3782,116 @@ mod tests {
         tab.view.select(at("C2"));
         tab.view.begin_edit(EditMode::Enter, Some("q".to_owned()));
         assert!(!tab.commit_checked("en").is_empty());
+    }
+
+    #[test]
+    fn a_copied_sheet_is_one_undo_step_and_is_written_whole() {
+        use aster_sheets::{ErrorStyle, ListSource, Validation};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("复制.xlsx");
+        std::fs::write(&file, blank_workbook("ja")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let name = tab.view.workbook().sheets[0].name.clone();
+        let rows: Vec<Vec<String>> = vec![
+            vec!["1".into(), "2".into(), "a".into()],
+            vec![
+                "=SUM(B2:C2)".into(),
+                format!("={}!B2*10", aster_sheets::sheets::qualifier(&name)),
+                "b".into(),
+            ],
+        ];
+        tab.type_cells(at("B2"), &rows, "ja");
+        tab.set_size(0, Resize::Column(5), 200.0);
+        tab.view.select(at("G2"));
+        tab.view.extend_to(at("H3"));
+        tab.merge();
+        tab.view.select(at("B2"));
+        assert_eq!(tab.set_comment(Some("备注")), Ok(true));
+        tab.view.workbook_mut().sheets[0]
+            .validations
+            .push(Validation {
+                ranges: vec![CellRange::parse("D2:D5").unwrap()],
+                source: ListSource::Formula(format!(
+                    "{}!$D$2:$D$3",
+                    aster_sheets::sheets::qualifier(&name)
+                )),
+                allow_blank: true,
+                show_arrow: true,
+                show_error: true,
+                style: ErrorStyle::Stop,
+                error_title: String::new(),
+                error: "只能选列表里的".into(),
+            });
+        // Copied before the first sheet: the copy is sheet 0.
+        let index = tab.copy_sheet(0, Some(0)).expect("a copy");
+        assert_eq!(index, 0);
+        let copy_name = format!("{name} (2)");
+        let names = |tab: &SheetTab| -> Vec<String> {
+            tab.view
+                .workbook()
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&tab), [copy_name.clone(), name.clone()]);
+        assert_eq!(tab.view.sheet_index(), 0, "the copy is shown");
+        tab.undo();
+        assert_eq!(names(&tab), [name.clone()]);
+        tab.redo();
+        assert_eq!(names(&tab), [copy_name.clone(), name.clone()]);
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&file).unwrap();
+        tab.finish_save(&job, &file, Some(written));
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(
+            again
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            [copy_name.clone(), name.clone()]
+        );
+        let (copy, original) = (&again.sheets[0], &again.sheets[1]);
+        let formula = |s: &aster_sheets::Sheet, a: &str| {
+            s.cell(at(a))
+                .and_then(|c| c.formula.as_deref().map(str::to_owned))
+        };
+        assert_eq!(formula(copy, "B3").as_deref(), Some("SUM(B2:C2)"));
+        assert_eq!(
+            formula(copy, "C3"),
+            Some(format!(
+                "{}!B2*10",
+                aster_sheets::sheets::qualifier(&copy_name)
+            )),
+            "the copy's formula points to the copy's own cells"
+        );
+        assert_eq!(
+            formula(original, "C3"),
+            Some(format!("{}!B2*10", aster_sheets::sheets::qualifier(&name)))
+        );
+        assert_eq!(copy.columns.size(5), 200.0);
+        assert_eq!(copy.merges, original.merges);
+        assert_eq!(copy.merges.len(), 1);
+        assert_eq!(
+            copy.comments.get(&at("B2")).map(|c| c.text.as_str()),
+            Some("备注")
+        );
+        assert_eq!(copy.validations.len(), 1);
+        assert_eq!(copy.validations[0].error, "只能选列表里的");
+        assert_eq!(
+            copy.validations[0].source,
+            ListSource::Formula(format!(
+                "{}!$D$2:$D$3",
+                aster_sheets::sheets::qualifier(&copy_name)
+            ))
+        );
     }
 
     #[test]

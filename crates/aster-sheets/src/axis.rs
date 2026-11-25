@@ -184,6 +184,14 @@ impl Axis {
         }
     }
 
+    /// The runs that differ from the default: first line, one past the
+    /// last, size.
+    pub fn runs(&self) -> impl Iterator<Item = (u32, u32, f64)> + '_ {
+        self.spans
+            .iter()
+            .map(|span| (span.start, span.end, span.size))
+    }
+
     pub fn count(&self) -> u32 {
         self.count
     }

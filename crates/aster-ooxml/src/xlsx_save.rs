@@ -219,6 +219,7 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             if let Some(filter) = &sheet.auto_filter {
                 bytes = sheets::filter_xml(&bytes, Some(filter));
             }
+            bytes = sheets::validations_xml(&bytes, &sheet.validations);
             if !sheet.comments.is_empty() {
                 bytes = write_notes(
                     &mut package,

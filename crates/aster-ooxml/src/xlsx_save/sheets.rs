@@ -602,3 +602,117 @@ pub(super) fn worksheet_type(bytes: &[u8]) -> String {
         })
         .unwrap_or_else(|| format!("{}/worksheet", REL_NAMESPACES[0]))
 }
+
+/// The worksheet children that come after `<dataValidations>`.
+const AFTER_VALIDATIONS: [&str; 23] = [
+    "hyperlinks",
+    "printOptions",
+    "pageMargins",
+    "pageSetup",
+    "headerFooter",
+    "rowBreaks",
+    "colBreaks",
+    "customProperties",
+    "cellWatches",
+    "ignoredErrors",
+    "smartTags",
+    "drawing",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "drawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+    "sortState",
+    "dataConsolidate",
+];
+
+fn attribute_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A new worksheet with the list rules the model has written into it, as
+/// `<dataValidations>` before the elements that follow it.
+pub(super) fn validations_xml(bytes: &[u8], rules: &[aster_sheets::Validation]) -> Vec<u8> {
+    if rules.is_empty() {
+        return bytes.to_vec();
+    }
+    let (bom, xml) = split_bom(bytes);
+    let text = String::from_utf8_lossy(xml).into_owned();
+    let children = top_level(xml);
+    let p = children
+        .iter()
+        .find(|(name, ..)| name == "sheetData")
+        .map(|(_, start, _)| {
+            let (_, name) = start_tag(&text[*start..]);
+            name.rsplit_once(':')
+                .map_or(String::new(), |(p, _)| format!("{p}:"))
+        })
+        .unwrap_or_default();
+    let mut items = String::new();
+    for rule in rules {
+        let sqref: Vec<String> = rule
+            .ranges
+            .iter()
+            .map(|range| {
+                if range.first == range.last {
+                    range.first.to_string()
+                } else {
+                    format!("{}:{}", range.first, range.last)
+                }
+            })
+            .collect();
+        let formula = match &rule.source {
+            aster_sheets::ListSource::Items(list) => {
+                format!("\"{}\"", list.join(",").replace('"', "\"\""))
+            }
+            aster_sheets::ListSource::Formula(formula) => formula.clone(),
+        };
+        let style = match rule.style {
+            aster_sheets::ErrorStyle::Stop => "",
+            aster_sheets::ErrorStyle::Warning => " errorStyle=\"warning\"",
+            aster_sheets::ErrorStyle::Information => " errorStyle=\"information\"",
+        };
+        let mut attributes = String::from(" type=\"list\"");
+        attributes.push_str(style);
+        if rule.allow_blank {
+            attributes.push_str(" allowBlank=\"1\"");
+        }
+        if !rule.show_arrow {
+            attributes.push_str(" showDropDown=\"1\"");
+        }
+        if rule.show_error {
+            attributes.push_str(" showErrorMessage=\"1\"");
+        }
+        if !rule.error_title.is_empty() {
+            attributes.push_str(&format!(
+                " errorTitle=\"{}\"",
+                attribute_text(&rule.error_title)
+            ));
+        }
+        if !rule.error.is_empty() {
+            attributes.push_str(&format!(" error=\"{}\"", attribute_text(&rule.error)));
+        }
+        items.push_str(&format!(
+            "<{p}dataValidation{attributes} sqref=\"{}\"><{p}formula1>{}</{p}formula1></{p}dataValidation>",
+            sqref.join(" "),
+            attribute_text(&formula).replace("&quot;", "\""),
+        ));
+    }
+    let element = format!(
+        "<{p}dataValidations count=\"{}\">{items}</{p}dataValidations>",
+        rules.len()
+    );
+    let at = children
+        .iter()
+        .find(|(name, ..)| AFTER_VALIDATIONS.contains(&name.as_str()))
+        .map(|(_, start, _)| *start)
+        .unwrap_or_else(|| text.rfind("</").unwrap_or(text.len()));
+    [bom, &xml[..at], element.as_bytes(), &xml[at..]].concat()
+}

@@ -215,6 +215,9 @@ struct Shell {
     shown_cell: CellLook,
     /// The autofilter list open on screen: the column and what it offers.
     filter_list: Option<office::FilterList>,
+    /// The "Move or Copy" question open: the sheet, and what each place in
+    /// its list means (before which sheet; `None` for the end).
+    move_copy: Option<(usize, Vec<Option<usize>>)>,
     /// The drop-down list open on screen: its cell and its values.
     dropdown: Option<(aster_sheets::CellRef, Vec<String>)>,
     /// The cell under the pointer, to show its note.
@@ -291,6 +294,7 @@ impl Shell {
             filter_list: None,
             hover_cell: None,
             dropdown: None,
+            move_copy: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1221,6 +1225,8 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
+    s.set_sheet_move_copy(strings.sheet_move_copy.into());
+    s.set_copy_make(strings.copy_make.into());
     s.set_menu_find(strings.menu_find.into());
     s.set_menu_find_next(strings.menu_find_next.into());
     s.set_menu_find_previous(strings.menu_find_previous.into());
@@ -6178,6 +6184,71 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         after_sheet_change(&ui, shell, changes);
     }));
+    ui.on_sheet_move_copy(handler!(|ui, shell, shown| {
+        let language = shell.language.tag();
+        let strings = shell.language.strings();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        let visible = tab.view.visible_sheets();
+        let Some(&index) = usize::try_from(shown).ok().and_then(|i| visible.get(i)) else {
+            return;
+        };
+        let mut places: Vec<Option<usize>> = visible.iter().map(|&i| Some(i)).collect();
+        places.push(None);
+        let names: Vec<SharedString> = visible
+            .iter()
+            .map(|&i| tab.view.workbook().sheets[i].name.as_str().into())
+            .chain(std::iter::once(strings.copy_end.into()))
+            .collect();
+        // Where it is now, or the end after the last.
+        let selected = places
+            .iter()
+            .position(|p| *p == Some(index))
+            .map_or(0, |at| at + 1)
+            .min(names.len() - 1);
+        shell.move_copy = Some((index, places));
+        ui.set_copy_title(strings.copy_title.into());
+        ui.set_copy_label(strings.copy_label.into());
+        ui.set_copy_places(model(names));
+        ui.set_copy_selected(selected as i32);
+        ui.set_copy_make_copy(false);
+        ui.set_copy_open(true);
+        after_sheet_change(&ui, shell, changes);
+    }));
+    ui.on_copy_cancel(handler!(|ui, shell| {
+        shell.move_copy = None;
+        ui.set_copy_open(false);
+    }));
+    ui.on_copy_accept(handler!(|ui, shell| {
+        let copy = ui.get_copy_make_copy();
+        let selected = ui.get_copy_selected();
+        ui.set_copy_open(false);
+        let Some((index, places)) = shell.move_copy.take() else {
+            return;
+        };
+        let Some(&before) = usize::try_from(selected).ok().and_then(|i| places.get(i)) else {
+            return;
+        };
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        if copy {
+            tab.copy_sheet(index, before);
+        } else {
+            tab.move_sheet_before(index, before);
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, Vec::new());
+    }));
     ui.on_sheet_delete(handler!(|ui, shell, shown| {
         let language = shell.language.tag();
         let Some(tab) = shell.active_sheet() else {
@@ -8041,6 +8112,70 @@ mod ui_tests {
             assert_eq!(value(tab, "B4"), None);
             assert!(tab.refusal.is_none());
         });
+    }
+
+    #[test]
+    fn move_or_copy_asks_where_and_copies_or_moves() {
+        let app = app();
+        let ui = &app.ui;
+        let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+        with_sheet(&app, |tab| {
+            tab.type_cells(at("B2"), &[vec!["7".to_owned()]], "en");
+            tab.add_sheet("Sheet");
+            tab.add_sheet("Sheet");
+        });
+        let names = |app: &App| -> Vec<String> {
+            with_sheet(app, |tab| {
+                tab.view
+                    .workbook()
+                    .sheets
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+        };
+        let first = names(&app)[0].clone();
+        // The tab's menu item opens the question: the sheets, then "end".
+        ui.invoke_sheet_move_copy(0);
+        assert!(ui.get_copy_open());
+        assert_eq!(ui.get_copy_places().row_count(), 4);
+        assert_eq!(ui.get_copy_selected(), 1, "before the next sheet");
+        // Without "create a copy" it is a move, to the end.
+        ui.set_copy_selected(3);
+        ui.invoke_copy_accept();
+        assert!(!ui.get_copy_open());
+        let moved = names(&app);
+        assert_eq!(moved.len(), 3);
+        assert_eq!(moved[2], first);
+        // Copy the (now last) sheet before the first one.
+        ui.invoke_sheet_move_copy(2);
+        ui.set_copy_make_copy(true);
+        ui.set_copy_selected(0);
+        ui.invoke_copy_accept();
+        let copied = names(&app);
+        assert_eq!(copied.len(), 4);
+        assert_eq!(copied[0], format!("{first} (2)"));
+        assert_eq!(
+            with_sheet(&app, |tab| {
+                let sheet = &tab.view.workbook().sheets[0];
+                sheet
+                    .cell(at("B2"))
+                    .map(|c| tab.view.workbook().input_text(c))
+            })
+            .as_deref(),
+            Some("7")
+        );
+        // The tabs show it, and one undo takes it away again.
+        assert_eq!(ui.get_sheet_names().row_count(), 4);
+        with_sheet(&app, |tab| {
+            tab.undo();
+        });
+        assert_eq!(names(&app).len(), 3);
+        // Cancelling does nothing.
+        ui.invoke_sheet_move_copy(0);
+        ui.invoke_copy_cancel();
+        assert!(!ui.get_copy_open());
+        assert_eq!(names(&app).len(), 3);
     }
 
     #[test]

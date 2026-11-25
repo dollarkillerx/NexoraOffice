@@ -1273,7 +1273,6 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_outline(strings.outline.into());
     s.set_outline_empty(strings.outline_empty.into());
     s.set_outline_none(strings.outline_none.into());
-    s.set_placeholder(strings.placeholder.into());
     s.set_placeholder_view(strings.placeholder_view.into());
     s.set_search_files(strings.search_files.into());
     s.set_language(strings.language.into());
@@ -1503,7 +1502,6 @@ fn apply_language(ui: &AppWindow, language: Language) {
                 kind: kind.index() as i32,
                 name: kind.name().into(),
                 tagline: strings.kind_tagline(kind).into(),
-                implemented: kind.is_implemented(),
             })
             .collect(),
     ));
@@ -2742,6 +2740,39 @@ fn open_file_types(strings: &'static i18n::Strings) -> [FileType; 5] {
             extensions: pdf::EXTENSIONS,
         },
     ]
+}
+
+/// The open dialog, then the usual open path for the chosen file.
+fn pick_and_open(
+    weak: slint::Weak<AppWindow>,
+    strings: &'static i18n::Strings,
+    types: Vec<FileType>,
+) {
+    // Dialogs cannot run in the headless UI tests.
+    if cfg!(test) {
+        return;
+    }
+    // Never block on a dialog inside an event handler: see `dialogs`.
+    let _ = slint::spawn_local(async move {
+        if let Some(path) = dialogs::pick_file_to_open(strings.open_dialog, &types).await
+            && let Some(ui) = weak.upgrade()
+        {
+            spawn_load(&ui, path);
+        }
+    });
+}
+
+/// The PDF card and the PDF entry of the new-document menu: the open dialog,
+/// offering only PDF files.
+fn ask_for_pdf(ui: &AppWindow, strings: &'static i18n::Strings) {
+    pick_and_open(
+        ui.as_weak(),
+        strings,
+        vec![FileType {
+            name: strings.file_type_pdf,
+            extensions: pdf::EXTENSIONS,
+        }],
+    );
 }
 
 // --- Work that leaves this thread and comes back ---------------------------
@@ -5841,6 +5872,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
 
     ui.on_new_document(handler!(|ui, shell, kind| {
         if let Some(kind) = usize::try_from(kind).ok().and_then(DocKind::from_index) {
+            // A blank PDF makes no sense: ask for a file instead.
+            if kind == DocKind::Pdf {
+                ask_for_pdf(&ui, shell.language.strings());
+                return;
+            }
             let id = shell.open_untitled(kind);
             if kind == DocKind::Sheets {
                 start_calc(&ui, shell, id);
@@ -6458,16 +6494,7 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             let Ok(strings) = shell.try_borrow().map(|shell| shell.language.strings()) else {
                 return;
             };
-            let weak = weak.clone();
-            // Never block on a dialog inside an event handler: see `dialogs`.
-            let _ = slint::spawn_local(async move {
-                let types = open_file_types(strings);
-                if let Some(path) = dialogs::pick_file_to_open(strings.open_dialog, &types).await
-                    && let Some(ui) = weak.upgrade()
-                {
-                    spawn_load(&ui, path);
-                }
-            });
+            pick_and_open(weak.clone(), strings, open_file_types(strings).to_vec());
         }
     });
 
@@ -9304,5 +9331,22 @@ mod ui_tests {
         // Yellow, the twelfth colour.
         click(&swatches[11]);
         assert_eq!(cell_style(&app, "A3").fill, Some([0xFF, 0xFF, 0x00, 0xFF]));
+    }
+
+    #[test]
+    fn new_document_cards_open_real_documents_and_pdf_asks_for_a_file() {
+        let app = app();
+        let ui = &app.ui;
+        let count = || app.shell.borrow().tabs.len();
+        let before = count();
+        ui.invoke_new_document(DocKind::Slides.index() as i32);
+        assert_eq!(count(), before + 1);
+        assert!(app.shell.borrow_mut().active_slides().is_some());
+        ui.invoke_new_document(DocKind::Sheets.index() as i32);
+        assert_eq!(count(), before + 2);
+        assert!(app.shell.borrow_mut().active_sheet().is_some());
+        // The PDF card opens the file dialog (skipped in tests) and no tab.
+        ui.invoke_new_document(DocKind::Pdf.index() as i32);
+        assert_eq!(count(), before + 2);
     }
 }

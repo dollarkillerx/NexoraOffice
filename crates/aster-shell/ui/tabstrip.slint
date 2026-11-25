@@ -204,7 +204,6 @@ export component TabStrip inherits Rectangle {
                         for entry in root.kinds: MenuRow {
                             kind: entry.kind;
                             text: entry.name;
-                            detail: entry.implemented ? "" : Strings.placeholder;
                             clicked => {
                                 root.new-document(entry.kind);
                             }

@@ -43,13 +43,6 @@ impl DocKind {
         }
     }
 
-    /// Whether this build has a working view for the kind. Everything else
-    /// opens a labelled placeholder. "Working" is modest: Writer tabs are plain
-    /// text, and Markdown tabs edit and save text without understanding Markdown.
-    pub fn is_implemented(self) -> bool {
-        matches!(self, DocKind::Writer | DocKind::Markdown)
-    }
-
     /// The phase of the roadmap that delivers the editor.
     pub fn planned_phase(self) -> Option<u8> {
         match self {
@@ -387,11 +380,5 @@ mod tests {
             assert!(!kind.name().is_empty());
         }
         assert_eq!(DocKind::from_index(DocKind::ALL.len()), None);
-        // Only the two text views exist so far.
-        let real: Vec<_> = DocKind::ALL
-            .into_iter()
-            .filter(|kind| kind.is_implemented())
-            .collect();
-        assert_eq!(real, [DocKind::Writer, DocKind::Markdown]);
     }
 }

@@ -85,7 +85,6 @@ export global Strings {
     in property <string> outline;
     in property <string> outline-empty;
     in property <string> outline-none;
-    in property <string> placeholder;
     in property <string> placeholder-view;
     in property <string> search-files;
     in property <string> language;
@@ -341,8 +340,6 @@ export struct KindItem {
     kind: int,
     name: string,
     tagline: string,
-    // False for the kinds that only open a placeholder.
-    implemented: bool,
 }
 
 export struct RecentItem {

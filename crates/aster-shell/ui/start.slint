@@ -1,5 +1,5 @@
 import { Tokens, Icons, Strings, KindItem, RecentItem } from "tokens.slint";
-import { Icon, KindGlyph, AsterMark, Badge, Hairline, TextButton, MenuFrame, RecentMenuItems } from "widgets.slint";
+import { Icon, KindGlyph, AsterMark, Hairline, TextButton, MenuFrame, RecentMenuItems } from "widgets.slint";
 
 component KindTile inherits Rectangle {
     in property <KindItem> item;
@@ -20,12 +20,6 @@ component KindTile inherits Rectangle {
         size: 32px;
         ink: touch.has-hover ? Tokens.accent : Tokens.text;
         animate ink { duration: Tokens.quick; }
-    }
-
-    if !root.item.implemented: Badge {
-        x: parent.width - self.width - Tokens.space-md;
-        y: Tokens.space-md;
-        text: Strings.placeholder;
     }
 
     Text {

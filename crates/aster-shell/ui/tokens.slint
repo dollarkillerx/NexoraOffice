@@ -68,6 +68,13 @@ export global Strings {
     in property <string> find-match-case;
     in property <string> find-whole-word;
     in property <string> find-regex;
+    in property <string> find-whole-cell;
+    in property <string> find-in-sheet;
+    in property <string> find-in-book;
+    in property <string> formula-hint-list;
+    in property <string> formula-hint-name;
+    in property <string> menu-print-area-set;
+    in property <string> menu-print-area-clear;
     in property <string> find-close;
     in property <string> replace-one;
     in property <string> replace-all;
@@ -408,6 +415,13 @@ export struct ApprovalItem {
 export struct EncodingChoice {
     label: string,
     preview: string,
+}
+
+// A function or defined name the formula hints offer.
+export struct HintItem {
+    name: string,
+    detail: string,
+    is-name: bool,
 }
 
 export struct OutlineItem {

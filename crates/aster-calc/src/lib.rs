@@ -300,6 +300,46 @@ mod tests {
     use super::*;
     use aster_sheets::{Cell, SheetBuilder, SheetKind};
 
+    /// The formula hints list what the engine implements: every function it
+    /// registers is described, every described one (older names included)
+    /// is one it can calculate, and the arguments listed are at least as many as
+    /// the engine asks for.
+    #[test]
+    fn the_hint_list_is_the_engines_list() {
+        formualizer::eval::builtins::load_builtins();
+        let registered = formualizer::eval::function_registry::snapshot_registered();
+        let catalogue = aster_sheets::hints::catalogue();
+        let mut known = std::collections::BTreeSet::new();
+        for (namespace, name, function) in &registered {
+            if !namespace.is_empty() {
+                continue;
+            }
+            known.insert(name.clone());
+            known.extend(function.aliases().iter().map(|a| (*a).to_owned()));
+            let Some(info) = catalogue.get(name) else {
+                panic!("{name} is registered but has no description");
+            };
+            // Excel may ask for fewer than the engine does (`IF(x)`), never
+            // more.
+            assert!(
+                info.args.len() >= function.min_args() || info.repeats,
+                "{name}: {} arguments listed, the engine asks for {}",
+                info.args.len(),
+                function.min_args()
+            );
+            for alias in function.aliases() {
+                assert!(catalogue.get(alias).is_some(), "{alias} is not listed");
+            }
+        }
+        for info in catalogue.all() {
+            assert!(
+                known.contains(&info.name),
+                "{} is not in the engine",
+                info.name
+            );
+        }
+    }
+
     fn formula(col: u32, text: &str, saved: Value) -> Cell {
         let mut cell = Cell::new(col, saved);
         cell.formula = Some(Arc::from(text));

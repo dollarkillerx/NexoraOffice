@@ -3,7 +3,7 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice, FilterChoice } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice, FilterChoice, HintItem } from "tokens.slint";
 import { FilterList } from "filter_list.slint";
 import { ChoiceList } from "choice_list.slint";
 import { TabStrip } from "tabstrip.slint";
@@ -359,6 +359,19 @@ export component AppWindow inherits Window {
     // The note shown beside a cell (selected or under the pointer), at a
     // place in the document pane, logical pixels; empty text hides it.
     in property <string> comment-text;
+    // The hints under the cell being typed into: the signature of the
+    // function the caret is in (the argument it is on in bold) and the list
+    // of functions and names that complete the word before the caret.
+    in property <[HintItem]> hint-items;
+    in property <int> hint-selected;
+    in property <string> hint-call-before;
+    in property <string> hint-call-current;
+    in property <string> hint-call-after;
+    // The cell's box in the document pane.
+    in property <length> hint-x;
+    in property <length> hint-top;
+    in property <length> hint-bottom;
+    callback hint-choose(int);
     in property <length> comment-x;
     in property <length> comment-y;
     callback dialog-save();
@@ -1698,7 +1711,133 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            if root.viewer-note != "": Text {
+                            // Hints for the formula being typed. Plain rectangles, not a popup
+            // window: the keyboard stays with the document, and an input method
+            // composing there is never interrupted.
+            hint-layer := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                visible: root.viewer == 1 && (root.hint-call-before != "" || root.hint-items.length > 0);
+                property <bool> has-call: root.hint-call-before != "";
+                property <length> call-height: Tokens.control-height;
+                property <length> row-height: Tokens.control-height;
+                property <length> list-height: min(root.hint-items.length, 8) * self.row-height + 2 * Tokens.space-xs;
+                property <length> stack-height: (self.has-call ? self.call-height + 2px : 0px) + (root.hint-items.length > 0 ? self.list-height : 0px);
+                property <length> base-y: root.hint-bottom + 2px + self.stack-height > self.height ? max(0px, root.hint-top - 2px - self.stack-height) : root.hint-bottom + 2px;
+
+                if hint-layer.has-call: Rectangle {
+                    accessible-role: text;
+                    accessible-label: root.hint-call-before + root.hint-call-current + root.hint-call-after;
+                    width: min(call-row.preferred-width + 2 * Tokens.space-sm, hint-layer.width - 2 * Tokens.space-sm);
+                    height: hint-layer.call-height;
+                    x: max(0px, min(root.hint-x, hint-layer.width - self.width));
+                    y: hint-layer.base-y;
+                    background: Tokens.surface;
+                    border-color: Tokens.outline;
+                    border-width: 1px;
+                    border-radius: Tokens.radius-sm;
+                    drop-shadow-blur: 12px;
+                    drop-shadow-offset-y: 3px;
+                    drop-shadow-color: Tokens.dark ? #00000099 : #00000033;
+                    clip: true;
+
+                    call-row := HorizontalLayout {
+                        padding-left: Tokens.space-sm;
+                        padding-right: Tokens.space-sm;
+                        Text {
+                            text: root.hint-call-before;
+                            color: Tokens.text-secondary;
+                            font-size: Tokens.font-sm;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: root.hint-call-current;
+                            color: Tokens.text;
+                            font-size: Tokens.font-sm;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: root.hint-call-after;
+                            color: Tokens.text-secondary;
+                            font-size: Tokens.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if root.hint-items.length > 0: Rectangle {
+                    accessible-role: list;
+                    accessible-label: Strings.formula-hint-list;
+                    width: min(380px, hint-layer.width - 2 * Tokens.space-sm);
+                    height: hint-layer.list-height;
+                    x: max(0px, min(root.hint-x, hint-layer.width - self.width));
+                    y: hint-layer.base-y + (hint-layer.has-call ? hint-layer.call-height + 2px : 0px);
+                    background: Tokens.surface;
+                    border-color: Tokens.outline;
+                    border-width: 1px;
+                    border-radius: Tokens.radius-sm;
+                    drop-shadow-blur: 12px;
+                    drop-shadow-offset-y: 3px;
+                    drop-shadow-color: Tokens.dark ? #00000099 : #00000033;
+                    clip: true;
+
+                    for item[index] in root.hint-items: Rectangle {
+                        x: Tokens.space-xs;
+                        y: Tokens.space-xs + index * hint-layer.row-height;
+                        width: parent.width - 2 * Tokens.space-xs;
+                        height: hint-layer.row-height;
+                        border-radius: Tokens.radius-sm;
+                        background: index == root.hint-selected ? Tokens.accent-soft : row-touch.has-hover ? Tokens.hover : transparent;
+                        accessible-role: list-item;
+                        accessible-label: item.name + " " + item.detail;
+                        accessible-item-selected: index == root.hint-selected;
+                        accessible-action-default => {
+                            root.hint-choose(index);
+                        }
+
+                        row-touch := TouchArea {
+                            clicked => {
+                                root.hint-choose(index);
+                                scope.focus();
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: Tokens.space-sm;
+                            padding-right: Tokens.space-sm;
+                            spacing: Tokens.space-sm;
+                            Text {
+                                text: item.name;
+                                color: Tokens.text;
+                                font-size: Tokens.font-sm;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+
+                            if item.is-name: Text {
+                                text: Strings.formula-hint-name;
+                                color: Tokens.accent;
+                                font-size: Tokens.font-xs;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: item.detail;
+                                color: Tokens.text-secondary;
+                                font-size: Tokens.font-xs;
+                                overflow: elide;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.viewer-note != "": Text {
                                 x: Tokens.space-xl;
                                 width: parent.width - 2 * Tokens.space-xl;
                                 height: parent.height;

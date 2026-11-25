@@ -25,6 +25,7 @@ pub mod fill;
 pub mod filter;
 pub mod format;
 pub mod formula;
+pub mod hints;
 pub mod input;
 pub mod model;
 pub mod restyle;

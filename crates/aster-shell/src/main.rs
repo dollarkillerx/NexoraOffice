@@ -242,6 +242,8 @@ struct Shell {
     dropdown: Option<(aster_sheets::CellRef, Vec<String>)>,
     /// The cell under the pointer, to show its note.
     hover_cell: Option<aster_sheets::CellRef>,
+    /// The functions, names and signature offered while a formula is typed.
+    hints: aster_shell::formula_hints::FormulaHints,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -321,6 +323,7 @@ impl Shell {
             shown_cell: CellLook::default(),
             filter_list: None,
             hover_cell: None,
+            hints: Default::default(),
             dropdown: None,
             move_copy: None,
             opening: Vec::new(),
@@ -1329,6 +1332,13 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_find_match_case(strings.find_match_case.into());
     s.set_find_whole_word(strings.find_whole_word.into());
     s.set_find_regex(strings.find_regex.into());
+    s.set_find_whole_cell(strings.find_whole_cell.into());
+    s.set_find_in_sheet(strings.find_in_sheet.into());
+    s.set_find_in_book(strings.find_in_book.into());
+    s.set_formula_hint_list(strings.formula_hint_list.into());
+    s.set_formula_hint_name(strings.formula_hint_name.into());
+    s.set_menu_print_area_set(strings.menu_print_area_set.into());
+    s.set_menu_print_area_clear(strings.menu_print_area_clear.into());
     s.set_find_close(strings.find_close.into());
     s.set_replace_one(strings.replace_one.into());
     s.set_replace_all(strings.replace_all.into());
@@ -4292,6 +4302,7 @@ fn after_pdf_move(ui: &AppWindow, shell: &mut Shell) {
 /// What the chrome around a viewer shows: the formula bar and sheet tabs of
 /// a workbook, the note over an empty presentation.
 fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
+    refresh_hints(ui, shell);
     let strings = shell.language.strings();
     if let Some(tab) = shell.active_sheet() {
         let view = &tab.view;
@@ -4344,6 +4355,136 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
     ui.set_comment_text(SharedString::new());
     ui.set_viewer_note(SharedString::new());
     ui.set_slide_notes(SharedString::new());
+}
+
+/// The formula hints for the cell being typed into, looked at again: what
+/// the text before the caret offers. Nothing while an input method is
+/// composing, so the keys and the candidate window stay the method's.
+fn refresh_hints(ui: &AppWindow, shell: &mut Shell) {
+    struct Typing {
+        text: String,
+        caret: usize,
+        names: Vec<(String, String)>,
+        cell: (f64, f64, f64, f64),
+    }
+    let typing = shell.active_sheet().and_then(|tab| {
+        let editor = tab.view.editor()?;
+        if editor.is_composing() || !editor.text().starts_with('=') {
+            return None;
+        }
+        let sheet = tab.view.sheet_index();
+        let names = tab
+            .view
+            .workbook()
+            .names
+            .iter()
+            .filter(|name| name.local.is_none() || name.local == Some(sheet))
+            .map(|name| (name.name.clone(), name.formula.clone()))
+            .collect();
+        let (text, caret, at) = (editor.text().to_owned(), editor.caret(), editor.at);
+        let cell = tab.view.cell_box(at).unwrap_or_default();
+        Some(Typing {
+            text,
+            caret,
+            names,
+            cell,
+        })
+    });
+    let names: Vec<(&str, &str)> = typing.as_ref().map_or_else(Vec::new, |t| {
+        t.names
+            .iter()
+            .map(|(name, formula)| (name.as_str(), formula.as_str()))
+            .collect()
+    });
+    let changed = shell
+        .hints
+        .update(typing.as_ref().map(|t| (t.text.as_str(), t.caret)), &names);
+    if !changed && typing.is_none() {
+        return;
+    }
+    let scale = ui.window().scale_factor();
+    if let Some(typing) = &typing {
+        let (left, top, _, bottom) = typing.cell;
+        ui.set_hint_x(left as f32 / scale);
+        ui.set_hint_top(top as f32 / scale);
+        ui.set_hint_bottom(bottom as f32 / scale);
+    }
+    show_hints(ui, shell);
+}
+
+/// Put what the formula hints hold into the window.
+fn show_hints(ui: &AppWindow, shell: &Shell) {
+    let (rows, at) = shell.hints.window();
+    ui.set_hint_items(model(
+        rows.iter()
+            .map(|item| HintItem {
+                name: item.name.as_str().into(),
+                detail: item.detail.as_str().into(),
+                is_name: item.kind == aster_sheets::hints::Kind::Name,
+            })
+            .collect(),
+    ));
+    ui.set_hint_selected(if rows.is_empty() { -1 } else { at as i32 });
+    let (before, current, after) = match shell.hints.call() {
+        Some(call) => call.function.split(Some(call.index)),
+        None => Default::default(),
+    };
+    ui.set_hint_call_before(before.into());
+    ui.set_hint_call_current(current.into());
+    ui.set_hint_call_after(after.into());
+}
+
+/// A key while the list of completions is open: Up and Down choose,
+/// Tab inserts (Enter does not: it enters the cell), Esc closes the list. `None` for any other key,
+/// which goes on to the cell as usual.
+fn hint_key(ui: &AppWindow, shell: &mut Shell, text: &str) -> Option<bool> {
+    use slint::platform::Key;
+
+    let is = |key: Key| text.chars().eq(std::iter::once(char::from(key)));
+    if shell
+        .active_sheet()
+        .is_none_or(|tab| tab.view.is_composing())
+    {
+        return None;
+    }
+    if is(Key::UpArrow) || is(Key::DownArrow) {
+        shell.hints.step(is(Key::DownArrow));
+        show_hints(ui, shell);
+        return Some(true);
+    }
+    // Enter is not here: it enters the cell, as it did before the list.
+    if is(Key::Tab) {
+        return Some(choose_hint(ui, shell, None));
+    }
+    if is(Key::Escape) {
+        let typed = shell
+            .active_sheet()
+            .and_then(|tab| tab.view.editor().map(|e| e.text().to_owned()))?;
+        shell.hints.dismiss(&typed);
+        show_hints(ui, shell);
+        return Some(true);
+    }
+    None
+}
+
+/// Put the chosen completion (a row of the list, or the selected one) into
+/// the cell being typed into, in place of the word before the caret.
+fn choose_hint(ui: &AppWindow, shell: &mut Shell, row: Option<usize>) -> bool {
+    let Some(insertion) = shell.hints.insertion(row) else {
+        return false;
+    };
+    let Some(tab) = shell.active_sheet() else {
+        return false;
+    };
+    let done = tab
+        .view
+        .edit(|editor| editor.replace_before_caret(insertion.replace, &insertion.text))
+        .unwrap_or(false);
+    if done {
+        refresh_viewer(ui, shell);
+        present(ui, shell);
+    }
+    done
 }
 
 /// Open the list of the filter button of a column of the sheet in front,
@@ -4493,6 +4634,12 @@ fn sheet_key_pressed(
 ) -> bool {
     use slint::platform::Key;
 
+    if shell.hints.is_open()
+        && !primary
+        && let Some(used) = hint_key(ui, shell, text)
+    {
+        return used;
+    }
     let language = shell.language.tag();
     let Some(tab) = shell.active_sheet() else {
         return false;
@@ -6709,6 +6856,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         after_sheet_change(&ui, shell, changes);
     }));
+    ui.on_hint_choose(handler!(|ui, shell, row| {
+        choose_hint(&ui, shell, usize::try_from(row).ok());
+    }));
+
     ui.on_dropdown_choose(handler!(|ui, shell, index| {
         let language = shell.language.tag();
         let Some((_, items)) = shell.dropdown.take() else {
@@ -8017,6 +8168,214 @@ mod ui_tests {
             with_sheet(&app, |tab| tab.view.workbook().sheets[0].name.clone()),
             "数据数据"
         );
+    }
+
+    /// A control key as the window reports it.
+    fn press(ui: &AppWindow, key: Key) {
+        type_text(ui, &char::from(key).to_string());
+    }
+
+    fn typed(app: &App) -> Option<String> {
+        with_sheet(app, |tab| tab.view.editor().map(|e| e.text().to_owned()))
+    }
+
+    fn hint_names(ui: &AppWindow) -> Vec<String> {
+        let items = ui.get_hint_items();
+        (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .map(|item| item.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn typing_a_function_name_lists_it_and_the_keys_choose() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_focus_document();
+        type_text(ui, "=su");
+        let names = hint_names(ui);
+        assert!(names.contains(&"SUM".to_owned()) && names.contains(&"SUMIF".to_owned()));
+        assert!(names.iter().all(|n| n.starts_with("SU")));
+        assert_eq!(ui.get_hint_selected(), 0);
+        assert!(
+            ui.get_hint_call_before().is_empty(),
+            "not inside a call yet"
+        );
+        // Down moves the choice, Up moves back, both wrap.
+        press(ui, Key::DownArrow);
+        assert_eq!(ui.get_hint_selected(), 1);
+        press(ui, Key::UpArrow);
+        press(ui, Key::UpArrow);
+        let shown = hint_names(ui);
+        assert_eq!(ui.get_hint_selected() as usize, shown.len() - 1);
+        press(ui, Key::DownArrow);
+        press(ui, Key::DownArrow);
+        let chosen = hint_names(ui)[ui.get_hint_selected() as usize].clone();
+        // Tab puts the name and the parenthesis in, and goes on to the arguments.
+        press(ui, Key::Tab);
+        assert_eq!(typed(&app), Some(format!("={chosen}(")));
+        assert!(hint_names(ui).is_empty());
+        assert!(ui.get_hint_call_before().starts_with(&format!("{chosen}(")));
+        // The cell is still being typed into: nothing was entered or moved.
+        with_sheet(&app, |tab| {
+            assert_eq!(tab.view.selected(), aster_sheets::CellRef::default());
+            assert!(tab.view.sheet().unwrap().cell_count() == 0);
+        });
+    }
+
+    #[test]
+    fn enter_enters_the_cell_even_while_the_list_is_open() {
+        let app = app();
+        let ui = &app.ui;
+        let input = |app: &App, cell: &str| {
+            with_sheet(app, |tab| {
+                let cell = tab
+                    .view
+                    .sheet()
+                    .unwrap()
+                    .cell(aster_sheets::CellRef::parse(cell).unwrap());
+                cell.map(|c| tab.view.workbook().input_text(c))
+            })
+        };
+        ui.invoke_focus_document();
+        // `=A1+B` offers B... functions, and Enter still enters the formula
+        // and moves down.
+        type_text(ui, "=A1+B");
+        assert!(!hint_names(ui).is_empty());
+        press(ui, Key::Return);
+        assert_eq!(typed(&app), None, "entered");
+        assert_eq!(input(&app, "A1").as_deref(), Some("=A1+B"));
+        assert_eq!(ui.get_cell_address(), "A2");
+        assert!(hint_names(ui).is_empty());
+        // Tab inserts; then the call is finished and entered with Enter.
+        type_text(ui, "=sumi");
+        assert_eq!(hint_names(ui), ["SUMIF", "SUMIFS"]);
+        press(ui, Key::Tab);
+        assert_eq!(typed(&app).as_deref(), Some("=SUMIF("));
+        type_text(ui, "1,2)");
+        press(ui, Key::Return);
+        assert_eq!(typed(&app), None);
+        assert_eq!(ui.get_cell_address(), "A3");
+        // Plain text never opens the list.
+        type_text(ui, "sum");
+        assert!(hint_names(ui).is_empty());
+        press(ui, Key::Return);
+        assert_eq!(input(&app, "A3").as_deref(), Some("sum"));
+    }
+
+    #[test]
+    fn escape_closes_the_list_first_and_the_entry_second() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_focus_document();
+        type_text(ui, "=ab");
+        assert!(!hint_names(ui).is_empty());
+        press(ui, Key::Escape);
+        assert!(hint_names(ui).is_empty());
+        assert_eq!(typed(&app).as_deref(), Some("=ab"), "still typing");
+        // More typing brings it back; Esc again, then Esc cancels the entry.
+        type_text(ui, "s");
+        assert!(hint_names(ui).contains(&"ABS".to_owned()));
+        press(ui, Key::Escape);
+        press(ui, Key::Escape);
+        assert_eq!(typed(&app), None);
+    }
+
+    #[test]
+    fn the_signature_shows_the_argument_being_typed() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_focus_document();
+        type_text(ui, "=VLOOKUP(");
+        let parts = || {
+            (
+                ui.get_hint_call_before().to_string(),
+                ui.get_hint_call_current().to_string(),
+                ui.get_hint_call_after().to_string(),
+            )
+        };
+        assert_eq!(parts().0, "VLOOKUP(");
+        assert_eq!(parts().1, "lookup_value");
+        type_text(ui, "A1,");
+        assert_eq!(parts().1, "table_array");
+        type_text(ui, "B:C,2,");
+        assert_eq!(parts().1, "[range_lookup]");
+        assert_eq!(parts().2, ")");
+        // Closed: gone.
+        type_text(ui, "0)");
+        assert_eq!(parts().0, "");
+    }
+
+    #[test]
+    fn defined_names_are_offered_with_the_functions() {
+        let app = app();
+        let ui = &app.ui;
+        with_sheet(&app, |tab| {
+            tab.view
+                .workbook_mut()
+                .names
+                .push(aster_sheets::model::DefinedName {
+                    name: "TaxRate".into(),
+                    local: None,
+                    formula: "Sheet1!$B$1".into(),
+                });
+        });
+        ui.invoke_focus_document();
+        type_text(ui, "=ta");
+        let items = ui.get_hint_items();
+        let found: Vec<(String, bool)> = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .map(|i| (i.name.to_string(), i.is_name))
+            .collect();
+        assert!(found.contains(&("TaxRate".to_owned(), true)));
+        assert!(found.contains(&("TAN".to_owned(), false)));
+        // A name takes no parenthesis.
+        while hint_names(ui)[ui.get_hint_selected() as usize] != "TaxRate" {
+            press(ui, Key::DownArrow);
+        }
+        press(ui, Key::Tab);
+        assert_eq!(typed(&app).as_deref(), Some("=TaxRate"));
+    }
+
+    #[test]
+    fn nothing_is_offered_and_no_key_taken_while_composing() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_focus_document();
+        type_text(ui, "=SUM(su");
+        assert!(!hint_names(ui).is_empty() && !ui.get_hint_call_before().is_empty());
+        // The input method starts composing: the list and signature go.
+        with_sheet(&app, |tab| {
+            tab.view.ime(ImeEvent::Preedit {
+                text: "ごう".into(),
+                cursor: None,
+            })
+        });
+        {
+            let mut shell = app.shell.borrow_mut();
+            refresh_viewer(ui, &mut shell);
+        }
+        assert!(hint_names(ui).is_empty());
+        assert!(ui.get_hint_call_before().is_empty());
+        // So the arrow keys and Enter belong to the composition's owner:
+        // here, with the list closed, Down is the cell's own key and Enter
+        // enters the cell (the method would have taken both first).
+        press(ui, Key::DownArrow);
+        assert_eq!(
+            with_sheet(&app, |tab| tab.view.editor().map(|e| e.text().to_owned())),
+            None,
+            "an arrow with nothing to choose enters the cell as usual"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_row_chooses_it() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_focus_document();
+        type_text(ui, "=sumi");
+        ui.invoke_hint_choose(1);
+        assert_eq!(typed(&app).as_deref(), Some("=SUMIFS("));
     }
 
     /// A drag with the left button through `points` (window coordinates).

@@ -10,6 +10,7 @@ pub mod assistant;
 pub mod cli;
 pub mod content;
 pub mod files;
+pub mod formula_hints;
 pub mod i18n;
 pub mod icons;
 pub mod office;

@@ -74,6 +74,21 @@ impl CellEditor {
         self.caret += text.len();
     }
 
+    /// Replace the `len` bytes before the caret by `text`, the caret after
+    /// it: a completion taking the place of the word typed so far. Does
+    /// nothing, and says so, if those bytes are not whole characters.
+    pub fn replace_before_caret(&mut self, len: usize, text: &str) -> bool {
+        let Some(start) = self.caret.checked_sub(len) else {
+            return false;
+        };
+        if !self.text.is_char_boundary(start) {
+            return false;
+        }
+        self.text.replace_range(start..self.caret, text);
+        self.caret = start + text.len();
+        true
+    }
+
     pub fn backspace(&mut self) -> bool {
         let Some((at, _)) = self.text[..self.caret].char_indices().next_back() else {
             return false;
@@ -168,6 +183,22 @@ mod tests {
         assert!(e.end());
         assert!(!e.right());
         assert!(!e.delete());
+    }
+
+    #[test]
+    fn a_completion_replaces_the_word_before_the_caret() {
+        let mut e = editor("=su+1");
+        e.left();
+        e.left();
+        assert_eq!(e.caret(), 3);
+        assert!(e.replace_before_caret(2, "SUM("));
+        assert_eq!(e.text(), "=SUM(+1");
+        assert_eq!(e.caret(), "=SUM(".len());
+        // Not into the middle of a character, nor before the start.
+        let mut e = editor("=あ");
+        assert!(!e.replace_before_caret(1, "x"));
+        assert!(!e.replace_before_caret(9, "x"));
+        assert_eq!(e.text(), "=あ");
     }
 
     #[test]

@@ -1,0 +1,455 @@
+# The functions the formula engine (formualizer 0.15.0) implements, with what
+# the formula hints show: NAME | arguments | what it does. In the arguments,
+# `[x]` is optional and `...` after the last one means it may repeat. A line
+# `ALIAS = TARGET` is the older name of a function. A test in aster-calc checks
+# this list against the engine's own registry, in both directions.
+ABS|number|Absolute value of a number.
+ACCRINT|issue, first_interest, settlement, rate, par, frequency, [basis], [calc_method]|Accrued interest of a security that pays periodic interest.
+ACCRINTM|issue, settlement, rate, par, [basis]|Accrued interest of a security that pays interest at maturity.
+ACOS|number|Arccosine of a number, in radians.
+ACOSH|number|Inverse hyperbolic cosine.
+ACOT|number|Arccotangent of a number, in radians.
+ACOTH|number|Inverse hyperbolic cotangent.
+ADDRESS|row, column, [abs_num], [a1], [sheet]|Cell address as text, from a row and column number.
+AGGREGATE|function_num, options, ref1, [ref2]...|Sum, average, count and more over a range, with options to ignore errors and hidden rows.
+ANCHORARRAY|reference|The whole spill range of the array that starts at a cell.
+AND|logical1, [logical2]...|TRUE if all arguments are TRUE.
+ARABIC|text|Converts a Roman numeral to a number.
+ARRAYTOTEXT|array, [format]|An array as text.
+ASC|text|Converts full-width characters to half-width.
+ASIN|number|Arcsine of a number, in radians.
+ASINH|number|Inverse hyperbolic sine.
+ATAN|number|Arctangent of a number, in radians.
+ATAN2|x_num, y_num|Arctangent from x and y coordinates.
+ATANH|number|Inverse hyperbolic tangent.
+AVEDEV|number1, [number2]...|Average of the absolute deviations from the mean.
+AVERAGE|number1, [number2]...|Average of the numbers.
+AVERAGEA|value1, [value2]...|Average of values, counting text as 0 and TRUE as 1.
+AVERAGEIF|range, criteria, [average_range]|Average of the cells that meet a condition.
+AVERAGEIFS|average_range, criteria_range1, criteria1, [criteria_range2, criteria2]...|Average of the cells that meet several conditions.
+BASE|number, radix, [min_length]|A number as text in another base.
+BESSELI|x, n|Modified Bessel function In(x).
+BESSELJ|x, n|Bessel function Jn(x).
+BESSELK|x, n|Modified Bessel function Kn(x).
+BESSELY|x, n|Bessel function Yn(x).
+BETA.DIST|x, alpha, beta, cumulative, [A], [B]|Beta distribution.
+BETA.INV|probability, alpha, beta, [A], [B]|Inverse of the beta distribution.
+BETADIST|x, alpha, beta, [A], [B]|Cumulative beta distribution (older form).
+BETAINV|probability, alpha, beta, [A], [B]|Inverse of the cumulative beta distribution (older form).
+BIN2DEC|number|Binary to decimal.
+BIN2HEX|number, [places]|Binary to hexadecimal.
+BIN2OCT|number, [places]|Binary to octal.
+BINOM.DIST|number_s, trials, probability_s, cumulative|Binomial distribution.
+BINOM.DIST.RANGE|trials, probability_s, number_s, [number_s2]|Probability of a trial result in a range, binomial.
+BINOM.INV|trials, probability_s, alpha|Smallest value with a cumulative binomial at least the criterion.
+BITAND|number1, number2|Bitwise AND.
+BITLSHIFT|number, shift_amount|Shifts bits left.
+BITOR|number1, number2|Bitwise OR.
+BITRSHIFT|number, shift_amount|Shifts bits right.
+BITXOR|number1, number2|Bitwise exclusive OR.
+CEILING|number, [significance]|Rounds up to a multiple of the significance.
+CEILING.MATH|number, [significance], [mode]|Rounds up to the nearest integer or multiple.
+CEILING.PRECISE|number, [significance]|Rounds up to a multiple, whatever the sign.
+CELL|info_type, [reference]|Information about a cell.
+CHAR|number|The character with a code number.
+CHIDIST|x, deg_freedom|Right-tailed chi-squared probability (older form).
+CHIINV|probability, deg_freedom|Inverse of the right-tailed chi-squared (older form).
+CHISQ.DIST|x, deg_freedom, cumulative|Chi-squared distribution.
+CHISQ.DIST.RT|x, deg_freedom|Right-tailed chi-squared distribution.
+CHISQ.INV|probability, deg_freedom|Inverse of the chi-squared distribution.
+CHISQ.INV.RT|probability, deg_freedom|Inverse of the right-tailed chi-squared distribution.
+CHISQ.TEST|actual_range, expected_range|Chi-squared test of independence.
+CHOOSE|index_num, value1, [value2]...|Picks a value from a list by position.
+CHOOSECOLS|array, col_num1, [col_num2]...|Chosen columns of an array.
+CHOOSEROWS|array, row_num1, [row_num2]...|Chosen rows of an array.
+CLEAN|text|Removes characters that cannot be printed.
+CODE|text|Code number of the first character.
+COLUMN|[reference]|Column number of a reference.
+COLUMNS|array|How many columns a range or array has.
+COMBIN|number, number_chosen|Combinations of items, without repeats.
+COMBINA|number, number_chosen|Combinations of items, with repeats.
+COMPLEX|real_num, i_num, [suffix]|A complex number from its real and imaginary parts.
+CONCAT|text1, [text2]...|Joins text from several cells or ranges.
+CONCATENATE|text1, [text2]...|Joins several pieces of text.
+CONFIDENCE.NORM|alpha, standard_dev, size|Confidence interval for a mean, normal distribution.
+CONFIDENCE.T|alpha, standard_dev, size|Confidence interval for a mean, Student's t.
+CONVERT|number, from_unit, to_unit|Converts a number between units of measure.
+CORREL|array1, array2|Correlation coefficient of two data sets.
+COS|number|Cosine of an angle in radians.
+COSH|number|Hyperbolic cosine.
+COT|number|Cotangent of an angle in radians.
+COTH|number|Hyperbolic cotangent.
+COUNT|[value1], [value2]...|Counts the cells that hold numbers.
+COUNTA|value1, [value2]...|Counts the cells that are not empty.
+COUNTBLANK|range|Counts the empty cells in a range.
+COUNTIF|range, criteria|Counts the cells that meet a condition.
+COUNTIFS|criteria_range1, criteria1, [criteria_range2, criteria2]...|Counts the cells that meet several conditions.
+COVARIANCE.P|array1, array2|Population covariance.
+COVARIANCE.S|array1, array2|Sample covariance.
+CSC|number|Cosecant of an angle in radians.
+CSCH|number|Hyperbolic cosecant.
+CUMIPMT|rate, nper, pv, start_period, end_period, type|Interest paid on a loan between two periods.
+CUMPRINC|rate, nper, pv, start_period, end_period, type|Principal paid on a loan between two periods.
+DATE|year, month, day|A date from a year, month and day.
+DATEDIF|start_date, end_date, unit|Difference between two dates in days, months or years.
+DATEVALUE|date_text|Converts a date in text to a date number.
+DAVERAGE|database, field, criteria|Average of the matching rows of a list.
+DAY|serial_number|Day of the month of a date.
+DAYS|end_date, start_date|Days between two dates.
+DAYS360|start_date, end_date, [method]|Days between two dates on a 360-day year.
+DB|cost, salvage, life, period, [month]|Depreciation by the fixed-declining balance method.
+DCOUNT|database, field, criteria|Counts the numbers in the matching rows of a list.
+DCOUNTA|database, field, criteria|Counts the non-empty cells in the matching rows of a list.
+DDB|cost, salvage, life, period, [factor]|Depreciation by the double-declining balance method.
+DEC2BIN|number, [places]|Decimal to binary.
+DEC2HEX|number, [places]|Decimal to hexadecimal.
+DEC2OCT|number, [places]|Decimal to octal.
+DECIMAL|text, radix|Converts text in another base to a decimal number.
+DEGREES|angle|Radians to degrees.
+DELTA|number1, [number2]|1 if two numbers are equal, otherwise 0.
+DEVSQ|number1, [number2]...|Sum of squared deviations from the mean.
+DGET|database, field, criteria|The one value in a list that matches.
+DMAX|database, field, criteria|Largest value in the matching rows of a list.
+DMIN|database, field, criteria|Smallest value in the matching rows of a list.
+DOLLAR|number, [decimals]|A number as currency text.
+DOLLARDE|fractional_dollar, fraction|Fractional price to a decimal.
+DOLLARFR|decimal_dollar, fraction|Decimal price to a fraction.
+DPRODUCT|database, field, criteria|Product of the values in the matching rows of a list.
+DROP|array, rows, [columns]|An array without its first or last rows or columns.
+DSTDEV|database, field, criteria|Sample standard deviation of the matching rows of a list.
+DSTDEVP|database, field, criteria|Population standard deviation of the matching rows of a list.
+DSUM|database, field, criteria|Sum of the matching rows of a list.
+DVAR|database, field, criteria|Sample variance of the matching rows of a list.
+DVARP|database, field, criteria|Population variance of the matching rows of a list.
+EDATE|start_date, months|The date some months before or after a date.
+EFFECT|nominal_rate, npery|Effective annual interest rate.
+EOMONTH|start_date, months|Last day of the month, some months before or after a date.
+ERF|lower_limit, [upper_limit]|Error function.
+ERF.PRECISE|x|Error function, from 0 to x.
+ERFC|x|Complementary error function.
+ERFC.PRECISE|x|Complementary error function, from x to infinity.
+ERROR.TYPE|error_val|Number that stands for an error.
+EVEN|number|Rounds up to the nearest even integer.
+EXACT|text1, text2|TRUE if two texts are exactly the same.
+EXP|number|e raised to a power.
+EXPON.DIST|x, lambda, cumulative|Exponential distribution.
+F.DIST|x, deg_freedom1, deg_freedom2, cumulative|F distribution.
+F.DIST.RT|x, deg_freedom1, deg_freedom2|Right-tailed F distribution.
+F.INV|probability, deg_freedom1, deg_freedom2|Inverse of the F distribution.
+F.INV.RT|probability, deg_freedom1, deg_freedom2|Inverse of the right-tailed F distribution.
+F.TEST|array1, array2|Result of an F test.
+FACT|number|Factorial.
+FACTDOUBLE|number|Double factorial.
+FALSE|Logical value FALSE.
+FDIST|x, deg_freedom1, deg_freedom2|Right-tailed F distribution (older form).
+FILTER|array, include, [if_empty]|The rows of a range that meet a condition.
+FIND|find_text, within_text, [start_num]|Position of a text in another, case-sensitive.
+FINDB|find_text, within_text, [start_num]|Position of a text in another, counted in bytes.
+FINV|probability, deg_freedom1, deg_freedom2|Inverse of the right-tailed F distribution (older form).
+FISHER|x|Fisher transformation.
+FISHERINV|y|Inverse of the Fisher transformation.
+FIXED|number, [decimals], [no_commas]|A number as text with fixed decimals.
+FLOOR|number, [significance]|Rounds down to a multiple of the significance.
+FLOOR.MATH|number, [significance], [mode]|Rounds down to the nearest integer or multiple.
+FLOOR.PRECISE|number, [significance]|Rounds down to a multiple, whatever the sign.
+FORECAST.LINEAR|x, known_ys, known_xs|Predicts a value along a linear trend.
+FORMULATEXT|reference|The formula of a cell as text.
+FREQUENCY|data_array, bins_array|How often values fall in ranges.
+FV|rate, nper, pmt, [pv], [type]|Future value of an investment.
+GAMMA|number|Gamma function.
+GAMMA.DIST|x, alpha, beta, cumulative|Gamma distribution.
+GAMMA.INV|probability, alpha, beta|Inverse of the gamma distribution.
+GAMMALN|x|Natural logarithm of the gamma function.
+GAMMALN.PRECISE|x|Natural logarithm of the gamma function, precise.
+GAUSS|x|Probability a standard normal value lies between the mean and x standard deviations.
+GCD|number1, [number2]...|Greatest common divisor.
+GEOMEAN|number1, [number2]...|Geometric mean.
+GESTEP|number, [step]|1 if a number is at least the step, otherwise 0.
+GROUPBY|row_fields, values, function, [field_headers], [total_depth], [sort_order], [filter_array], [field_relationship]|Groups and summarises rows of an array.
+GROWTH|known_ys, [known_xs], [new_xs], [const]|Values along an exponential trend.
+HARMEAN|number1, [number2]...|Harmonic mean.
+HEX2BIN|number, [places]|Hexadecimal to binary.
+HEX2DEC|number|Hexadecimal to decimal.
+HEX2OCT|number, [places]|Hexadecimal to octal.
+HLOOKUP|lookup_value, table_array, row_index_num, [range_lookup]|Looks up a value in the top row, returns one from a row below.
+HOUR|serial_number|Hour of a time.
+HSTACK|array1, [array2]...|Arrays joined side by side.
+HYPERLINK|link_location, [friendly_name]|A link to a document or page.
+HYPGEOM.DIST|sample_s, number_sample, population_s, number_pop, cumulative|Hypergeometric distribution.
+HYPGEOMDIST|sample_s, number_sample, population_s, number_pop|Hypergeometric distribution (older form).
+IF|logical_test, [value_if_true], [value_if_false]|One value if a condition is true, another if not.
+IFERROR|value, value_if_error|A value, or another if it is an error.
+IFNA|value, value_if_na|A value, or another if it is #N/A.
+IFS|logical_test1, value_if_true1, [logical_test2, value_if_true2]...|The value for the first condition that is true.
+IMABS|inumber|Absolute value of a complex number.
+IMAGINARY|inumber|Imaginary part of a complex number.
+IMARGUMENT|inumber|Angle of a complex number, in radians.
+IMCONJUGATE|inumber|Complex conjugate.
+IMCOS|inumber|Cosine of a complex number.
+IMCOSH|inumber|Hyperbolic cosine of a complex number.
+IMCOT|inumber|Cotangent of a complex number.
+IMCSC|inumber|Cosecant of a complex number.
+IMCSCH|inumber|Hyperbolic cosecant of a complex number.
+IMDIV|inumber1, inumber2|Quotient of two complex numbers.
+IMEXP|inumber|e raised to a complex power.
+IMLN|inumber|Natural logarithm of a complex number.
+IMLOG10|inumber|Base-10 logarithm of a complex number.
+IMLOG2|inumber|Base-2 logarithm of a complex number.
+IMPOWER|inumber, number|A complex number raised to a power.
+IMPRODUCT|inumber1, [inumber2]...|Product of complex numbers.
+IMREAL|inumber|Real part of a complex number.
+IMSEC|inumber|Secant of a complex number.
+IMSECH|inumber|Hyperbolic secant of a complex number.
+IMSIN|inumber|Sine of a complex number.
+IMSINH|inumber|Hyperbolic sine of a complex number.
+IMSQRT|inumber|Square root of a complex number.
+IMSUB|inumber1, inumber2|Difference of two complex numbers.
+IMSUM|inumber1, [inumber2]...|Sum of complex numbers.
+IMTAN|inumber|Tangent of a complex number.
+INDEX|array, row_num, [column_num]|The value at a row and column of a range.
+INDIRECT|ref_text, [a1]|The reference a text stands for.
+INT|number|Rounds down to the nearest integer.
+INTERCEPT|known_ys, known_xs|Where a regression line crosses the y axis.
+IPMT|rate, per, nper, pv, [fv], [type]|Interest part of a loan payment.
+IRR|values, [guess]|Internal rate of return.
+ISBLANK|value|TRUE if the cell is empty.
+ISERR|value|TRUE for any error except #N/A.
+ISERROR|value|TRUE for any error.
+ISEVEN|number|TRUE if a number is even.
+ISFORMULA|reference|TRUE if the cell holds a formula.
+ISLOGICAL|value|TRUE if the value is TRUE or FALSE.
+ISNA|value|TRUE if the value is #N/A.
+ISNONTEXT|value|TRUE if the value is not text.
+ISNUMBER|value|TRUE if the value is a number.
+ISO.CEILING|number, [significance]|Rounds up to a multiple, whatever the sign.
+ISODD|number|TRUE if a number is odd.
+ISOWEEKNUM|date|ISO week number of a date.
+ISPMT|rate, per, nper, pv|Interest paid in a period of an even-principal loan.
+ISREF|value|TRUE if the value is a reference.
+ISTEXT|value|TRUE if the value is text.
+KURT|number1, [number2]...|Kurtosis of a data set.
+LAMBDA|[parameter1], calculation|A function of your own, made from a formula.
+LARGE|array, k|The k-th largest value.
+LCM|number1, [number2]...|Least common multiple.
+LEFT|text, [num_chars]|The first characters of a text.
+LEFTB|text, [num_bytes]|The first bytes of a text.
+LEN|text|Number of characters in a text.
+LENB|text|Number of bytes in a text.
+LET|name1, name_value1, calculation_or_name2, [name_value2, calculation_or_name3]...|Gives names to values inside a formula.
+LINEST|known_ys, [known_xs], [const], [stats]|Statistics of a linear trend.
+LN|number|Natural logarithm.
+LOG|number, [base]|Logarithm to a base.
+LOG10|number|Base-10 logarithm.
+LOGEST|known_ys, [known_xs], [const], [stats]|Statistics of an exponential trend.
+LOGNORM.DIST|x, mean, standard_dev, cumulative|Lognormal distribution.
+LOGNORM.INV|probability, mean, standard_dev|Inverse of the lognormal distribution.
+LOGNORMDIST|x, mean, standard_dev|Cumulative lognormal distribution (older form).
+LOOKUP|lookup_value, lookup_vector, [result_vector]|Looks up a value in a row or column.
+LOWER|text|Text in lower case.
+MATCH|lookup_value, lookup_array, [match_type]|Position of a value in a range.
+MAX|number1, [number2]...|Largest number.
+MAXA|value1, [value2]...|Largest value, counting text as 0 and TRUE as 1.
+MAXIFS|max_range, criteria_range1, criteria1, [criteria_range2, criteria2]...|Largest value among the cells that meet conditions.
+MEDIAN|number1, [number2]...|Median of the numbers.
+MID|text, start_num, num_chars|Characters from the middle of a text.
+MIDB|text, start_num, num_bytes|Bytes from the middle of a text.
+MIN|number1, [number2]...|Smallest number.
+MINA|value1, [value2]...|Smallest value, counting text as 0 and TRUE as 1.
+MINIFS|min_range, criteria_range1, criteria1, [criteria_range2, criteria2]...|Smallest value among the cells that meet conditions.
+MINUTE|serial_number|Minute of a time.
+MIRR|values, finance_rate, reinvest_rate|Modified internal rate of return.
+MOD|number, divisor|Remainder after division.
+MODE.MULT|number1, [number2]...|The most frequent values, as a column.
+MODE.SNGL|number1, [number2]...|The most frequent value.
+MONTH|serial_number|Month of a date.
+MROUND|number, multiple|Rounds to the nearest multiple.
+MULTINOMIAL|number1, [number2]...|Multinomial of a set of numbers.
+N|value|A value as a number.
+NA|The error #N/A.
+NEGBINOM.DIST|number_f, number_s, probability_s, cumulative|Negative binomial distribution.
+NEGBINOMDIST|number_f, number_s, probability_s|Negative binomial distribution (older form).
+NETWORKDAYS|start_date, end_date, [holidays]|Working days between two dates.
+NETWORKDAYS.INTL|start_date, end_date, [weekend], [holidays]|Working days between two dates, with custom weekends.
+NOMINAL|effect_rate, npery|Nominal annual interest rate.
+NORM.DIST|x, mean, standard_dev, cumulative|Normal distribution.
+NORM.INV|probability, mean, standard_dev|Inverse of the normal distribution.
+NORM.S.DIST|z, cumulative|Standard normal distribution.
+NORM.S.INV|probability|Inverse of the standard normal distribution.
+NORMSDIST|z|Standard normal distribution (older form).
+NOT|logical|Reverses TRUE and FALSE.
+NOW|The current date and time.
+NPER|rate, pmt, pv, [fv], [type]|Number of periods of an investment.
+NPV|rate, value1, [value2]...|Net present value.
+NUMBERVALUE|text, [decimal_separator], [group_separator]|Converts text to a number, whatever the locale.
+OCT2BIN|number, [places]|Octal to binary.
+OCT2DEC|number|Octal to decimal.
+OCT2HEX|number, [places]|Octal to hexadecimal.
+ODD|number|Rounds up to the nearest odd integer.
+OFFSET|reference, rows, cols, [height], [width]|A range some rows and columns away from a reference.
+OR|logical1, [logical2]...|TRUE if any argument is TRUE.
+PDURATION|rate, pv, fv|Periods an investment needs to reach a value.
+PEARSON|array1, array2|Pearson correlation coefficient.
+PERCENTILE.EXC|array, k|Percentile, excluding the ends.
+PERCENTILE.INC|array, k|Percentile, including the ends.
+PERCENTRANK.EXC|array, x, [significance]|Rank of a value as a percentage, excluding the ends.
+PERCENTRANK.INC|array, x, [significance]|Rank of a value as a percentage, including the ends.
+PERMUT|number, number_chosen|Permutations of items.
+PHI|x|Density of the standard normal distribution.
+PI|The number pi.
+PIVOTBY|row_fields, col_fields, values, function, [field_headers], [row_total_depth], [row_sort_order], [col_total_depth], [col_sort_order], [filter_array]|Groups and summarises an array by rows and columns.
+PMT|rate, nper, pv, [fv], [type]|Payment of a loan.
+POISSON.DIST|x, mean, cumulative|Poisson distribution.
+POWER|number, power|A number raised to a power.
+PPMT|rate, per, nper, pv, [fv], [type]|Principal part of a loan payment.
+PRICE|settlement, maturity, rate, yld, redemption, frequency, [basis]|Price of a security that pays periodic interest.
+PRODUCT|number1, [number2]...|Product of the numbers.
+PROPER|text|Capitalises the first letter of each word.
+PV|rate, nper, pmt, [fv], [type]|Present value of an investment.
+QUARTILE.EXC|array, quart|Quartile, excluding the ends.
+QUARTILE.INC|array, quart|Quartile, including the ends.
+QUOTIENT|numerator, denominator|Integer part of a division.
+RADIANS|angle|Degrees to radians.
+RAND|A random number from 0 up to 1.
+RANDARRAY|[rows], [columns], [min], [max], [integer]|An array of random numbers.
+RANDBETWEEN|bottom, top|A random integer between two numbers.
+RANK.AVG|number, ref, [order]|Rank of a number in a list, ties get the average rank.
+RANK.EQ|number, ref, [order]|Rank of a number in a list, ties get the top rank.
+RATE|nper, pmt, pv, [fv], [type], [guess]|Interest rate per period.
+REPLACE|old_text, start_num, num_chars, new_text|Replaces part of a text by position.
+REPLACEB|old_text, start_num, num_bytes, new_text|Replaces part of a text by byte position.
+REPT|text, number_times|Repeats a text.
+RIGHT|text, [num_chars]|The last characters of a text.
+RIGHTB|text, [num_bytes]|The last bytes of a text.
+ROMAN|number, [form]|A number as a Roman numeral.
+ROUND|number, num_digits|Rounds to a number of digits.
+ROUNDDOWN|number, num_digits|Rounds toward zero.
+ROUNDUP|number, num_digits|Rounds away from zero.
+ROW|[reference]|Row number of a reference.
+ROWS|array|How many rows a range or array has.
+RRI|nper, pv, fv|Interest rate for the growth of an investment.
+RSQ|known_ys, known_xs|Square of the Pearson correlation.
+SEARCH|find_text, within_text, [start_num]|Position of a text in another, ignoring case.
+SEARCHB|find_text, within_text, [start_num]|Position of a text in another in bytes, ignoring case.
+SEC|number|Secant of an angle in radians.
+SECH|number|Hyperbolic secant.
+SECOND|serial_number|Second of a time.
+SEQUENCE|rows, [columns], [start], [step]|A list of numbers in a row.
+SERIESSUM|x, n, m, coefficients|Sum of a power series.
+SHEET|[value]|Sheet number of a reference.
+SHEETS|[reference]|Number of sheets in a reference.
+SIGN|number|1 for positive, 0 for zero, -1 for negative.
+SIN|number|Sine of an angle in radians.
+SINGLE|value|The single value an array formula would give.
+SINH|number|Hyperbolic sine.
+SKEW|number1, [number2]...|Skewness of a distribution.
+SKEW.P|number1, [number2]...|Skewness of a population.
+SLN|cost, salvage, life|Straight-line depreciation.
+SLOPE|known_ys, known_xs|Slope of a regression line.
+SMALL|array, k|The k-th smallest value.
+SORT|array, [sort_index], [sort_order], [by_col]|A sorted array.
+SORTBY|array, by_array1, [sort_order1], [by_array2, sort_order2]...|An array sorted by another.
+SQRT|number|Square root.
+SQRTPI|number|Square root of a number times pi.
+STANDARDIZE|x, mean, standard_dev|A value as a z-score.
+STDEV.P|number1, [number2]...|Standard deviation of a population.
+STDEV.S|number1, [number2]...|Standard deviation of a sample.
+STDEVA|value1, [value2]...|Sample standard deviation, with text and logicals.
+STDEVPA|value1, [value2]...|Population standard deviation, with text and logicals.
+STEYX|known_ys, known_xs|Standard error of the predicted y values.
+SUBSTITUTE|text, old_text, new_text, [instance_num]|Replaces text by matching it.
+SUBTOTAL|function_num, ref1, [ref2]...|A subtotal of a list, leaving out other subtotals.
+SUM|number1, [number2]...|Adds the numbers.
+SUMIF|range, criteria, [sum_range]|Adds the cells that meet a condition.
+SUMIFS|sum_range, criteria_range1, criteria1, [criteria_range2, criteria2]...|Adds the cells that meet several conditions.
+SUMPRODUCT|array1, [array2]...|Sum of the products of matching cells.
+SUMSQ|number1, [number2]...|Sum of the squares.
+SUMX2MY2|array_x, array_y|Sum of the differences of squares.
+SUMX2PY2|array_x, array_y|Sum of the sums of squares.
+SUMXMY2|array_x, array_y|Sum of the squares of differences.
+SWITCH|expression, value1, result1, [default_or_value2, result2]...|The result for the first value that matches an expression.
+SYD|cost, salvage, life, per|Sum-of-years' digits depreciation.
+T|value|The text of a value, or an empty text.
+T.DIST|x, deg_freedom, cumulative|Student's t distribution.
+T.DIST.2T|x, deg_freedom|Two-tailed Student's t distribution.
+T.DIST.RT|x, deg_freedom|Right-tailed Student's t distribution.
+T.INV|probability, deg_freedom|Inverse of Student's t distribution.
+T.INV.2T|probability, deg_freedom|Two-tailed inverse of Student's t distribution.
+T.TEST|array1, array2, tails, type|Result of a Student's t test.
+TAKE|array, rows, [columns]|The first or last rows or columns of an array.
+TAN|number|Tangent of an angle in radians.
+TANH|number|Hyperbolic tangent.
+TBILLEQ|settlement, maturity, discount|Bond-equivalent yield of a Treasury bill.
+TBILLPRICE|settlement, maturity, discount|Price of a Treasury bill.
+TBILLYIELD|settlement, maturity, pr|Yield of a Treasury bill.
+TDIST|x, deg_freedom, tails|Student's t distribution (older form).
+TEXT|value, format_text|A number as text in a format.
+TEXTAFTER|text, delimiter, [instance_num], [match_mode], [match_end], [if_not_found]|The text after a delimiter.
+TEXTBEFORE|text, delimiter, [instance_num], [match_mode], [match_end], [if_not_found]|The text before a delimiter.
+TEXTJOIN|delimiter, ignore_empty, text1, [text2]...|Joins texts with a delimiter.
+TEXTSPLIT|text, col_delimiter, [row_delimiter], [ignore_empty], [match_mode], [pad_with]|Splits a text into cells by delimiters.
+TIME|hour, minute, second|A time from hour, minute and second.
+TIMEVALUE|time_text|Converts a time in text to a time number.
+TINV|probability, deg_freedom|Two-tailed inverse of Student's t (older form).
+TOCOL|array, [ignore], [scan_by_column]|An array as one column.
+TODAY|Today's date.
+TOROW|array, [ignore], [scan_by_column]|An array as one row.
+TRANSPOSE|array|Swaps the rows and columns of a range.
+TREND|known_ys, [known_xs], [new_xs], [const]|Values along a linear trend.
+TRIM|text|Removes extra spaces.
+TRIMMEAN|array, percent|Mean without a share of the extremes.
+TRUE|Logical value TRUE.
+TRUNC|number, [num_digits]|Cuts a number to some digits.
+TYPE|value|Number that stands for the type of a value.
+UNICHAR|number|The character of a Unicode number.
+UNICODE|text|Unicode number of the first character.
+UNIQUE|array, [by_col], [exactly_once]|The unique values of a range.
+UPPER|text|Text in upper case.
+VALUE|text|Text to number.
+VALUETOTEXT|value, [format]|A value as text.
+VAR.P|number1, [number2]...|Variance of a population.
+VAR.S|number1, [number2]...|Variance of a sample.
+VARA|value1, [value2]...|Sample variance, with text and logicals.
+VARPA|value1, [value2]...|Population variance, with text and logicals.
+VLOOKUP|lookup_value, table_array, col_index_num, [range_lookup]|Looks up a value in the first column, returns one from a column to the right.
+VSTACK|array1, [array2]...|Arrays joined one under another.
+WEEKDAY|serial_number, [return_type]|Day of the week of a date.
+WEEKNUM|serial_number, [return_type]|Week number of a date.
+WEIBULL.DIST|x, alpha, beta, cumulative|Weibull distribution.
+WORKDAY|start_date, days, [holidays]|The date some working days away.
+WORKDAY.INTL|start_date, days, [weekend], [holidays]|The date some working days away, with custom weekends.
+XIRR|values, dates, [guess]|Internal rate of return of cash flows on dates.
+XLOOKUP|lookup_value, lookup_array, return_array, [if_not_found], [match_mode], [search_mode]|Looks up a value and returns the matching one from another range.
+XMATCH|lookup_value, lookup_array, [match_mode], [search_mode]|Position of a value in a range.
+XNPV|rate, values, dates|Net present value of cash flows on dates.
+XOR|logical1, [logical2]...|TRUE if an odd number of arguments are TRUE.
+YEAR|serial_number|Year of a date.
+YEARFRAC|start_date, end_date, [basis]|Fraction of a year between two dates.
+YIELD|settlement, maturity, rate, pr, redemption, frequency, [basis]|Yield of a security that pays periodic interest.
+Z.TEST|array, x, [sigma]|One-tailed probability of a z test.
+BINOMDIST = BINOM.DIST
+CRITBINOM = BINOM.INV
+CHITEST = CHISQ.TEST
+CONFIDENCE = CONFIDENCE.NORM
+COVAR = COVARIANCE.P
+EXPONDIST = EXPON.DIST
+FTEST = F.TEST
+FORECAST = FORECAST.LINEAR
+GAMMADIST = GAMMA.DIST
+GAMMAINV = GAMMA.INV
+LOGINV = LOGNORM.INV
+MODE = MODE.SNGL
+NORMDIST = NORM.DIST
+NORMINV = NORM.INV
+NORMSINV = NORM.S.INV
+PERCENTILE = PERCENTILE.INC
+PERCENTRANK = PERCENTRANK.INC
+POISSON = POISSON.DIST
+QUARTILE = QUARTILE.INC
+RANK = RANK.EQ
+STDEVP = STDEV.P
+STDEV = STDEV.S
+TTEST = T.TEST
+VARP = VAR.P
+VAR = VAR.S
+WEIBULL = WEIBULL.DIST
+ZTEST = Z.TEST

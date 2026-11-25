@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use aster_sheets::style::{self, Rgba};
 use aster_sheets::{
-    Anchor, AutoFilter, Axis, Borders, Cell, CellRange, CellRef, CellStyle, Font, Format, HAlign,
-    Line, LineStyle, MAX_COLUMNS, MAX_ROWS, Picture, Placement, Sheet, SheetBuilder, SheetKind,
-    Shown, VAlign, Value, Workbook,
+    Anchor, AutoFilter, Axis, Borders, Cell, CellRange, CellRef, CellStyle, Comment, Font, Format,
+    HAlign, Line, LineStyle, MAX_COLUMNS, MAX_ROWS, Picture, Placement, Sheet, SheetBuilder,
+    SheetKind, Shown, VAlign, Value, Workbook,
 };
 
 use crate::drawingml::{Theme, parse_hex, read_theme};
@@ -45,6 +45,14 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
             .and_then(|(_, target)| target.clone())
     };
 
+    // Who wrote threaded comments, by their id. A list that does not
+    // parse leaves the names out.
+    let persons = match target_of("person") {
+        Some(part) if package.has(&part) => {
+            persons(&package.read(&part)?, &part).unwrap_or_default()
+        }
+        _ => HashMap::new(),
+    };
     let strings = match target_of("sharedStrings") {
         Some(part) if package.has(&part) => shared_strings(&package.read(&part)?, &part)?,
         _ => Vec::new(),
@@ -103,6 +111,24 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
                 {
                     builder.pictures = pictures(package, &part)?;
                     charts.extend(linked_charts(package, &part)?);
+                }
+                // Notes, then threaded comments over the notes Excel
+                // writes for them.
+                for rel in &rels {
+                    let Some(part) = rel.target.as_ref().filter(|part| package.has(part)) else {
+                        continue;
+                    };
+                    match rel.kind.as_str() {
+                        "comments" => {
+                            let found = notes(&package.read(part)?, part)?;
+                            builder.comments.extend(found);
+                        }
+                        "threadedComment" => {
+                            let found = threads(&package.read(part)?, part, &persons)?;
+                            builder.comments.extend(found);
+                        }
+                        _ => {}
+                    }
                 }
                 let mut sheet = builder.finish();
                 sheet.structure_blocker = rels
@@ -798,6 +824,139 @@ fn worksheet(
     Ok((builder, drawing))
 }
 
+/// The notes of a comments part, by cell: author and text.
+pub(crate) fn notes(bytes: &[u8], part: &str) -> Result<Vec<(CellRef, Comment)>> {
+    let mut reader = XmlReader::new(bytes, part);
+    let mut authors: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        match reader.next()? {
+            Ev::Open(tag) if tag.is("author") => authors.push(reader.text()?),
+            Ev::Open(tag) if tag.is("comment") => {
+                let at = tag.attr("ref").as_deref().and_then(CellRef::parse);
+                let author = tag
+                    .attr_i64("authorId")
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| authors.get(i).cloned())
+                    .unwrap_or_default();
+                let mut text = String::new();
+                each_child(&mut reader, |reader, child| {
+                    if child.is("text") {
+                        rich_text(reader, &mut text)
+                    } else {
+                        reader.skip()
+                    }
+                })?;
+                if let Some(at) = at {
+                    let text = decode_escapes(&text)
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n");
+                    out.push((at, Comment::note(&author, &text)));
+                }
+            }
+            Ev::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The text of a rich text element (`<text>`, `<is>`): its runs' `<t>`,
+/// without phonetic guides.
+fn rich_text(reader: &mut XmlReader<'_>, out: &mut String) -> Result<()> {
+    each_child(reader, |reader, child| {
+        if child.is("t") {
+            out.push_str(&reader.text()?);
+            Ok(())
+        } else if child.is("r") {
+            each_child(reader, |reader, inner| {
+                if inner.is("t") {
+                    out.push_str(&reader.text()?);
+                    Ok(())
+                } else {
+                    reader.skip()
+                }
+            })
+        } else {
+            reader.skip()
+        }
+    })
+}
+
+/// The people a workbook's threaded comments name: id to display name.
+fn persons(bytes: &[u8], part: &str) -> Result<HashMap<String, String>> {
+    let mut reader = XmlReader::new(bytes, part);
+    let mut out = HashMap::new();
+    loop {
+        match reader.next()? {
+            Ev::Open(tag) if tag.is("person") => {
+                if let (Some(id), Some(name)) = (tag.attr("id"), tag.attr("displayName")) {
+                    out.insert(id, name);
+                }
+                reader.skip()?;
+            }
+            Ev::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The threaded comments of a part, by cell: the first one's author, and
+/// each comment of the thread on a line of its own, replies after
+/// "name: ".
+fn threads(
+    bytes: &[u8],
+    part: &str,
+    persons: &HashMap<String, String>,
+) -> Result<Vec<(CellRef, Comment)>> {
+    let mut reader = XmlReader::new(bytes, part);
+    let mut found: Vec<(CellRef, Comment)> = Vec::new();
+    loop {
+        match reader.next()? {
+            Ev::Open(tag) if tag.is("threadedComment") => {
+                let at = tag.attr("ref").as_deref().and_then(CellRef::parse);
+                let name = tag
+                    .attr("personId")
+                    .and_then(|id| persons.get(&id).cloned())
+                    .unwrap_or_default();
+                let mut text = String::new();
+                each_child(&mut reader, |reader, child| {
+                    if child.is("text") {
+                        text = reader.text()?;
+                        Ok(())
+                    } else {
+                        reader.skip()
+                    }
+                })?;
+                let Some(at) = at else { continue };
+                let line = if name.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{name}: {text}")
+                };
+                match found.iter_mut().find(|(cell, _)| *cell == at) {
+                    Some((_, thread)) => {
+                        thread.text.push('\n');
+                        thread.text.push_str(&line);
+                    }
+                    None => found.push((
+                        at,
+                        Comment {
+                            author: name,
+                            text: line,
+                            threaded: true,
+                        },
+                    )),
+                }
+            }
+            Ev::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
 /// An `<autoFilter>`: its range and, per filtered column, the values its
 /// list shows. A column filtered some other way is only noted.
 fn auto_filter(reader: &mut XmlReader<'_>, tag: &Tag<'_>) -> Result<Option<AutoFilter>> {
@@ -1013,11 +1172,15 @@ fn read_cell(
 }
 
 /// What a worksheet may be linked to and still have rows and columns
-/// inserted and deleted: its drawing's anchors are moved, hyperlinks are
+/// inserted and deleted: its drawing's anchors are moved, its notes' and
+/// threaded comments' cells and boxes are moved, hyperlinks are
 /// cell references in the sheet itself, printer settings, a background
 /// picture and custom properties name no cells.
-const RESTRUCTURABLE: [&str; 5] = [
+const RESTRUCTURABLE: [&str; 8] = [
     "drawing",
+    "comments",
+    "vmlDrawing",
+    "threadedComment",
     "printerSettings",
     "hyperlink",
     "image",

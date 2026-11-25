@@ -1062,3 +1062,207 @@ fn a_files_filter_is_read_kept_and_moved_with_its_columns() {
         "{xml}"
     );
 }
+
+#[test]
+fn notes_are_read_changed_added_and_moved() {
+    use aster_sheets::Comment;
+    use aster_sheets::structure::Lines;
+    // G4's note on B2.
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let note = book.sheets[0]
+        .comments
+        .get(&at("B2"))
+        .cloned()
+        .expect("B2's note");
+    assert_eq!(note.author, "Aster Tester");
+    assert_eq!(note.text, "Aster Tester:\n单价含税 税込み");
+    assert!(!note.threaded);
+
+    // Changed, and one more on D4: B2's box stays, D4 gets one; the
+    // sheet's own part is not touched.
+    book.sheets[0]
+        .comments
+        .insert(at("B2"), Comment::note("Aster Tester", "税込み & <tax>"));
+    book.sheets[0]
+        .comments
+        .insert(at("D4"), Comment::note("新人", "看这里"));
+    let mut changes = Changes::default();
+    changes.comments.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let changed = differences(&source, &saved);
+    assert_eq!(
+        changed,
+        ["xl/comments1.xml", "xl/drawings/vmlDrawing1.vml"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let vml = part(&saved, "xl/drawings/vmlDrawing1.vml");
+    assert_eq!(vml.matches("ObjectType=\"Note\"").count(), 2, "{vml}");
+    assert!(vml.contains("_x0000_s1025") && vml.contains("<x:Row>3</x:Row><x:Column>3</x:Column>"));
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(again.sheets[0].comments, book.sheets[0].comments);
+    let xml = part(&saved, "xl/comments1.xml");
+    assert!(
+        xml.contains("<author>Aster Tester</author><author>新人</author>"),
+        "{xml}"
+    );
+
+    // B2's taken away: its box goes too.
+    let mut book = again;
+    book.sheets[0].comments.remove(&at("B2"));
+    let saved = save(saved, &book, &changes).unwrap();
+    let vml = part(&saved, "xl/drawings/vmlDrawing1.vml");
+    assert!(!vml.contains("<x:Row>1</x:Row>"), "{vml}");
+    let again = Xlsx.read(saved).unwrap();
+    assert_eq!(
+        again.sheets[0].comments.keys().copied().collect::<Vec<_>>(),
+        [at("D4")]
+    );
+
+    // A workbook without notes gets its parts.
+    let blank = aster_ooxml::xlsx_save::blank("Sheet1", "Calibri");
+    let mut book = Xlsx.read(blank.clone()).unwrap();
+    assert_eq!(book.sheets[0].structure_blocker, None);
+    book.sheets[0]
+        .comments
+        .insert(at("C3"), Comment::note("我", "第一条"));
+    let saved = save(blank, &book, &changes).unwrap();
+    let sheet = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(":id=\"rId"), "{sheet}");
+    assert!(sheet.contains("legacyDrawing"), "{sheet}");
+    let types = part(&saved, "[Content_Types].xml");
+    assert!(types.contains("Extension=\"vml\""), "{types}");
+    assert!(types.contains("/xl/comments1.xml"), "{types}");
+    let rels = part(&saved, "xl/worksheets/_rels/sheet1.xml.rels");
+    assert!(
+        rels.contains("../comments1.xml") && rels.contains("../drawings/vmlDrawing1.vml"),
+        "{rels}"
+    );
+    let mut book = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(
+        book.sheets[0]
+            .comments
+            .get(&at("C3"))
+            .map(|c| c.text.as_str()),
+        Some("第一条")
+    );
+    assert_eq!(
+        book.sheets[0].structure_blocker, None,
+        "notes no longer block lines"
+    );
+
+    // Two rows inserted above it: the note and its box move.
+    let mut changes = Changes::default();
+    restructure(
+        &mut book,
+        &mut changes,
+        Lines {
+            columns: false,
+            at: 0,
+            count: 2,
+            insert: true,
+        },
+    );
+    let saved = save(saved, &book, &changes).unwrap();
+    assert!(part(&saved, "xl/comments1.xml").contains("ref=\"C5\""));
+    assert!(part(&saved, "xl/drawings/vmlDrawing1.vml").contains("<x:Row>4</x:Row>"));
+    let again = Xlsx.read(saved).unwrap();
+    assert!(again.sheets[0].comments.contains_key(&at("C5")));
+}
+
+#[test]
+fn every_note_taken_away_leaves_a_valid_empty_list() {
+    let source = g4();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    book.sheets[0].comments.clear();
+    let mut changes = Changes::default();
+    changes.comments.insert(0);
+    let saved = save(source, &book, &changes).unwrap();
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert!(again.sheets[0].comments.is_empty());
+    let vml = part(&saved, "xl/drawings/vmlDrawing1.vml");
+    assert!(!vml.contains("ObjectType=\"Note\""), "{vml}");
+}
+
+#[test]
+fn a_threaded_comment_is_read_and_kept_while_a_note_is_added() {
+    use aster_sheets::Comment;
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let workbook = format!(
+        r#"<workbook xmlns="{MAIN}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="表" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let sheet = format!(
+        r#"<worksheet xmlns="{MAIN}"><sheetData><row r="2"><c r="B2"><v>1</v></c></row></sheetData><legacyDrawing r:id="rId2" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></worksheet>"#
+    );
+    let notes = format!(
+        r#"<comments xmlns="{MAIN}"><authors><author>tc={{AAA}}</author></authors><commentList><comment ref="B2" authorId="0" shapeId="0"><text><t>[Threaded comment]</t></text></comment></commentList></comments>"#
+    );
+    let threads = r#"<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><threadedComment ref="B2" dT="2026-01-01T00:00:00.00" personId="{P1}" id="{AAA}"><text>能再核对吗？</text></threadedComment><threadedComment ref="B2" dT="2026-01-01T00:01:00.00" personId="{P2}" id="{BBB}" parentId="{AAA}"><text>好的</text></threadedComment></ThreadedComments>"#;
+    let persons = r#"<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><person displayName="王" id="{P1}" userId="a" providerId="None"/><person displayName="李" id="{P2}" userId="b" providerId="None"/></personList>"#;
+    let vml = r##"<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"/><v:shape id="_x0000_s1025" type="#_x0000_t202" style="position:absolute"><x:ClientData ObjectType="Note"><x:Row>1</x:Row><x:Column>1</x:Column></x:ClientData></v:shape></xml>"##;
+    let types = format!(
+        r#"{CONTENT_TYPES_HEAD}<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#
+    );
+    let sheet_rels = rels(&[
+        ("rId1", "comments", "../comments1.xml"),
+        ("rId2", "vmlDrawing", "../drawings/vmlDrawing1.vml"),
+    ])
+    .replace(
+        "</Relationships>",
+        r#"<Relationship Id="rId3" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>"#,
+    );
+    let source = package(&[
+        ("[Content_Types].xml", types.as_bytes()),
+        ("_rels/.rels", root_rels("xl/workbook.xml").as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "person", "persons/person.xml"),
+            ])
+            .as_bytes(),
+        ),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels.as_bytes()),
+        ("xl/comments1.xml", notes.as_bytes()),
+        (
+            "xl/threadedComments/threadedComment1.xml",
+            threads.as_bytes(),
+        ),
+        ("xl/persons/person.xml", persons.as_bytes()),
+        ("xl/drawings/vmlDrawing1.vml", vml.as_bytes()),
+    ]);
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let thread = book.sheets[0].comments.get(&at("B2")).cloned().expect("B2");
+    assert!(thread.threaded);
+    assert_eq!(thread.text, "王: 能再核对吗？\n李: 好的");
+    // The model refuses to change it.
+    assert!(
+        book.set_comment(0, at("B2"), None).is_err(),
+        "a thread is read only"
+    );
+    // A note beside it: the thread's parts stay as they were.
+    book.sheets[0]
+        .comments
+        .insert(at("D4"), Comment::note("我", "旁注"));
+    let mut changes = Changes::default();
+    changes.comments.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let changed = differences(&source, &saved);
+    assert!(
+        !changed.contains("xl/threadedComments/threadedComment1.xml")
+            && !changed.contains("xl/persons/person.xml"),
+        "{changed:?}"
+    );
+    let xml = part(&saved, "xl/comments1.xml");
+    assert!(
+        xml.contains("[Threaded comment]") && xml.contains("ref=\"D4\""),
+        "{xml}"
+    );
+    let again = Xlsx.read(saved).unwrap();
+    assert!(again.sheets[0].comments[&at("B2")].threaded);
+    assert_eq!(again.sheets[0].comments[&at("D4")].text, "旁注");
+}

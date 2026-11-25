@@ -20,6 +20,8 @@ use crate::model::{Cell, Sheet, Value, Workbook};
 pub enum SortRefusal {
     /// Merged cells in the range: their rows cannot be told apart.
     Merged,
+    /// A threaded comment in the range: it cannot move with its row.
+    Threaded,
     /// Nothing to sort.
     Empty,
 }
@@ -31,6 +33,9 @@ pub struct Sorted {
     pub range: CellRange,
     /// The cells to put.
     pub cells: Vec<(CellRef, Option<Cell>)>,
+    /// The notes of the range as they are after the sort: they move with
+    /// their rows. Empty when the range has none.
+    pub comments: Vec<(CellRef, Option<crate::comment::Comment>)>,
 }
 
 impl Sheet {
@@ -129,6 +134,15 @@ impl Workbook {
             return Err(SortRefusal::Empty);
         }
         let range = CellRange::new(range.first, CellRef::new(last_row, range.last.col));
+        let noted: Vec<CellRef> = sheet
+            .comments
+            .keys()
+            .copied()
+            .filter(|at| range.contains(*at))
+            .collect();
+        if noted.iter().any(|at| sheet.comments[at].threaded) {
+            return Err(SortRefusal::Threaded);
+        }
         // Rows a filter hides stay where they are, as in Excel.
         let filtered = sheet.auto_filter.as_ref().map(|f| &f.hidden);
         let rows: Vec<u32> = (range.first.row..=range.last.row)
@@ -151,7 +165,15 @@ impl Workbook {
             .collect();
         order.sort_by(|(_, a), (_, b)| compare(a.as_ref(), b.as_ref(), descending));
         let mut cells = Vec::new();
+        let mut comments = Vec::new();
         for (to, (from, _)) in rows.iter().zip(&order) {
+            for col in range.first.col..=range.last.col {
+                let now = sheet.comments.get(&CellRef::new(*to, col));
+                let moved = sheet.comments.get(&CellRef::new(*from, col));
+                if now != moved {
+                    comments.push((CellRef::new(*to, col), moved.cloned()));
+                }
+            }
             let moved = i64::from(*to) - i64::from(*from);
             for (i, cell) in row_cells(*from).into_iter().enumerate() {
                 let col = range.first.col + i as u32;
@@ -167,7 +189,11 @@ impl Workbook {
                 }
             }
         }
-        Ok(Sorted { range, cells })
+        Ok(Sorted {
+            range,
+            cells,
+            comments,
+        })
     }
 }
 

@@ -215,6 +215,8 @@ struct Shell {
     shown_cell: CellLook,
     /// The autofilter list open on screen: the column and what it offers.
     filter_list: Option<office::FilterList>,
+    /// The cell under the pointer, to show its note.
+    hover_cell: Option<aster_sheets::CellRef>,
     /// Lays out a small document's first preview on this thread, so the
     /// pane is never shown empty. Made and warmed up on a worker thread at
     /// start-up; `None` until then.
@@ -285,6 +287,7 @@ impl Shell {
             shown_styles: Styles::default(),
             shown_cell: CellLook::default(),
             filter_list: None,
+            hover_cell: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1209,6 +1212,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_filter(strings.menu_filter.into());
     s.set_filter_select_all(strings.filter_select_all.into());
     s.set_filter_blanks(strings.filter_blanks.into());
+    s.set_menu_comment_new(strings.menu_comment_new.into());
+    s.set_menu_comment_edit(strings.menu_comment_edit.into());
+    s.set_menu_comment_delete(strings.menu_comment_delete.into());
     s.set_sheet_add(strings.sheet_add.into());
     s.set_sheet_rename(strings.sheet_rename.into());
     s.set_sheet_delete(strings.sheet_delete.into());
@@ -1705,6 +1711,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                 }
                 Some(office::Refusal::Merged) => notice = strings.sort_merged.to_owned(),
                 Some(office::Refusal::NoData) => notice = strings.filter_empty.to_owned(),
+                Some(office::Refusal::Threaded) => notice = strings.comment_threaded.to_owned(),
                 None => {
                     if let Some(count) = tab.find.replaced {
                         notice = i18n::fill(strings.notice_replaced, "count", &group_digits(count));
@@ -3543,6 +3550,8 @@ enum Prompt {
     Rename(PathBuf),
     /// A new name for a sheet of this workbook.
     RenameSheet(TabId, usize),
+    /// What the active cell's note says, in this workbook.
+    Comment(TabId),
 }
 
 /// What stops rows, columns or a sheet from changing, as a user would say
@@ -3594,6 +3603,7 @@ fn show_prompt(
     ui.set_prompt_label(label.into());
     ui.set_prompt_problem(SharedString::new());
     ui.set_prompt_text(text.into());
+    ui.set_prompt_multiline(matches!(shell.prompt, Some(Prompt::Comment(_))));
     ui.set_prompt_open(true);
     present(ui, shell);
 }
@@ -3957,6 +3967,39 @@ fn finish_calc(ui: &AppWindow, shell: &mut Shell, id: TabId, message: office::Ca
     }
 }
 
+/// The note beside the cell under the pointer, or else beside the active
+/// cell, when it has one and nothing is being typed.
+fn show_comment(ui: &AppWindow, shell: &mut Shell) {
+    let hover = shell.hover_cell;
+    let scale = ui.window().scale_factor();
+    let shown = shell.active_sheet().and_then(|tab| {
+        if tab.view.is_editing() {
+            return None;
+        }
+        let sheet = tab.view.sheet()?;
+        let owner = |at: aster_sheets::CellRef| sheet.merge_at(at).map_or(at, |m| m.first);
+        let at = [hover, Some(tab.view.selected())]
+            .into_iter()
+            .flatten()
+            .map(owner)
+            .find(|at| sheet.comments.contains_key(at))?;
+        let (_, top, right, _) = tab.view.cell_box(at)?;
+        Some((
+            sheet.comments[&at].text.clone(),
+            right as f32 / scale,
+            top as f32 / scale,
+        ))
+    });
+    match shown {
+        Some((text, x, y)) => {
+            ui.set_comment_x(x);
+            ui.set_comment_y(y);
+            ui.set_comment_text(text.into());
+        }
+        None => ui.set_comment_text(SharedString::new()),
+    }
+}
+
 /// What the chrome around a viewer shows: the formula bar and sheet tabs of
 /// a workbook, the note over an empty presentation.
 fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
@@ -3987,6 +4030,8 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_cell_content(content.into());
         ui.set_viewer_note(note.into());
         ui.set_sheet_filtered(view.sheet().is_some_and(|s| s.auto_filter.is_some()));
+        ui.set_cell_has_comment(tab.comment().is_some());
+        show_comment(ui, shell);
         return;
     }
     if let Some(tab) = shell.active_slides() {
@@ -4001,6 +4046,7 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         return;
     }
     ui.set_viewer(0);
+    ui.set_comment_text(SharedString::new());
     ui.set_viewer_note(SharedString::new());
     ui.set_slide_notes(SharedString::new());
 }
@@ -4942,6 +4988,16 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         if cursor != ui.get_resize_cursor() {
             ui.set_resize_cursor(cursor);
         }
+        let over = shell
+            .active_sheet()
+            .and_then(|tab| match tab.view.hit(x, y) {
+                Some(aster_surface::sheet_view::Hit::Cell(at)) => Some(at),
+                _ => None,
+            });
+        if over != shell.hover_cell {
+            shell.hover_cell = over;
+            show_comment(&ui, shell);
+        }
     }));
 
     ui.on_pointer_double(handler!(|ui, shell, x, y| {
@@ -5514,6 +5570,20 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                         ui.set_prompt_problem(sheet_name_problem(strings, &problem).into());
                     }
                 }
+            }
+            Some(Prompt::Comment(id)) => {
+                let typed = ui.get_prompt_text().to_string();
+                hide_prompt(&ui, shell);
+                let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) else {
+                    return;
+                };
+                if let Err(refusal) = tab.set_comment(Some(&typed)) {
+                    tab.refusal = Some(refusal);
+                }
+                if shell.sync_modified() {
+                    refresh_tabs(&ui, shell);
+                }
+                after_sheet_change(&ui, shell, Vec::new());
             }
             None => hide_prompt(&ui, shell),
         }
@@ -6096,6 +6166,48 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             refresh_tabs(&ui, shell);
         }
         after_sheet_change(&ui, shell, changes);
+    }));
+    ui.on_sheet_comment(handler!(|ui, shell| {
+        let language = shell.language.tag();
+        let strings = shell.language.strings();
+        let Some(id) = shell.tabs.active().map(|tab| tab.id) else {
+            return;
+        };
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        if tab.comment().is_some_and(|c| c.threaded) {
+            tab.refusal = Some(office::Refusal::Threaded);
+            after_sheet_change(&ui, shell, changes);
+            return;
+        }
+        let text = tab.comment().map(|c| c.text.clone()).unwrap_or_default();
+        show_prompt(
+            &ui,
+            shell,
+            Prompt::Comment(id),
+            strings.comment_title.to_owned(),
+            strings.comment_label.to_owned(),
+            text,
+        );
+    }));
+    ui.on_sheet_comment_delete(handler!(|ui, shell| {
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        if let Err(refusal) = tab.set_comment(None) {
+            tab.refusal = Some(refusal);
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, Vec::new());
     }));
     ui.on_sheet_filter(handler!(|ui, shell| {
         let language = shell.language.tag();
@@ -7684,6 +7796,81 @@ mod ui_tests {
         with_sheet(&app, |tab| {
             let sheet = tab.view.sheet().unwrap();
             assert!((0..6).all(|r| sheet.row_sizes.size(r) > 0.0));
+        });
+    }
+
+    #[test]
+    fn a_note_is_written_shown_on_hover_changed_and_taken_away() {
+        let app = app();
+        let ui = &app.ui;
+        let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+        with_sheet(&app, |tab| {
+            tab.type_cells(at("B2"), &[vec!["x".to_owned()]], "en");
+            tab.view.select(at("A1"));
+            tab.view.select(at("B2"));
+        });
+        ui.invoke_sheet_comment();
+        assert!(ui.get_prompt_open(), "the note dialog opens");
+        assert!(ui.get_prompt_multiline());
+        ui.set_prompt_text("看这里\n第二行".into());
+        ui.invoke_prompt_accept();
+        assert!(ui.get_cell_has_comment());
+        assert_eq!(ui.get_comment_text(), "看这里\n第二行");
+        // Elsewhere, the selection shows none; the pointer over B2 does.
+        with_sheet(&app, |tab| tab.view.select(at("D5")));
+        refresh_viewer(ui, &mut app.shell.borrow_mut());
+        assert_eq!(ui.get_comment_text(), "");
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = ui.window().scale_factor();
+        let (x0, y0, x1, y1) =
+            with_sheet(&app, |tab| tab.view.cell_box(at("B2"))).expect("B2 is on screen");
+        let over = LogicalPosition::new(
+            origin.x + ((x0 + x1) / 2.0) as f32 / scale,
+            origin.y + ((y0 + y1) / 2.0) as f32 / scale,
+        );
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: over });
+        assert_eq!(ui.get_comment_text(), "看这里\n第二行", "shown on hover");
+        ui.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(origin.x + 600.0, origin.y + 400.0),
+        });
+        assert_eq!(ui.get_comment_text(), "");
+        // Changed, then undone and redone.
+        with_sheet(&app, |tab| tab.view.select(at("B2")));
+        ui.invoke_sheet_comment();
+        assert_eq!(ui.get_prompt_text(), "看这里\n第二行");
+        ui.set_prompt_text("新的".into());
+        ui.invoke_prompt_accept();
+        assert_eq!(ui.get_comment_text(), "新的");
+        with_sheet(&app, |tab| {
+            tab.undo();
+            assert_eq!(tab.comment().unwrap().text, "看这里\n第二行");
+            tab.redo();
+            assert_eq!(tab.comment().unwrap().text, "新的");
+        });
+        // Taken away by the menu; the checkbox state follows.
+        ui.invoke_sheet_comment_delete();
+        assert!(!ui.get_cell_has_comment());
+        assert_eq!(ui.get_comment_text(), "");
+        with_sheet(&app, |tab| {
+            assert!(tab.view.sheet().unwrap().comments.is_empty())
+        });
+        // A threaded comment is refused with a message, and kept.
+        with_sheet(&app, |tab| {
+            let mut thread = aster_sheets::Comment::note("她", "问题");
+            thread.threaded = true;
+            tab.view.workbook_mut().sheets[0]
+                .comments
+                .insert(at("B2"), thread);
+        });
+        ui.invoke_sheet_comment();
+        assert!(!ui.get_prompt_open(), "no dialog for a thread");
+        ui.invoke_sheet_comment_delete();
+        with_sheet(&app, |tab| {
+            assert!(tab.view.sheet().unwrap().comments.contains_key(&at("B2")));
         });
     }
 

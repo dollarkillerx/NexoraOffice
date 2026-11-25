@@ -9,6 +9,9 @@ export component PromptDialog inherits Rectangle {
     in property <string> label;
     // Why the last entry was not taken; empty while there is nothing wrong.
     in property <string> problem;
+    // Several lines of text: Return starts a line, Cmd+Return (Ctrl+Return)
+    // accepts.
+    in property <bool> multiline;
     in-out property <string> text;
     callback confirmed();
     callback dismissed();
@@ -27,6 +30,10 @@ export component PromptDialog inherits Rectangle {
         capture-key-pressed(event) => {
             if (event.text == Key.Escape) {
                 root.dismissed();
+                return accept;
+            }
+            if (root.multiline && event.text == Key.Return && event.modifiers.control) {
+                root.confirmed();
                 return accept;
             }
             return reject;
@@ -56,6 +63,7 @@ export component PromptDialog inherits Rectangle {
 
                 input := LabeledInput {
                     label: root.label;
+                    multiline: root.multiline;
                     text <=> root.text;
                     accepted => {
                         root.confirmed();

@@ -20,8 +20,8 @@ use aster_surface::cell_editor::EditMode;
 
 use crate::toolbar::{CellLook, Command, font_size_step};
 use aster_sheets::{
-    AutoFilter, CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Computed, DateOrder,
-    Edit, Shown, Workbook,
+    AutoFilter, CalcEngine, CalcError, Cancel, CellRange, CellRef, Change, Comment, Computed,
+    DateOrder, Edit, Shown, Workbook,
 };
 use aster_slides::Presentation;
 use aster_surface::sheet_view::{Direction, MIN_SIZE, Resize, SheetKey, SheetStyle, SheetView};
@@ -321,6 +321,8 @@ pub struct Step {
     frozen: Vec<(usize, Frozen, Frozen)>,
     /// The autofilter changed: sheet, before, after.
     filter: Option<Box<FilterStep>>,
+    /// Notes put, changed or taken away: sheet, cell, before, after.
+    comments: Vec<CommentStep>,
     /// How many styles the workbook had before the step.
     styles_before: usize,
     /// The styles undo took away, put back by redo.
@@ -335,6 +337,9 @@ pub struct Step {
 
 /// An autofilter put on, changed or taken off: sheet, before, after.
 type FilterStep = (usize, Option<AutoFilter>, Option<AutoFilter>);
+
+/// A cell's note changed: sheet, cell, before, after.
+type CommentStep = (usize, CellRef, Option<Comment>, Option<Comment>);
 
 /// What a filtered column's list offers.
 #[derive(Debug, Clone, PartialEq)]
@@ -430,6 +435,7 @@ struct Marks {
     line_formats: Vec<(bool, u32)>,
     frozen: bool,
     filter: bool,
+    comments: bool,
 }
 
 /// The find bar on a workbook: what to look for and the cells of the sheet
@@ -493,6 +499,9 @@ pub enum Refusal {
     Merged,
     /// Nothing to filter where the filter was to go.
     NoData,
+    /// A threaded comment, which changes (and moves with a sort) only in
+    /// Excel.
+    Threaded,
 }
 
 impl History {
@@ -505,6 +514,7 @@ impl History {
             && step.line_formats.is_empty()
             && step.frozen.is_empty()
             && step.filter.is_none()
+            && step.comments.is_empty()
         {
             return;
         }
@@ -595,6 +605,8 @@ pub struct SheetTab {
     pub frozen_changed: BTreeSet<usize>,
     /// Sheets whose autofilter changed since then.
     pub filter_changed: BTreeSet<usize>,
+    /// Sheets whose notes changed since then.
+    pub comments_changed: BTreeSet<usize>,
     /// Rows and columns inserted and deleted since then, in order, by the
     /// file's sheet numbers.
     pub structure: Vec<(usize, Lines)>,
@@ -667,6 +679,7 @@ impl SheetTab {
             line_formats_changed: BTreeSet::new(),
             frozen_changed: BTreeSet::new(),
             filter_changed: BTreeSet::new(),
+            comments_changed: BTreeSet::new(),
             structure: Vec::new(),
             origins: (0..sheet_count).map(Some).collect(),
             file: 0,
@@ -1128,6 +1141,7 @@ impl SheetTab {
             line_formats: Vec::new(),
             frozen: Vec::new(),
             filter: None,
+            comments: Vec::new(),
         });
         changes
     }
@@ -1181,6 +1195,7 @@ impl SheetTab {
             line_styles: self.line_formats_changed.clone(),
             frozen: self.frozen_changed.clone(),
             filters: self.filter_changed.clone(),
+            comments: self.comments_changed.clone(),
             structure: self.structure.clone(),
             origins: self.origins.clone(),
         }
@@ -1275,6 +1290,7 @@ impl SheetTab {
             self.line_formats_changed.clear();
             self.frozen_changed.clear();
             self.filter_changed.clear();
+            self.comments_changed.clear();
         }
         self.history.mark_saved_at(job.depth);
     }
@@ -1315,6 +1331,9 @@ impl SheetTab {
         }
         if let Some(filter) = &step.filter {
             self.set_filter(filter.0, filter.1.clone());
+        }
+        for (sheet, at, before, _) in step.comments.iter().rev() {
+            self.put_comment(*sheet, *at, before.clone());
         }
         // The formats the step added go with it: no cell uses them now,
         // since every later step was undone first.
@@ -1364,6 +1383,9 @@ impl SheetTab {
         }
         if let Some(filter) = &step.filter {
             self.set_filter(filter.0, filter.2.clone());
+        }
+        for (sheet, at, _, after) in &step.comments {
+            self.put_comment(*sheet, *at, after.clone());
         }
         self.note(&step.changes);
         self.show(&step.changes);
@@ -1940,6 +1962,7 @@ impl SheetTab {
             &mut self.merges_changed,
             &mut self.frozen_changed,
             &mut self.filter_changed,
+            &mut self.comments_changed,
         ] {
             *set = std::mem::take(set).into_iter().map(shift).collect();
         }
@@ -1973,6 +1996,7 @@ impl SheetTab {
         marks.merges = self.merges_changed.remove(&index);
         marks.frozen = self.frozen_changed.remove(&index);
         marks.filter = self.filter_changed.remove(&index);
+        marks.comments = self.comments_changed.remove(&index);
         marks.line_formats = self
             .line_formats_changed
             .iter()
@@ -1999,6 +2023,9 @@ impl SheetTab {
         }
         if marks.filter {
             self.filter_changed.insert(index);
+        }
+        if marks.comments {
+            self.comments_changed.insert(index);
         }
         self.line_formats_changed.extend(
             marks
@@ -2152,6 +2179,7 @@ impl SheetTab {
             line_formats: Vec::new(),
             frozen: Vec::new(),
             filter: None,
+            comments: Vec::new(),
         });
         true
     }
@@ -2251,14 +2279,91 @@ impl SheetTab {
         {
             Ok(sorted) => sorted,
             Err(SortRefusal::Merged) => return Err(Refusal::Merged),
+            Err(SortRefusal::Threaded) => return Err(Refusal::Threaded),
             Err(SortRefusal::Empty) => return Ok(Vec::new()),
         };
         let styles_before = self.view.workbook().styles.len();
         let changes = self.view.workbook_mut().set_cells(sheet, sorted.cells);
+        let steps = self.history.undo.len();
         let changes = self.record(changes, styles_before);
+        // The notes move with their rows, in the same step.
+        if !sorted.comments.is_empty() {
+            let comments: Vec<CommentStep> = sorted
+                .comments
+                .into_iter()
+                .map(|(at, after)| {
+                    let before = self.view.sheet().and_then(|s| s.comments.get(&at).cloned());
+                    (sheet, at, before, after)
+                })
+                .collect();
+            for (sheet, at, _, after) in &comments {
+                self.put_comment(*sheet, *at, after.clone());
+            }
+            let pushed = self.history.undo.len() > steps;
+            match self.history.undo.last_mut() {
+                Some(step) if pushed => step.comments = comments,
+                _ => self.history.push(Step {
+                    styles_before,
+                    comments,
+                    ..Step::default()
+                }),
+            }
+        }
         self.view.select(sorted.range.first);
         self.view.extend_to(sorted.range.last);
         Ok(changes)
+    }
+
+    /// The note of the active cell (of the top left cell of its merged
+    /// area), if it has one.
+    pub fn comment(&self) -> Option<&Comment> {
+        let sheet = self.view.sheet()?;
+        let at = self.view.selected();
+        let at = sheet.merge_at(at).map_or(at, |m| m.first);
+        sheet.comments.get(&at)
+    }
+
+    /// Give the active cell a note saying `text`, change what its note
+    /// says, or (`None`, or nothing but spaces) take it away. One undo
+    /// step. A threaded comment is refused: it changes only in Excel.
+    pub fn set_comment(&mut self, text: Option<&str>) -> Result<bool, Refusal> {
+        self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
+        let Some(current) = self.view.sheet() else {
+            return Ok(false);
+        };
+        let at = self.view.selected();
+        let at = current.merge_at(at).map_or(at, |m| m.first);
+        let before = current.comments.get(&at).cloned();
+        if before.as_ref().is_some_and(|c| c.threaded) {
+            return Err(Refusal::Threaded);
+        }
+        let text = text.map(|t| t.trim_end()).filter(|t| !t.trim().is_empty());
+        let after = text.map(|text| {
+            let author = before.as_ref().map_or("", |c| c.author.as_str());
+            Comment::note(author, text)
+        });
+        if before == after {
+            return Ok(false);
+        }
+        self.put_comment(sheet, at, after.clone());
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            comments: vec![(sheet, at, before, after)],
+            ..Step::default()
+        });
+        self.refusal = None;
+        Ok(true)
+    }
+
+    fn put_comment(&mut self, sheet: usize, at: CellRef, comment: Option<Comment>) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            match comment {
+                Some(comment) => target.comments.insert(at, comment),
+                None => target.comments.remove(&at),
+            };
+        }
+        self.comments_changed.insert(sheet);
     }
 
     /// Put an autofilter on the block of data around the active cell (or
@@ -2563,6 +2668,7 @@ impl SheetTab {
             line_formats: Vec::new(),
             frozen: Vec::new(),
             filter: None,
+            comments: Vec::new(),
         });
         self.view.select(range.first);
         self.view.extend_to(range.last);
@@ -3455,6 +3561,48 @@ mod tests {
         tab.view.select(at("C3"));
         tab.view.extend_to(at("D6"));
         assert_eq!(tab.sort(false), Err(Refusal::Merged));
+    }
+
+    #[test]
+    fn notes_move_with_a_sort_and_come_back_with_undo() {
+        let mut tab = tab();
+        let rows = [
+            vec!["城市".to_owned(), "人口".to_owned()],
+            vec!["大阪".to_owned(), "270".to_owned()],
+            vec!["東京".to_owned(), "1400".to_owned()],
+            vec!["札幌".to_owned(), "197".to_owned()],
+        ];
+        tab.type_cells(at("C3"), &rows, "ja");
+        // The note on Osaka's population.
+        tab.view.select(at("D4"));
+        assert_eq!(tab.set_comment(Some("関西")), Ok(true));
+        assert_eq!(tab.set_comment(Some("関西")), Ok(false), "nothing changed");
+        tab.sort(true).unwrap();
+        let notes = |tab: &SheetTab| -> Vec<String> {
+            tab.view
+                .sheet()
+                .unwrap()
+                .comments
+                .keys()
+                .map(|at| at.to_string())
+                .collect()
+        };
+        assert_eq!(notes(&tab), ["D5"], "Osaka is second after the sort");
+        assert!(tab.comments_changed.contains(&0));
+        tab.undo();
+        assert_eq!(notes(&tab), ["D4"]);
+        tab.redo();
+        assert_eq!(notes(&tab), ["D5"]);
+        // A thread stops the sort.
+        let mut thread = aster_sheets::Comment::note("她", "问题");
+        thread.threaded = true;
+        tab.view.workbook_mut().sheets[0]
+            .comments
+            .insert(at("D6"), thread);
+        tab.view.select(at("D5"));
+        assert_eq!(tab.sort(false), Err(Refusal::Threaded));
+        tab.view.select(at("D6"));
+        assert_eq!(tab.set_comment(None), Err(Refusal::Threaded));
     }
 
     #[test]

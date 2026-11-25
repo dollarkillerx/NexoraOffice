@@ -3,6 +3,8 @@ import { TextButton } from "widgets.slint";
 
 export component LabeledInput inherits VerticalLayout {
     in property <string> label;
+    // Several lines: Return starts a new line instead of accepting.
+    in property <bool> multiline;
     in-out property <string> text;
     callback accepted();
     spacing: 4px;
@@ -19,17 +21,20 @@ export component LabeledInput inherits VerticalLayout {
     }
 
     Rectangle {
-        height: Tokens.control-height;
+        height: root.multiline ? 5 * Tokens.control-height : Tokens.control-height;
         border-radius: Tokens.radius-md;
         border-width: 1px;
         border-color: input.has-focus ? Tokens.accent : Tokens.hairline;
         background: Tokens.surface;
+        clip: true;
         input := TextInput {
             x: Tokens.space-sm;
+            y: root.multiline ? Tokens.space-xs + 2px : 0px;
             width: parent.width - 2 * Tokens.space-sm;
-            height: parent.height;
-            vertical-alignment: center;
-            single-line: true;
+            height: root.multiline ? parent.height - 2 * (Tokens.space-xs + 2px) : parent.height;
+            vertical-alignment: root.multiline ? top : center;
+            single-line: !root.multiline;
+            wrap: root.multiline ? word-wrap : no-wrap;
             font-size: Tokens.font-md;
             color: Tokens.text;
             text <=> root.text;

@@ -99,6 +99,7 @@ export component AppWindow inherits Window {
     in property <string> prompt-title;
     in property <string> prompt-label;
     in property <string> prompt-problem;
+    in property <bool> prompt-multiline;
     in-out property <string> prompt-text;
     callback prompt-accept();
     callback prompt-cancel();
@@ -341,6 +342,15 @@ export component AppWindow inherits Window {
     in property <bool> sheet-filtered;
     // Hide (or show) the columns (or rows) the selection spans.
     callback sheet-hide(/* columns */ bool, /* hide */ bool);
+    // The active cell's note: write or change it, take it away.
+    callback sheet-comment();
+    callback sheet-comment-delete();
+    in property <bool> cell-has-comment;
+    // The note shown beside a cell (selected or under the pointer), at a
+    // place in the document pane, logical pixels; empty text hides it.
+    in property <string> comment-text;
+    in property <length> comment-x;
+    in property <length> comment-y;
     callback dialog-save();
     callback dialog-discard();
     callback dialog-cancel();
@@ -721,6 +731,24 @@ export component AppWindow inherits Window {
                 enabled: root.viewer == 1 && root.can-save;
                 activated => {
                     root.sheet-hide(true, false);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: root.cell-has-comment ? Strings.menu-comment-edit : Strings.menu-comment-new;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-comment();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-comment-delete;
+                enabled: root.viewer == 1 && root.can-save && root.cell-has-comment;
+                activated => {
+                    root.sheet-comment-delete();
                 }
             }
 
@@ -1600,6 +1628,29 @@ export component AppWindow inherits Window {
                                 }
                             }
 
+                            if root.comment-text != "" && root.viewer == 1: Rectangle {
+                                accessible-role: text;
+                                accessible-label: root.comment-text;
+                                x: max(0px, min(root.comment-x, parent.width - self.width));
+                                y: max(0px, min(root.comment-y, parent.height - self.height));
+                                width: 220px;
+                                height: comment-body.preferred-height + 2 * Tokens.space-sm;
+                                background: Tokens.surface;
+                                border-color: Tokens.hairline;
+                                border-width: 1px;
+                                border-radius: Tokens.radius-sm;
+
+                                comment-body := Text {
+                                    x: Tokens.space-sm;
+                                    y: Tokens.space-sm;
+                                    width: parent.width - 2 * Tokens.space-sm;
+                                    text: root.comment-text;
+                                    color: Tokens.text;
+                                    font-size: Tokens.font-sm;
+                                    wrap: word-wrap;
+                                }
+                            }
+
                             if root.viewer-note != "": Text {
                                 x: Tokens.space-xl;
                                 width: parent.width - 2 * Tokens.space-xl;
@@ -1904,6 +1955,7 @@ export component AppWindow inherits Window {
         title: root.prompt-title;
         label: root.prompt-label;
         problem: root.prompt-problem;
+        multiline: root.prompt-multiline;
         text <=> root.prompt-text;
         confirmed => {
             root.prompt-accept();

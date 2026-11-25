@@ -501,6 +501,7 @@ impl crate::model::Workbook {
         } else {
             axis.remove(lines.at, lines.count);
         }
+        host.comments = crate::comment::moved(std::mem::take(&mut host.comments), lines);
         // The filter's block and what it filters move with the lines.
         if let Some(filter) = &mut host.auto_filter {
             match lines.moved_range(filter.range) {

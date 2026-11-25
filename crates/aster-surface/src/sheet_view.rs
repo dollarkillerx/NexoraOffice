@@ -154,6 +154,9 @@ fn filter_button(right: f64, bottom: f64, width: f64, height: f64) -> Option<Rec
     Some(Rect::new(x1 - size, y1 - size, x1, y1))
 }
 
+/// The corner that marks a cell with a note.
+const COMMENT_MARK: Rgba8 = [0xd9, 0x2d, 0x20, 0xff];
+
 /// The smallest size a drag leaves, logical pixels.
 pub const MIN_SIZE: f64 = 4.0;
 
@@ -784,6 +787,21 @@ impl SheetView {
         )?;
         let s = self.s();
         Some((button.x0 * s, button.x1 * s, button.y1 * s))
+    }
+
+    /// Where a cell (all of its merged area) is on screen: left, top, right
+    /// and bottom, physical pixels from the view's top left.
+    pub fn cell_box(&self, at: CellRef) -> Option<(f64, f64, f64, f64)> {
+        let sheet = self.sheet()?;
+        let (first, last) = sheet
+            .merge_at(at)
+            .map_or((at, at), |merge| (merge.first, merge.last));
+        let (left, _) = self.column_span(first.col);
+        let (_, right) = self.column_span(last.col);
+        let (top, _) = self.row_span(first.row);
+        let (_, bottom) = self.row_span(last.row);
+        let s = self.s();
+        Some((left * s, top * s, right * s, bottom * s))
     }
 
     /// Where the fill handle is, physical pixels from the view's top left.
@@ -1732,6 +1750,29 @@ impl SheetView {
             }
         }
 
+        // A red corner at the top right of each cell with a note.
+        if !sheet.comments.is_empty() {
+            let corner = (6.0 * s).round();
+            for at in sheet.comments.keys() {
+                if !view.contains(*at) {
+                    continue;
+                }
+                let last_col_of = sheet.merge_at(*at).map_or(at.col, |m| m.last.col);
+                if sheet.columns.size(at.col) == 0.0 || sheet.row_sizes.size(at.row) == 0.0 {
+                    continue;
+                }
+                let right = x_of(last_col_of + 1) - line;
+                let top = y_of(at.row);
+                let mut triangle = vello_cpu::kurbo::BezPath::new();
+                triangle.move_to((right - corner, top));
+                triangle.line_to((right, top));
+                triangle.line_to((right, top + corner));
+                triangle.close_path();
+                self.ctx.set_paint(color(COMMENT_MARK));
+                self.ctx.fill_path(&triangle);
+            }
+        }
+
         // Pictures float over the cells; each is drawn in the pane its top
         // left corner is fastened in.
         for picture in &sheet.pictures {
@@ -2395,6 +2436,23 @@ mod tests {
         let data = pixmap.data_as_u8_slice();
         let at = (y as usize * width + x as usize) * 4;
         [data[at], data[at + 1], data[at + 2], data[at + 3]]
+    }
+
+    #[test]
+    fn a_cell_with_a_note_gets_a_red_corner() {
+        let mut book = Arc::unwrap_or_clone(workbook());
+        book.sheets[0].comments.insert(
+            CellRef::new(2, 3),
+            aster_sheets::Comment::note("我", "看这里"),
+        );
+        let mut view = SheetView::new(Arc::new(book));
+        view.set_sheet(0);
+        view.resize(600, 400, 1.0);
+        let (_, y0, x1, _) = view.cell_box(CellRef::new(2, 3)).unwrap();
+        let near = pixel(&mut view, x1 - 3.0, y0 + 1.0);
+        assert_eq!(near, [0xd9, 0x2d, 0x20, 0xff], "the corner is red");
+        let far = pixel(&mut view, x1 - 3.0, y0 + 12.0);
+        assert_ne!(far, [0xd9, 0x2d, 0x20, 0xff]);
     }
 
     /// Styled cells, a frozen row and column, and a picture.

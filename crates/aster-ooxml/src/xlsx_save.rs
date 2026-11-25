@@ -32,6 +32,7 @@ use crate::error::{Error, Result};
 use crate::package::{Kind, Package};
 use crate::xlsx::{shared_strings, workbook_entries};
 
+mod comments;
 mod sheets;
 pub(crate) mod structure;
 
@@ -70,6 +71,9 @@ pub struct Changes {
     /// Sheets whose autofilter changed: `<autoFilter>` is written again
     /// from the sheet's filter.
     pub filters: BTreeSet<usize>,
+    /// Sheets whose notes changed: their comments part and boxes are
+    /// written again.
+    pub comments: BTreeSet<usize>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -165,6 +169,8 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         .rsplit_once('/')
         .map_or(String::new(), |(dir, _)| format!("{dir}/"));
     let mut next_part = 1;
+    // Content types the notes need.
+    let mut new_types: Vec<(bool, String, String)> = Vec::new();
     // Column widths count in the Normal font's digit width.
     let normal = workbook
         .styles
@@ -212,6 +218,17 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             };
             if let Some(filter) = &sheet.auto_filter {
                 bytes = sheets::filter_xml(&bytes, Some(filter));
+            }
+            if !sheet.comments.is_empty() {
+                bytes = write_notes(
+                    &mut package,
+                    &mut replaced,
+                    &mut added,
+                    &mut new_types,
+                    &part,
+                    bytes,
+                    sheet,
+                )?;
             }
             bytes.splice(0..0, XML_DECLARATION.bytes());
             added.push((part.clone(), bytes));
@@ -262,11 +279,13 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         let rules = !elsewhere.is_empty() || plan.changed();
         let frozen = changes.frozen.contains(&index).then_some(sheet.frozen);
         let filter = changes.filters.contains(&index);
+        let notes = changes.comments.contains(&index);
         let cells_changed = !(cells.is_empty()
             && merges.is_none()
             && sizes.is_empty()
             && frozen.is_none()
-            && !filter);
+            && !filter
+            && !notes);
         if !cells_changed && !rules {
             continue;
         }
@@ -289,10 +308,24 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             bytes = structure::restructure_sheet(&bytes, &part, &entry.name, &moves)?;
             for rel in package.relationships(&part)? {
                 if rel.kind == "drawing"
-                    && let Some(drawing) = rel.target.filter(|d| package.has(d))
+                    && let Some(drawing) = rel.target.clone().filter(|d| package.has(d))
                 {
                     let moved = structure::move_anchors(&package.read(&drawing)?, &moves);
                     replaced.insert(key(&drawing), moved);
+                }
+                let Some(target) = rel.target.filter(|t| package.has(t)) else {
+                    continue;
+                };
+                match rel.kind.as_str() {
+                    "comments" | "threadedComment" => {
+                        let moved = comments::move_notes(&package.read(&target)?, &moves);
+                        replaced.insert(key(&target), moved);
+                    }
+                    "vmlDrawing" => {
+                        let moved = comments::move_boxes(&package.read(&target)?, &moves);
+                        replaced.insert(key(&target), moved);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -303,6 +336,17 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
         }
         if filter {
             rewritten = sheets::filter_xml(&rewritten, sheet.auto_filter.as_ref());
+        }
+        if notes {
+            rewritten = write_notes(
+                &mut package,
+                &mut replaced,
+                &mut added,
+                &mut new_types,
+                &part,
+                rewritten,
+                sheet,
+            )?;
         }
         replaced.insert(key(&part), rewritten);
     }
@@ -455,7 +499,63 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
             replaced.insert(key(types), edited);
         }
     }
+    if !new_types.is_empty() {
+        let types = "[Content_Types].xml";
+        let bytes = current(&mut package, &replaced, types)?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut items = String::new();
+        for (default, name, kind) in &new_types {
+            let item = if *default {
+                if text
+                    .to_ascii_lowercase()
+                    .contains(&format!("extension=\"{name}\""))
+                    || items.contains(&format!("Extension=\"{name}\""))
+                {
+                    continue;
+                }
+                format!("<Default Extension=\"{name}\" ContentType=\"{kind}\"/>")
+            } else {
+                format!("<Override PartName=\"{name}\" ContentType=\"{kind}\"/>")
+            };
+            items.push_str(&item);
+        }
+        if !items.is_empty() {
+            replaced.insert(key(types), sheets::append_to_root(&bytes, &items));
+        }
+    }
     package.rewrite_adding(&replaced, &removed, &added)
+}
+
+/// Write a sheet's notes (see [`comments`]): the sheet's XML back, the
+/// other parts into `replaced` and `added`, content types to add into
+/// `types`.
+fn write_notes(
+    package: &mut Package,
+    replaced: &mut HashMap<String, Vec<u8>>,
+    added: &mut Vec<(String, Vec<u8>)>,
+    types: &mut Vec<(bool, String, String)>,
+    part: &str,
+    sheet_xml: Vec<u8>,
+    sheet: &aster_sheets::Sheet,
+) -> Result<Vec<u8>> {
+    let mut parts = comments::Parts::default();
+    let names: Vec<String> = added.iter().map(|(name, _)| key(name)).collect();
+    let snapshot = replaced.clone();
+    let bytes = comments::write(
+        package,
+        &|package, name| current(package, &snapshot, name),
+        &|package, name| package.has(name) || names.contains(&key(name)),
+        part,
+        sheet_xml,
+        &sheet.comments,
+        &mut parts,
+    )?;
+    for (name, bytes) in parts.replaced {
+        replaced.insert(key(&name), bytes);
+    }
+    added.extend(parts.added);
+    types.extend(parts.types);
+    Ok(bytes)
 }
 
 const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";

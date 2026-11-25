@@ -142,6 +142,8 @@ pub struct Sheet {
     pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
     /// The autofilter, if the sheet has one.
     pub auto_filter: Option<crate::filter::AutoFilter>,
+    /// Comments, by cell.
+    pub comments: std::collections::BTreeMap<CellRef, crate::comment::Comment>,
 }
 
 impl Sheet {
@@ -359,6 +361,7 @@ pub struct SheetBuilder {
     pub pictures: Vec<Picture>,
     pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
     pub auto_filter: Option<crate::filter::AutoFilter>,
+    pub comments: std::collections::BTreeMap<CellRef, crate::comment::Comment>,
 }
 
 impl SheetBuilder {
@@ -378,6 +381,7 @@ impl SheetBuilder {
             pictures: Vec::new(),
             hidden_sizes: std::collections::BTreeMap::new(),
             auto_filter: None,
+            comments: std::collections::BTreeMap::new(),
         }
     }
 
@@ -455,6 +459,7 @@ impl SheetBuilder {
             delete_blocker: None,
             hidden_sizes: self.hidden_sizes,
             auto_filter: self.auto_filter,
+            comments: self.comments,
         }
     }
 }

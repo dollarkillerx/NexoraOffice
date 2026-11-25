@@ -1179,7 +1179,6 @@ mod tests {
                         Command::FitWidth
                     ]
                 ),
-                _ => assert_eq!(enabled, [], "{kind:?} is a placeholder"),
             }
         }
     }

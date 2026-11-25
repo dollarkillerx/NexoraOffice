@@ -114,15 +114,74 @@ pub fn rename(xml: &str, local: &str) -> String {
     out
 }
 
+/// Where an attribute sits in a start tag: the whole attribute (from the
+/// whitespace before it to the end of its closing quote) and its value.
+struct AttributeSpan {
+    whole: std::ops::Range<usize>,
+    value: std::ops::Range<usize>,
+}
+
+fn is_xml_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Finds attribute `name` in a start tag by walking its attributes, so text
+/// inside another attribute's value never matches and `xid`/`r:id` are not
+/// `id`. Whitespace may surround `=`.
+fn find_attribute(tag: &str, name: &str) -> Option<AttributeSpan> {
+    let bytes = tag.as_bytes();
+    let skip_space = |mut i: usize| {
+        while i < bytes.len() && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        i
+    };
+    // Skip the element name.
+    let mut i = 1;
+    while i < bytes.len() && !is_xml_space(bytes[i]) && !matches!(bytes[i], b'>' | b'/') {
+        i += 1;
+    }
+    loop {
+        let before = i;
+        i = skip_space(i);
+        if i == before || i >= bytes.len() || matches!(bytes[i], b'>' | b'/') {
+            return None;
+        }
+        let name_start = i;
+        while i < bytes.len() && !is_xml_space(bytes[i]) && bytes[i] != b'=' {
+            if matches!(bytes[i], b'>' | b'/') {
+                return None;
+            }
+            i += 1;
+        }
+        let found = &tag[name_start..i];
+        i = skip_space(i);
+        if bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i = skip_space(i + 1);
+        let quote = match bytes.get(i) {
+            Some(&q @ (b'"' | b'\'')) => q,
+            _ => return None,
+        };
+        let start = i + 1;
+        let end = start + tag[start..].find(quote as char)?;
+        i = end + 1;
+        if found == name {
+            return Some(AttributeSpan {
+                whole: before..i,
+                value: start..end,
+            });
+        }
+    }
+}
+
 /// The value of attribute `name` (as written, entities not resolved).
 pub fn attribute(xml: &str, name: &str) -> Option<String> {
     let (open, _) = inner(xml);
     let tag = &xml[..open];
-    let pattern = format!(" {name}=");
-    let at = tag.find(&pattern)? + pattern.len();
-    let quote = tag[at..].chars().next()?;
-    let rest = &tag[at + 1..];
-    Some(rest[..rest.find(quote)?].to_owned())
+    let span = find_attribute(tag, name)?;
+    Some(tag[span.value].to_owned())
 }
 
 /// The element with attribute `name` set to `value` (escaped here), added at
@@ -131,17 +190,12 @@ pub fn set_attribute(xml: &str, name: &str, value: &str) -> String {
     let (open, _) = inner(xml);
     let tag = &xml[..open];
     let value = escape_attribute(value);
-    let pattern = format!(" {name}=");
-    if let Some(found) = tag.find(&pattern) {
-        let at = found + pattern.len();
-        let quote = tag[at..].chars().next().unwrap_or('"');
-        if let Some(len) = tag[at + 1..].find(quote) {
-            return format!(
-                "{}{quote}{value}{quote}{}",
-                &xml[..at],
-                &xml[at + 1 + len + 1..]
-            );
-        }
+    if let Some(span) = find_attribute(tag, name) {
+        return format!(
+            "{}{value}{}",
+            &xml[..span.value.start],
+            &xml[span.value.end..]
+        );
     }
     let end = if tag.ends_with("/>") {
         open - 2
@@ -154,15 +208,8 @@ pub fn set_attribute(xml: &str, name: &str, value: &str) -> String {
 /// The element without attribute `name`.
 pub fn remove_attribute(xml: &str, name: &str) -> String {
     let (open, _) = inner(xml);
-    let tag = &xml[..open];
-    let pattern = format!(" {name}=");
-    let Some(found) = tag.find(&pattern) else {
-        return xml.to_owned();
-    };
-    let at = found + pattern.len();
-    let quote = tag[at..].chars().next().unwrap_or('"');
-    match tag[at + 1..].find(quote) {
-        Some(len) => format!("{}{}", &xml[..found], &xml[at + 1 + len + 1..]),
+    match find_attribute(&xml[..open], name) {
+        Some(span) => format!("{}{}", &xml[..span.whole.start], &xml[span.whole.end..]),
         None => xml.to_owned(),
     }
 }
@@ -303,22 +350,89 @@ pub fn append_to_root(bytes: &[u8], items: &str) -> Vec<u8> {
 
 /// The first `rId` number not used in a relationships part.
 pub fn free_rel_number(text: &str) -> u32 {
-    text.match_indices("Id=\"rId")
-        .filter_map(|(at, m)| {
-            let digits: String = text[at + m.len()..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse::<u32>().ok()
-        })
-        .max()
-        .unwrap_or(0)
-        + 1
+    let bytes = text.as_bytes();
+    let mut max = 0;
+    for (at, _) in text.match_indices("Id") {
+        if at == 0 || !is_xml_space(bytes[at - 1]) {
+            continue;
+        }
+        let mut i = at + 2;
+        while i < bytes.len() && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        if !matches!(bytes.get(i), Some(b'"' | b'\'')) {
+            continue;
+        }
+        let Some(rest) = text[i + 1..].strip_prefix("rId") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            max = max.max(n);
+        }
+    }
+    max + 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribute_text_inside_values_never_matches() {
+        let tag = r#"<p:cNvPr descr="see id='4' here" id="5" name="x"/>"#;
+        assert_eq!(attribute(tag, "id").as_deref(), Some("5"));
+        assert_eq!(
+            set_attribute(tag, "id", "9"),
+            r#"<p:cNvPr descr="see id='4' here" id="9" name="x"/>"#
+        );
+        assert_eq!(
+            remove_attribute(tag, "id"),
+            r#"<p:cNvPr descr="see id='4' here" name="x"/>"#
+        );
+    }
+
+    #[test]
+    fn attributes_split_by_any_whitespace() {
+        let tag = "<a:rPr\n  lang=\"en-US\"\n\tsz='1800'/>";
+        assert_eq!(attribute(tag, "lang").as_deref(), Some("en-US"));
+        assert_eq!(attribute(tag, "sz").as_deref(), Some("1800"));
+        let bigger = set_attribute(tag, "sz", "2400");
+        assert_eq!(bigger, "<a:rPr\n  lang=\"en-US\"\n\tsz='2400'/>");
+        assert_eq!(bigger.matches("sz=").count(), 1);
+        assert_eq!(remove_attribute(tag, "lang"), "<a:rPr\n\tsz='1800'/>");
+        let spaced = "<a:x id = \"7\"/>";
+        assert_eq!(attribute(spaced, "id").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn attribute_names_match_whole_names_only() {
+        let tag = r#"<p:cNvPr xid="1" r:id="rId2" id="3"/>"#;
+        assert_eq!(attribute(tag, "id").as_deref(), Some("3"));
+        assert_eq!(
+            set_attribute(tag, "id", "9"),
+            r#"<p:cNvPr xid="1" r:id="rId2" id="9"/>"#
+        );
+        assert_eq!(
+            remove_attribute(tag, "id"),
+            r#"<p:cNvPr xid="1" r:id="rId2"/>"#
+        );
+    }
+
+    #[test]
+    fn free_rel_number_reads_both_quotes() {
+        let rels = "<Relationships><Relationship Id=\"rId1\"/>\
+            <Relationship\n Id='rId7'/><Relationship Id = \"rId3\"/></Relationships>";
+        assert_eq!(free_rel_number(rels), 8);
+        assert_eq!(free_rel_number("<Relationships/>"), 1);
+    }
 
     #[test]
     fn attributes_and_children_change_in_place() {

@@ -266,6 +266,12 @@ export component Sidebar inherits Rectangle {
     // The lower part shows 0 the folder, 1 the outline.
     in-out property <int> lower-page;
     callback outline-clicked(int);
+    // The disclosure triangle of a PDF bookmark was clicked.
+    callback outline-toggled(int);
+    // The outline is a PDF's: rows leave room for the triangle, and the
+    // empty text is `outline-hint` (nothing while the outline is awaited).
+    in property <bool> outline-pdf;
+    in property <string> outline-hint;
     background: Tokens.panel;
     clip: true;
 
@@ -451,7 +457,7 @@ export component Sidebar inherits Rectangle {
                 padding-left: Tokens.space-md + 2px;
                 padding-right: Tokens.space-md;
                 Text {
-                    text: root.has-outline ? Strings.outline-empty : Strings.outline-none;
+                    text: root.outline-pdf ? root.outline-hint : root.has-outline ? Strings.outline-empty : Strings.outline-none;
                     font-size: Tokens.font-sm;
                     color: Tokens.text-tertiary;
                     wrap: word-wrap;
@@ -471,7 +477,7 @@ export component Sidebar inherits Rectangle {
                     }
 
                     Text {
-                        x: Tokens.space-md + 2px + (heading.level - 1) * 12px;
+                        x: Tokens.space-md + 2px + (heading.level - 1) * 12px + (root.outline-pdf ? 14px : 0px);
                         width: parent.width - self.x - Tokens.space-md;
                         height: parent.height;
                         text: heading.text;
@@ -485,6 +491,26 @@ export component Sidebar inherits Rectangle {
                     outline-touch := TouchArea {
                         clicked => {
                             root.outline-clicked(index);
+                        }
+                    }
+
+                    // The disclosure triangle of a bookmark with children.
+                    if heading.expandable: Rectangle {
+                        x: Tokens.space-md + (heading.level - 1) * 12px;
+                        width: 18px;
+                        height: parent.height;
+                        Icon {
+                            x: 2px;
+                            y: (parent.height - self.height) / 2;
+                            data: heading.expanded ? Icons.chevron-down : Icons.chevron-right;
+                            size: 14px;
+                            tint: Tokens.text-tertiary;
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                root.outline-toggled(index);
+                            }
                         }
                     }
                 }

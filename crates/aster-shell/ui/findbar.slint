@@ -129,6 +129,9 @@ component ScopeButton inherits Rectangle {
 
 export component FindBar inherits Rectangle {
     in property <bool> replace-visible;
+    // Only the query and "match case": a PDF has no replace, whole-word or
+    // pattern search.
+    in property <bool> simple;
     in-out property <string> query;
     in-out property <string> replacement;
     // "3 / 120", "无结果", "正在统计…": put together by the shell.
@@ -264,7 +267,7 @@ export component FindBar inherits Rectangle {
                     }
                 }
 
-                Toggle {
+                if !root.simple: Toggle {
                     label: "ab";
                     description: Strings.find-whole-word;
                     checked: root.whole-word;
@@ -282,7 +285,7 @@ export component FindBar inherits Rectangle {
                     }
                 }
 
-                Toggle {
+                if !root.simple: Toggle {
                     label: ".*";
                     description: Strings.find-regex;
                     checked: root.use-regex;

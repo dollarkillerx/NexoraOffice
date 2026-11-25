@@ -429,6 +429,10 @@ export struct OutlineItem {
     text: string,
     // The heading the caret is under.
     current: bool,
+    // A PDF's bookmark with children below it, and whether they show.
+    // Markdown headings have neither.
+    expandable: bool,
+    expanded: bool,
 }
 
 // A value in an autofilter's list, with whether it shows.

@@ -52,6 +52,13 @@ const PAGE_MIN: f32 = 1.0;
 const PAGE_MAX: f32 = 14_400.0;
 /// Scroll by this much (logical pixels) when the arrow keys are used.
 pub const LINE_STEP: f64 = 48.0;
+/// Most bytes of text layers a view holds (characters and boxes).
+pub const TEXT_BUDGET: usize = 64 << 20;
+/// Most bytes of text `selected_text` returns.
+pub const SELECTION_MAX: usize = 1 << 20;
+/// Search hits kept, and boxes kept per hit.
+pub const MAX_HITS: usize = 10_000;
+pub const MAX_HIT_BOXES: usize = 256;
 
 fn color(rgba: Rgba8) -> Color {
     Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
@@ -76,6 +83,11 @@ pub struct PdfStyle {
     pub hairline: Rgba8,
     pub secondary: Rgba8,
     pub accent: Rgba8,
+    /// Selected text (translucent, drawn over the page).
+    pub selection: Rgba8,
+    /// Search hits, and the current one.
+    pub hit: Rgba8,
+    pub current_hit: Rgba8,
 }
 
 impl Default for PdfStyle {
@@ -86,6 +98,9 @@ impl Default for PdfStyle {
             hairline: [0xd0, 0xd0, 0xd0, 0xff],
             secondary: [0x6b, 0x6b, 0x6b, 0xff],
             accent: [0x7c, 0x5c, 0xe0, 0xff],
+            selection: [0x7c, 0x5c, 0xe0, 0x59],
+            hit: [0xff, 0xeb, 0x3b, 0x80],
+            current_hit: [0xff, 0x8c, 0x00, 0xa6],
         }
     }
 }
@@ -97,6 +112,88 @@ fn clamp_page(points: f32) -> f32 {
     } else {
         points.clamp(PAGE_MIN, PAGE_MAX)
     }
+}
+
+/// The text of one page, with where each character is: points from the
+/// page's top-left corner as shown, in the page's real size.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextLayer {
+    pub text: String,
+    /// One entry per `char` of `text`: left, top, right, bottom; `None` for
+    /// separators the reader inserted (' ' or '\n').
+    pub boxes: Vec<Option<[f32; 4]>>,
+}
+
+/// One search hit: where it is on a page (a hit that wraps has several boxes).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FindMark {
+    pub page: usize,
+    pub boxes: Vec<[f32; 4]>,
+}
+
+/// A character: page and index in the page's text.
+type Pos = (usize, usize);
+
+struct TextPage {
+    chars: Vec<char>,
+    boxes: Vec<Option<[f32; 4]>>,
+    used: u64,
+    any: bool,
+}
+
+impl TextPage {
+    fn bytes(&self) -> usize {
+        self.chars.len() * std::mem::size_of::<char>()
+            + self.boxes.len() * std::mem::size_of::<Option<[f32; 4]>>()
+    }
+}
+
+/// What a press started: the characters it covers and the unit (1 character,
+/// 2 word, 3 line) a drag extends by.
+#[derive(Clone, Copy)]
+struct Anchor {
+    start: Pos,
+    end: Pos,
+    unit: u8,
+}
+
+/// Distance class and distance from a point to a box (all in points).
+fn box_distance(b: &[f32; 4], x: f64, y: f64) -> (u8, f64) {
+    let (l, t, r, bt) = (
+        f64::from(b[0]),
+        f64::from(b[1]),
+        f64::from(b[2]),
+        f64::from(b[3]),
+    );
+    let dx = (l - x).max(x - r).max(0.0);
+    let dy = (t - y).max(y - bt).max(0.0);
+    if dx == 0.0 && dy == 0.0 {
+        (0, (x - (l + r) / 2.0).abs())
+    } else if dy == 0.0 {
+        (1, dx)
+    } else {
+        (2, dx * dx + dy * dy)
+    }
+}
+
+/// Join boxes in reading order into one rectangle per run on a line.
+fn merge_boxes(boxes: impl Iterator<Item = [f32; 4]>) -> Vec<[f32; 4]> {
+    let mut out: Vec<[f32; 4]> = Vec::new();
+    for b in boxes {
+        if let Some(last) = out.last_mut() {
+            let h = (last[3] - last[1]).min(b[3] - b[1]);
+            let overlap = last[3].min(b[3]) - last[1].max(b[1]);
+            if h > 0.0 && overlap >= 0.5 * h && b[0] <= last[2] + 0.6 * h && b[2] >= last[0] {
+                last[0] = last[0].min(b[0]);
+                last[1] = last[1].min(b[1]);
+                last[2] = last[2].max(b[2]);
+                last[3] = last[3].max(b[3]);
+                continue;
+            }
+        }
+        out.push(b);
+    }
+    out
 }
 
 /// A rendering of a page, and the scale (pixels per point) it was made at.
@@ -186,6 +283,17 @@ pub struct PdfView {
     drawn: Option<Drawn>,
     /// Bumped whenever a page arrives, so the next frame is drawn.
     version: u64,
+    text: HashMap<usize, TextPage>,
+    text_budget: usize,
+    /// Pages whose layer was refused: not asked for again.
+    text_refused: HashSet<usize>,
+    anchor: Option<Anchor>,
+    /// The selected characters, first to last, both included.
+    sel: Option<(Pos, Pos)>,
+    finds: Vec<FindMark>,
+    /// Per page: indexes into `finds`.
+    find_pages: HashMap<usize, Vec<usize>>,
+    current_hit: Option<usize>,
 }
 
 impl PdfView {
@@ -236,6 +344,14 @@ impl PdfView {
             glyphs: Vec::new(),
             drawn: None,
             version: 0,
+            text: HashMap::new(),
+            text_budget: TEXT_BUDGET,
+            text_refused: HashSet::new(),
+            anchor: None,
+            sel: None,
+            finds: Vec::new(),
+            find_pages: HashMap::new(),
+            current_hit: None,
         };
         view.lay_out();
         view
@@ -285,6 +401,7 @@ impl PdfView {
     pub fn drop_pixels(&mut self) {
         self.shots.clear();
         self.thumbs.clear();
+        self.text.clear();
         self.numbers.clear();
         self.ctx = RenderContext::new(1, 1);
         self.pixmap = Pixmap::new(1, 1);
@@ -363,6 +480,461 @@ impl PdfView {
     /// The text on the pages: not read yet, so empty.
     pub fn text(&self) -> String {
         String::new()
+    }
+
+    // ---- Text: layers, selection, search hits ----
+
+    /// Change the byte budget for text layers.
+    pub fn set_text_budget(&mut self, bytes: usize) {
+        self.text_budget = bytes;
+        self.enforce_text_budget();
+    }
+
+    /// Bytes of text layers held now.
+    pub fn text_bytes(&self) -> usize {
+        self.text.values().map(TextPage::bytes).sum()
+    }
+
+    /// The text of a page arrives. Refused (false) for a page that does not
+    /// exist, a layer with other than one box per character, or one larger
+    /// than the budget by itself.
+    pub fn set_text(&mut self, page: usize, layer: TextLayer) -> bool {
+        if page >= self.count() {
+            return false;
+        }
+        let chars: Vec<char> = layer.text.chars().collect();
+        if chars.len() != layer.boxes.len() {
+            self.text_refused.insert(page);
+            return false;
+        }
+        let boxes: Vec<Option<[f32; 4]>> = layer
+            .boxes
+            .into_iter()
+            .map(|b| b.filter(|b| b.iter().all(|v| v.is_finite())))
+            .collect();
+        self.clock += 1;
+        let any = boxes.iter().any(Option::is_some);
+        let entry = TextPage {
+            chars,
+            boxes,
+            used: self.clock,
+            any,
+        };
+        if entry.bytes() > self.text_budget {
+            self.text_refused.insert(page);
+            return false;
+        }
+        self.text_refused.remove(&page);
+        self.text.insert(page, entry);
+        self.enforce_text_budget();
+        self.version += 1;
+        true
+    }
+
+    /// Drop the least recently used layers until the budget holds, except
+    /// those on or next to the screen and at the ends of the selection.
+    fn enforce_text_budget(&mut self) {
+        let visible = self.visible();
+        let around = visible.start.saturating_sub(1)..(visible.end + 1).min(self.count());
+        let mut keep: Vec<usize> = Vec::new();
+        if let Some((a, b)) = self.sel {
+            keep.extend([a.0, b.0]);
+        }
+        if let Some(a) = self.anchor {
+            keep.extend([a.start.0, a.end.0]);
+        }
+        while self.text_bytes() > self.text_budget {
+            let oldest = self
+                .text
+                .iter()
+                .filter(|(p, _)| !around.contains(p) && !keep.contains(p))
+                .map(|(p, l)| (l.used, *p))
+                .min();
+            match oldest {
+                Some((_, page)) => self.text.remove(&page),
+                None => break,
+            };
+        }
+    }
+
+    /// Pages whose text to read, nearest the current page first: those on
+    /// screen and one either side that have no layer yet.
+    pub fn wanted_text(&self) -> Vec<usize> {
+        if self.count() == 0 || self.width == 0 {
+            return Vec::new();
+        }
+        let visible = self.visible();
+        let around = visible.start.saturating_sub(1)..(visible.end + 1).min(self.count());
+        let current = self.current();
+        let mut pages: Vec<usize> = around
+            .filter(|p| !self.text.contains_key(p) && !self.text_refused.contains(p))
+            .collect();
+        pages.sort_by_key(|p| p.abs_diff(current));
+        pages
+    }
+
+    /// `None` until the page's layer arrives; then whether it has any
+    /// characters (`Some(false)` for a scanned page).
+    pub fn text_state(&self, page: usize) -> Option<bool> {
+        self.text.get(&page).map(|l| l.any)
+    }
+
+    /// Physical pixels per real point of a page (layout scale times the clamp factor).
+    fn text_scale(&self, page: usize) -> f64 {
+        self.pixels_per_point() * f64::from(self.factors[page])
+    }
+
+    /// The page under a point and the point in that page's real points; none
+    /// on the strip.
+    fn text_point(&self, x: f64, y: f64) -> Option<(usize, f64, f64)> {
+        if self.count() == 0 || x < self.strip_width() || !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let page = self.page_at(y + self.scroll_y);
+        let rect = self.page_rect(page);
+        let k = self.text_scale(page);
+        Some((page, (x - rect.x0) / k, (y - rect.y0) / k))
+    }
+
+    fn nearest_char(&self, page: usize, px: f64, py: f64) -> Option<usize> {
+        let layer = self.text.get(&page)?;
+        let mut best: Option<((u8, f64), usize)> = None;
+        for (i, b) in layer.boxes.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let key = box_distance(b, px, py);
+            if best.is_none_or(|(k, _)| key.0 < k.0 || (key.0 == k.0 && key.1 < k.1)) {
+                best = Some((key, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Whether the point is on a character (for an I-beam cursor).
+    pub fn is_over_text(&self, x: f64, y: f64) -> bool {
+        let Some((page, px, py)) = self.text_point(x, y) else {
+            return false;
+        };
+        self.text.get(&page).is_some_and(|l| {
+            l.boxes
+                .iter()
+                .flatten()
+                .any(|b| box_distance(b, px, py).0 == 0)
+        })
+    }
+
+    /// The characters a unit covers around `at`: itself, its word, its line.
+    fn unit_range(&self, at: Pos, unit: u8) -> (Pos, Pos) {
+        let Some(layer) = self.text.get(&at.0) else {
+            return (at, at);
+        };
+        let chars = &layer.chars;
+        if chars.is_empty() {
+            return (at, at);
+        }
+        let i = at.1.min(chars.len() - 1);
+        let (s, e) = match unit {
+            2 if chars[i].is_alphanumeric() => {
+                let s = chars[..i]
+                    .iter()
+                    .rposition(|c| !c.is_alphanumeric())
+                    .map_or(0, |n| n + 1);
+                let e = chars[i..]
+                    .iter()
+                    .position(|c| !c.is_alphanumeric())
+                    .map_or(chars.len(), |n| i + n);
+                (s, e - 1)
+            }
+            3 if chars[i] != '\n' => {
+                let s = chars[..i]
+                    .iter()
+                    .rposition(|c| *c == '\n')
+                    .map_or(0, |n| n + 1);
+                let e = chars[i..]
+                    .iter()
+                    .position(|c| *c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                (s, e - 1)
+            }
+            _ => (i, i),
+        };
+        ((at.0, s), (at.0, e))
+    }
+
+    /// A press on the pages: 1 click starts a selection at the character
+    /// nearest the point (the old selection goes), 2 selects the word, 3 the
+    /// line. Returns whether the selection changed.
+    pub fn press_text(&mut self, x: f64, y: f64, clicks: u8) -> bool {
+        let Some((page, px, py)) = self.text_point(x, y) else {
+            return false;
+        };
+        let before = self.sel;
+        let Some(i) = self.nearest_char(page, px, py) else {
+            self.anchor = None;
+            self.sel = None;
+            if before.is_some() {
+                self.version += 1;
+            }
+            return before.is_some();
+        };
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(layer) = self.text.get_mut(&page) {
+            layer.used = clock;
+        }
+        let unit = clicks.clamp(1, 3);
+        let (start, end) = self.unit_range((page, i), unit);
+        self.anchor = Some(Anchor { start, end, unit });
+        self.sel = (unit > 1).then_some((start, end));
+        if self.sel != before {
+            self.version += 1;
+        }
+        self.sel != before
+    }
+
+    /// Extend the selection a press started to the character nearest the
+    /// point, on any page. Returns whether it changed.
+    pub fn drag_text(&mut self, x: f64, y: f64) -> bool {
+        let Some(anchor) = self.anchor else {
+            return false;
+        };
+        let Some((page, px, py)) = self.text_point(x, y) else {
+            return false;
+        };
+        let Some(i) = self.nearest_char(page, px, py) else {
+            return false;
+        };
+        let (ts, te) = self.unit_range((page, i), anchor.unit);
+        let (s, e) = if ts < anchor.start {
+            (ts, anchor.end.max(te))
+        } else {
+            (anchor.start, te.max(anchor.end))
+        };
+        let new = (anchor.unit > 1 || s != e).then_some((s, e));
+        if new == self.sel {
+            return false;
+        }
+        self.sel = new;
+        self.version += 1;
+        true
+    }
+
+    /// Select all the text of the current page.
+    pub fn select_all(&mut self) -> bool {
+        let page = self.current();
+        let Some(layer) = self.text.get(&page) else {
+            return false;
+        };
+        if !layer.any {
+            return false;
+        }
+        let new = Some(((page, 0), (page, layer.chars.len() - 1)));
+        self.anchor = None;
+        if new == self.sel {
+            return false;
+        }
+        self.sel = new;
+        self.version += 1;
+        true
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.sel.take().is_some() {
+            self.version += 1;
+        }
+        self.anchor = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.sel.is_some()
+    }
+
+    /// The selected text, pages joined with a newline. Control characters
+    /// other than newline are left out; at most `SELECTION_MAX` bytes.
+    pub fn selected_text(&self) -> String {
+        let Some((start, end)) = self.sel else {
+            return String::new();
+        };
+        let mut pages: Vec<usize> = self
+            .text
+            .keys()
+            .copied()
+            .filter(|p| (start.0..=end.0).contains(p))
+            .collect();
+        pages.sort_unstable();
+        let mut out = String::new();
+        for page in pages {
+            let layer = &self.text[&page];
+            if layer.chars.is_empty() {
+                continue;
+            }
+            let last = layer.chars.len() - 1;
+            let lo = if page == start.0 { start.1 } else { 0 };
+            let hi = if page == end.0 { end.1.min(last) } else { last };
+            if lo > hi {
+                continue;
+            }
+            let mut piece = String::new();
+            for &c in &layer.chars[lo..=hi] {
+                if !c.is_control() || c == '\n' {
+                    piece.push(c);
+                }
+            }
+            if piece.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&piece);
+            if out.len() >= SELECTION_MAX {
+                break;
+            }
+        }
+        if out.len() > SELECTION_MAX {
+            let mut cut = SELECTION_MAX;
+            while !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+        }
+        out
+    }
+
+    /// Replace the search hits.
+    pub fn set_find_hits(&mut self, hits: Vec<FindMark>) {
+        self.finds.clear();
+        self.find_pages.clear();
+        self.current_hit = None;
+        self.add_find_hits(hits);
+        self.version += 1;
+    }
+
+    /// Add search hits (at most `MAX_HITS` are kept, `MAX_HIT_BOXES` boxes each).
+    pub fn add_find_hits(&mut self, hits: Vec<FindMark>) {
+        for mut hit in hits {
+            if self.finds.len() >= MAX_HITS {
+                break;
+            }
+            hit.boxes.retain(|b| b.iter().all(|v| v.is_finite()));
+            hit.boxes.truncate(MAX_HIT_BOXES);
+            self.find_pages
+                .entry(hit.page)
+                .or_default()
+                .push(self.finds.len());
+            self.finds.push(hit);
+        }
+        self.version += 1;
+    }
+
+    pub fn clear_find(&mut self) {
+        if !self.finds.is_empty() || self.current_hit.is_some() {
+            self.version += 1;
+        }
+        self.finds.clear();
+        self.find_pages.clear();
+        self.current_hit = None;
+    }
+
+    /// Number of search hits kept.
+    pub fn hit_count(&self) -> usize {
+        self.finds.len()
+    }
+
+    /// The hit drawn stronger (none when `index` is out of range).
+    pub fn set_current_hit(&mut self, index: Option<usize>) {
+        let index = index.filter(|i| *i < self.finds.len());
+        if index != self.current_hit {
+            self.current_hit = index;
+            self.version += 1;
+        }
+    }
+
+    pub fn current_hit(&self) -> Option<usize> {
+        self.current_hit
+    }
+
+    /// Scroll so hit `index` is on screen (sideways too when zoomed). Returns
+    /// whether the view moved; false also when there is no such hit.
+    pub fn go_to_hit(&mut self, index: usize) -> bool {
+        let Some(mark) = self.finds.get(index) else {
+            return false;
+        };
+        let page = mark.page;
+        let (Some(b), true) = (mark.boxes.first().copied(), page < self.count()) else {
+            return false;
+        };
+        let k = self.text_scale(page);
+        let rect = self.page_rect(page);
+        let (left, right) = (rect.x0 + f64::from(b[0]) * k, rect.x0 + f64::from(b[2]) * k);
+        let (top, bottom) = (rect.y0 + f64::from(b[1]) * k, rect.y0 + f64::from(b[3]) * k);
+        let before = (self.scroll_x, self.scroll_y);
+        let h = f64::from(self.height);
+        let pad = h * 0.15;
+        if top < pad || bottom > h - pad {
+            self.scroll_y += (top + bottom) / 2.0 - h / 3.0;
+        }
+        let (cl, cw) = self.column();
+        let pad = cw * 0.1;
+        if left < cl + pad || right > cl + cw - pad {
+            self.scroll_x += (left + right) / 2.0 - (cl + cw / 2.0);
+        }
+        self.clamp();
+        self.reveal_thumb(self.current());
+        (self.scroll_x, self.scroll_y) != before
+    }
+
+    /// Selection and search hits of one page, over the page's pixels.
+    fn draw_marks(&mut self, index: usize, rect: Rect, style: &PdfStyle) {
+        let selected = self.sel.is_some_and(|(a, b)| (a.0..=b.0).contains(&index));
+        let found = self.find_pages.contains_key(&index);
+        if !selected && !found {
+            return;
+        }
+        let k = self.text_scale(index);
+        let to_rect = |b: &[f32; 4]| {
+            Rect::new(
+                rect.x0 + f64::from(b[0]) * k,
+                rect.y0 + f64::from(b[1]) * k,
+                rect.x0 + f64::from(b[2]) * k,
+                rect.y0 + f64::from(b[3]) * k,
+            )
+            .intersect(rect)
+        };
+        let mut plain: Vec<Rect> = Vec::new();
+        let mut strong: Vec<Rect> = Vec::new();
+        if let Some(list) = self.find_pages.get(&index) {
+            for &n in list {
+                let target = if Some(n) == self.current_hit {
+                    &mut strong
+                } else {
+                    &mut plain
+                };
+                target.extend(self.finds[n].boxes.iter().map(to_rect));
+            }
+        }
+        let mut chosen: Vec<Rect> = Vec::new();
+        if let (Some((a, b)), Some(layer)) = (self.sel, self.text.get(&index))
+            && (a.0..=b.0).contains(&index)
+            && !layer.chars.is_empty()
+        {
+            let last = layer.chars.len() - 1;
+            let lo = if index == a.0 { a.1 } else { 0 };
+            let hi = if index == b.0 { b.1.min(last) } else { last };
+            if lo <= hi {
+                let boxes = layer.boxes[lo..=hi].iter().flatten().copied();
+                chosen.extend(merge_boxes(boxes).iter().map(to_rect));
+            }
+        }
+        for (rects, paint) in [
+            (plain, style.hit),
+            (strong, style.current_hit),
+            (chosen, style.selection),
+        ] {
+            self.ctx.set_paint(color(paint));
+            for r in rects.iter().filter(|r| r.width() > 0.0 && r.height() > 0.0) {
+                self.ctx.fill_rect(r);
+            }
+        }
     }
 
     pub fn set_style(&mut self, style: PdfStyle) {
@@ -986,6 +1558,7 @@ impl PdfView {
                 let pixmap = thumb.pixmap.clone();
                 draw_image(&mut self.ctx, &pixmap, rect, None, Affine::IDENTITY);
             }
+            self.draw_marks(index, rect, &style);
         }
 
         if self.shows_strip() {

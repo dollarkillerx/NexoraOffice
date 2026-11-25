@@ -1863,11 +1863,16 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_zoom(format!("{}%", tab.view.zoom_percent()).into());
             ui.set_zoom_enabled(true);
             ui.set_status_format("PDF".into());
-            ui.set_status_notice(if tab.stopped() {
-                strings.pdf_stopped.into()
+            let notice = if tab.stopped() {
+                strings.pdf_stopped.to_owned()
+            } else if tab.find.open && tab.find.truncated {
+                pdf::truncated_notice(strings, tab.view.hit_count())
+            } else if tab.view.text_state(tab.view.current()) == Some(false) {
+                strings.pdf_no_text_page.to_owned()
             } else {
-                SharedString::new()
-            });
+                String::new()
+            };
+            ui.set_status_notice(notice.into());
         }
         None => {
             ui.set_status_zoom(SharedString::new());
@@ -2326,10 +2331,15 @@ fn schedule_outline(ui: &AppWindow, shell: &mut Shell) {
     let Some((id, version, len)) = state else {
         shell.outline.clear();
         shell.outline_of = None;
+        if refresh_pdf_outline(ui, shell) {
+            return;
+        }
+        ui.set_outline_pdf(false);
         ui.set_has_outline(false);
         ui.set_outline(model(Vec::new()));
         return;
     };
+    ui.set_outline_pdf(false);
     ui.set_has_outline(true);
     if shell.outline_of == Some((id, version)) {
         mark_outline(ui, shell);
@@ -2388,6 +2398,46 @@ fn build_outline(ui: &AppWindow, shell: &mut Shell) {
     mark_outline(ui, shell);
 }
 
+/// The outline rows shown for a PDF: at most this deep, so a deeply nested
+/// file does not push its titles out of the sidebar.
+const PDF_OUTLINE_INDENT: u16 = 8;
+
+/// Show the bookmarks of the PDF in front in the sidebar: only the rows
+/// whose parents are open are put into the model. False when the tab in
+/// front is not a PDF.
+fn refresh_pdf_outline(ui: &AppWindow, shell: &mut Shell) -> bool {
+    let strings = shell.language.strings();
+    let Some(tab) = shell.active_pdf() else {
+        return false;
+    };
+    let (items, hint) = match &tab.outline {
+        Some(outline) => (
+            outline
+                .rows()
+                .map(|row| OutlineItem {
+                    level: i32::from(row.depth.min(PDF_OUTLINE_INDENT)) + 1,
+                    text: row.title.into(),
+                    current: false,
+                    expandable: row.expandable,
+                    expanded: row.expanded,
+                })
+                .collect::<Vec<_>>(),
+            if outline.is_empty() {
+                strings.pdf_outline_none
+            } else {
+                ""
+            },
+        ),
+        // Not here yet: nothing to say.
+        None => (Vec::new(), ""),
+    };
+    ui.set_outline_pdf(true);
+    ui.set_has_outline(true);
+    ui.set_outline_hint(hint.into());
+    ui.set_outline(model(items));
+    true
+}
+
 /// Show the outline with the heading the caret is under marked.
 fn mark_outline(ui: &AppWindow, shell: &mut Shell) {
     let caret = shell
@@ -2405,6 +2455,8 @@ fn mark_outline(ui: &AppWindow, shell: &mut Shell) {
             level: i32::from(heading.level),
             text: heading.text.as_str().into(),
             current: Some(index) == current,
+            expandable: false,
+            expanded: false,
         })
         .collect();
     ui.set_outline(model(items));
@@ -3288,6 +3340,23 @@ fn find_position(strings: &i18n::Strings, editor: &MarkdownEditor) -> String {
 /// Push the find bar's state into the window.
 fn refresh_find(ui: &AppWindow, shell: &mut Shell) {
     let strings = shell.language.strings();
+    if let Some(tab) = shell.active_pdf() {
+        let find = &tab.find;
+        ui.set_find_open(find.open);
+        ui.set_find_replace(false);
+        ui.set_find_case(find.match_case);
+        ui.set_find_whole(false);
+        ui.set_find_regex(false);
+        ui.set_find_error(false);
+        ui.set_find_busy(false);
+        let position =
+            pdf::find_position(strings, find, tab.view.hit_count(), tab.view.current_hit());
+        ui.set_find_position(position.into());
+        if ui.get_find_query().as_str() != find.query {
+            ui.set_find_query(find.query.as_str().into());
+        }
+        return;
+    }
     if let Some(tab) = shell.active_sheet() {
         let find = &tab.find;
         ui.set_find_open(find.open);
@@ -4185,6 +4254,10 @@ fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Ev
                 show_dialog(ui, shell, 2, title, pdf::error_message(error, strings));
             }
             Event::Page(_) | Event::PageFailed(_) | Event::Stopped => {}
+            Event::Text(_)
+            | Event::Outline(_)
+            | Event::FindHits { .. }
+            | Event::FindDone { .. } => {}
         }
         return;
     }
@@ -4201,12 +4274,23 @@ fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Ev
         return;
     };
     let gave_up = matches!(event, Event::Failed(_) | Event::Stopped);
+    let outline = matches!(event, Event::Outline(_));
+    let text = matches!(event, Event::Text(_));
+    let find = matches!(event, Event::FindHits { .. } | Event::FindDone { .. });
     let changed = tab.take(event);
     if active == Some(id) {
         if changed {
             present(ui, shell);
         }
-        if gave_up {
+        if outline {
+            refresh_pdf_outline(ui, shell);
+        }
+        // A page's text may say the page has none; hits move the count.
+        if gave_up || text {
+            refresh_status(ui, shell);
+        }
+        if find {
+            refresh_find(ui, shell);
             refresh_status(ui, shell);
         }
     }
@@ -5335,6 +5419,22 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         if shell.active_sheet().is_some() {
             return sheet_key_pressed(&ui, shell, text.as_str(), shift, primary, alt);
         }
+        if text.as_str() == "\u{1b}"
+            && let Some(tab) = shell.active_pdf()
+        {
+            // Esc closes the find bar, then clears the selection.
+            if tab.find.open {
+                tab.close_find();
+                after_find(&ui, shell, None);
+                return true;
+            }
+            if tab.view.has_selection() {
+                tab.view.clear_selection();
+                present(&ui, shell);
+                return true;
+            }
+            return false;
+        }
         if shell.active_pdf().is_some() {
             let Some(key) = viewer_key(text.as_str()) else {
                 return false;
@@ -5417,7 +5517,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                 return;
             }
             Some(Content::Pdf(tab)) => {
-                if tab.view.press(x, y) {
+                // A thumbnail goes to its page; on a page the press starts
+                // (or, doubled, widens) a text selection.
+                if tab.press(x, y, clicks.clamp(1, 3)) {
                     after_pdf_move(&ui, shell);
                 }
                 return;
@@ -5454,6 +5556,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             }
             Some(Content::Slides(_)) => {
                 slides_ui::pointer_drag(&ui, shell, x, y);
+                return;
+            }
+            Some(Content::Pdf(tab)) => {
+                if tab.view.drag_text(x, y) {
+                    present(&ui, shell);
+                }
                 return;
             }
             _ => return,
@@ -5495,6 +5603,14 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             return;
         }
         let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
+        if let Some(tab) = shell.active_pdf() {
+            // The I-beam over text (4 in the window's cursor numbers).
+            let cursor = if tab.view.is_over_text(x, y) { 4 } else { 0 };
+            if cursor != ui.get_resize_cursor() {
+                ui.set_resize_cursor(cursor);
+            }
+            return;
+        }
         let cursor = shell
             .active_sheet()
             .map_or(0, |tab| match tab.view.resize_hit(x, y) {
@@ -6169,7 +6285,29 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         shell.link_edit = None;
         ui.invoke_focus_document();
     }));
+    ui.on_outline_toggled(handler!(|ui, shell, index| {
+        if let Some(tab) = shell.active_pdf()
+            && let Ok(row) = usize::try_from(index)
+            && tab
+                .outline
+                .as_mut()
+                .is_some_and(|outline| outline.toggle_row(row))
+        {
+            refresh_pdf_outline(&ui, shell);
+        }
+    }));
     ui.on_outline_clicked(handler!(|ui, shell, index| {
+        if let Some(tab) = shell.active_pdf() {
+            // Items that go nowhere do nothing.
+            if let Ok(row) = usize::try_from(index)
+                && tab.go_to_row(row)
+            {
+                // The rows shown stay the rows the click was counted in.
+                refresh_pdf_outline(&ui, shell);
+                after_pdf_move(&ui, shell);
+            }
+            return;
+        }
         let Some(offset) = usize::try_from(index)
             .ok()
             .and_then(|index| shell.outline.get(index))
@@ -6551,6 +6689,14 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         if slides_ui::edit(&ui, shell, slides_ui::Edit::Copy) {
             return;
         }
+        // A PDF copies the selected text, if there is any.
+        if let Some(tab) = shell.active_pdf() {
+            let text = tab.view.selected_text();
+            if !text.is_empty() {
+                ui.invoke_copy_to_clipboard(text.into());
+            }
+            return;
+        }
         // A workbook copies the selected cells as tab-separated text.
         if let Some(tab) = shell.active_sheet() {
             if let Some(text) = tab.copy(false) {
@@ -6607,6 +6753,13 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
 
     ui.on_edit_select_all(handler!(|ui, shell| {
         if slides_ui::edit(&ui, shell, slides_ui::Edit::SelectAll) {
+            return;
+        }
+        // A PDF selects the text of the page in front.
+        if let Some(tab) = shell.active_pdf() {
+            if tab.view.select_all() {
+                present(&ui, shell);
+            }
             return;
         }
         if let Some(editor) = shell.active_markdown()
@@ -6998,6 +7151,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     // --- Find and replace ---
 
     ui.on_menu_find(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_pdf() {
+            tab.open_find();
+            after_find(&ui, shell, None);
+            ui.invoke_focus_find_query();
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.open_find(false);
             let query = tab.find.query.clone();
@@ -7038,6 +7197,16 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_menu_find_selection(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_pdf() {
+            // The first line of what is selected.
+            let text = tab.view.selected_text();
+            tab.open_find();
+            if let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) {
+                tab.set_query(line.to_owned());
+            }
+            after_find(&ui, shell, None);
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             // What the active cell holds, as the formula bar shows it.
             let text = tab
@@ -7066,6 +7235,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_query_edited(handler!(|ui, shell, text| {
+        if let Some(tab) = shell.active_pdf() {
+            tab.set_query(text.to_string());
+            after_find(&ui, shell, None);
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             let mut query = tab.find.query.clone();
             query.pattern = text.to_string();
@@ -7093,6 +7267,14 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_toggle(handler!(|ui, shell, option| {
+        if let Some(tab) = shell.active_pdf() {
+            // Only "match case" exists for a PDF.
+            if option == 0 {
+                tab.toggle_match_case();
+            }
+            after_find(&ui, shell, None);
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             let mut query = tab.find.query.clone();
             match option {
@@ -7128,6 +7310,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_next(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_pdf() {
+            tab.find_step(true);
+            after_find(&ui, shell, None);
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.find_step(true);
             after_sheet_find(&ui, shell, Vec::new());
@@ -7140,6 +7327,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_previous(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_pdf() {
+            tab.find_step(false);
+            after_find(&ui, shell, None);
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.find_step(false);
             after_sheet_find(&ui, shell, Vec::new());
@@ -7152,6 +7344,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_close(handler!(|ui, shell| {
+        if let Some(tab) = shell.active_pdf() {
+            tab.close_find();
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.close_find();
         }

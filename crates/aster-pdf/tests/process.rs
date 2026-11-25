@@ -80,7 +80,12 @@ fn crashy() -> Limits {
 fn fake(script: &str) -> Program {
     Program {
         executable: PathBuf::from("/bin/sh"),
-        arguments: vec!["-c".into(), script.into(), "fake".into()],
+        arguments: vec![
+            "-c".into(),
+            // Like the real child: nothing inherited stays open.
+            format!("for fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do eval \"exec $fd>&-\"; done 2>/dev/null; {script}").into(),
+            "fake".into(),
+        ],
     }
 }
 
@@ -89,9 +94,9 @@ fn fake(script: &str) -> Program {
 const FAKE_OPENED: &str = r"printf 'O\001\000\000\000\000\000\110\103\000\000\310\102\000';";
 /// Page 0 started (only after it was asked for: anything else is refused).
 const FAKE_STARTED: &str = r"printf 'S\000\000\000\000';";
-/// Wait until the start frame (53 bytes) and a request for one page (13)
-/// have arrived.
-const FAKE_WAIT_FOR_WANT: &str = "head -c 60 >/dev/null;";
+/// Wait until the start frame (101 bytes), the empty request that follows
+/// the opening (5) and the start of the one for a page (13) have arrived.
+const FAKE_WAIT_FOR_WANT: &str = "head -c 110 >/dev/null;";
 
 fn open_fake(program: Program, limits: Limits) -> (Worker, Receiver<Event>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -493,7 +498,7 @@ fn a_child_that_hangs_when_opened_again_stops_the_tab() {
     // First time: opens, takes a request, and ends in the middle of a page.
     // The second time it says nothing at all.
     let script = format!(
-        "if [ -e '{m}' ]; then exec sleep 60; fi; : > '{m}'; {FAKE_OPENED} {FAKE_WAIT_FOR_WANT} {FAKE_STARTED} exit 1",
+        "if [ -e '{m}' ]; then exec sleep 30; fi; : > '{m}'; {FAKE_OPENED} {FAKE_WAIT_FOR_WANT} {FAKE_STARTED} exit 1",
         m = marker.display()
     );
     let limits = Limits {
@@ -517,7 +522,7 @@ fn requests_do_not_wait_for_a_child_that_reads_nothing() {
     // The child opens the file and never reads its input. Requests that fill
     // the pipe many times over must not stop the supervisor, which has to
     // end the child when the tab closes.
-    let script = format!("{FAKE_OPENED} exec sleep 60");
+    let script = format!("{FAKE_OPENED} exec sleep 30");
     let (worker, events, _dir) = open_fake(fake(&script), Limits::default());
     assert!(matches!(next(&events), Event::Opened(_)));
     let pid = worker.child_id();
@@ -663,7 +668,9 @@ const PYTHON: &str = "/usr/bin/python3";
 /// A child that speaks the protocol (three pages of 1000 x 1000 points) and
 /// then misbehaves as `argv[1]` says.
 const EVIL_CHILD: &str = r#"
-import sys, struct, time, os
+import sys, struct, time, os, signal
+os.closerange(3, 4096)
+signal.alarm(30)
 mode = sys.argv[1]
 marker = None
 if "=" in mode:
@@ -681,7 +688,7 @@ def started(p): out.write(b"S" + struct.pack("<I", p))
 def page(p, scale, w, h, body):
     out.write(b"P" + struct.pack("<IfII", p, scale, w, h)); out.write(body)
 assert read(1) == b"K"
-(n,) = struct.unpack("<I", read(4)); read(n); read(48)
+(n,) = struct.unpack("<I", read(4)); read(n); read(96)
 out.write(b"O" + struct.pack("<I", 3) + struct.pack("<ff", 1000.0, 1000.0) * 3 + b"\0"); out.flush()
 while True:
     assert read(1) == b"W"
@@ -738,15 +745,26 @@ elif mode == "page_range":
     page(99, 1.0, 10, 10, b"\0" * 400); out.flush()
 elif mode == "failed_unasked":
     started(0); out.write(b"X" + struct.pack("<I", 2)); out.flush()
-time.sleep(60)
+time.sleep(30)
 "#;
 
 fn rss_mb() -> u64 {
-    let out = std::process::Command::new("ps")
+    // Through a file, not a pipe: a child that another thread starts at the
+    // same moment may inherit a pipe's write end (no atomic close-on-exec
+    // for pipes on macOS) and keep it open, so that the reading never ends.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rss");
+    let file = std::fs::File::create(&path).unwrap();
+    let status = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .stderr(std::process::Stdio::null())
+        .status()
         .unwrap();
-    String::from_utf8_lossy(&out.stdout)
+    assert!(status.success());
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
         .trim()
         .parse::<u64>()
         .unwrap_or(0)
@@ -762,6 +780,15 @@ fn open_evil(
     script: &std::path::Path,
     mode: &str,
     slow: Duration,
+) -> Option<(Worker, Receiver<Event>, tempfile::TempDir)> {
+    open_evil_with(script, mode, slow, Limits::default())
+}
+
+fn open_evil_with(
+    script: &std::path::Path,
+    mode: &str,
+    slow: Duration,
+    limits: Limits,
 ) -> Option<(Worker, Receiver<Event>, tempfile::TempDir)> {
     if !std::path::Path::new(PYTHON).exists() {
         eprintln!("skipped: no {PYTHON}");
@@ -780,7 +807,7 @@ fn open_evil(
         program,
         path,
         String::new(),
-        Limits::default(),
+        limits,
         move |event| {
             if !slow.is_zero() {
                 std::thread::sleep(slow);
@@ -1008,4 +1035,686 @@ fn a_child_that_lied_does_not_make_its_page_fail() {
     // the page is asked of the next, which draws it.
     assert!(matches!(next(&events), Event::Page(p) if p.page == 0));
     wait_until("the first child is still there", 2, || !alive(pid));
+}
+
+// Text, the outline and search, with the real child.
+
+/// A document of `pages` pages that each say "Page <n> needle" in
+/// Helvetica, with an outline: "Chapter one" (page 0, open) holding
+/// "Section 1.1" (page 1), then "Chapter two" (page 2, 90 points up).
+fn text_document(pages: usize) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let tree = b.reserve();
+    let outlines = b.reserve();
+    let font = b.add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let mut kids = Vec::new();
+    for n in 0..pages {
+        let content = b.stream(
+            "",
+            format!("BT /F1 24 Tf 20 50 Td (Page {n} needle) Tj ET").as_bytes(),
+        );
+        kids.push(b.add(format!(
+            "<< /Type /Page /Parent {tree} 0 R /MediaBox [0 0 300 100] \
+             /Resources << /Font << /F1 {font} 0 R >> >> /Contents {content} 0 R >>"
+        )));
+    }
+    let (one, section, two) = (b.reserve(), b.reserve(), b.reserve());
+    let page = |n: usize| kids[n.min(pages - 1)];
+    b.set(
+        one,
+        format!(
+            "<< /Title (Chapter one) /Parent {outlines} 0 R /Next {two} 0 R /First {section} 0 R \
+             /Last {section} 0 R /Count 1 /Dest [{} 0 R /XYZ 0 90 0] >>",
+            page(0)
+        ),
+    );
+    b.set(
+        section,
+        format!(
+            "<< /Title (Section 1.1) /Parent {one} 0 R /Dest [{} 0 R /Fit] >>",
+            page(1)
+        ),
+    );
+    b.set(
+        two,
+        format!(
+            "<< /Title (Chapter two) /Parent {outlines} 0 R /Prev {one} 0 R \
+             /Dest [{} 0 R /XYZ 0 90 0] >>",
+            page(2)
+        ),
+    );
+    b.set(
+        outlines,
+        format!("<< /Type /Outlines /First {one} 0 R /Last {two} 0 R /Count 3 >>"),
+    );
+    let kids: Vec<String> = kids.iter().map(|k| format!("{k} 0 R")).collect();
+    b.set(
+        tree,
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+            kids.join(" ")
+        ),
+    );
+    b.set(
+        catalog,
+        format!("<< /Type /Catalog /Pages {tree} 0 R /Outlines {outlines} 0 R >>"),
+    );
+    b.finish(catalog)
+}
+
+/// Events until `done` says so; the others are returned too.
+fn collect_until(events: &Receiver<Event>, mut done: impl FnMut(&Event) -> bool) -> Vec<Event> {
+    let mut all = Vec::new();
+    loop {
+        let event = next(events);
+        let end = done(&event);
+        all.push(event);
+        if end {
+            return all;
+        }
+    }
+}
+
+fn opened_text_document(
+    pages: usize,
+    limits: Limits,
+) -> (Worker, Receiver<Event>, tempfile::TempDir) {
+    let (worker, events, dir) = open(&text_document(pages), limits);
+    assert!(matches!(next(&events), Event::Opened(info) if info.pages.len() == pages));
+    (worker, events, dir)
+}
+
+#[test]
+fn the_text_of_pages_comes_back_with_a_box_for_each_char() {
+    let (worker, events, _dir) = opened_text_document(3, Limits::default());
+    worker.want_text(vec![2, 0]);
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let Event::Text(text) = next(&events) else {
+            panic!("no text");
+        };
+        texts.push(text);
+    }
+    // In the order asked.
+    assert_eq!(texts.iter().map(|t| t.page).collect::<Vec<_>>(), [2, 0]);
+    for text in &texts {
+        assert!(
+            text.text.contains(&format!("Page {} needle", text.page)),
+            "{:?}",
+            text.text
+        );
+        assert_eq!(text.boxes.len(), text.text.chars().count());
+        assert!(
+            !text.text.chars().any(|c| c.is_control() && c != '\n'),
+            "{:?}",
+            text.text
+        );
+        let drawn: Vec<_> = text.boxes.iter().flatten().collect();
+        assert!(!drawn.is_empty());
+        for b in drawn {
+            assert!(b.iter().all(|v| v.is_finite()));
+            // On the page (300 x 100), left before right, top before bottom.
+            assert!(b[0] >= -1.0 && b[2] <= 301.0 && b[0] <= b[2], "{b:?}");
+            assert!(b[1] >= -1.0 && b[3] <= 101.0 && b[1] <= b[3], "{b:?}");
+        }
+    }
+    // A page that does not exist is left out; asking again gives it again.
+    worker.want_text(vec![9, 1, 1]);
+    assert!(matches!(next(&events), Event::Text(t) if t.page == 1));
+    quiet(&events);
+    worker.want_text(vec![1]);
+    assert!(matches!(next(&events), Event::Text(t) if t.page == 1));
+}
+
+#[test]
+fn a_page_and_texts_asked_together_all_come() {
+    let (worker, events, _dir) = opened_text_document(3, Limits::default());
+    worker.want_text(vec![0, 1, 2]);
+    worker.want(vec![(1, 1.0)]);
+    let (mut pages, mut texts) = (0, 0);
+    let _ = collect_until(&events, |e| {
+        match e {
+            Event::Page(_) => pages += 1,
+            Event::Text(_) => texts += 1,
+            _ => {}
+        }
+        pages == 1 && texts == 3
+    });
+}
+
+#[test]
+fn the_outline_comes_back_flat_with_targets() {
+    let (worker, events, _dir) = opened_text_document(3, Limits::default());
+    worker.want_outline();
+    let Event::Outline(items) = next(&events) else {
+        panic!("no outline");
+    };
+    let shown: Vec<_> = items
+        .iter()
+        .map(|i| (i.depth, i.title.as_str(), i.open))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (0, "Chapter one", true),
+            (1, "Section 1.1", false),
+            (0, "Chapter two", false)
+        ]
+    );
+    let targets: Vec<_> = items.iter().map(|i| i.target.map(|t| t.page)).collect();
+    assert_eq!(targets, [Some(0), Some(1), Some(2)]);
+    // 90 points up on a page of 100 is 10 from the top.
+    let top = items[0].target.unwrap().top.unwrap();
+    assert!((top - 10.0).abs() < 1.5, "{top}");
+    assert_eq!(items[1].target.unwrap().top, None);
+    // A document without one has an empty list.
+    let (worker2, events2, _dir2) = open(
+        &Builder::document(&[b"0 g 0 0 1 1 re f"]),
+        Limits::default(),
+    );
+    assert!(matches!(next(&events2), Event::Opened(_)));
+    worker2.want_outline();
+    assert!(matches!(next(&events2), Event::Outline(items) if items.is_empty()));
+    drop(worker);
+}
+
+/// What a search reported: its hits (page, start, len) and its end (total,
+/// truncated).
+type SearchResults = (Vec<(usize, u32, u32)>, Option<(usize, bool)>);
+
+/// Every FindHits of the events: (page, start, len), and the end.
+fn search_results(events: &[Event], search: u64) -> SearchResults {
+    let mut hits = Vec::new();
+    let mut end = None;
+    for event in events {
+        match event {
+            Event::FindHits { search: s, hits: h } if *s == search => {
+                hits.extend(h.iter().map(|h| (h.page, h.start, h.len)));
+            }
+            Event::FindDone {
+                search: s,
+                total,
+                truncated,
+            } if *s == search => end = Some((*total, *truncated)),
+            _ => {}
+        }
+    }
+    (hits, end)
+}
+
+fn is_done(search: u64) -> impl FnMut(&Event) -> bool {
+    move |e| matches!(e, Event::FindDone { search: s, .. } if *s == search)
+}
+
+#[test]
+fn a_search_reports_its_hits_in_page_order_and_ends() {
+    let (worker, events, _dir) = opened_text_document(3, Limits::default());
+    worker.want_text(vec![0, 1, 2]);
+    let mut texts = std::collections::HashMap::new();
+    for _ in 0..3 {
+        let Event::Text(t) = next(&events) else {
+            panic!("no text");
+        };
+        texts.insert(t.page, t);
+    }
+    worker.find(7, "NEEDLE".into(), false);
+    let all = collect_until(&events, is_done(7));
+    let (hits, end) = search_results(&all, 7);
+    assert_eq!(end, Some((3, false)));
+    assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [0, 1, 2]);
+    for (page, start, len) in hits {
+        let chars: String = texts[&page]
+            .text
+            .chars()
+            .skip(start as usize)
+            .take(len as usize)
+            .collect();
+        assert_eq!(chars, "needle");
+    }
+    for event in &all {
+        if let Event::FindHits { hits, .. } = event {
+            assert!(
+                hits.iter()
+                    .all(|h| !h.boxes.is_empty() && h.boxes.len() <= 256)
+            );
+        }
+    }
+    // Case matters when it is asked to.
+    worker.find(8, "NEEDLE".into(), true);
+    let all = collect_until(&events, is_done(8));
+    assert_eq!(search_results(&all, 8), (vec![], Some((0, false))));
+    worker.find(9, "Page 1".into(), true);
+    let all = collect_until(&events, is_done(9));
+    let (hits, end) = search_results(&all, 9);
+    assert_eq!((hits.len(), end), (1, Some((1, false))));
+    assert_eq!(hits[0].0, 1);
+}
+
+#[test]
+fn a_search_stops_at_the_hit_limit_and_says_so() {
+    let limits = Limits {
+        max_find_hits: 2,
+        ..Limits::default()
+    };
+    let (worker, events, _dir) = opened_text_document(5, limits);
+    worker.find(1, "needle".into(), false);
+    let all = collect_until(&events, is_done(1));
+    let (hits, end) = search_results(&all, 1);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(end, Some((2, true)));
+}
+
+#[test]
+fn an_empty_or_too_long_query_finds_nothing_at_once() {
+    let limits = Limits {
+        max_query_chars: 8,
+        ..Limits::default()
+    };
+    let (worker, events, _dir) = opened_text_document(2, limits);
+    worker.find(1, String::new(), false);
+    assert!(matches!(
+        next(&events),
+        Event::FindDone {
+            search: 1,
+            total: 0,
+            truncated: false
+        }
+    ));
+    // Nine chars against a limit of eight; the child never hears of it.
+    worker.find(2, "needle!!!".into(), false);
+    assert!(matches!(
+        next(&events),
+        Event::FindDone {
+            search: 2,
+            total: 0,
+            truncated: false
+        }
+    ));
+    worker.find(3, "needle".into(), false);
+    let all = collect_until(&events, is_done(3));
+    assert_eq!(search_results(&all, 3).1, Some((2, false)));
+}
+
+#[test]
+fn a_search_that_is_cancelled_or_replaced_reports_nothing_more() {
+    let (worker, events, _dir) = opened_text_document(300, Limits::default());
+    worker.find(1, "needle".into(), false);
+    worker.cancel_find();
+    // What came before the cancel was read may be there; no end for it.
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    assert!(
+        seen.iter().all(|e| !matches!(e, Event::FindDone { .. })),
+        "{seen:?}"
+    );
+    worker.find(2, "needle".into(), false);
+    worker.find(3, "Page 7 ".into(), true);
+    let all = collect_until(&events, is_done(3));
+    assert!(
+        !all.iter()
+            .any(|e| matches!(e, Event::FindDone { search: 2, .. })),
+        "the replaced search ended"
+    );
+    let (hits, end) = search_results(&all, 3);
+    assert_eq!(end.map(|e| e.1), Some(false));
+    // "Page 7 " is page 7 only, and "Page 70 ".. do not match: the space.
+    assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [7]);
+}
+
+#[test]
+fn a_child_killed_in_the_middle_is_replaced_and_the_work_goes_on() {
+    let (worker, events, _dir) = opened_text_document(300, Limits::default());
+    worker.want_text(vec![5]);
+    worker.want_outline();
+    let pid = worker.child_id();
+    // SAFETY: only a signal to the child of this test.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    let mut got_text = false;
+    let mut got_outline = false;
+    let mut found = Vec::new();
+    // (Whatever the first child had done is not done twice.)
+    let all = collect_until(&events, |e| {
+        got_text |= matches!(e, Event::Text(t) if t.page == 5);
+        got_outline |= matches!(e, Event::Outline(_));
+        got_text && got_outline
+    });
+    drop(all);
+    worker.find(1, "needle".into(), false);
+    let mut killed = false;
+    let all = collect_until(&events, |e| {
+        if matches!(e, Event::FindHits { .. }) && !killed {
+            killed = true;
+            let pid = worker.child_id();
+            // SAFETY: as above.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        matches!(e, Event::FindDone { .. })
+    });
+    let (hits, end) = search_results(&all, 1);
+    found.extend(hits.iter().map(|h| h.0));
+    let mut sorted = found.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    // No page twice, in order; and what the end says is what was reported.
+    assert_eq!(found, sorted, "a page was reported twice or out of order");
+    assert_eq!(end.map(|e| e.0), Some(found.len()));
+    assert!(found.len() >= 290, "{} of 300 pages", found.len());
+}
+
+// A compromised child that sends text, an outline or search results it
+// should not.
+
+/// Run `mode` of the repository's fake child: it is asked by `ask` once the
+/// document is open; the child must be killed quickly and the application
+/// must not be flooded. With `to_the_end` the events are read up to the
+/// `Stopped` that the tab ends in after repeated misbehaviour (the fake
+/// misbehaves again in each child that is started, which takes a while);
+/// otherwise the next moments' events. Returns the events.
+fn compromised(
+    mode: &str,
+    limits: Limits,
+    to_the_end: bool,
+    ask: impl FnOnce(&Worker),
+) -> Vec<Event> {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let Some((worker, events, _dir)) = open_evil_with(
+        std::path::Path::new(repo_fake),
+        mode,
+        Duration::ZERO,
+        limits,
+    ) else {
+        return Vec::new();
+    };
+    let before = rss_mb();
+    assert!(matches!(next(&events), Event::Opened(_)), "{mode}");
+    let began = Instant::now();
+    let pid = worker.child_id();
+    ask(&worker);
+    wait_until(&format!("{mode}: the child was not killed"), 5, || {
+        !alive(pid)
+    });
+    let killed_after = began.elapsed();
+    let mut all = Vec::new();
+    if to_the_end {
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("{mode}: never stopped"));
+            let stopped = matches!(event, Event::Stopped);
+            all.push(event);
+            if stopped {
+                break;
+            }
+        }
+        wait_until("a child is left", 5, || worker.child_id() == 0);
+    } else {
+        let until = Instant::now() + Duration::from_millis(300);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(event) = events.recv_timeout(left) {
+                all.push(event);
+            }
+        }
+    }
+    let growth = rss_mb().saturating_sub(before);
+    eprintln!(
+        "[{mode}] killed after {killed_after:?}, {} events, RSS growth {growth} MB",
+        all.len()
+    );
+    assert!(growth < 300, "{mode}: RSS grew by {growth} MB");
+    assert!(all.len() < 50, "{mode}: {} events", all.len());
+    all
+}
+
+/// Nothing of what the child said came through.
+fn nothing_came_through(mode: &str, events: &[Event]) {
+    for event in events {
+        assert!(
+            matches!(event, Event::Stopped),
+            "{mode}: an event from a lying child: {event:?}"
+        );
+    }
+}
+
+#[test]
+fn text_that_breaks_a_limit_never_reaches_the_application() {
+    for mode in [
+        "text_oversized",
+        "text_chars_over",
+        "text_mismatch",
+        "text_nan",
+        "text_utf8",
+        "text_wrong_page",
+        "text_out_of_range",
+        "text_without_start",
+        "text_flood",
+    ] {
+        let events = compromised(mode, Limits::default(), false, |w| w.want_text(vec![0]));
+        nothing_came_through(mode, &events);
+    }
+    // Text nobody asked for.
+    let events = compromised("text_unasked", Limits::default(), false, |_| {});
+    nothing_came_through("text_unasked", &events);
+}
+
+#[test]
+fn a_text_answered_twice_ends_the_child_after_the_first() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let Some((worker, events, _dir)) = open_evil_with(
+        std::path::Path::new(repo_fake),
+        "text_twice",
+        Duration::ZERO,
+        Limits::default(),
+    ) else {
+        return;
+    };
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.want_text(vec![0]);
+    assert!(matches!(next(&events), Event::Text(t) if t.page == 0 && t.text == "a"));
+    wait_until("the child was not killed", 5, || !alive(pid));
+    // The one answer was the asked one: no more of them.
+    std::thread::sleep(Duration::from_millis(500));
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, Event::Text(_)), "{event:?}");
+    }
+}
+
+#[test]
+fn an_outline_that_breaks_a_limit_never_reaches_the_application() {
+    for mode in [
+        "outline_huge",
+        "outline_many",
+        "outline_deep",
+        "outline_title",
+        "outline_target",
+    ] {
+        let events = compromised(mode, Limits::default(), false, |w| w.want_outline());
+        nothing_came_through(mode, &events);
+    }
+    let events = compromised("outline_unasked", Limits::default(), false, |_| {});
+    nothing_came_through("outline_unasked", &events);
+}
+
+#[test]
+fn search_results_that_do_not_belong_never_reach_the_application() {
+    let few = Limits {
+        max_find_hits: 5,
+        ..Limits::default()
+    };
+    for (mode, limits) in [
+        ("find_wrong_search", Limits::default()),
+        ("find_hits_wrong_search", Limits::default()),
+        ("find_unknown_search", Limits::default()),
+        ("find_hits_in_a_frame", few),
+        ("find_boxes_in_a_hit", Limits::default()),
+        ("find_nan", Limits::default()),
+        ("find_descending", Limits::default()),
+        ("find_page_range", Limits::default()),
+        ("find_done_early", Limits::default()),
+        ("find_done_total", Limits::default()),
+        ("find_flood", Limits::default()),
+    ] {
+        let events = compromised(mode, limits, false, |w| w.find(5, "x".into(), false));
+        if mode == "find_done_total" {
+            // All three pages were reported as searched (honestly) before
+            // the lie about the total: the next child has nothing left to
+            // search, and the parent ends the search with what it counted,
+            // not with what the child said (7).
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [Event::FindDone {
+                        total: 0,
+                        truncated: false,
+                        ..
+                    }]
+                ),
+                "{events:?}"
+            );
+            continue;
+        }
+        nothing_came_through(mode, &events);
+    }
+}
+
+#[test]
+fn more_hits_than_the_limit_ends_the_child_after_the_ones_that_fit() {
+    let few = Limits {
+        max_find_hits: 5,
+        ..Limits::default()
+    };
+    // Three hits are within the limit and come through; three more are not.
+    // The next child goes on after the page that was reported, finds the
+    // same lie, and the tab ends.
+    let events = compromised("find_hits_over_total", few, true, |w| {
+        w.find(5, "x".into(), false)
+    });
+    let hits: usize = events
+        .iter()
+        .map(|e| match e {
+            Event::FindHits { hits, .. } => hits.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(hits, 3, "{events:?}");
+    assert!(matches!(events.last(), Some(Event::Stopped)));
+}
+
+#[test]
+fn repeated_misbehaviour_ends_the_tab_for_text_outline_and_search() {
+    for (mode, ask) in [
+        ("text_oversized", 0),
+        ("outline_huge", 1),
+        ("find_wrong_search", 2),
+    ] {
+        let events = compromised(mode, Limits::default(), true, |w| match ask {
+            0 => w.want_text(vec![0]),
+            1 => w.want_outline(),
+            _ => w.find(5, "x".into(), false),
+        });
+        nothing_came_through(mode, &events);
+        assert!(matches!(events.last(), Some(Event::Stopped)), "{mode}");
+    }
+}
+
+#[test]
+fn an_outline_or_search_answered_twice_ends_the_child_after_the_first() {
+    for (mode, ask) in [("outline_twice", 0), ("find_done_twice", 1)] {
+        let events = compromised(mode, Limits::default(), false, |w| match ask {
+            0 => w.want_outline(),
+            _ => w.find(5, "x".into(), false),
+        });
+        // The first, the asked-for answer, came through: nothing more.
+        assert_eq!(events.len(), 1, "{mode}: {events:?}");
+        assert!(
+            matches!(&events[0], Event::Outline(items) if items.is_empty())
+                || matches!(&events[0], Event::FindDone { total: 0, .. }),
+            "{mode}: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn a_replaced_search_may_finish_its_page_and_is_not_blamed() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let Some((worker, events, _dir)) = open_evil_with(
+        std::path::Path::new(repo_fake),
+        "find_replaced",
+        Duration::ZERO,
+        Limits::default(),
+    ) else {
+        return;
+    };
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.find(1, "x".into(), false);
+    std::thread::sleep(Duration::from_millis(500));
+    // The child is on page 0 of search 1; the application stops it, and
+    // the child's answer comes after.
+    worker.cancel_find();
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(alive(pid), "an honest answer to a search that was stopped");
+    assert_eq!(worker.child_id(), pid);
+    quiet(&events);
+}
+
+#[test]
+fn text_outline_and_search_steps_are_timed_like_pages() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let limits = Limits {
+        page_time: Duration::from_millis(700),
+        ..Limits::default()
+    };
+    let open_mode = |mode: &str| {
+        open_evil_with(
+            std::path::Path::new(repo_fake),
+            mode,
+            Duration::ZERO,
+            limits,
+        )
+    };
+    // A text that never comes: killed, and the text is empty.
+    let Some((worker, events, _dir)) = open_mode("text_hang") else {
+        return;
+    };
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    let began = Instant::now();
+    worker.want_text(vec![0]);
+    assert!(matches!(
+        next(&events),
+        Event::Text(t) if t.page == 0 && t.text.is_empty() && t.boxes.is_empty()
+    ));
+    assert!(began.elapsed() < Duration::from_secs(10));
+    wait_until("the hanging child is still there", 5, || !alive(pid));
+    // The same for the outline.
+    let (worker, events, _dir) = open_mode("outline_hang").unwrap();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.want_outline();
+    assert!(matches!(next(&events), Event::Outline(items) if items.is_empty()));
+    wait_until("the hanging child is still there", 5, || !alive(pid));
+    // A search: the page it hung on is skipped and the next child goes on
+    // at the page after it.
+    let (worker, events, _dir) = open_mode("find_hang").unwrap();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.find(4, "x".into(), false);
+    assert!(matches!(
+        next(&events),
+        Event::FindDone {
+            search: 4,
+            total: 0,
+            truncated: false
+        }
+    ));
+    wait_until("the hanging child is still there", 5, || !alive(pid));
 }

@@ -287,3 +287,37 @@ pub fn with_object_stream(inner: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&stream);
     out
 }
+
+// ---- Text, outline and search tests -------------------------------------
+
+/// Resources for text tests: `/F1` Helvetica, `/F2` a non-embedded
+/// Simplified Chinese font (UCS-2 text), `/F3` Identity-H with the GB1
+/// collection and no `ToUnicode`.
+pub const TEXT_RESOURCES: &str = "<< /Font << \
+    /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
+    /F2 << /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H \
+    /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light \
+    /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 4 >> /DW 1000 >>] >> \
+    /F3 << /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /Identity-H \
+    /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light \
+    /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 4 >> /DW 1000 >>] >> \
+    >> >>";
+
+/// A one-page document of `media_box` (like `0 0 200 100`) and `extra`
+/// page entries (like `/Rotate 90`), with [`TEXT_RESOURCES`] and `content`.
+pub fn text_page(media_box: &str, extra: &str, content: &[u8]) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let pages = b.reserve();
+    let stream = b.stream("", content);
+    let page = b.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /MediaBox [{media_box}] {extra} \
+         /Resources {TEXT_RESOURCES} /Contents {stream} 0 R >>"
+    ));
+    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    b.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    b.finish(catalog)
+}

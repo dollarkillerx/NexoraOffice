@@ -19,6 +19,17 @@
 //! closing the tab or sending the child away is a flag that the supervisor
 //! and the reading thread look at first, never a message behind answers.
 //!
+//! Text, the outline and searches follow the same rules as pages. Each such
+//! step is announced by the child before it starts (`Step`), so that it is
+//! timed like a page; the ledger knows which texts were asked for, whether the
+//! outline was, and which search is running (and which ended a moment ago,
+//! whose last answers are read and dropped). A text for a page not asked for,
+//! an outline nobody asked for, hits for a search that is not known, pages
+//! out of order, more hits than the limit, a second end of a search: the child
+//! is killed like for any other lie. A child that ends restarts the work:
+//! texts and the outline are asked again, and a search goes on after the page
+//! it had reached.
+//!
 //! All the children of a process live in one [`Pool`]: at most
 //! `max_alive` at a time, each with an equal share of the memory budget.
 //! A tab in the background ([`Worker::suspend`]) has its child ended after a
@@ -35,8 +46,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::child::{self, FromChild, ToChild};
-use crate::{Event, Exceeded, Info, Limits, OpenError, PageSize, Rendered};
+use crate::child::{self, FromChild, Peek, ReadLimits, Step, ToChild};
+use crate::{Event, Exceeded, Info, Limits, OpenError, PageSize, PageText, Rendered};
 
 /// How to start a child: an executable and the arguments that come before
 /// [`child::SUBCOMMAND`]'s own (usually none).
@@ -74,6 +85,17 @@ const MAX_IN_FLIGHT: usize = 2;
 const ANSWER_WINDOW: Duration = Duration::from_secs(60);
 /// Requests that may be open at once, whatever their age.
 const MAX_OPEN: usize = 65_536;
+/// Texts that may be open at once: two full requests (a newer one replaces
+/// the older while the child may still answer the older), and aging as for
+/// pages.
+const MAX_TEXT_OPEN: usize = 2 * MAX_WANTED;
+/// Searches that were replaced or cancelled and whose last answers may still
+/// be on their way.
+const MAX_RETIRED: usize = 64;
+/// How long after a search was replaced its answers are still read (and
+/// dropped): the child finishes the page it is on, which takes up to
+/// `page_time`.
+const RETIRED_SLACK: Duration = Duration::from_secs(10);
 
 enum Message {
     Answer(u64, FromChild, Permit),
@@ -81,6 +103,16 @@ enum Message {
     /// something that cannot be right (the flag).
     Ended(u64, bool),
     Want(Vec<(usize, f32)>),
+    WantText(Vec<usize>),
+    WantOutline,
+    /// An empty query ends the running search and finds nothing (so does
+    /// one that is too long, which [`Worker::find`] makes empty).
+    Find {
+        search: u64,
+        query: String,
+        match_case: bool,
+    },
+    CancelFind,
     Suspend,
     Resume,
     /// The pool asks for this worker's child (see [`Pool::try_acquire`]).
@@ -256,6 +288,7 @@ pub struct Worker {
     closing: Arc<AtomicBool>,
     pool: Pool,
     id: u64,
+    max_query_chars: usize,
 }
 
 impl Worker {
@@ -281,6 +314,7 @@ impl Worker {
         limits: Limits,
         events: impl FnMut(Event) + Send + 'static,
     ) -> Worker {
+        let max_query_chars = limits.max_query_chars;
         let (messages, inbox) = mpsc::channel();
         let pid = Arc::new(AtomicU32::new(0));
         let (id, evict) = pool.register(messages.clone());
@@ -313,7 +347,46 @@ impl Worker {
             closing,
             pool: pool.clone(),
             id,
+            max_query_chars,
         }
+    }
+
+    /// Ask for the text of these pages (selection, find), in this order,
+    /// replacing what was asked before (at most 4096 pages; the rest is
+    /// left out). Each page answers with [`Event::Text`], empty when its
+    /// text could not be read.
+    pub fn want_text(&self, pages: Vec<usize>) {
+        self.pool.touch(self.id);
+        let _ = self.messages.send(Message::WantText(pages));
+    }
+
+    /// Ask for the outline; answers with one [`Event::Outline`].
+    pub fn want_outline(&self) {
+        self.pool.touch(self.id);
+        let _ = self.messages.send(Message::WantOutline);
+    }
+
+    /// Start search `search` for `query` over the whole document; results
+    /// come as `FindHits` and one `FindDone`. A new search replaces the
+    /// running one. An empty query, or one of more than `max_query_chars`
+    /// chars (refused here, before anything is copied or sent), ends the
+    /// running search and finds nothing: `FindDone` with a total of 0.
+    pub fn find(&self, search: u64, query: String, match_case: bool) {
+        self.pool.touch(self.id);
+        let limit = self.max_query_chars;
+        // Counts at most `limit + 1` chars, however long the string is.
+        let too_long = query.chars().take(limit.saturating_add(1)).count() > limit;
+        let query = if too_long { String::new() } else { query };
+        let _ = self.messages.send(Message::Find {
+            search,
+            query,
+            match_case,
+        });
+    }
+
+    /// Stop the running search; nothing more is reported for it.
+    pub fn cancel_find(&self) {
+        let _ = self.messages.send(Message::CancelFind);
     }
 
     /// Render these pages, in this order, replacing what was asked before.
@@ -462,6 +535,21 @@ struct Ledger {
     /// when it started: a request that replaces them while it renders does
     /// not take them away.
     started: Option<(usize, Vec<Key>)>,
+    /// Texts asked for, by page, with the sequence numbers of the requests
+    /// (at most two for a page), and the same in order for aging.
+    text: HashMap<usize, VecDeque<u64>>,
+    text_log: VecDeque<(u64, Instant, usize)>,
+    /// When the outline was asked for (an answer takes the oldest).
+    outline: VecDeque<Instant>,
+    /// The text, outline or search step the child has announced and not
+    /// finished. Only one thing at a time: the child does one thing at a
+    /// time, in the order of its answers.
+    step: Option<Step>,
+    /// The running search, and those replaced lately.
+    find: Option<SearchState>,
+    retired: VecDeque<(SearchState, Instant)>,
+    max_hits: usize,
+    retired_for: Duration,
 }
 
 impl Ledger {
@@ -510,7 +598,7 @@ impl Ledger {
     /// The child says it renders `page`: is it one that was asked for, and
     /// is the child through with the last?
     fn start(&mut self, page: usize) -> bool {
-        if self.started.is_some() {
+        if self.started.is_some() || self.step.is_some() {
             return false;
         }
         self.prune(Instant::now());
@@ -558,6 +646,290 @@ impl Ledger {
     }
 }
 
+/// A search as the ledger knows it.
+#[derive(Debug, Clone, Copy)]
+struct SearchState {
+    id: u64,
+    /// The first page it may look at.
+    start: usize,
+    /// The last page it began on.
+    stepped: Option<usize>,
+    /// Matches reported, with those of a child before.
+    total: usize,
+    /// Its end has been reported.
+    finished: bool,
+}
+
+impl SearchState {
+    /// The next page it would look at.
+    fn next(&self) -> usize {
+        self.stepped.map_or(self.start, |p| p + 1)
+    }
+}
+
+/// What to do with an answer that is not about a page.
+#[derive(Debug)]
+enum Ruling {
+    /// It is not what was asked for: end the child.
+    Kill,
+    /// It is right, but for a search that was replaced: read and not passed
+    /// on.
+    Drop,
+    Forward(FromChild),
+}
+
+impl Ledger {
+    fn new(limits: &Limits) -> Ledger {
+        Ledger {
+            max_hits: limits.max_find_hits,
+            retired_for: limits.page_time + RETIRED_SLACK,
+            ..Ledger::default()
+        }
+    }
+
+    /// Texts are asked for (written to the child, in this order).
+    fn ask_text(&mut self, pages: &[usize]) {
+        let now = Instant::now();
+        for page in pages {
+            self.next += 1;
+            let entries = self.text.entry(*page).or_default();
+            if entries.len() >= 2 {
+                entries.pop_front();
+            }
+            entries.push_back(self.next);
+            self.text_log.push_back((self.next, now, *page));
+        }
+        self.prune_text(now);
+    }
+
+    fn prune_text(&mut self, now: Instant) {
+        while let Some(&(seq, sent, page)) = self.text_log.front() {
+            if self.text_log.len() <= MAX_TEXT_OPEN && now.duration_since(sent) <= ANSWER_WINDOW {
+                break;
+            }
+            self.text_log.pop_front();
+            if let Some(entries) = self.text.get_mut(&page) {
+                if entries.front() == Some(&seq) {
+                    entries.pop_front();
+                }
+                if entries.is_empty() {
+                    self.text.remove(&page);
+                }
+            }
+        }
+    }
+
+    fn text_open(&mut self, page: usize) -> bool {
+        self.prune_text(Instant::now());
+        self.text.contains_key(&page)
+    }
+
+    /// The outline is asked for.
+    fn ask_outline(&mut self) {
+        let now = Instant::now();
+        self.outline.push_back(now);
+        if self.outline.len() > 2 {
+            self.outline.pop_front();
+        }
+    }
+
+    fn outline_open(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .outline
+            .front()
+            .is_some_and(|sent| now.duration_since(*sent) > ANSWER_WINDOW)
+        {
+            self.outline.pop_front();
+        }
+        !self.outline.is_empty()
+    }
+
+    /// A search is started (written to the child): the one before it ends.
+    fn find_start(&mut self, id: u64, start: usize, found: usize) {
+        self.find_cancel();
+        self.find = Some(SearchState {
+            id,
+            start,
+            stepped: None,
+            total: found,
+            finished: false,
+        });
+    }
+
+    /// The running search is stopped or replaced; the child may still send
+    /// what it has begun.
+    fn find_cancel(&mut self) {
+        let now = Instant::now();
+        while self
+            .retired
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > self.retired_for)
+        {
+            self.retired.pop_front();
+        }
+        if let Some(state) = self.find.take()
+            && !state.finished
+        {
+            self.retired.push_back((state, now));
+            if self.retired.len() > MAX_RETIRED {
+                self.retired.pop_front();
+            }
+        }
+    }
+
+    /// The state of search `id`: the running one, or one retired a moment
+    /// ago (`true`).
+    fn search_mut(&mut self, id: u64) -> Option<(&mut SearchState, bool)> {
+        let now = Instant::now();
+        let retired_for = self.retired_for;
+        self.retired
+            .retain(|(_, at)| now.duration_since(*at) <= retired_for);
+        if self.find.as_ref().is_some_and(|s| s.id == id) {
+            return self.find.as_mut().map(|s| (s, false));
+        }
+        self.retired
+            .iter_mut()
+            .rev()
+            .find(|(s, _)| s.id == id)
+            .map(|(s, _)| (s, true))
+    }
+
+    /// May the child send the body of this answer? Asked before it is read.
+    fn accept(&mut self, peek: &Peek) -> bool {
+        match *peek {
+            Peek::Page { .. } => false,
+            Peek::Text { page } => self.step == Some(Step::Text(page)) && self.text_open(page),
+            Peek::Outline => self.step == Some(Step::Outline) && self.outline_open(),
+            Peek::FindHits { search, page } => {
+                self.step == Some(Step::Find { search, page }) && self.search_mut(search).is_some()
+            }
+        }
+    }
+
+    /// An answer other than a page, a start or a failure of a page. `pages`
+    /// is the page count of the document.
+    fn rule(&mut self, answer: FromChild, pages: usize) -> Ruling {
+        let max_hits = self.max_hits;
+        match answer {
+            FromChild::Working(step) => {
+                if self.started.is_some() || self.step.is_some() {
+                    return Ruling::Kill;
+                }
+                let fine = match step {
+                    Step::Text(page) => self.text_open(page),
+                    Step::Outline => self.outline_open(),
+                    Step::Find { search, page } => {
+                        self.search_mut(search).is_some_and(|(state, _)| {
+                            let fine = !state.finished
+                                && state.total < max_hits
+                                && page >= state.next()
+                                && page < pages;
+                            if fine {
+                                state.stepped = Some(page);
+                            }
+                            fine
+                        })
+                    }
+                };
+                if !fine {
+                    return Ruling::Kill;
+                }
+                self.step = Some(step);
+                Ruling::Forward(FromChild::Working(step))
+            }
+            FromChild::Text(text) => {
+                if self.step != Some(Step::Text(text.page)) {
+                    return Ruling::Kill;
+                }
+                let Some(entries) = self.text.get_mut(&text.page) else {
+                    return Ruling::Kill;
+                };
+                entries.pop_front();
+                if entries.is_empty() {
+                    self.text.remove(&text.page);
+                }
+                self.step = None;
+                Ruling::Forward(FromChild::Text(text))
+            }
+            FromChild::Outline(items) => {
+                if self.step != Some(Step::Outline) || !self.outline_open() {
+                    return Ruling::Kill;
+                }
+                self.outline.pop_front();
+                self.step = None;
+                Ruling::Forward(FromChild::Outline(items))
+            }
+            FromChild::FindHits { search, hits } => {
+                let Some(page) = hits.first().map(|h| h.page) else {
+                    return Ruling::Kill;
+                };
+                if self.step != Some(Step::Find { search, page }) {
+                    return Ruling::Kill;
+                }
+                let Some((state, retired)) = self.search_mut(search) else {
+                    return Ruling::Kill;
+                };
+                state.total += hits.len();
+                if state.total > max_hits || hits.iter().any(|h| h.page != page) {
+                    return Ruling::Kill;
+                }
+                self.step = None;
+                // An old search's matches are not passed on, but the end of
+                // the step is.
+                if retired {
+                    Ruling::Forward(FromChild::Searched { search, page })
+                } else {
+                    Ruling::Forward(FromChild::FindHits { search, hits })
+                }
+            }
+            FromChild::Searched { search, page } => {
+                if self.step != Some(Step::Find { search, page }) {
+                    return Ruling::Kill;
+                }
+                self.step = None;
+                Ruling::Forward(FromChild::Searched { search, page })
+            }
+            FromChild::FindDone {
+                search,
+                total,
+                truncated,
+            } => {
+                if self.step.is_some() {
+                    return Ruling::Kill;
+                }
+                let Some((state, retired)) = self.search_mut(search) else {
+                    return Ruling::Kill;
+                };
+                // It says what it found, and it either looked at every page
+                // or stopped at the limit.
+                let fine = !state.finished
+                    && total == state.total
+                    && if truncated {
+                        total >= max_hits
+                    } else {
+                        state.next() >= pages
+                    };
+                if !fine {
+                    return Ruling::Kill;
+                }
+                state.finished = true;
+                if retired {
+                    Ruling::Drop
+                } else {
+                    Ruling::Forward(FromChild::FindDone {
+                        search,
+                        total,
+                        truncated,
+                    })
+                }
+            }
+            // Pages are judged where they are read.
+            other => Ruling::Forward(other),
+        }
+    }
+}
+
 /// The newest request for a child's writer thread, and whether to stop.
 #[derive(Default)]
 struct Outbox {
@@ -568,7 +940,23 @@ struct Outbox {
 #[derive(Default)]
 struct OutSlot {
     want: Option<Vec<(usize, f32)>>,
+    text: Option<Vec<usize>>,
+    outline: bool,
+    find: Option<FindCommand>,
     closed: bool,
+}
+
+/// A search request for the writer: the newest wins, and a cancel replaces
+/// a start that has not been written (the child never hears of it).
+enum FindCommand {
+    Start {
+        search: u64,
+        query: String,
+        match_case: bool,
+        start_page: usize,
+        found: usize,
+    },
+    Cancel,
 }
 
 impl Outbox {
@@ -582,9 +970,47 @@ impl Outbox {
         self.ready.notify_all();
     }
 
+    fn put_text(&self, pages: Vec<usize>) {
+        self.slot().text = Some(pages);
+        self.ready.notify_all();
+    }
+
+    fn put_outline(&self) {
+        self.slot().outline = true;
+        self.ready.notify_all();
+    }
+
+    fn put_find(&self, command: FindCommand) {
+        self.slot().find = Some(command);
+        self.ready.notify_all();
+    }
+
     fn close(&self) {
         self.slot().closed = true;
         self.ready.notify_all();
+    }
+}
+
+/// A search that goes on, whichever child runs it.
+struct FindState {
+    search: u64,
+    query: String,
+    match_case: bool,
+    /// The page to go on at, after the last one reported.
+    next: usize,
+    /// Matches reported.
+    total: usize,
+}
+
+impl FindState {
+    fn command(&self) -> FindCommand {
+        FindCommand::Start {
+            search: self.search,
+            query: self.query.clone(),
+            match_case: self.match_case,
+            start_page: self.next,
+            found: self.total,
+        }
     }
 }
 
@@ -597,6 +1023,8 @@ struct Running {
     /// It has said it opened the file.
     opened: bool,
     rendering: Option<(usize, Instant)>,
+    /// The text, outline or search step it is in.
+    working: Option<(Step, Instant)>,
     /// Killed for taking too long.
     timed_out: bool,
     ledger: Arc<Mutex<Ledger>>,
@@ -677,7 +1105,7 @@ impl Supervisor {
             return None;
         };
         let outbox = Arc::new(Outbox::default());
-        let ledger = Arc::new(Mutex::new(Ledger::default()));
+        let ledger = Arc::new(Mutex::new(Ledger::new(&self.limits)));
         let gate = Gate::new();
         let running = Running {
             child: process,
@@ -686,6 +1114,7 @@ impl Supervisor {
             began: Instant::now(),
             opened: false,
             rendering: None,
+            working: None,
             timed_out: false,
             ledger: ledger.clone(),
             gate: gate.clone(),
@@ -694,15 +1123,16 @@ impl Supervisor {
             password: self.password.clone(),
             limits: child::WireLimits::of(&self.limits),
         };
+        let writer_ledger = ledger.clone();
         let writer = std::thread::Builder::new()
             .name("pdf-requests".into())
-            .spawn(move || write_requests(input, start, &outbox));
+            .spawn(move || write_requests(input, start, &outbox, &writer_ledger));
         if writer.is_err() {
             return None;
         }
         self.pid.store(running.child.id(), Ordering::Relaxed);
         let messages = self.messages.clone();
-        let max_pixels = self.limits.max_render_pixels;
+        let limits = self.limits;
         let flags = self.flags.clone();
         let (ledger, gate) = (ledger.clone(), gate.clone());
         let reader = std::thread::Builder::new()
@@ -717,23 +1147,38 @@ impl Supervisor {
                     if flags.raised() {
                         break true;
                     }
+                    let count = sizes.as_ref().map_or(0, |s| s.len());
                     let answer = child::read_answer_with(
                         &mut output,
-                        max_pixels,
-                        |page, scale, width, height| {
-                            let Some(size) = seen_opened
-                                .then_some(sizes.as_ref())
-                                .flatten()
-                                .and_then(|s| s.get(page))
-                            else {
-                                return false;
-                            };
-                            u64::from(width) <= bound(size.width, scale)
-                                && u64::from(height) <= bound(size.height, scale)
-                                && ledger
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .answer(page, scale)
+                        &ReadLimits::of(&limits, count),
+                        |peek| match *peek {
+                            Peek::Page {
+                                page,
+                                scale,
+                                width,
+                                height,
+                            } => {
+                                let Some(size) = seen_opened
+                                    .then_some(sizes.as_ref())
+                                    .flatten()
+                                    .and_then(|s| s.get(page))
+                                else {
+                                    return false;
+                                };
+                                u64::from(width) <= bound(size.width, scale)
+                                    && u64::from(height) <= bound(size.height, scale)
+                                    && ledger
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .answer(page, scale)
+                            }
+                            _ => {
+                                seen_opened
+                                    && ledger
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .accept(peek)
+                            }
                         },
                     );
                     let answer = match answer {
@@ -745,40 +1190,69 @@ impl Supervisor {
                             break error.kind() != ErrorKind::UnexpectedEof;
                         }
                     };
-                    let count = sizes.as_ref().map_or(0, |s| s.len());
-                    let fine = match &answer {
-                        FromChild::Opened(info) => {
-                            let once = !seen_opened;
-                            seen_opened = true;
-                            match &sizes {
-                                None => {
-                                    sizes = Some(Arc::new(info.pages.clone()));
-                                    once
-                                }
-                                // The file must be the one that was opened.
-                                Some(known) => once && known.as_slice() == info.pages.as_slice(),
+                    let answer = match answer {
+                        FromChild::Working(_)
+                        | FromChild::Text(_)
+                        | FromChild::Outline(_)
+                        | FromChild::FindHits { .. }
+                        | FromChild::Searched { .. }
+                        | FromChild::FindDone { .. } => {
+                            if !seen_opened {
+                                break true;
+                            }
+                            let ruling = ledger
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .rule(answer, count);
+                            match ruling {
+                                Ruling::Kill => break true,
+                                Ruling::Drop => continue,
+                                Ruling::Forward(answer) => answer,
                             }
                         }
-                        FromChild::Failed(_) => true,
-                        // (Pages were checked as they were read.)
-                        FromChild::Page(..) => true,
-                        FromChild::Started(page) => {
-                            seen_opened
-                                && *page < count
-                                && ledger
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .start(*page)
-                        }
-                        FromChild::PageFailed(page) => {
-                            seen_opened
-                                && *page < count
-                                && ledger.lock().unwrap_or_else(|e| e.into_inner()).fail(*page)
+                        answer => {
+                            let fine = match &answer {
+                                FromChild::Opened(info) => {
+                                    let once = !seen_opened;
+                                    seen_opened = true;
+                                    match &sizes {
+                                        None => {
+                                            sizes = Some(Arc::new(info.pages.clone()));
+                                            once
+                                        }
+                                        // The file must be the one that was opened.
+                                        Some(known) => {
+                                            once && known.as_slice() == info.pages.as_slice()
+                                        }
+                                    }
+                                }
+                                FromChild::Failed(_) => true,
+                                // (Pages were checked as they were read.)
+                                FromChild::Page(..) => true,
+                                FromChild::Started(page) => {
+                                    seen_opened
+                                        && *page < count
+                                        && ledger
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .start(*page)
+                                }
+                                FromChild::PageFailed(page) => {
+                                    seen_opened
+                                        && *page < count
+                                        && ledger
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .fail(*page)
+                                }
+                                _ => false,
+                            };
+                            if !fine {
+                                break true;
+                            }
+                            answer
                         }
                     };
-                    if !fine {
-                        break true;
-                    }
                     // Wait for room: a child that is faster than the
                     // supervisor waits on its pipe.
                     let Some(permit) = gate.acquire(&flags) else {
@@ -821,6 +1295,13 @@ impl Supervisor {
         let mut known: Option<Arc<Vec<PageSize>>> = None;
         let mut wanted: Vec<(usize, f32)> = Vec::new();
         let mut broken: HashSet<usize> = HashSet::new();
+        // Pages whose text ended a child; their text is empty.
+        let mut broken_text: HashSet<usize> = HashSet::new();
+        // Texts asked for and not delivered, the outline likewise, and the
+        // search that goes on.
+        let mut text_open: Vec<usize> = Vec::new();
+        let mut outline_open = false;
+        let mut find: Option<FindState> = None;
         let mut running: Option<Running> = None;
         // A child is to be started (again) as soon as there is room.
         let mut pending = true;
@@ -871,6 +1352,77 @@ impl Supervisor {
                         None => pending = pending || (opened.is_some() && suspended.is_none()),
                     }
                 }
+                Ok(Message::WantText(pages)) => {
+                    let count = known.as_ref().map(|k| k.len());
+                    let mut seen = HashSet::new();
+                    text_open = pages
+                        .into_iter()
+                        .filter(|p| count.is_none_or(|c| *p < c) && seen.insert(*p))
+                        .take(child::MAX_WANTED_TEXT)
+                        .collect();
+                    // What cannot be read is empty; nobody is left waiting.
+                    let (gone, wanted_now): (Vec<usize>, Vec<usize>) =
+                        text_open.iter().partition(|p| broken_text.contains(p));
+                    for page in gone {
+                        (self.events)(Event::Text(PageText {
+                            page,
+                            ..PageText::default()
+                        }));
+                    }
+                    text_open = wanted_now;
+                    match &mut running {
+                        Some(r) if r.opened => r.outbox.put_text(text_open.clone()),
+                        Some(_) => {}
+                        None => pending = pending || (opened.is_some() && suspended.is_none()),
+                    }
+                }
+                Ok(Message::WantOutline) => {
+                    outline_open = true;
+                    match &mut running {
+                        Some(r) if r.opened => r.outbox.put_outline(),
+                        Some(_) => {}
+                        None => pending = pending || (opened.is_some() && suspended.is_none()),
+                    }
+                }
+                Ok(Message::Find {
+                    search,
+                    query,
+                    match_case,
+                }) => {
+                    if query.is_empty() {
+                        find = None;
+                        if let Some(r) = running.as_mut().filter(|r| r.opened) {
+                            r.outbox.put_find(FindCommand::Cancel);
+                        }
+                        (self.events)(Event::FindDone {
+                            search,
+                            total: 0,
+                            truncated: false,
+                        });
+                    } else {
+                        let state = FindState {
+                            search,
+                            query,
+                            match_case,
+                            next: 0,
+                            total: 0,
+                        };
+                        match &mut running {
+                            Some(r) if r.opened => {
+                                r.outbox.put_find(state.command());
+                            }
+                            Some(_) => {}
+                            None => pending = pending || (opened.is_some() && suspended.is_none()),
+                        }
+                        find = Some(state);
+                    }
+                }
+                Ok(Message::CancelFind) => {
+                    find = None;
+                    if let Some(r) = running.as_mut().filter(|r| r.opened) {
+                        r.outbox.put_find(FindCommand::Cancel);
+                    }
+                }
                 Ok(Message::Suspend) => suspended = Some(Instant::now()),
                 Ok(Message::Resume) => {
                     suspended = None;
@@ -916,6 +1468,29 @@ impl Supervisor {
                                 opened = Some(info);
                             }
                             self.send_wanted(r, &wanted, &broken);
+                            let pages = known.as_ref().map_or(0, |k| k.len());
+                            // A child that is new asks again for what the
+                            // last had not given, and a search goes on after
+                            // the page it reached.
+                            text_open.retain(|p| *p < pages && !broken_text.contains(p));
+                            if !text_open.is_empty() {
+                                r.outbox.put_text(text_open.clone());
+                            }
+                            if outline_open {
+                                r.outbox.put_outline();
+                            }
+                            if let Some(state) = &find {
+                                if state.next >= pages {
+                                    (self.events)(Event::FindDone {
+                                        search: state.search,
+                                        total: state.total,
+                                        truncated: false,
+                                    });
+                                    find = None;
+                                } else {
+                                    r.outbox.put_find(state.command());
+                                }
+                            }
                         }
                         FromChild::Failed(error) => {
                             if let Some(mut r) = running.take() {
@@ -931,6 +1506,47 @@ impl Supervisor {
                             return;
                         }
                         FromChild::Started(page) => r.rendering = Some((page, Instant::now())),
+                        FromChild::Working(step) => r.working = Some((step, Instant::now())),
+                        FromChild::Text(text) => {
+                            r.working = None;
+                            text_open.retain(|p| *p != text.page);
+                            (self.events)(Event::Text(text));
+                        }
+                        FromChild::Outline(items) => {
+                            r.working = None;
+                            outline_open = false;
+                            (self.events)(Event::Outline(items));
+                        }
+                        FromChild::FindHits { search, hits } => {
+                            r.working = None;
+                            // A search the application has replaced since is
+                            // not reported.
+                            if let Some(state) = find.as_mut().filter(|f| f.search == search) {
+                                state.total += hits.len();
+                                state.next = state.next.max(hits[0].page + 1);
+                                (self.events)(Event::FindHits { search, hits });
+                            }
+                        }
+                        FromChild::Searched { search, page } => {
+                            r.working = None;
+                            if let Some(state) = find.as_mut().filter(|f| f.search == search) {
+                                state.next = state.next.max(page + 1);
+                            }
+                        }
+                        FromChild::FindDone {
+                            search,
+                            total,
+                            truncated,
+                        } => {
+                            if find.as_ref().is_some_and(|f| f.search == search) {
+                                find = None;
+                                (self.events)(Event::FindDone {
+                                    search,
+                                    total,
+                                    truncated,
+                                });
+                            }
+                        }
                         FromChild::Page(page, scale, width, height, pixels) => {
                             r.rendering = None;
                             restarts = 0;
@@ -986,6 +1602,30 @@ impl Supervisor {
                     {
                         (self.events)(Event::PageFailed(page));
                     }
+                    // Ended in a text, the outline or a page of a search:
+                    // the text is empty, there is no outline, the page of
+                    // the search is skipped.
+                    if !misbehaved && let Some((step, _)) = r.working {
+                        match step {
+                            Step::Text(page) => {
+                                broken_text.insert(page);
+                                text_open.retain(|p| *p != page);
+                                (self.events)(Event::Text(PageText {
+                                    page,
+                                    ..PageText::default()
+                                }));
+                            }
+                            Step::Outline => {
+                                outline_open = false;
+                                (self.events)(Event::Outline(Vec::new()));
+                            }
+                            Step::Find { search, page } => {
+                                if let Some(state) = find.as_mut().filter(|f| f.search == search) {
+                                    state.next = state.next.max(page + 1);
+                                }
+                            }
+                        }
+                    }
                     restarts += 1;
                     if restarts > MAX_RESTARTS || misbehaved_count > MAX_RESTARTS {
                         (self.events)(Event::Stopped);
@@ -1000,6 +1640,11 @@ impl Supervisor {
                     r.give_up();
                 }
                 if let Some((_, since)) = r.rendering
+                    && since.elapsed() > self.limits.page_time
+                {
+                    r.give_up();
+                }
+                if let Some((_, since)) = r.working
                     && since.elapsed() > self.limits.page_time
                 {
                     r.give_up();
@@ -1041,27 +1686,61 @@ impl Supervisor {
     }
 }
 
-/// The child's input: the start frame, then the newest request whenever the
-/// previous one is written. Ends when the outbox is closed or a write fails
-/// (the child has ended; its end arrives as a message).
-fn write_requests(mut input: ChildStdin, start: ToChild, outbox: &Outbox) {
+/// The child's input: the start frame, then the newest of each kind of
+/// request whenever the previous one is written (pages, texts, the outline,
+/// the search, in that order). Each is entered in the ledger before the child
+/// can hear of it. Ends when the outbox is closed or a write fails (the child
+/// has ended; its end arrives as a message).
+fn write_requests(mut input: ChildStdin, start: ToChild, outbox: &Outbox, ledger: &Mutex<Ledger>) {
     if child::write_request(&mut input, &start).is_err() {
         return;
     }
+    let ledger = || ledger.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        let pages = {
+        let request = {
             let mut slot = outbox.slot();
             loop {
                 if slot.closed {
                     return;
                 }
                 if let Some(pages) = slot.want.take() {
-                    break pages;
+                    break ToChild::Want(pages);
+                }
+                if let Some(pages) = slot.text.take() {
+                    ledger().ask_text(&pages);
+                    break ToChild::WantText(pages);
+                }
+                if std::mem::take(&mut slot.outline) {
+                    ledger().ask_outline();
+                    break ToChild::WantOutline;
+                }
+                match slot.find.take() {
+                    Some(FindCommand::Start {
+                        search,
+                        query,
+                        match_case,
+                        start_page,
+                        found,
+                    }) => {
+                        ledger().find_start(search, start_page, found);
+                        break ToChild::Find {
+                            search,
+                            query,
+                            match_case,
+                            start_page,
+                            found,
+                        };
+                    }
+                    Some(FindCommand::Cancel) => {
+                        ledger().find_cancel();
+                        break ToChild::CancelFind;
+                    }
+                    None => {}
                 }
                 slot = outbox.ready.wait(slot).unwrap_or_else(|e| e.into_inner());
             }
         };
-        if child::write_request(&mut input, &ToChild::Want(pages)).is_err() {
+        if child::write_request(&mut input, &request).is_err() {
             return;
         }
     }

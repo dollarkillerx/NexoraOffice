@@ -18,9 +18,12 @@
 
 pub mod check;
 pub mod child;
+pub mod find;
 pub mod fonts;
 pub mod inflate;
+pub mod outline;
 pub mod sandbox;
+pub mod text;
 pub mod worker;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -57,6 +60,18 @@ pub struct Limits {
     pub open_time: Duration,
     /// Time to render one page.
     pub page_time: Duration,
+    /// Characters in one page's text (selection and find).
+    pub max_text_chars: usize,
+    /// Entries in a document's outline.
+    pub max_outline_items: usize,
+    /// Levels of nesting in a document's outline.
+    pub max_outline_depth: usize,
+    /// Characters in one outline title.
+    pub max_title_chars: usize,
+    /// Matches one search reports; past this it stops and says so.
+    pub max_find_hits: usize,
+    /// Characters in a search query.
+    pub max_query_chars: usize,
 }
 
 impl Default for Limits {
@@ -72,6 +87,12 @@ impl Default for Limits {
             max_memory_bytes: default_memory(),
             open_time: Duration::from_secs(60),
             page_time: Duration::from_secs(20),
+            max_text_chars: 200_000,
+            max_outline_items: 10_000,
+            max_outline_depth: 32,
+            max_title_chars: 512,
+            max_find_hits: 10_000,
+            max_query_chars: 256,
         }
     }
 }
@@ -176,6 +197,72 @@ pub enum Event {
     /// The document can no longer be shown: its child process kept ending
     /// or could not open the file again. Pages not drawn stay blank.
     Stopped,
+    /// A page's text, asked for with [`Worker::want_text`].
+    Text(PageText),
+    /// The document's outline (bookmarks), asked for with
+    /// [`Worker::want_outline`]. Empty when it has none.
+    Outline(Vec<OutlineItem>),
+    /// Matches found on some pages by search `search` ([`Worker::find`]),
+    /// in page order. More may follow.
+    FindHits { search: u64, hits: Vec<FindHit> },
+    /// Search `search` has looked at every page. `truncated` when it
+    /// stopped at `max_find_hits`.
+    FindDone {
+        search: u64,
+        total: usize,
+        truncated: bool,
+    },
+}
+
+/// A box on a page: left, top, right, bottom in points from the page's
+/// top-left corner as shown (after its `/Rotate`).
+pub type TextBox = [f32; 4];
+
+/// The text of one page and where each character is.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PageText {
+    pub page: usize,
+    /// The characters in the order the page draws them, with a space or a
+    /// line break put in where words and lines part. No control
+    /// characters other than `\n`.
+    pub text: String,
+    /// One entry per `char` of `text`: where it is, or `None` for a space
+    /// or line break that was put in.
+    pub boxes: Vec<Option<TextBox>>,
+}
+
+/// One entry of a document's outline, in a flat list in document order;
+/// `depth` 0 is the top level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineItem {
+    pub depth: u16,
+    /// The title, without control characters.
+    pub title: String,
+    /// Where it goes, if anywhere inside the document.
+    pub target: Option<Target>,
+    /// Shown open at first (`/Count` > 0).
+    pub open: bool,
+}
+
+/// A place in the document.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Target {
+    pub page: usize,
+    /// Points from the top of the page as shown, when the destination
+    /// names a height.
+    pub top: Option<f32>,
+}
+
+/// One match of a search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindHit {
+    pub page: usize,
+    /// Where it starts and how long it is, in `char`s of the page's
+    /// [`PageText::text`].
+    pub start: u32,
+    pub len: u32,
+    /// The boxes it covers (one per line it spans, or per character).
+    pub boxes: Vec<TextBox>,
 }
 
 /// An open document. Lives on one thread (the parser's caches are not

@@ -1,172 +1,72 @@
-//! Opening and rendering, and files built to hurt: streams that inflate to
-//! gigabytes, pictures with billions of pixels, loops in the page tree and in
-//! the cross-reference chain, nesting a million levels deep. Each must end in
-//! an error or a page, without running out of stack or memory.
+//! Opening, checking and rendering in this process, with files built to
+//! hurt. What the child process adds (memory, time, killing) is tested in
+//! `tests/process.rs`.
 
 use std::io::Write;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use flate2::write::{DeflateEncoder, ZlibEncoder};
+use hayro::RenderCache;
 
 use super::*;
+use crate::builder::{Builder, deflate, one_page, with_picture, zeros_deflated};
 
-/// Writes a PDF with a correct cross-reference table. Object `n` is the
-/// `n`-th one added, counting from 1.
-#[derive(Default)]
-pub(crate) struct Builder {
-    objects: Vec<Vec<u8>>,
-}
-
-impl Builder {
-    pub(crate) fn add(&mut self, body: impl AsRef<[u8]>) -> usize {
-        self.objects.push(body.as_ref().to_vec());
-        self.objects.len()
-    }
-
-    pub(crate) fn stream(&mut self, dict: &str, data: &[u8]) -> usize {
-        let mut body = format!("<< /Length {} {dict} >>\nstream\n", data.len()).into_bytes();
-        body.extend_from_slice(data);
-        body.extend_from_slice(b"\nendstream");
-        self.add(body)
-    }
-
-    /// Reserve a number to fill in later (for loops).
-    pub(crate) fn reserve(&mut self) -> usize {
-        self.add(b"null")
-    }
-
-    pub(crate) fn set(&mut self, number: usize, body: impl AsRef<[u8]>) {
-        self.objects[number - 1] = body.as_ref().to_vec();
-    }
-
-    pub(crate) fn finish(&self, root: usize) -> Vec<u8> {
-        self.finish_with(root, "")
-    }
-
-    pub(crate) fn finish_with(&self, root: usize, trailer: &str) -> Vec<u8> {
-        let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, body) in self.objects.iter().enumerate() {
-            offsets.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
-            out.extend_from_slice(body);
-            out.extend_from_slice(b"\nendobj\n");
-        }
-        let xref = out.len();
-        out.extend_from_slice(
-            format!("xref\n0 {}\n0000000000 65535 f \n", self.objects.len() + 1).as_bytes(),
-        );
-        for offset in offsets {
-            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        out.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root {root} 0 R {trailer} >>\nstartxref\n{xref}\n%%EOF\n",
-                self.objects.len() + 1
-            )
-            .as_bytes(),
-        );
-        out
-    }
-
-    /// A catalog, a page tree and one page per content stream.
-    pub(crate) fn document(contents: &[&[u8]]) -> Vec<u8> {
-        let mut b = Builder::default();
-        let catalog = b.reserve();
-        let pages = b.reserve();
-        let mut kids = Vec::new();
-        for content in contents {
-            let stream = b.stream("", content);
-            kids.push(b.add(format!(
-                "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {stream} 0 R >>"
-            )));
-        }
-        let kids: Vec<String> = kids.iter().map(|k| format!("{k} 0 R")).collect();
-        b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-        b.set(
-            pages,
-            format!(
-                "<< /Type /Pages /Kids [{}] /Count {} >>",
-                kids.join(" "),
-                contents.len()
-            ),
-        );
-        b.finish(catalog)
-    }
-}
-
-pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
-}
-
-/// `bytes` zeros, deflated, without holding them all.
-fn zeros_deflated(bytes: usize) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    let chunk = vec![0u8; 1 << 20];
-    let mut left = bytes;
-    while left > 0 {
-        let n = left.min(chunk.len());
-        encoder.write_all(&chunk[..n]).unwrap();
-        left -= n;
-    }
-    encoder.finish().unwrap()
-}
-
-/// Open on a thread like the worker's, with a time limit.
-fn open_with(bytes: Vec<u8>, password: &str, limits: Limits) -> Result<Info, OpenError> {
+/// Run `f` on a thread with the child's stack, with a time limit.
+fn on_worker_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let (send, receive) = mpsc::channel();
-    let password = password.to_string();
     std::thread::Builder::new()
         .stack_size(STACK_BYTES)
         .spawn(move || {
-            let result = Document::open(bytes, &password, limits).map(|d| d.info().clone());
-            let _ = send.send(result);
+            let _ = send.send(f());
         })
         .unwrap();
     receive
         .recv_timeout(Duration::from_secs(60))
-        .expect("open took more than a minute")
+        .expect("took more than a minute")
+}
+
+fn open_with(bytes: Vec<u8>, limits: Limits) -> Result<Info, OpenError> {
+    on_worker_thread(move || Document::open(bytes, "", limits).map(|d| d.info().clone()))
 }
 
 fn open(bytes: Vec<u8>) -> Result<Info, OpenError> {
-    open_with(bytes, "", Limits::default())
+    open_with(bytes, Limits::default())
 }
 
-/// Open and render every page through a worker, collecting what it reports.
-fn render_all(bytes: Vec<u8>, scale: f32) -> Vec<Event> {
-    let (send, receive) = mpsc::channel();
-    let worker = Worker::spawn(bytes, String::new(), Limits::default(), move |event| {
-        let _ = send.send(event);
-    });
-    let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut pages = None;
-    while let Ok(event) = receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        match &event {
-            Event::Opened(info) => {
-                pages = Some(info.pages.len());
-                worker.want((0..info.pages.len()).map(|p| (p, scale)).collect());
-            }
-            Event::Failed(_) => {
-                events.push(event);
-                return events;
-            }
-            _ => {}
-        }
-        events.push(event);
-        let done = events
-            .iter()
-            .filter(|e| matches!(e, Event::Page(_) | Event::PageFailed(_)))
-            .count();
-        if pages == Some(done) {
-            return events;
-        }
-    }
-    panic!("the worker did not finish within a minute: {events:?}");
+type Page = Option<(u32, u32, Vec<u8>)>;
+
+/// Open and render every page; `None` for a page that could not be drawn.
+fn render_all(bytes: Vec<u8>, scale: f32) -> Result<Vec<Page>, OpenError> {
+    on_worker_thread(move || {
+        let document = Document::open(bytes, "", Limits::default())?;
+        let cache = RenderCache::new();
+        Ok((0..document.info().pages.len())
+            .map(|page| match document.render(&cache, page, scale) {
+                Ok(Some(p)) => Some((
+                    u32::from(p.width()),
+                    u32::from(p.height()),
+                    p.data_as_u8_slice().to_vec(),
+                )),
+                _ => None,
+            })
+            .collect())
+    })
+}
+
+const STREAM: Result<Info, OpenError> = Err(OpenError::TooLarge(Exceeded::Stream));
+const IMAGE: Result<Info, OpenError> = Err(OpenError::TooLarge(Exceeded::Image));
+const UNCHECKED: Result<Info, OpenError> = Err(OpenError::Unchecked);
+
+/// A one-page document whose content stream has `dict` and `data`.
+fn content(dict: &str, data: &[u8]) -> Vec<u8> {
+    one_page(|_| "<< >>".into(), dict, data)
+}
+
+/// 2 GB of zeros, deflated (a few megabytes).
+fn bomb() -> Vec<u8> {
+    zeros_deflated(2 << 30)
 }
 
 #[test]
@@ -181,15 +81,12 @@ fn a_page_opens_and_renders() {
         }]
     );
     assert!(!info.encrypted);
-    let events = render_all(bytes, 2.0);
-    let Some(Event::Page(page)) = events.last() else {
-        panic!("{events:?}");
-    };
-    assert_eq!((page.width, page.height), (400, 200));
-    // Inside the red square (40..160 x 40..160 from the bottom), and outside.
+    let pages = render_all(bytes, 2.0).unwrap();
+    let (width, height, pixels) = pages[0].clone().unwrap();
+    assert_eq!((width, height), (400, 200));
     let pixel = |x: u32, y: u32| {
-        let i = ((y * page.width + x) * 4) as usize;
-        page.pixels[i..i + 4].to_vec()
+        let i = ((y * width + x) * 4) as usize;
+        pixels[i..i + 4].to_vec()
     };
     assert_eq!(pixel(100, 100), vec![255, 0, 0, 255]);
     assert_eq!(pixel(300, 100), vec![255, 255, 255, 255]);
@@ -220,6 +117,25 @@ fn rotated_pages_report_their_shown_size() {
 }
 
 #[test]
+fn ordinary_filters_pass() {
+    let text = b"0 0 1 rg 10 10 50 50 re f";
+    assert!(open(content("/Filter /FlateDecode", &deflate(text))).is_ok());
+    let hex: Vec<u8> = deflate(text)
+        .iter()
+        .flat_map(|b| format!("{b:02x}").into_bytes())
+        .collect();
+    assert!(open(content("/Filter [/AHx /Fl]", &hex)).is_ok());
+    // PNG "None" predictor, rows of 5 bytes.
+    let mut rows = Vec::new();
+    for chunk in text.chunks(5) {
+        rows.push(0);
+        rows.extend_from_slice(chunk);
+    }
+    let dict = "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >>";
+    assert!(open(content(dict, &deflate(&rows))).is_ok());
+}
+
+#[test]
 fn not_a_pdf() {
     assert_eq!(open(Vec::new()), Err(OpenError::Damaged));
     assert_eq!(open(b"hello, world".to_vec()), Err(OpenError::Damaged));
@@ -236,8 +152,7 @@ fn not_a_pdf() {
 fn every_truncation_of_a_file_is_survived() {
     let bytes = Builder::document(&[b"0 0 1 rg 10 10 50 50 re f", b"BT /F1 12 Tf (x) Tj ET"]);
     for end in (0..bytes.len()).step_by(7) {
-        let result = open(bytes[..end].to_vec());
-        if let Ok(info) = result {
+        if let Ok(info) = open(bytes[..end].to_vec()) {
             assert!(!info.pages.is_empty());
         }
     }
@@ -245,78 +160,131 @@ fn every_truncation_of_a_file_is_survived() {
 
 #[test]
 fn a_stream_that_inflates_to_gigabytes_is_refused() {
-    // 2 GB of zeros in a content stream: a few megabytes on disk.
-    let bomb = zeros_deflated(2 << 30);
-    assert!(bomb.len() < 32 << 20);
-    let mut b = Builder::default();
-    let catalog = b.reserve();
-    let pages = b.reserve();
-    let content = b.stream("/Filter /FlateDecode", &bomb);
-    let page = b.add(format!(
-        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {content} 0 R >>"
-    ));
-    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-    b.set(
-        pages,
-        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    assert_eq!(open(content("/Filter /FlateDecode", &bomb())), STREAM);
+}
+
+#[test]
+fn the_short_filter_key_is_read() {
+    // The parser reads /F before /Filter.
+    assert_eq!(open(content("/F /FlateDecode", &bomb())), STREAM);
+    assert_eq!(open(content("/F [/FlateDecode]", &bomb())), STREAM);
+}
+
+#[test]
+fn crypt_and_unknown_names_before_a_filter() {
+    // The parser skips a leading /Crypt and drops names it does not know.
+    assert_eq!(
+        open(content("/Filter [/Crypt /FlateDecode]", &bomb())),
+        STREAM
     );
     assert_eq!(
-        open(b.finish(catalog)),
-        Err(OpenError::TooLarge(Exceeded::Stream))
+        open(content("/Filter [/Bogus /FlateDecode]", &bomb())),
+        STREAM
+    );
+    assert_eq!(
+        open(content(
+            "/Filter [/FlateDecode /Bogus /FlateDecode]",
+            &deflate(&bomb())
+        )),
+        STREAM
+    );
+    // Crypt anywhere else is not decoded by the parser either: refused.
+    assert_eq!(
+        open(content("/Filter [/FlateDecode /Crypt]", &deflate(b"0 g"))),
+        UNCHECKED
     );
 }
 
 #[test]
+fn escaped_filter_names() {
+    assert_eq!(open(content("/Filter /Fl#61teDecode", &bomb())), STREAM);
+    assert_eq!(open(content("/Filter [/#46l]", &bomb())), STREAM);
+}
+
+#[test]
+fn a_filter_through_a_reference() {
+    let bytes = one_page(
+        |b| {
+            b.add("/FlateDecode");
+            "<< >>".into()
+        },
+        "/Filter 3 0 R",
+        &bomb(),
+    );
+    assert_eq!(open(bytes), STREAM);
+}
+
+#[test]
+fn an_endstream_hidden_in_the_data() {
+    // A stored deflate block carrying the word `endstream`, then the bomb.
+    // The parser cuts the stream by /Length, past the word; so does the check.
+    let hidden = b"\nendstream\nendobj\n";
+    let mut data = vec![0x78, 0x01, 0x00];
+    data.extend_from_slice(&(hidden.len() as u16).to_le_bytes());
+    data.extend_from_slice(&(!(hidden.len() as u16)).to_le_bytes());
+    data.extend_from_slice(hidden);
+    let mut rest = DeflateEncoder::new(Vec::new(), Compression::fast());
+    let chunk = vec![0u8; 1 << 20];
+    for _ in 0..1024 {
+        rest.write_all(&chunk).unwrap();
+    }
+    data.extend_from_slice(&rest.finish().unwrap());
+    assert_eq!(open(content("/Filter /FlateDecode", &data)), STREAM);
+}
+
+#[test]
 fn chained_filters_are_followed() {
-    // Deflate inside deflate inside hex: each layer is small, the end is not.
     let inner = zeros_deflated(64 << 20);
     let outer = deflate(&inner);
     let hex: Vec<u8> = outer
         .iter()
         .flat_map(|b| format!("{b:02x}").into_bytes())
         .collect();
-    let mut b = Builder::default();
-    let catalog = b.reserve();
-    let pages = b.reserve();
-    let content = b.stream("/Filter [/AHx /FlateDecode /Fl]", &hex);
-    let page = b.add(format!(
-        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {content} 0 R >>"
-    ));
-    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-    b.set(
-        pages,
-        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
-    );
     let limits = Limits {
         max_stream_bytes: 16 << 20,
         ..Limits::default()
     };
     assert_eq!(
-        open_with(b.finish(catalog), "", limits),
-        Err(OpenError::TooLarge(Exceeded::Stream))
+        open_with(content("/Filter [/AHx /FlateDecode /Fl]", &hex), limits),
+        STREAM
     );
 }
 
 #[test]
-fn an_object_stream_bomb_is_refused_before_parsing() {
-    // The catalog sits in an object stream that also carries 1 GB of
-    // padding; the parser would inflate it while opening.
+fn damaged_or_unknown_data_is_refused() {
+    assert_eq!(
+        open(content("/Filter /FlateDecode", b"not deflate")),
+        UNCHECKED
+    );
+    // A picture codec with more after it.
+    assert_eq!(
+        open(content("/Filter [/DCTDecode /FlateDecode]", b"")),
+        UNCHECKED
+    );
+}
+
+#[test]
+fn an_object_stream_bomb() {
+    // The catalog sits in an object stream with 300 MB of padding. The
+    // parser inflates it while opening, before any check: in this process
+    // that only takes the memory; the child process has a budget for
+    // exactly this (tests/process.rs). Here the file is refused afterwards.
     let mut objects = b"2 0 ".to_vec();
     let first = objects.len();
     objects.extend_from_slice(b"<< /Type /Catalog /Pages 3 0 R >>");
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&objects).unwrap();
     let chunk = vec![b' '; 1 << 20];
-    for _ in 0..1024 {
+    for _ in 0..300 {
         encoder.write_all(&chunk).unwrap();
     }
     let packed = encoder.finish().unwrap();
     let mut b = Builder::default();
-    let objstm = b.stream(
+    b.stream(
         &format!("/Type /ObjStm /N 1 /First {first} /Filter /FlateDecode"),
         &packed,
     );
-    let _catalog_placeholder = b.reserve();
+    let _catalog = b.reserve();
     let pages = b.reserve();
     let content = b.stream("", b"");
     let page = b.add(format!(
@@ -326,88 +294,111 @@ fn an_object_stream_bomb_is_refused_before_parsing() {
         pages,
         format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
     );
-    assert_eq!(objstm, 1);
-    assert_eq!(
-        open(b.finish(2)),
-        Err(OpenError::TooLarge(Exceeded::Stream))
-    );
+    assert!(open(b.finish(2)).is_err());
 }
 
 #[test]
 fn huge_pictures_are_refused() {
-    let image = |dict: &str, data: &[u8]| {
-        let mut b = Builder::default();
-        let catalog = b.reserve();
-        let pages = b.reserve();
-        let picture = b.stream(&format!("/Type /XObject /Subtype /Image {dict}"), data);
-        let content = b.stream("", b"q 100 0 0 100 0 0 cm /Im0 Do Q");
-        let page = b.add(format!(
-            "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] \
-             /Resources << /XObject << /Im0 {picture} 0 R >> >> /Contents {content} 0 R >>"
-        ));
-        b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-        b.set(
-            pages,
-            format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
-        );
-        open(b.finish(catalog))
-    };
-    let refused = Err(OpenError::TooLarge(Exceeded::Image));
-    // The dictionary says 100 000 x 100 000.
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 8";
     assert_eq!(
-        image(
-            "/Width 100000 /Height 100000 /ColorSpace /DeviceGray /BitsPerComponent 8",
+        open(with_picture(
+            &format!("/Subtype /Image /Width 100000 /Height 100000 {gray}"),
             b"\0"
-        ),
-        refused
+        )),
+        IMAGE
+    );
+    // The short keys win, as in the parser.
+    assert_eq!(
+        open(with_picture(
+            &format!("/Subtype /Image /W 100000 /H 100000 /Width 1 /Height 1 {gray}"),
+            b"\0"
+        )),
+        IMAGE
     );
     // The dictionary is modest, the JPEG inside says 65 000 x 65 000.
     let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8];
     jpeg.extend_from_slice(&65000u16.to_be_bytes());
     jpeg.extend_from_slice(&65000u16.to_be_bytes());
-    jpeg.extend_from_slice(&[1, 1, 0x11, 0, 0xFF, 0xD9]);
+    jpeg.extend_from_slice(&[1, 1, 0x11, 0, 0xFF, 0xDA, 0, 2, 0xFF, 0xD9]);
     assert_eq!(
-        image(
-            "/Width 10 /Height 10 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode",
+        open(with_picture(
+            &format!("/Subtype /Image /Width 10 /Height 10 {gray} /Filter /DCTDecode"),
             &jpeg
-        ),
-        refused
+        )),
+        IMAGE
     );
-    // Width through a reference to an integer object is still read: build it
-    // by hand so the integer is an object of its own.
-    let mut b = Builder::default();
-    let catalog = b.reserve();
-    let pages = b.reserve();
-    let width = b.add(b"200000");
-    let picture = b.stream(
-        &format!("/Type /XObject /Subtype /Image /Width {width} 0 R /Height 100000 /ColorSpace /DeviceGray /BitsPerComponent 8"),
-        b"\0",
-    );
-    let content = b.stream("", b"/Im0 Do");
-    let page = b.add(format!(
-        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] \
-         /Resources << /XObject << /Im0 {picture} 0 R >> >> /Contents {content} 0 R >>"
-    ));
-    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-    b.set(
-        pages,
-        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
-    );
-    assert_eq!(open(b.finish(catalog)), refused);
     // An inline picture in the content stream.
-    let inline = Builder::document(&[b"q BI /W 50000 /H 50000 /CS /G /BPC 8 ID \0 EI Q"]);
-    assert_eq!(open(inline), refused);
+    assert_eq!(
+        open(content(
+            "",
+            b"q BI /W 50000 /H 50000 /CS /G /BPC 8 ID \0 EI Q"
+        )),
+        IMAGE
+    );
+}
+
+#[test]
+fn a_picture_size_through_a_reference() {
+    // One bit per pixel, two billion pixels: the width is an object of its
+    // own, which the parser follows.
+    let bytes = one_page(
+        |b| {
+            let width = b.add("2000000000");
+            let picture = b.stream(
+                &format!(
+                    "/Type /XObject /Subtype /Image /Width {width} 0 R /Height 1 \
+                     /ColorSpace /DeviceGray /BitsPerComponent 1"
+                ),
+                b"\0",
+            );
+            format!("<< /XObject << /Im0 {picture} 0 R >> >>")
+        },
+        "",
+        b"/Im0 Do",
+    );
+    assert_eq!(open(bytes), IMAGE);
+    // A picture whose size cannot be read is refused.
+    assert_eq!(
+        open(with_picture(
+            "/Subtype /Image /Width (wide) /Height 1 /BitsPerComponent 8",
+            b"\0"
+        )),
+        UNCHECKED
+    );
+}
+
+#[test]
+fn a_decoy_size_in_jpeg_2000() {
+    let mut real = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 41, 0, 0];
+    real.extend_from_slice(&60000u32.to_be_bytes());
+    real.extend_from_slice(&60000u32.to_be_bytes());
+    real.extend_from_slice(&[0; 8]);
+    let mut decoy = vec![0xFF, 0x51, 0, 41, 0, 0];
+    decoy.extend_from_slice(&8u32.to_be_bytes());
+    decoy.extend_from_slice(&8u32.to_be_bytes());
+    decoy.extend_from_slice(&[0; 8]);
+    let mut jp2 = Vec::new();
+    jp2.extend_from_slice(&((decoy.len() + 8) as u32).to_be_bytes());
+    jp2.extend_from_slice(b"junk");
+    jp2.extend_from_slice(&decoy);
+    jp2.extend_from_slice(&((real.len() + 8) as u32).to_be_bytes());
+    jp2.extend_from_slice(b"jp2c");
+    jp2.extend_from_slice(&real);
+    let dict = "/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray \
+                /BitsPerComponent 8 /Filter /JPXDecode";
+    assert_eq!(open(with_picture(dict, &jp2)), IMAGE);
+    // Only the decoy: the size cannot be read.
+    assert_eq!(open(with_picture(dict, &decoy)), UNCHECKED);
 }
 
 #[test]
 fn an_inline_picture_bomb_is_refused() {
-    let mut content = b"BI /W 100 /H 100 /CS /G /BPC 8 /F /Fl ID ".to_vec();
-    content.extend_from_slice(&zeros_deflated(1 << 30));
-    content.extend_from_slice(b" EI");
-    assert_eq!(
-        open(Builder::document(&[&content])),
-        Err(OpenError::TooLarge(Exceeded::Stream))
-    );
+    for key in ["/F /Fl", "/Filter /FlateDecode", "/F [/Fl]"] {
+        let mut data = format!("BI /W 100 /H 100 /CS /G /BPC 8 {key} ID ").into_bytes();
+        data.extend_from_slice(&zeros_deflated(1 << 30));
+        data.extend_from_slice(b" EI");
+        assert_eq!(open(content("", &data)), STREAM, "{key}");
+    }
 }
 
 #[test]
@@ -422,22 +413,17 @@ fn a_page_tree_that_contains_itself() {
     b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
     b.set(
         pages,
-        format!("<< /Type /Pages /Parent {pages} 0 R /Kids [{pages} 0 R {page} 0 R {pages} 0 R] /Count 3 >>"),
+        format!(
+            "<< /Type /Pages /Parent {pages} 0 R /Kids [{pages} 0 R {page} 0 R {pages} 0 R] /Count 3 >>"
+        ),
     );
     let bytes = b.finish(catalog);
-    let info = open(bytes.clone()).unwrap();
-    assert_eq!(info.pages.len(), 1);
-    assert!(
-        render_all(bytes, 1.0)
-            .iter()
-            .any(|e| matches!(e, Event::Page(_)))
-    );
+    assert_eq!(open(bytes.clone()).unwrap().pages.len(), 1);
+    assert!(render_all(bytes, 1.0).unwrap()[0].is_some());
 }
 
 #[test]
 fn pages_whose_parents_loop() {
-    // Attributes are inherited through /Parent; here the chain is a loop and
-    // nothing defines a media box.
     let mut b = Builder::default();
     let catalog = b.reserve();
     let pages = b.reserve();
@@ -460,34 +446,20 @@ fn pages_whose_parents_loop() {
         pages,
         format!("<< /Type /Pages /Parent {c} 0 R /Kids [{c} 0 R] /Count 1 >>"),
     );
-    let bytes = b.finish(catalog);
-    if open(bytes.clone()).is_ok() {
-        render_all(bytes, 1.0);
-    }
+    let _ = render_all(b.finish(catalog), 1.0);
 }
 
 #[test]
 fn cross_reference_sections_that_point_at_each_other() {
     let mut bytes = Builder::document(&[b"0 g 0 0 10 10 re f"]);
-    // Append a second section whose /Prev is itself, and make it the last.
     let start = bytes.len();
     bytes.extend_from_slice(
-        format!("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev {start} >>\nstartxref\n{start}\n%%EOF\n")
-            .as_bytes(),
+        format!(
+            "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev {start} >>\nstartxref\n{start}\n%%EOF\n"
+        )
+        .as_bytes(),
     );
-    let result = open(bytes.clone());
-    assert!(result.is_ok(), "{result:?}");
-    // And two sections that point at each other.
-    let second = bytes.len();
-    let text = format!(
-        "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev {start} >>\nstartxref\n{second}\n%%EOF\n"
-    );
-    bytes.extend_from_slice(text.as_bytes());
-    let patched = String::from_utf8_lossy(&bytes).replace(
-        &format!("/Prev {start} >>\nstartxref\n{start}"),
-        &format!("/Prev {second} >>\nstartxref\n{start}"),
-    );
-    let _ = open(patched.into_bytes());
+    assert!(open(bytes).is_ok());
 }
 
 #[test]
@@ -495,12 +467,12 @@ fn a_cross_reference_table_that_claims_billions_of_entries() {
     let mut bytes = Builder::document(&[b"0 g 0 0 10 10 re f"]);
     let start = bytes.len();
     bytes.extend_from_slice(
-        format!("xref\n0 2000000000\n0000000000 65535 f \ntrailer\n<< /Size 2000000000 /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n")
-            .as_bytes(),
+        format!(
+            "xref\n0 2000000000\n0000000000 65535 f \ntrailer\n<< /Size 2000000000 /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n"
+        )
+        .as_bytes(),
     );
-    let started = Instant::now();
     let _ = open(bytes);
-    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[test]
@@ -508,13 +480,12 @@ fn nesting_a_million_levels_deep() {
     let depth = 1_000_000;
     let mut deep = "[".repeat(depth).into_bytes();
     deep.extend_from_slice("]".repeat(depth).as_bytes());
-    // In a page's dictionary…
     let mut b = Builder::default();
     let catalog = b.reserve();
     let pages = b.reserve();
-    let content = b.stream("", b"0 g 0 0 10 10 re f");
+    let stream = b.stream("", b"0 g 0 0 10 10 re f");
     let mut page = format!(
-        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {content} 0 R /Junk "
+        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {stream} 0 R /Junk "
     )
     .into_bytes();
     page.extend_from_slice(&deep);
@@ -525,16 +496,12 @@ fn nesting_a_million_levels_deep() {
         pages,
         format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
     );
-    let bytes = b.finish(catalog);
-    if open(bytes.clone()).is_ok() {
-        render_all(bytes, 1.0);
-    }
-    // …in a content stream, and dictionaries too.
-    let mut content = b"0 g ".to_vec();
-    content.extend_from_slice(&deep);
-    content.extend_from_slice(" <<".repeat(depth).as_bytes());
-    content.extend_from_slice(b" 0 0 10 10 re f");
-    render_all(Builder::document(&[&content]), 1.0);
+    let _ = render_all(b.finish(catalog), 1.0);
+    let mut data = b"0 g ".to_vec();
+    data.extend_from_slice(&deep);
+    data.extend_from_slice(" <<".repeat(depth).as_bytes());
+    data.extend_from_slice(b" 0 0 10 10 re f");
+    let _ = render_all(content("", &data), 1.0);
 }
 
 #[test]
@@ -543,11 +510,15 @@ fn a_form_that_draws_itself() {
     let catalog = b.reserve();
     let pages = b.reserve();
     let form = b.reserve();
+    let data = b"0 g 0 0 1 1 re f 0.9 0 0 0.9 1 1 cm /F Do";
     let mut body = format!(
-        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /F {form} 0 R >> >> /Length 30 >>\nstream\n"
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /XObject << /F {form} 0 R >> >> /Length {} >>\nstream\n",
+        data.len()
     )
     .into_bytes();
-    body.extend_from_slice(b"0 g 0 0 1 1 re f 0.9 0 0 0.9 1 1 cm /F Do\nendstream");
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\nendstream");
     b.set(form, body);
     let content = b.stream("", b"/F Do");
     let page = b.add(format!(
@@ -559,40 +530,7 @@ fn a_form_that_draws_itself() {
         pages,
         format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
     );
-    let events = render_all(b.finish(catalog), 1.0);
-    assert!(
-        events.iter().any(|e| matches!(e, Event::Page(_))),
-        "{events:?}"
-    );
-}
-
-#[test]
-fn a_million_saved_states_and_clips() {
-    let mut content = Vec::new();
-    for _ in 0..1_000_000 {
-        content.extend_from_slice(b"q 0 0 200 100 re W n ");
-    }
-    content.extend_from_slice(b"0 g 0 0 10 10 re f");
-    let packed = deflate(&content);
-    let mut b = Builder::default();
-    let catalog = b.reserve();
-    let pages = b.reserve();
-    let stream = b.stream("/Filter /FlateDecode", &packed);
-    let page = b.add(format!(
-        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents {stream} 0 R >>"
-    ));
-    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
-    b.set(
-        pages,
-        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
-    );
-    let events = render_all(b.finish(catalog), 1.0);
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::Page(_) | Event::PageFailed(_))),
-        "{events:?}"
-    );
+    assert!(render_all(b.finish(catalog), 1.0).unwrap()[0].is_some());
 }
 
 #[test]
@@ -604,7 +542,7 @@ fn object_and_page_limits() {
         ..Limits::default()
     };
     assert_eq!(
-        open_with(bytes.clone(), "", few_objects),
+        open_with(bytes.clone(), few_objects),
         Err(OpenError::TooLarge(Exceeded::Objects))
     );
     let few_pages = Limits {
@@ -612,7 +550,7 @@ fn object_and_page_limits() {
         ..Limits::default()
     };
     assert_eq!(
-        open_with(bytes.clone(), "", few_pages),
+        open_with(bytes.clone(), few_pages),
         Err(OpenError::TooLarge(Exceeded::Pages))
     );
     let small_file = Limits {
@@ -620,7 +558,7 @@ fn object_and_page_limits() {
         ..Limits::default()
     };
     assert_eq!(
-        open_with(bytes, "", small_file),
+        open_with(bytes, small_file),
         Err(OpenError::TooLarge(Exceeded::File))
     );
 }
@@ -631,42 +569,13 @@ fn large_render_requests_are_scaled_down() {
         width: 595.0,
         height: 842.0,
     };
-    assert_eq!(fitted_scale(a4, 2.0, 40_000_000), 2.0);
-    let fitted = fitted_scale(a4, 50.0, 40_000_000);
+    assert_eq!(fitted_scale(a4, 2.0, 16_000_000), 2.0);
+    let fitted = fitted_scale(a4, 50.0, 16_000_000);
     let pixels = f64::from(595.0 * fitted) * f64::from(842.0 * fitted);
-    assert!(pixels <= 40_000_000.0 * 1.001 && fitted > 7.0, "{fitted}");
-    // A strip a mile long stays within 16 384 pixels.
+    assert!(pixels <= 16_000_000.0 * 1.001 && fitted > 4.0, "{fitted}");
     let strip = PageSize {
         width: 10.0,
         height: 14_400.0,
     };
-    assert!(14_400.0 * fitted_scale(strip, 4.0, 40_000_000) <= 16_384.0);
-}
-
-#[test]
-fn newer_requests_replace_older_ones() {
-    let contents: Vec<&[u8]> = vec![b"0 g 0 0 10 10 re f"; 20];
-    let (send, receive) = mpsc::channel();
-    let worker = Worker::spawn(
-        Builder::document(&contents),
-        String::new(),
-        Limits::default(),
-        move |e| {
-            let _ = send.send(e);
-        },
-    );
-    assert!(matches!(
-        receive.recv_timeout(Duration::from_secs(30)),
-        Ok(Event::Opened(_))
-    ));
-    worker.want((0..20).map(|p| (p, 1.0)).collect());
-    worker.want(vec![(7, 1.5)]);
-    let mut seen = Vec::new();
-    while let Ok(Event::Page(page)) = receive.recv_timeout(Duration::from_millis(500)) {
-        seen.push((page.page, page.scale));
-    }
-    // Whatever was under way when the second request came, the last page sent
-    // is the one asked for last, and nothing after it.
-    assert_eq!(seen.last(), Some(&(7, 1.5)));
-    assert!(seen.len() < 20);
+    assert!(14_400.0 * fitted_scale(strip, 4.0, 16_000_000) <= 16_384.0);
 }

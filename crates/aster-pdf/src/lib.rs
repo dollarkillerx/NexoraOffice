@@ -1,38 +1,38 @@
-//! PDF files: opening them within limits and rendering their pages.
+//! PDF files: opening them within limits and rendering their pages, in a
+//! process of their own.
 //!
 //! Parsing and rendering are done by hayro, a rasteriser written in Rust. It
 //! runs no scripts, fetches nothing and opens nothing by itself. Around it this
 //! crate adds what a viewer needs before it can be handed files from anywhere:
 //!
-//! - [`scan`] looks at the whole file before the parser does and refuses one
-//!   whose streams inflate past a ceiling, whose pictures are too large, or
-//!   that has too many objects ([`Limits`]). The parser keeps its own limits
-//!   on nesting (512 levels of arrays and dictionaries, 50 of nested forms
-//!   and patterns, 256 cross-reference sections) and skips pages it has
-//!   already visited.
-//! - Everything that calls into the parser runs on a [`Worker`] thread with a
-//!   large stack, inside `catch_unwind`: a panic in the parser becomes an
-//!   error for that file or page, not the end of the program. A stack
-//!   overflow or running out of memory would still end the process; the
-//!   limits are what keep those away.
+//! - [`check`] looks at every stream of an opened file the way the parser sees
+//!   it and refuses the file if a stream inflates past a ceiling, a picture is
+//!   too large, or something cannot be checked ([`Limits`]). The parser keeps
+//!   its own limits on nesting (512 levels of arrays and dictionaries, 50 of
+//!   nested forms and patterns, 256 cross-reference sections).
+//! - Opening and rendering happen in a child process ([`worker`], [`child`]):
+//!   the same executable started with a sub-command. Its allocations are
+//!   counted and it exits when it passes its memory budget; a page that takes
+//!   too long gets the process killed and restarted. Whatever a file does to
+//!   it, the window and the other documents stay.
 
+pub mod check;
+pub mod child;
 pub mod fonts;
 pub mod inflate;
-pub mod scan;
+pub mod worker;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use hayro::hayro_interpret::InterpreterSettings;
-use hayro::hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
+use hayro::vello_cpu::Pixmap;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
-pub use scan::Exceeded;
+pub use check::Refusal;
+pub use worker::{Program, Worker};
 
 /// Ceilings on what a file may ask for.
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +49,12 @@ pub struct Limits {
     pub max_image_pixels: u64,
     /// Pixels in one rendered page; larger requests are rendered smaller.
     pub max_render_pixels: u64,
+    /// Memory the child process may allocate.
+    pub max_memory_bytes: u64,
+    /// Time to open and check a file.
+    pub open_time: Duration,
+    /// Time to render one page.
+    pub page_time: Duration,
 }
 
 impl Default for Limits {
@@ -60,9 +66,31 @@ impl Default for Limits {
             max_stream_bytes: 256 << 20,
             // The same as for pictures in other documents (`aster-image`).
             max_image_pixels: 100_000_000,
-            max_render_pixels: 40_000_000,
+            max_render_pixels: 16_000_000,
+            max_memory_bytes: 3 << 30,
+            open_time: Duration::from_secs(60),
+            page_time: Duration::from_secs(20),
         }
     }
+}
+
+/// Which limit a file broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exceeded {
+    /// The file itself is larger than `max_file_bytes`.
+    File,
+    /// More objects than `max_objects`.
+    Objects,
+    /// More pages than `max_pages`.
+    Pages,
+    /// A stream inflates to more than `max_stream_bytes`.
+    Stream,
+    /// A picture has more pixels than `max_image_pixels`.
+    Image,
+    /// The child process needed more than `max_memory_bytes`.
+    Memory,
+    /// Opening took longer than `open_time`.
+    Time,
 }
 
 /// Why a file could not be opened.
@@ -76,9 +104,12 @@ pub enum OpenError {
     UnsupportedEncryption,
     /// It breaks one of the [`Limits`].
     TooLarge(Exceeded),
+    /// Something in it cannot be checked: a filter we do not decode, data
+    /// that does not decode, a picture without a readable size.
+    Unchecked,
     /// It is not a PDF, or too damaged to read.
     Damaged,
-    /// The parser failed unexpectedly (a panic, caught).
+    /// The parser failed unexpectedly (a panic, or the process ended).
     Crashed,
     /// The file could not be read.
     Unreadable(std::io::ErrorKind),
@@ -128,8 +159,22 @@ impl std::fmt::Debug for Rendered {
     }
 }
 
+/// Something a [`Worker`] reports.
+#[derive(Debug)]
+pub enum Event {
+    /// The file is open.
+    Opened(Info),
+    /// The file could not be opened; the worker has stopped.
+    Failed(OpenError),
+    /// A page asked for with [`Worker::want`].
+    Page(Rendered),
+    /// A page that cannot be drawn: it failed, took too long or needed too
+    /// much memory. It is not asked for again.
+    PageFailed(usize),
+}
+
 /// An open document. Lives on one thread (the parser's caches are not
-/// shared); [`Worker`] owns one.
+/// shared); the child process owns one.
 pub struct Document {
     pdf: Pdf,
     info: Info,
@@ -138,10 +183,13 @@ pub struct Document {
 }
 
 impl Document {
-    /// Check and open `bytes`. Call on a thread with a large stack
-    /// ([`STACK_BYTES`]); [`Worker`] does.
+    /// Open and check `bytes`. Call on a thread with a large stack
+    /// ([`STACK_BYTES`]).
     pub fn open(bytes: Vec<u8>, password: &str, limits: Limits) -> Result<Document, OpenError> {
-        let scanned = scan::scan(&bytes, &limits).map_err(OpenError::TooLarge)?;
+        if bytes.len() as u64 > limits.max_file_bytes {
+            return Err(OpenError::TooLarge(Exceeded::File));
+        }
+        let encrypted = has_encrypt_key(&bytes);
         let opened = catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(bytes, password)));
         let pdf = match opened {
             Err(_) => return Err(OpenError::Crashed),
@@ -156,10 +204,10 @@ impl Document {
             Ok(Err(LoadPdfError::Invalid)) => return Err(OpenError::Damaged),
             Ok(Ok(pdf)) => pdf,
         };
-        let checked = catch_unwind(AssertUnwindSafe(|| check_opened(&pdf, &scanned, &limits)));
-        match checked {
+        match catch_unwind(AssertUnwindSafe(|| check::check_document(&pdf, &limits))) {
             Err(_) => return Err(OpenError::Crashed),
-            Ok(Err(exceeded)) => return Err(OpenError::TooLarge(exceeded)),
+            Ok(Err(Refusal::Exceeded(exceeded))) => return Err(OpenError::TooLarge(exceeded)),
+            Ok(Err(Refusal::Unchecked)) => return Err(OpenError::Unchecked),
             Ok(Ok(())) => {}
         }
         let pages = catch_unwind(AssertUnwindSafe(|| {
@@ -177,10 +225,7 @@ impl Document {
         }
         Ok(Document {
             pdf,
-            info: Info {
-                pages,
-                encrypted: scanned.encrypted,
-            },
+            info: Info { pages, encrypted },
             limits,
             settings: fonts::settings(),
         })
@@ -200,17 +245,22 @@ impl Document {
         fitted_scale(*size, scale, self.limits.max_render_pixels)
     }
 
-    /// Render `page` at `scale` pixels per point. `None` if the page cannot
-    /// be drawn (the parser panicked on it, or it is empty).
+    /// Render `page` at `scale` pixels per point. `Err` if the parser
+    /// panicked (the caller should start over: its caches and locks may be
+    /// poisoned), `Ok(None)` if there is nothing to draw.
+    // The only failure is a caught panic; there is nothing to say about it.
+    #[allow(clippy::result_unit_err)]
     pub fn render<'s>(
         &'s self,
         cache: &RenderCache<'s>,
         page: usize,
         scale: f32,
-    ) -> Option<Rendered> {
+    ) -> Result<Option<Pixmap>, ()> {
         let fitted = self.fitted_scale(page, scale);
         let pages = self.pdf.pages();
-        let page_ref = pages.get(page)?;
+        let Some(page_ref) = pages.get(page) else {
+            return Ok(None);
+        };
         let pixmap = catch_unwind(AssertUnwindSafe(|| {
             hayro::render(
                 page_ref,
@@ -224,19 +274,20 @@ impl Document {
                 },
             )
         }))
-        .ok()?;
-        let (width, height) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
-        if width == 0 || height == 0 {
-            return None;
+        .map_err(|_| ())?;
+        if pixmap.width() == 0 || pixmap.height() == 0 {
+            return Ok(None);
         }
-        Some(Rendered {
-            page,
-            scale,
-            width,
-            height,
-            pixels: pixmap.data_as_u8_slice().to_vec(),
-        })
+        Ok(Some(pixmap))
     }
+}
+
+/// Whether the file names an encryption dictionary. Only to tell the user;
+/// nothing about safety depends on it.
+fn has_encrypt_key(bytes: &[u8]) -> bool {
+    bytes.windows(9).any(|w| {
+        &w[..8] == b"/Encrypt" && (w[8].is_ascii_whitespace() || b"/<[(0123456789".contains(&w[8]))
+    })
 }
 
 /// `scale`, or less so that the page stays within `max_pixels` and 16 384
@@ -253,181 +304,12 @@ pub fn fitted_scale(size: PageSize, scale: f32, max_pixels: u64) -> f32 {
     fitted
 }
 
-/// Checks that need the parser: the object count it found, the number of
-/// pages, and, in encrypted files, the streams the scan could not read.
-fn check_opened(pdf: &Pdf, scanned: &scan::Scan, limits: &Limits) -> Result<(), Exceeded> {
-    if pdf.len() > limits.max_objects {
-        return Err(Exceeded::Objects);
-    }
-    if pdf.pages().len() > limits.max_pages {
-        return Err(Exceeded::Pages);
-    }
-    if scanned.encrypted {
-        let integers = std::collections::HashMap::new();
-        for stream in scanned
-            .streams
-            .iter()
-            .filter(|s| !s.checked && !s.structural)
-        {
-            let Some((number, generation)) = stream.id else {
-                continue;
-            };
-            let id = ObjectIdentifier::new(number, i32::from(generation));
-            let Some(found) = pdf.xref().get::<Stream<'_>>(id) else {
-                continue;
-            };
-            let raw = found.raw_data();
-            scan::check_stream(&stream.dict, &raw, &integers, limits)?;
-        }
-    }
-    Ok(())
-}
-
 /// Stack for threads that call into the parser. Its nesting limits keep
 /// recursion to a few hundred levels; this leaves room for unoptimised
 /// builds.
 pub const STACK_BYTES: usize = 256 << 20;
 
-/// Something a [`Worker`] reports.
-#[derive(Debug)]
-pub enum Event {
-    /// The file is open.
-    Opened(Info),
-    /// The file could not be opened; the worker has stopped.
-    Failed(OpenError),
-    /// A page asked for with [`Worker::want`].
-    Page(Rendered),
-    /// A page that cannot be drawn.
-    PageFailed(usize),
-}
-
-enum Request {
-    Want(Vec<(usize, f32)>),
-}
-
-/// A thread that owns one open document and renders its pages on request.
-/// Dropping it stops the thread once its current page is done.
-pub struct Worker {
-    requests: Sender<Request>,
-}
-
-impl Worker {
-    /// Open `bytes` on a new thread. `events` is called on that thread.
-    pub fn spawn(
-        bytes: Vec<u8>,
-        password: String,
-        limits: Limits,
-        events: impl FnMut(Event) + Send + 'static,
-    ) -> Worker {
-        Worker::start(Ok(bytes), password, limits, events)
-    }
-
-    /// Read the file at `path` and open it, both on a new thread. A file
-    /// larger than `max_file_bytes` is not read.
-    pub fn open_file(
-        path: PathBuf,
-        password: String,
-        limits: Limits,
-        events: impl FnMut(Event) + Send + 'static,
-    ) -> Worker {
-        Worker::start(Err(path), password, limits, events)
-    }
-
-    fn start(
-        source: Result<Vec<u8>, PathBuf>,
-        password: String,
-        limits: Limits,
-        mut events: impl FnMut(Event) + Send + 'static,
-    ) -> Worker {
-        let (requests, inbox) = mpsc::channel();
-        let body = move || {
-            let bytes = match source {
-                Ok(bytes) => bytes,
-                Err(path) => match read(&path, &limits) {
-                    Ok(bytes) => bytes,
-                    Err(error) => return events(Event::Failed(error)),
-                },
-            };
-            run(bytes, &password, limits, inbox, &mut events)
-        };
-        let spawned = std::thread::Builder::new()
-            .name("pdf".into())
-            .stack_size(STACK_BYTES)
-            .spawn(body);
-        // Without a thread the requests go nowhere and nothing is reported;
-        // the caller sees no answer, as for a file that takes long.
-        drop(spawned);
-        Worker { requests }
-    }
-
-    /// Render these pages, in this order, replacing what was asked before.
-    /// Pages already sent at the same scale are sent again.
-    pub fn want(&self, pages: Vec<(usize, f32)>) {
-        let _ = self.requests.send(Request::Want(pages));
-    }
-}
-
-fn read(path: &Path, limits: &Limits) -> Result<Vec<u8>, OpenError> {
-    let size = std::fs::metadata(path)
-        .map_err(|e| OpenError::Unreadable(e.kind()))?
-        .len();
-    if size > limits.max_file_bytes {
-        return Err(OpenError::TooLarge(Exceeded::File));
-    }
-    std::fs::read(path).map_err(|e| OpenError::Unreadable(e.kind()))
-}
-
-fn run(
-    bytes: Vec<u8>,
-    password: &str,
-    limits: Limits,
-    inbox: Receiver<Request>,
-    events: &mut dyn FnMut(Event),
-) {
-    let document = match catch_unwind(AssertUnwindSafe(|| Document::open(bytes, password, limits)))
-    {
-        Ok(Ok(document)) => document,
-        Ok(Err(error)) => return events(Event::Failed(error)),
-        Err(_) => return events(Event::Failed(OpenError::Crashed)),
-    };
-    events(Event::Opened(document.info().clone()));
-    let mut cache = RenderCache::new();
-    let mut broken = vec![false; document.info().pages.len()];
-    let mut queue: Vec<(usize, f32)> = Vec::new();
-    loop {
-        // Take the newest request; wait only when there is nothing to do.
-        let next = if queue.is_empty() {
-            inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        } else {
-            inbox.recv_timeout(Duration::ZERO)
-        };
-        match next {
-            Ok(Request::Want(pages)) => {
-                queue = pages;
-                queue.reverse();
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-        let Some((page, scale)) = queue.pop() else {
-            continue;
-        };
-        if broken.get(page).is_none_or(|b| *b) {
-            events(Event::PageFailed(page));
-            continue;
-        }
-        match document.render(&cache, page, scale) {
-            Some(rendered) => events(Event::Page(rendered)),
-            None => {
-                broken[page] = true;
-                // A panic may leave the caches half-filled.
-                cache = RenderCache::new();
-                events(Event::PageFailed(page));
-            }
-        }
-    }
-}
-
+#[cfg(test)]
+mod builder;
 #[cfg(test)]
 mod tests;

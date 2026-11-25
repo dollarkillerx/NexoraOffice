@@ -38,7 +38,7 @@ const ZOOM_STEPS: [f32; 15] = [
 pub const ZOOM_MIN: f32 = 10.0;
 pub const ZOOM_MAX: f32 = 800.0;
 /// Pages kept rendered beyond those on screen, before and after.
-const KEEP_AROUND: usize = 2;
+const KEEP_AROUND: usize = 1;
 const THUMBS_AROUND: usize = 12;
 /// How far a rendering's scale may differ from the wanted one and still be
 /// used as it is.
@@ -665,17 +665,22 @@ impl PdfView {
         if pixels.len() != usize::from(w) * usize::from(h) * 4 || w == 0 || h == 0 {
             return false;
         }
-        let pixels: Vec<PremulRgba8> = pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|p| PremulRgba8 {
-                r: p[0],
-                g: p[1],
-                b: p[2],
-                a: p[3],
-            })
-            .collect();
+        // Same bytes, no copy; the copy is for a buffer whose capacity is
+        // not a multiple of four.
+        let pixels: Vec<PremulRgba8> = match bytemuck::allocation::try_cast_vec(pixels) {
+            Ok(pixels) => pixels,
+            Err((_, pixels)) => pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| PremulRgba8 {
+                    r: p[0],
+                    g: p[1],
+                    b: p[2],
+                    a: p[3],
+                })
+                .collect(),
+        };
         let shot = Shot {
             scale,
             pixmap: Arc::new(Pixmap::from_parts_with_opacity(pixels, w, h, false)),

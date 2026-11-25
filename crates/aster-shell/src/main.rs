@@ -19,6 +19,11 @@
 //! source is highlighted as it is typed; the preview is laid out on a worker
 //! thread shortly after typing stops, and only drawn here.
 
+// Counts allocations in a PDF child process (a no-op elsewhere), so the
+// child can end itself when it passes its memory budget.
+#[global_allocator]
+static ALLOCATOR: aster_pdf::child::Budgeted = aster_pdf::child::Budgeted;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -186,7 +191,9 @@ struct SaveJob {
 /// A PDF file being opened: its worker, until the file is open or fails.
 struct PdfLoad {
     path: PathBuf,
-    worker: aster_pdf::Worker,
+    /// None when the child process could not be started: the failure is
+    /// reported as an event.
+    worker: Option<aster_pdf::Worker>,
 }
 
 struct Shell {
@@ -4087,6 +4094,7 @@ fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Ev
         let strings = shell.language.strings();
         match event {
             Event::Opened(info) => {
+                let Some(worker) = worker else { return };
                 shell.remember_file(&path);
                 shell.open_pdf(path, token, worker, info);
                 after_tab_change(ui, shell);
@@ -7196,6 +7204,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
+    // A PDF child process is this program with a sub-command: it must run
+    // before anything else starts.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = aster_pdf::child::run_if_child(&args) {
+        std::process::exit(code);
+    }
     let options = match cli::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(err) => {

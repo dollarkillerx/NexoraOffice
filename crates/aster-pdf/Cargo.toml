@@ -10,5 +10,14 @@ publish.workspace = true
 [dependencies]
 hayro = { workspace = true }
 flate2 = { workspace = true }
+libc = { workspace = true }
+
+# The child process on its own, for the process tests. The application is
+# its own child (`aster-shell --pdf-worker`); this binary is not shipped.
+[[bin]]
+name = "aster-pdf-worker"
+path = "src/bin/aster-pdf-worker.rs"
+test = false
 
 [dev-dependencies]
+tempfile = { workspace = true }

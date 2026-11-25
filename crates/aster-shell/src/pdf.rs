@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aster_pdf::{Event, Exceeded, Info, OpenError, Worker};
+use aster_pdf::{Event, Exceeded, Info, Limits, OpenError, Program, Worker};
 use aster_surface::pdf_view::{PdfStyle, PdfView, Zoom};
 
 use crate::i18n::{self, Strings};
@@ -103,10 +103,27 @@ impl PdfTab {
     }
 }
 
-/// Start opening `path`; events arrive through `events`, on the worker's
-/// thread.
-pub fn open(path: PathBuf, password: String, events: impl FnMut(Event) + Send + 'static) -> Worker {
-    Worker::open_file(path, password, aster_pdf::Limits::default(), events)
+/// Start opening `path` in a child process; events arrive through
+/// `events`, on the supervising thread. If this program's own path cannot be
+/// found, the failure is reported through `events` and there is no worker.
+pub fn open(
+    path: PathBuf,
+    password: String,
+    mut events: impl FnMut(Event) + Send + 'static,
+) -> Option<Worker> {
+    match Program::current() {
+        Ok(program) => Some(Worker::open(
+            program,
+            path,
+            password,
+            Limits::default(),
+            events,
+        )),
+        Err(_) => {
+            std::thread::spawn(move || events(Event::Failed(OpenError::Crashed)));
+            None
+        }
+    }
 }
 
 pub fn pdf_style(tokens: &theme::Tokens) -> PdfStyle {
@@ -147,6 +164,7 @@ pub fn error_message(error: OpenError, strings: &Strings) -> String {
         }
         OpenError::UnsupportedEncryption => strings.pdf_error_encryption.to_owned(),
         OpenError::Crashed => strings.pdf_error_crashed.to_owned(),
+        OpenError::Unchecked => strings.pdf_error_unchecked.to_owned(),
         OpenError::Unreadable(kind) => i18n::fill(
             strings.pdf_error_unreadable,
             "reason",
@@ -159,7 +177,8 @@ pub fn error_message(error: OpenError, strings: &Strings) -> String {
                 Exceeded::Pages => strings.pdf_limit_pages,
                 Exceeded::Stream => strings.pdf_limit_stream,
                 Exceeded::Image => strings.pdf_limit_image,
-                Exceeded::Encrypted => strings.pdf_limit_encrypted,
+                Exceeded::Memory => strings.pdf_limit_memory,
+                Exceeded::Time => strings.pdf_limit_time,
             };
             i18n::fill(strings.pdf_error_too_large, "what", what)
         }
@@ -199,6 +218,7 @@ mod tests {
         let errors = [
             OpenError::Damaged,
             OpenError::Crashed,
+            OpenError::Unchecked,
             OpenError::UnsupportedEncryption,
             OpenError::Unreadable(std::io::ErrorKind::PermissionDenied),
             OpenError::TooLarge(Exceeded::File),
@@ -206,7 +226,8 @@ mod tests {
             OpenError::TooLarge(Exceeded::Pages),
             OpenError::TooLarge(Exceeded::Stream),
             OpenError::TooLarge(Exceeded::Image),
-            OpenError::TooLarge(Exceeded::Encrypted),
+            OpenError::TooLarge(Exceeded::Memory),
+            OpenError::TooLarge(Exceeded::Time),
         ];
         for language in crate::i18n::Language::ALL {
             let strings = language.strings();

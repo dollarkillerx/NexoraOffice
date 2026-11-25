@@ -62,6 +62,17 @@ impl Finder {
     /// nothing; `Err` with the reason for a regular expression that does
     /// not compile.
     pub fn new(query: &Query) -> Result<Option<Self>, String> {
+        Self::build(query, false)
+    }
+
+    /// Like [`Finder::new`], but a match must be the whole of the text it
+    /// is looked for in: a spreadsheet's "match entire cell". (`^` and `$`
+    /// are line ends here, so this anchors at the ends of the text itself.)
+    pub fn new_whole(query: &Query) -> Result<Option<Self>, String> {
+        Self::build(query, true)
+    }
+
+    fn build(query: &Query, whole_text: bool) -> Result<Option<Self>, String> {
         if query.pattern.is_empty() {
             return Ok(None);
         }
@@ -70,7 +81,9 @@ impl Finder {
         } else {
             regex_syntax::escape(&query.pattern)
         };
-        let pattern = if query.whole_word {
+        let pattern = if whole_text {
+            format!(r"\A(?:{body})\z")
+        } else if query.whole_word {
             format!(r"\b(?:{body})\b")
         } else {
             body
@@ -361,6 +374,36 @@ mod tests {
                 .matches
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_whole_text_only() {
+        let hits = |query: &Query, text: &str| {
+            Finder::new_whole(query)
+                .unwrap()
+                .unwrap()
+                .find_from(text, 0)
+                .is_some()
+        };
+        let cat = query("cat");
+        assert!(hits(&cat, "cat"));
+        assert!(!hits(&cat, "cat "));
+        assert!(!hits(&cat, "a cat"));
+        // Not the end of a line: a cell of several lines is one text.
+        assert!(!hits(&cat, "cat\ndog"));
+        assert!(!hits(&cat, "dog\ncat"));
+        let any = Query {
+            regex: true,
+            ..query("cat|dog")
+        };
+        assert!(hits(&any, "dog") && !hits(&any, "cat dog"));
+        let folded = Query {
+            case_sensitive: false,
+            ..query("cat")
+        };
+        assert!(hits(&folded, "CAT"));
+        // Characters of the pattern that mean something stay plain text.
+        assert!(hits(&query("1+1"), "1+1") && !hits(&query("1+1"), "11"));
     }
 
     #[test]

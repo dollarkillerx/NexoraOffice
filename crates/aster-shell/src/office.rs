@@ -438,16 +438,25 @@ struct Marks {
     comments: bool,
 }
 
-/// The find bar on a workbook: what to look for and the cells of the sheet
-/// in front that have it, by rows as Excel searches.
+/// A cell the find bar found: its sheet and place.
+pub type Found = (usize, CellRef);
+
+/// The find bar on a workbook: what to look for and the cells that have it,
+/// by sheets and by rows as Excel searches: the sheet in front, or every
+/// visible sheet in turn.
 #[derive(Debug, Default)]
 pub struct SheetFind {
     pub open: bool,
     pub replace_open: bool,
     pub query: Query,
+    /// Look in the whole workbook rather than the sheet in front.
+    pub workbook: bool,
+    /// A match must be the whole content of its cell.
+    pub whole_cell: bool,
     pub replacement: String,
-    /// The cells that match, in order: row by row, left to right.
-    pub matches: Vec<CellRef>,
+    /// The cells that match, in order: sheet by sheet, row by row, left to
+    /// right.
+    pub matches: Vec<Found>,
     /// More cells matched than are kept.
     pub truncated: bool,
     /// Index of the cell selected from `matches`.
@@ -1017,7 +1026,12 @@ impl SheetTab {
     }
 
     fn finder(&mut self) -> Option<Finder> {
-        match Finder::new(&self.find.query) {
+        let built = if self.find.whole_cell {
+            Finder::new_whole(&self.find.query)
+        } else {
+            Finder::new(&self.find.query)
+        };
+        match built {
             Ok(finder) => {
                 self.find.error = None;
                 finder
@@ -1029,9 +1043,19 @@ impl SheetTab {
         }
     }
 
-    /// Look for the query again on the sheet in front, as it is now. The
-    /// cells are searched in what the formula bar shows: the input, or the
-    /// formula with its `=`.
+    /// The sheets the find bar looks in: every visible one, or the one in
+    /// front.
+    fn searched_sheets(&self) -> Vec<usize> {
+        if self.find.workbook {
+            self.view.visible_sheets()
+        } else {
+            vec![self.view.sheet_index()]
+        }
+    }
+
+    /// Look for the query again, as the workbook is now. The cells are
+    /// searched in what the formula bar shows: the input, or the formula
+    /// with its `=`.
     fn research(&mut self) {
         self.find.matches.clear();
         self.find.truncated = false;
@@ -1040,21 +1064,25 @@ impl SheetTab {
             return;
         };
         let workbook = self.view.workbook();
-        let Some(sheet) = self.view.sheet() else {
-            return;
-        };
-        'rows: for row in sheet.rows() {
-            for cell in &row.cells {
-                let text = workbook.input_text(cell);
-                if text.is_empty() {
-                    continue;
-                }
-                if finder.find_from(&text, 0).is_some() {
-                    if self.find.matches.len() == MAX_FOUND {
-                        self.find.truncated = true;
-                        break 'rows;
+        'sheets: for index in self.searched_sheets() {
+            let Some(sheet) = workbook.sheets.get(index) else {
+                continue;
+            };
+            for row in sheet.rows() {
+                for cell in &row.cells {
+                    let text = workbook.input_text(cell);
+                    if text.is_empty() {
+                        continue;
                     }
-                    self.find.matches.push(CellRef::new(row.index, cell.col));
+                    if finder.find_from(&text, 0).is_some() {
+                        if self.find.matches.len() == MAX_FOUND {
+                            self.find.truncated = true;
+                            break 'sheets;
+                        }
+                        self.find
+                            .matches
+                            .push((index, CellRef::new(row.index, cell.col)));
+                    }
                 }
             }
         }
@@ -1066,53 +1094,78 @@ impl SheetTab {
         self.find.query = query;
         self.find.replaced = None;
         self.research();
-        self.step_from(self.view.selected(), true, true);
+        let from = (self.view.sheet_index(), self.view.selected());
+        self.step_from(from, true, true);
+    }
+
+    /// Look in the sheet in front or in the whole workbook, and search
+    /// again.
+    pub fn set_workbook_scope(&mut self, workbook: bool) {
+        self.find.workbook = workbook;
+        self.find.replaced = None;
+        self.research();
+        let from = (self.view.sheet_index(), self.view.selected());
+        self.step_from(from, true, true);
+    }
+
+    /// Match the whole content of a cell only, or any part of it.
+    pub fn set_whole_cell(&mut self, whole: bool) {
+        self.find.whole_cell = whole;
+        self.find.replaced = None;
+        self.research();
+        let from = (self.view.sheet_index(), self.view.selected());
+        self.step_from(from, true, true);
     }
 
     /// Select the next (or previous) cell that has the query, wrapping
-    /// around the sheet. Looks again first: cells may have changed.
+    /// around the sheet, or the workbook, and showing the sheet it is on.
+    /// Looks again first: cells may have changed.
     pub fn find_step(&mut self, forward: bool) {
         self.view.cancel_edit();
         self.research();
-        self.step_from(self.view.selected(), forward, false);
+        let from = (self.view.sheet_index(), self.view.selected());
+        self.step_from(from, forward, false);
     }
 
     /// Select the match at or after `from` (`inclusive`), or the one before
     /// it going back.
-    fn step_from(&mut self, from: CellRef, forward: bool, inclusive: bool) {
-        let key = |at: &CellRef| (at.row, at.col);
+    fn step_from(&mut self, from: Found, forward: bool, inclusive: bool) {
+        let key = |at: &Found| (at.0, at.1.row, at.1.col);
         let from = key(&from);
         let matches = &self.find.matches;
         if matches.is_empty() {
             return;
         }
+        // The matches are in order, so these are binary searches: a
+        // workbook with a hundred thousand of them is stepped through at
+        // once.
         let index = if forward {
-            matches
-                .iter()
-                .position(|at| {
-                    if inclusive {
-                        key(at) >= from
-                    } else {
-                        key(at) > from
-                    }
-                })
-                .unwrap_or(0)
+            let first = if inclusive {
+                matches.partition_point(|at| key(at) < from)
+            } else {
+                matches.partition_point(|at| key(at) <= from)
+            };
+            if first == matches.len() { 0 } else { first }
         } else {
-            matches
-                .iter()
-                .rposition(|at| key(at) < from)
-                .unwrap_or(matches.len() - 1)
+            match matches.partition_point(|at| key(at) < from) {
+                0 => matches.len() - 1,
+                before => before - 1,
+            }
         };
         self.find.current = Some(index);
-        let at = matches[index];
+        let (sheet, at) = matches[index];
+        if sheet != self.view.sheet_index() {
+            self.view.cancel_edit();
+            self.view.set_sheet(sheet);
+        }
         self.view.select(at);
     }
 
     /// The input of a cell with every match of the query replaced; `None`
     /// if it has none.
-    fn replaced_input(&self, finder: &Finder, at: CellRef) -> Option<String> {
+    fn replaced_input(&self, finder: &Finder, sheet: usize, at: CellRef) -> Option<String> {
         let workbook = self.view.workbook();
-        let cell = self.view.sheet()?.cell(at)?;
+        let cell = workbook.sheets.get(sheet)?.cell(at)?;
         let text = workbook.input_text(cell);
         let never = AtomicBool::new(false);
         let found = finder.find_all(&text, &never, |_| {})?;
@@ -1124,45 +1177,52 @@ impl SheetTab {
     }
 
     /// Replace in the selected cell if it is a match, as if its new input
-    /// were typed, then go to the next match. One undo step.
+    /// were typed, then go to the next match, on this sheet or the next one
+    /// that has any. One undo step.
     pub fn replace_one(&mut self, language: &str) -> Vec<Change> {
         self.view.cancel_edit();
+        let sheet = self.view.sheet_index();
         let at = self.view.selected();
         let Some(finder) = self.finder() else {
             return Vec::new();
         };
-        let changes = match self.replaced_input(&finder, at) {
+        let changes = match self.replaced_input(&finder, sheet, at) {
             Some(text) => self.type_cells(at, &[vec![text]], language),
             None => Vec::new(),
         };
         self.research();
-        self.step_from(at, true, false);
+        self.step_from((sheet, at), true, false);
         changes
     }
 
-    /// Replace in every cell of the sheet that has the query, as if each new
-    /// input were typed. One undo step.
+    /// Replace in every cell that has the query, in the sheet in front or
+    /// in every sheet, as if each new input were typed. One undo step.
     pub fn replace_all(&mut self, language: &str) -> Vec<Change> {
         self.view.cancel_edit();
         self.research();
         let Some(finder) = self.finder() else {
             return Vec::new();
         };
-        let sheet = self.view.sheet_index();
         let styles_before = self.view.workbook().styles.len();
         let reading = self.reading(language);
         let targets = self.find.matches.clone();
-        let mut cells = Vec::new();
-        for at in targets {
-            let Some(text) = self.replaced_input(&finder, at) else {
-                continue;
-            };
-            let (entry, look) = input::read(&text, &reading);
-            let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
-            cells.push((at, cell));
+        let mut changes = Vec::new();
+        let mut count = 0;
+        // Sheet by sheet: the matches are in sheet order.
+        for group in targets.chunk_by(|a, b| a.0 == b.0) {
+            let sheet = group[0].0;
+            let mut cells = Vec::new();
+            for &(_, at) in group {
+                let Some(text) = self.replaced_input(&finder, sheet, at) else {
+                    continue;
+                };
+                let (entry, look) = input::read(&text, &reading);
+                let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
+                cells.push((at, cell));
+            }
+            count += cells.len();
+            changes.extend(self.view.workbook_mut().set_cells(sheet, cells));
         }
-        let count = cells.len();
-        let changes = self.view.workbook_mut().set_cells(sheet, cells);
         let changes = self.record(changes, styles_before);
         self.find.replaced = Some(count);
         self.research();
@@ -4359,6 +4419,8 @@ mod tests {
     fn find_and_replace_in_a_sheet() {
         use aster_surface::cell_editor::EditMode;
 
+        let cells =
+            |tab: &SheetTab| -> Vec<CellRef> { tab.find.matches.iter().map(|m| m.1).collect() };
         let mut tab = tab();
         for (cell, text) in [
             ("B1", "東京 支店"),
@@ -4378,7 +4440,7 @@ mod tests {
         };
         tab.set_query(query("東京"));
         // By rows: B1, then C2. The first after A1 is selected.
-        assert_eq!(tab.find.matches, [at("B1"), at("C2")]);
+        assert_eq!(cells(&tab), [at("B1"), at("C2")]);
         assert_eq!((tab.find.current, tab.view.selected()), (Some(0), at("B1")));
         tab.find_step(true);
         assert_eq!(tab.view.selected(), at("C2"));
@@ -4388,7 +4450,7 @@ mod tests {
         assert_eq!(tab.view.selected(), at("C2"));
         // Formulas are found in what the formula bar shows.
         tab.set_query(query("len("));
-        assert_eq!(tab.find.matches, [at("D4")]);
+        assert_eq!(cells(&tab), [at("D4")]);
         // A bad regular expression says so.
         tab.set_query(Query {
             regex: true,
@@ -4409,7 +4471,7 @@ mod tests {
         };
         assert_eq!(text(&tab, "B1").as_deref(), Some("名古屋 支店"));
         assert_eq!(tab.view.selected(), at("C2"));
-        assert_eq!(tab.find.matches, [at("C2")]);
+        assert_eq!(cells(&tab), [at("C2")]);
         tab.undo();
         assert_eq!(text(&tab, "B1").as_deref(), Some("東京 支店"));
 
@@ -4422,6 +4484,240 @@ mod tests {
         tab.undo();
         assert_eq!(text(&tab, "B1").as_deref(), Some("東京 支店"));
         assert_eq!(text(&tab, "C2").as_deref(), Some("東京本社"));
+    }
+
+    /// A workbook of three sheets, `Sheet2` hidden, with the same words on
+    /// each, for the find bar.
+    fn three_sheets() -> SheetTab {
+        use aster_surface::cell_editor::EditMode;
+
+        let mut tab = tab();
+        tab.add_sheet("S");
+        tab.add_sheet("S");
+        assert_eq!(tab.view.workbook().sheets.len(), 3);
+        for (sheet, cells) in [
+            (
+                0,
+                vec![("A1", "Apple pie"), ("C3", "apple"), ("B2", "Pineapple")],
+            ),
+            (1, vec![("A1", "apple"), ("A5", "APPLE")]),
+            (2, vec![("B1", "Apple"), ("D9", "banana")]),
+        ] {
+            tab.view.set_sheet(sheet);
+            for (cell, text) in cells {
+                tab.view.select(at(cell));
+                tab.view.begin_edit(EditMode::Enter, Some(text.into()));
+                tab.commit("en");
+            }
+        }
+        tab.view.set_sheet(0);
+        tab.view.select(at("A1"));
+        tab
+    }
+
+    #[test]
+    fn find_steps_across_the_sheets_of_a_workbook() {
+        let query = |pattern: &str| Query {
+            pattern: pattern.into(),
+            ..Query::default()
+        };
+        let mut tab = three_sheets();
+        tab.open_find(false);
+        // This sheet only, to begin with.
+        tab.set_query(query("apple"));
+        assert_eq!(tab.find.matches.len(), 3);
+        assert!(tab.find.matches.iter().all(|m| m.0 == 0));
+        // The whole workbook: "n of m" counts every sheet.
+        tab.set_workbook_scope(true);
+        let found: Vec<(usize, String)> = tab
+            .find
+            .matches
+            .iter()
+            .map(|(s, a)| (*s, a.to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (0, "A1".into()),
+                (0, "B2".into()),
+                (0, "C3".into()),
+                (1, "A1".into()),
+                (1, "A5".into()),
+                (2, "B1".into())
+            ]
+        );
+        assert_eq!(tab.find.current, Some(0));
+        // Next goes on to the other sheets, which come to the front.
+        tab.find_step(true);
+        tab.find_step(true);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (0, at("C3")));
+        tab.find_step(true);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (1, at("A1")));
+        assert_eq!(tab.find.current, Some(3));
+        tab.find_step(true);
+        tab.find_step(true);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (2, at("B1")));
+        // And round to the start; backwards from there is the last.
+        tab.find_step(true);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (0, at("A1")));
+        tab.find_step(false);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (2, at("B1")));
+        tab.find_step(false);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (1, at("A5")));
+        // A hidden sheet is not searched.
+        tab.view.workbook_mut().sheets[1].hidden = true;
+        tab.find_step(true);
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (2, at("B1")));
+        assert!(tab.find.matches.iter().all(|m| m.0 != 1));
+        tab.view.workbook_mut().sheets[1].hidden = false;
+        // Back to this sheet only: the matches are this sheet's.
+        tab.set_workbook_scope(false);
+        assert!(
+            tab.find
+                .matches
+                .iter()
+                .all(|m| m.0 == tab.view.sheet_index())
+        );
+    }
+
+    #[test]
+    fn match_case_and_whole_cell_narrow_the_matches() {
+        let mut tab = three_sheets();
+        tab.open_find(false);
+        tab.set_workbook_scope(true);
+        let count = |tab: &SheetTab| tab.find.matches.len();
+        let query = |case: bool| Query {
+            pattern: "apple".into(),
+            case_sensitive: case,
+            ..Query::default()
+        };
+        tab.set_query(query(false));
+        assert_eq!(count(&tab), 6);
+        tab.set_query(query(true));
+        // "apple" in lower case: Apple pie no, apple yes, Pineapple yes,
+        // apple yes, APPLE no, Apple no.
+        let found: Vec<String> = tab
+            .find
+            .matches
+            .iter()
+            .map(|(s, a)| format!("{s}{a}"))
+            .collect();
+        assert_eq!(found, ["0B2", "0C3", "1A1"]);
+        tab.set_whole_cell(true);
+        let found: Vec<String> = tab
+            .find
+            .matches
+            .iter()
+            .map(|(s, a)| format!("{s}{a}"))
+            .collect();
+        assert_eq!(found, ["0C3", "1A1"], "Pineapple is only part of its cell");
+        tab.set_query(query(false));
+        assert_eq!(count(&tab), 4, "whole cells, any case");
+        // A regular expression is anchored too.
+        tab.set_query(Query {
+            pattern: "app.e|banana".into(),
+            regex: true,
+            ..query(false)
+        });
+        assert_eq!(count(&tab), 4 + 1);
+        tab.set_whole_cell(false);
+        assert_eq!(count(&tab), 6 + 1);
+    }
+
+    #[test]
+    fn replace_all_in_a_workbook_is_one_undo_step() {
+        let mut tab = three_sheets();
+        tab.open_find(true);
+        tab.set_workbook_scope(true);
+        tab.set_query(Query {
+            pattern: "apple".into(),
+            ..Query::default()
+        });
+        tab.find.replacement = "pear".into();
+        let changes = tab.replace_all("en");
+        assert_eq!(changes.len(), 6);
+        assert_eq!(tab.find.replaced, Some(6));
+        assert!(tab.find.matches.is_empty());
+        let text = |tab: &SheetTab, sheet: usize, cell: &str| {
+            let book = tab.view.workbook();
+            book.sheets[sheet]
+                .cell(at(cell))
+                .map(|c| book.input_text(c))
+        };
+        assert_eq!(text(&tab, 0, "A1").as_deref(), Some("pear pie"));
+        assert_eq!(text(&tab, 0, "B2").as_deref(), Some("Pinepear"));
+        assert_eq!(text(&tab, 1, "A5").as_deref(), Some("pear"));
+        assert_eq!(text(&tab, 2, "B1").as_deref(), Some("pear"));
+        assert_eq!(text(&tab, 2, "D9").as_deref(), Some("banana"));
+        // One step brings every sheet back.
+        tab.undo();
+        assert_eq!(text(&tab, 0, "A1").as_deref(), Some("Apple pie"));
+        assert_eq!(text(&tab, 1, "A5").as_deref(), Some("APPLE"));
+        assert_eq!(text(&tab, 2, "B1").as_deref(), Some("Apple"));
+        tab.redo();
+        assert_eq!(text(&tab, 1, "A1").as_deref(), Some("pear"));
+        tab.undo();
+        assert_eq!(text(&tab, 1, "A1").as_deref(), Some("apple"));
+
+        // Replace one goes on to the next match, on another sheet.
+        tab.set_query(Query {
+            pattern: "banana".into(),
+            ..Query::default()
+        });
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (2, at("D9")));
+        tab.find.replacement = "cherry".into();
+        tab.set_query(Query {
+            pattern: "apple".into(),
+            ..Query::default()
+        });
+        tab.view.set_sheet(1);
+        tab.view.select(at("A5"));
+        tab.replace_one("en");
+        assert_eq!(text(&tab, 1, "A5").as_deref(), Some("cherry"));
+        assert_eq!((tab.view.sheet_index(), tab.view.selected()), (2, at("B1")));
+        assert_eq!(tab.find.current, Some(tab.find.matches.len() - 1));
+    }
+
+    #[test]
+    fn a_hundred_thousand_cells_are_searched_at_once() {
+        let mut sheet = aster_sheets::SheetBuilder::new("Big", aster_sheets::SheetKind::Worksheet);
+        for row in 0..10_000u32 {
+            for col in 0..10u32 {
+                let value = if (row * 10 + col) % 997 == 0 {
+                    aster_sheets::Value::Text(Arc::from(format!("needle {row}")))
+                } else {
+                    aster_sheets::Value::Number(f64::from(row * 10 + col))
+                };
+                sheet.push(row, aster_sheets::Cell::new(col, value));
+            }
+        }
+        let workbook = Workbook {
+            sheets: vec![sheet.finish()],
+            styles: vec![aster_sheets::CellStyle::default()],
+            ..Workbook::default()
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, Arc::new(Vec::new()), None, &tokens);
+        tab.open_find(false);
+        tab.set_workbook_scope(true);
+        let started = std::time::Instant::now();
+        tab.set_query(Query {
+            pattern: "needle".into(),
+            ..Query::default()
+        });
+        let search = started.elapsed();
+        assert_eq!(tab.find.matches.len(), 101);
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            tab.find_step(true);
+        }
+        let steps = started.elapsed();
+        // Generous for a debug build: 100,000 cells searched 51 times.
+        assert!(
+            search + steps < std::time::Duration::from_secs(20),
+            "{search:?} {steps:?}"
+        );
+        eprintln!("one search of 100,000 cells: {search:?}; 50 steps: {steps:?}");
     }
 
     #[test]

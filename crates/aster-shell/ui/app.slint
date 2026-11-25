@@ -232,6 +232,8 @@ export component AppWindow inherits Window {
     in property <bool> find-case;
     in property <bool> find-whole;
     in property <bool> find-regex;
+    in property <bool> find-whole-cell;
+    in property <bool> find-workbook;
     in property <bool> find-busy;
 
     // Geometry the Rust side needs to size its buffer and place the candidate window.
@@ -1475,6 +1477,9 @@ export component AppWindow inherits Window {
                         match-case: root.find-case;
                         whole-word: root.find-whole;
                         use-regex: root.find-regex;
+                        sheet-mode: root.viewer == 1;
+                        whole-cell: root.find-whole-cell;
+                        in-workbook: root.find-workbook;
                         busy: root.find-busy;
                         query-edited(text) => {
                             root.find-query-edited(text);

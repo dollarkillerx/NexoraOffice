@@ -100,6 +100,33 @@ component Toggle inherits Rectangle {
     }
 }
 
+// A small button that says what it does now, such as the part of a workbook
+// the search looks in; a click switches to the other.
+component ScopeButton inherits Rectangle {
+    in property <string> label;
+    in property <string> description;
+    callback clicked();
+    height: Tokens.control-height;
+    width: scope-text.preferred-width + 2 * Tokens.space-sm;
+    border-radius: Tokens.radius-md;
+    background: touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : Tokens.fill;
+    accessible-role: button;
+    accessible-label: root.description;
+    scope-text := Text {
+        text: root.label;
+        font-size: Tokens.font-sm;
+        color: Tokens.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 export component FindBar inherits Rectangle {
     in property <bool> replace-visible;
     in-out property <string> query;
@@ -110,6 +137,11 @@ export component FindBar inherits Rectangle {
     in property <bool> match-case;
     in property <bool> whole-word;
     in property <bool> use-regex;
+    // A workbook's find bar: the search can look in every sheet, and a
+    // match can be the whole content of a cell.
+    in property <bool> sheet-mode;
+    in property <bool> whole-cell;
+    in property <bool> in-workbook;
     // Replacing everything is running: the buttons wait.
     in property <bool> busy;
     callback query-edited(string);
@@ -117,7 +149,8 @@ export component FindBar inherits Rectangle {
     callback next();
     callback previous();
     callback close();
-    // 0 case, 1 whole word, 2 regular expression.
+    // 0 case, 1 whole word, 2 regular expression, 3 whole cell, 4 the
+    // search's scope: this sheet or the workbook.
     callback toggle(int);
     callback replace-one();
     callback replace-all();
@@ -240,12 +273,29 @@ export component FindBar inherits Rectangle {
                     }
                 }
 
+                if root.sheet-mode: Toggle {
+                    label: "[ab]";
+                    description: Strings.find-whole-cell;
+                    checked: root.whole-cell;
+                    toggled => {
+                        root.toggle(3);
+                    }
+                }
+
                 Toggle {
                     label: ".*";
                     description: Strings.find-regex;
                     checked: root.use-regex;
                     toggled => {
                         root.toggle(2);
+                    }
+                }
+
+                if root.sheet-mode: ScopeButton {
+                    label: root.in-workbook ? Strings.find-in-book : Strings.find-in-sheet;
+                    description: root.in-workbook ? Strings.find-in-book : Strings.find-in-sheet;
+                    clicked => {
+                        root.toggle(4);
                     }
                 }
 

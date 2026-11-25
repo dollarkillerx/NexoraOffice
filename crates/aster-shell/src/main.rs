@@ -3290,6 +3290,8 @@ fn refresh_find(ui: &AppWindow, shell: &mut Shell) {
         ui.set_find_case(find.query.case_sensitive);
         ui.set_find_whole(find.query.whole_word);
         ui.set_find_regex(find.query.regex);
+        ui.set_find_whole_cell(find.whole_cell);
+        ui.set_find_workbook(find.workbook);
         ui.set_find_error(find.error.is_some());
         ui.set_find_busy(false);
         ui.set_find_position(sheet_find_position(strings, find).into());
@@ -7069,9 +7071,19 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             match option {
                 0 => query.case_sensitive = !query.case_sensitive,
                 1 => query.whole_word = !query.whole_word,
+                3 => {
+                    let whole = !tab.find.whole_cell;
+                    tab.set_whole_cell(whole);
+                }
+                4 => {
+                    let book = !tab.find.workbook;
+                    tab.set_workbook_scope(book);
+                }
                 _ => query.regex = !query.regex,
             }
-            tab.set_query(query);
+            if !matches!(option, 3 | 4) {
+                tab.set_query(query);
+            }
             after_sheet_find(&ui, shell, Vec::new());
             return;
         }
@@ -8376,6 +8388,86 @@ mod ui_tests {
         type_text(ui, "=sumi");
         ui.invoke_hint_choose(1);
         assert_eq!(typed(&app).as_deref(), Some("=SUMIFS("));
+    }
+
+    #[test]
+    fn the_find_bar_looks_through_the_workbook_and_switches_sheets() {
+        let app = app();
+        let ui = &app.ui;
+        with_sheet(&app, |tab| {
+            let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+            tab.add_sheet("S");
+            tab.add_sheet("S");
+            for (sheet, cell, text) in [
+                (0, "A1", "Apple"),
+                (0, "B2", "apple pie"),
+                (1, "C3", "apple"),
+                (2, "A1", "APPLE"),
+            ] {
+                tab.view.set_sheet(sheet);
+                tab.type_cells(at(cell), &[vec![text.to_owned()]], "en");
+            }
+            tab.view.set_sheet(0);
+            tab.view.select(at("A1"));
+        });
+        {
+            let mut shell = app.shell.borrow_mut();
+            refresh_viewer(ui, &mut shell);
+        }
+        ui.invoke_menu_find();
+        assert!(ui.get_find_open());
+        ui.invoke_find_query_edited("apple".into());
+        // This sheet: two matches, the case ignored.
+        assert_eq!(ui.get_find_position(), "1 / 2");
+        assert!(!ui.get_find_workbook());
+        // The whole workbook: four, counted across the sheets.
+        ui.invoke_find_toggle(4);
+        assert!(ui.get_find_workbook());
+        assert_eq!(ui.get_find_position(), "1 / 4");
+        ui.invoke_find_next();
+        ui.invoke_find_next();
+        assert_eq!(ui.get_find_position(), "3 / 4");
+        assert_eq!(ui.get_sheet_index(), 1, "the second sheet is in front");
+        assert_eq!(ui.get_cell_address(), "C3");
+        ui.invoke_find_next();
+        assert_eq!(ui.get_sheet_index(), 2);
+        ui.invoke_find_next();
+        assert_eq!(
+            (ui.get_sheet_index(), ui.get_find_position().as_str()),
+            (0, "1 / 4")
+        );
+        ui.invoke_find_previous();
+        assert_eq!(ui.get_sheet_index(), 2);
+        // Match case and whole cell narrow it.
+        ui.invoke_find_toggle(0);
+        assert_eq!(ui.get_find_position().split(" / ").nth(1), Some("2"));
+        ui.invoke_find_toggle(0);
+        ui.invoke_find_toggle(3);
+        assert!(ui.get_find_whole_cell());
+        assert_eq!(ui.get_find_position().split(" / ").nth(1), Some("3"));
+        // Replace all, in every sheet, is one step.
+        ui.invoke_find_toggle(3);
+        ui.invoke_find_replacement_edited("pear".into());
+        ui.invoke_replace_all();
+        let texts = with_sheet(&app, |tab| {
+            let book = tab.view.workbook();
+            book.sheets
+                .iter()
+                .flat_map(|s| s.rows().iter().flat_map(|r| &r.cells))
+                .map(|c| book.input_text(c))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(texts, ["pear", "pear pie", "pear", "pear"]);
+        ui.invoke_edit_undo();
+        let texts = with_sheet(&app, |tab| {
+            let book = tab.view.workbook();
+            book.sheets
+                .iter()
+                .flat_map(|s| s.rows().iter().flat_map(|r| &r.cells))
+                .map(|c| book.input_text(c))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(texts, ["Apple", "apple pie", "apple", "APPLE"]);
     }
 
     /// A drag with the left button through `points` (window coordinates).

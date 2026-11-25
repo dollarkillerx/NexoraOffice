@@ -45,6 +45,13 @@ fn assert_contained(lines: &[String]) {
         "connect denied",
         "resolve denied",
         "spawn denied",
+        "procargs denied",
+        "proclist denied",
+        "stat denied",
+        "stat etc denied",
+        "readlink denied",
+        "list parent denied",
+        "iokit denied",
     ] {
         assert!(has(denied), "{denied} missing: {lines:?}");
     }

@@ -126,6 +126,23 @@ struct Drawn {
     version: u64,
 }
 
+/// The state of the view under which a page found no room.
+#[derive(Clone, Debug, PartialEq)]
+struct Pressure {
+    visible: std::ops::Range<usize>,
+    bytes: usize,
+    scale: u32,
+}
+
+impl Pressure {
+    /// Whether a page that found no room under `self` still finds none under
+    /// `now`: same pages on screen at the same scale, and they hold no less
+    /// than before (more pixels on screen only leave less room).
+    fn still_holds(&self, now: &Pressure) -> bool {
+        self.visible == now.visible && self.scale == now.scale && now.bytes >= self.bytes
+    }
+}
+
 pub struct PdfView {
     /// Page sizes in points, as shown.
     pages: Vec<(f32, f32)>,
@@ -152,10 +169,11 @@ pub struct PdfView {
     /// recently.
     clock: u64,
     budget: usize,
-    /// Pages next to the visible ones that found no room when they arrived,
-    /// with the bytes the visible ones held then: not asked for again until
-    /// that changes.
-    declined: HashMap<usize, usize>,
+    /// Pages next to the visible ones that found no room (when they arrived,
+    /// or when they were dropped to make room for another): not asked for
+    /// again until what is visible, the zoom or the bytes the visible pages
+    /// hold change. Bounded by the page count.
+    declined: HashMap<usize, Pressure>,
     /// The pixels were given up (background tab): the drawing buffers are
     /// made again at the next frame.
     released: bool,
@@ -279,8 +297,18 @@ impl PdfView {
     /// Drop the least recently drawn renderings until the budget holds. What
     /// is on screen stays, even if it alone is over the budget (a page is at
     /// most 16 Mpx, and few pages are on screen at once).
+    fn pressure(&self) -> Pressure {
+        Pressure {
+            visible: self.visible(),
+            bytes: self.visible_bytes(),
+            scale: (self.pixels_per_point() as f32).to_bits(),
+        }
+    }
+
     fn enforce_budget(&mut self) {
         let pages = self.visible();
+        let pressure = self.pressure();
+        let around = pages.start.saturating_sub(1)..(pages.end + 1).min(self.count());
         let strip = if self.shows_strip() {
             self.visible_thumbs()
         } else {
@@ -300,7 +328,14 @@ impl PdfView {
                 )
                 .min();
             match oldest {
-                Some((_, false, page)) => self.shots.remove(&page),
+                Some((_, false, page)) => {
+                    // Dropped for lack of room: asking again would only
+                    // push another page out, round after round.
+                    if around.contains(&page) {
+                        self.declined.insert(page, pressure.clone());
+                    }
+                    self.shots.remove(&page)
+                }
                 Some((_, true, page)) => self.thumbs.remove(&page),
                 None => break,
             };
@@ -755,9 +790,14 @@ impl PdfView {
         let current = self.current();
         let mut pages: Vec<usize> = around.collect();
         pages.sort_by_key(|p| p.abs_diff(current));
-        let on_screen = self.visible_bytes();
+        let pressure = self.pressure();
         for page in pages {
-            if self.failed.contains(&page) || self.declined.get(&page) == Some(&on_screen) {
+            if self.failed.contains(&page)
+                || self
+                    .declined
+                    .get(&page)
+                    .is_some_and(|d| d.still_holds(&pressure))
+            {
                 continue;
             }
             // A thumbnail made at this scale does as well.
@@ -867,8 +907,8 @@ impl PdfView {
         self.enforce_budget();
         if !self.shots.contains_key(&page) && !self.thumbs.contains_key(&page) {
             // No room beside what is on screen.
-            let on_screen = self.visible_bytes();
-            self.declined.insert(page, on_screen);
+            let pressure = self.pressure();
+            self.declined.insert(page, pressure);
         }
         self.version += 1;
         true
@@ -876,7 +916,7 @@ impl PdfView {
 
     /// A page that cannot be drawn: shown blank, not asked for again.
     pub fn mark_failed(&mut self, page: usize) {
-        if self.failed.insert(page) {
+        if page < self.count() && self.failed.insert(page) {
             self.version += 1;
         }
     }

@@ -15,9 +15,10 @@
 //! boundary against kernel bugs, and `sandbox_init` is deprecated by Apple
 //! (but is what Chromium, Firefox and others still use for their helpers;
 //! the supported route is an App Sandbox entitlement on the signed bundle,
-//! which cannot be set per child process). The profile still allows reading
-//! system metadata and the font directories, and using Mach services the
-//! frameworks may need.
+//! which cannot be set per child process). The profile allows nothing but
+//! reading below the font directories (see `PROFILE_BASE`); the IOKit
+//! registry's read-only entries can still be listed, which Seatbelt cannot
+//! stop.
 
 use std::path::{Path, PathBuf};
 
@@ -130,12 +131,21 @@ fn profile(read_dirs: &[&Path]) -> Result<String, String> {
     Ok(text)
 }
 
+// Nothing is allowed beyond reading below the font directories (added by
+// `profile`): by experiment the renderer, the budgeted allocator and the pipe
+// protocol need no sysctl, no metadata outside those directories, no Mach
+// service and no IOKit. `deny default` already refuses all of these, with one
+// exception found by the second review: it leaves `process-info-pidinfo`
+// open, which is what `sysctl(KERN_PROCARGS2)` checks, so any process's
+// arguments and environment could be read. The explicit `deny process-info*`
+// closes that (and the rest of the process-info family). Reading the IOKit
+// registry's names is not mediated by Seatbelt at all; opening any IOKit
+// user client is denied.
 #[cfg(any(target_os = "macos", test))]
 const PROFILE_BASE: &str = "\
 (version 1)
 (deny default)
-(allow sysctl-read)
-(allow file-read-metadata)
+(deny process-info*)
 ";
 
 /// Enter the sandbox. Irreversible; call it after the PDF is read and the
@@ -199,5 +209,9 @@ mod tests {
     fn profile_lists_the_directories() {
         let text = profile(&[Path::new("/fonts")]).unwrap();
         assert!(text.contains("(allow file-read* (subpath \"/fonts\"))"));
+        // Nothing else is allowed: no sysctl, no metadata of other paths.
+        assert!(!text.contains("sysctl"));
+        assert!(!text.contains("file-read-metadata"));
+        assert!(text.contains("(deny process-info*)"));
     }
 }

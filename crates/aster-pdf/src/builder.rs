@@ -176,3 +176,114 @@ pub fn exponential(depth: usize, fan: usize) -> Vec<u8> {
     );
     b.finish(catalog)
 }
+
+/// `pages` pages that all list the same content stream (`stream_dict` and
+/// `data`) `listed` times in an array.
+pub fn shared_content(pages: usize, listed: usize, stream_dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let tree = b.reserve();
+    let shared = b.stream(stream_dict, data);
+    let list = vec![format!("{shared} 0 R"); listed].join(" ");
+    let mut kids = String::new();
+    for _ in 0..pages {
+        let page = b.add(format!(
+            "<< /Type /Page /Parent {tree} 0 R /MediaBox [0 0 200 100] /Contents [{list}] >>"
+        ));
+        kids.push_str(&format!("{page} 0 R "));
+    }
+    b.set(
+        tree,
+        format!("<< /Type /Pages /Kids [{kids}] /Count {pages} >>"),
+    );
+    b.set(catalog, format!("<< /Type /Catalog /Pages {tree} 0 R >>"));
+    b.finish(catalog)
+}
+
+/// One page, and an object nothing refers to: arrays `depth` deep around a
+/// hex string of `digits` digits.
+pub fn nested_hex(depth: usize, digits: usize) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let tree = b.reserve();
+    let content = b.stream("", b"0 g 0 0 10 10 re f");
+    let page = b.add(format!(
+        "<< /Type /Page /Parent {tree} 0 R /MediaBox [0 0 200 100] /Contents {content} 0 R >>"
+    ));
+    let mut deep = "[".repeat(depth).into_bytes();
+    deep.push(b'<');
+    deep.extend(std::iter::repeat_n(b'a', digits));
+    deep.push(b'>');
+    deep.extend_from_slice("]".repeat(depth).as_bytes());
+    b.add(deep);
+    b.set(
+        tree,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    b.set(catalog, format!("<< /Type /Catalog /Pages {tree} 0 R >>"));
+    b.finish(catalog)
+}
+
+/// A document with a cross-reference stream whose object 6 lives in an
+/// object stream (object 5, not compressed): `inner` is the body of object
+/// 6. Object 4 is an ordinary content stream and the page's contents; the
+/// page also refers to object 6 as `/Extra`.
+pub fn with_object_stream(inner: &[u8]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut put = |out: &mut Vec<u8>, number: usize, body: &[u8]| {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    put(&mut out, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    put(&mut out, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    put(
+        &mut out,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R /Extra 6 0 R >>",
+    );
+    put(
+        &mut out,
+        4,
+        b"<< /Length 18 >>\nstream\n0 g 0 0 10 10 re f\nendstream",
+    );
+    let head = b"6 0 ";
+    let mut data = head.to_vec();
+    data.extend_from_slice(inner);
+    let body = [
+        format!(
+            "<< /Type /ObjStm /N 1 /First {} /Length {} >>\nstream\n",
+            head.len(),
+            data.len()
+        )
+        .into_bytes(),
+        data,
+        b"\nendstream".to_vec(),
+    ]
+    .concat();
+    put(&mut out, 5, &body);
+    let xref = out.len();
+    let mut table = Vec::new();
+    let mut entry = |kind: u8, a: u32, b: u16| {
+        table.push(kind);
+        table.extend_from_slice(&a.to_be_bytes());
+        table.extend_from_slice(&b.to_be_bytes());
+    };
+    entry(0, 0, 65535);
+    for offset in &offsets {
+        entry(1, *offset as u32, 0);
+    }
+    entry(2, 5, 0);
+    entry(1, xref as u32, 0);
+    let mut stream = format!(
+        "7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+        table.len()
+    )
+    .into_bytes();
+    stream.extend_from_slice(&table);
+    stream.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out.extend_from_slice(&stream);
+    out
+}

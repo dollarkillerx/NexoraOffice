@@ -1466,10 +1466,22 @@ hayro 自己限制了嵌套的深度：数组和字典 512 层，表单和图案
 - 渐变（shading）和函数的计算。
 - JBIG2、CCITT、JPEG 2000 解码器内部的行为。检查只看它们声称的尺寸。
 - 打成 `.app` 之后的程序里这些保护是否照样工作，还没有试过。
-- Linux 和 Windows 没有沙盒。
+- Linux 和 Windows 没有沙盒。被攻破的子进程拥有用户的全部权限，包括连上应用自己的 MCP 套接字。
 - 不经过 Rust 分配器拿的内存（系统库、字体加载等）不计入预算。
 - Seatbelt 不是挡内核漏洞的边界；`sandbox_init` 是 Apple 标为弃用的接口。
-- 沙盒允许读文件的元数据（`file-read-metadata`），所以子进程仍能知道某个路径是否存在、多大，但读不到内容。
+- macOS 的沙盒配置现在是：
+
+  ```
+  (version 1)
+  (deny default)
+  (deny process-info*)
+  (allow file-read* (subpath "/System/Library/Fonts"))
+  (allow file-read* (subpath "/Library/Fonts"))
+  ```
+
+  除了读字体目录，什么都不允许：不能读系统参数（sysctl），也就不能读父进程的环境变量和进程列表；除字体目录外，不能查看任何路径的元数据，`readlink` 也不行；不能打开 IOKit 的用户客户端。`deny default` 本来会放过 `process-info-pidinfo`（`KERN_PROCARGS2` 查的就是它），所以要明确写 `(deny process-info*)`。IOKit 注册表里只读条目的名字仍能列出来，Seatbelt 管不到这一项。这些都有自检测试盯着。
+- 每个文档请求过的缩放比例有上限，不会无限增长。
+- 同时开着好几个 PDF 时，只有两个子进程名额，名额可能在文档之间来回交换，每次切换都要重新打开文档。
 
 ### 新 crate 和依赖
 

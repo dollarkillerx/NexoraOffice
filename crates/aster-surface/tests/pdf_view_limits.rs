@@ -182,3 +182,90 @@ fn a_clamped_page_is_asked_for_at_a_scale_that_fits_the_screen() {
     assert!(view.wanted().is_empty(), "{:?}", view.wanted());
     assert!(view.pixel_bytes() < 16 << 20);
 }
+
+/// Like the real loop: everything wanted is rendered, in order, then a frame
+/// is drawn. Returns the number of inserts and what is still wanted.
+fn settle(view: &mut PdfView, pages: &[(f32, f32)], cap: u32, rounds: usize) -> (usize, usize) {
+    let mut inserts = 0;
+    for _ in 0..rounds {
+        let wanted = view.wanted();
+        if wanted.is_empty() {
+            return (inserts, 0);
+        }
+        for (page, scale) in wanted {
+            let (w, h, px) = render(pages, page, scale, cap);
+            view.insert(page, scale, w, h, px);
+            inserts += 1;
+            let _ = view.render();
+        }
+    }
+    (inserts, view.wanted().len())
+}
+
+#[test]
+fn wide_short_pages_zoomed_in_do_not_push_each_other_out_forever() {
+    use aster_surface::pdf_view::Zoom;
+    let pages = vec![(600.0f32, 100.0f32); 40];
+    let mut view = PdfView::new(pages.clone());
+    view.resize(2880, 1800, 2.0);
+    view.set_zoom(Zoom::Percent(800.0));
+    view.set_strip(false);
+    view.go_to(10);
+    // 9600 x 1600 pixels each, 61 MB: four fit the budget.
+    let (inserts, left) = settle(&mut view, &pages, 20_000, 100);
+    assert_eq!(left, 0, "still wanted after {inserts} inserts");
+    assert!(inserts <= 4 + 4, "{inserts} inserts");
+    assert!(view.pixel_bytes() <= PIXEL_BUDGET.max(view.visible_bytes()));
+}
+
+#[test]
+fn small_budgets_settle_for_pages_of_two_sizes() {
+    // The reviewer's search: neighbours bigger than the pages on screen.
+    let pages: Vec<(f32, f32)> = (0..60)
+        .map(|i| {
+            if i % 2 == 0 {
+                (300.0, 50.0)
+            } else {
+                (300.0, 2000.0)
+            }
+        })
+        .collect();
+    for at in [10usize, 11] {
+        let mut view = PdfView::new(pages.clone());
+        view.resize(2880, 1800, 2.0);
+        view.set_pixel_budget(24 << 20);
+        view.set_strip(false);
+        view.go_to(at);
+        let (inserts, left) = settle(&mut view, &pages, 8192, 100);
+        assert_eq!(left, 0, "at {at}: still wanted after {inserts} inserts");
+        assert!(inserts <= 8, "at {at}: {inserts} inserts");
+    }
+}
+
+#[test]
+fn a_failure_for_a_page_that_does_not_exist_is_ignored() {
+    let mut view = PdfView::new(vec![(612.0, 792.0); 3]);
+    view.resize(1000, 800, 1.0);
+    let before = view.wanted();
+    for page in [3, 4, 1_000_000, usize::MAX] {
+        view.mark_failed(page);
+    }
+    assert_eq!(view.wanted(), before);
+    // A real one still counts.
+    view.mark_failed(0);
+    assert!(view.wanted().iter().all(|(page, _)| *page != 0));
+}
+
+#[test]
+fn the_thumbnail_strip_does_not_keep_the_main_pages_churning() {
+    use aster_surface::pdf_view::Zoom;
+    let pages = vec![(600.0f32, 100.0f32); 40];
+    let mut view = PdfView::new(pages.clone());
+    view.resize(2880, 1800, 2.0);
+    view.set_zoom(Zoom::Percent(800.0));
+    view.go_to(10);
+    let (inserts, left) = settle(&mut view, &pages, 20_000, 100);
+    assert_eq!(left, 0, "still wanted after {inserts} inserts");
+    // Four main pages, plus the thumbnails on screen.
+    assert!(inserts <= 4 + 4 + 14, "{inserts} inserts");
+}

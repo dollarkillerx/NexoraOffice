@@ -2,7 +2,9 @@
 //! [`PdfView`]. The worker renders the pages the view asks for; nothing about
 //! the file is read on the window's thread.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use aster_pdf::{Event, Exceeded, Info, Limits, OpenError, Program, Worker};
 use aster_surface::pdf_view::{PdfStyle, PdfView, Zoom};
@@ -65,6 +67,119 @@ impl Asked {
 
     fn clear(&mut self) {
         self.0.clear();
+    }
+}
+
+/// Most rendered frames waiting for the window's thread, and their bytes. A
+/// worker that is keeping up never has more than a few; beyond this the
+/// oldest are dropped (the view asks for what it still needs).
+const MAILBOX_FRAMES: usize = 64;
+const MAILBOX_BYTES: usize = 256 << 20;
+/// Most page failures kept (also never more than the page count).
+const MAILBOX_FAILED: usize = 100_000;
+
+/// Where a worker's events wait for the window's thread. They are coalesced:
+/// one frame per page and scale (the newest), each failed page once, the
+/// latest of each kind of control event. However much the worker (or a child
+/// process behind it) sends, this holds a bounded amount, and only one
+/// wake-up of the event loop is pending at a time.
+#[derive(Default)]
+pub struct Mailbox {
+    state: Mutex<Inbox>,
+}
+
+#[derive(Default)]
+struct Inbox {
+    /// The page count, known once the file opened; pages before that, or
+    /// beyond it, are not kept.
+    pages: Option<usize>,
+    next: u64,
+    frames: BTreeMap<u64, aster_pdf::Rendered>,
+    by_page: HashMap<(usize, u32), u64>,
+    bytes: usize,
+    failed: BTreeSet<usize>,
+    opened: Option<Event>,
+    ended: Option<Event>,
+    /// A wake-up has been posted and not yet answered.
+    waking: bool,
+}
+
+impl Mailbox {
+    /// Take an event in. True if the caller must now post a wake-up.
+    pub fn push(&self, event: Event) -> bool {
+        let mut inbox = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            Event::Opened(info) => {
+                inbox.pages = Some(info.pages.len());
+                inbox.opened = Some(Event::Opened(info));
+            }
+            Event::Failed(_) | Event::Stopped => inbox.ended = Some(event),
+            Event::Page(frame) => {
+                if inbox.pages.is_none_or(|count| frame.page >= count) {
+                    return false;
+                }
+                let key = (frame.page, frame.scale.to_bits());
+                if let Some(old) = inbox.by_page.remove(&key)
+                    && let Some(old) = inbox.frames.remove(&old)
+                {
+                    inbox.bytes -= old.pixels.len();
+                }
+                inbox.bytes += frame.pixels.len();
+                let seq = inbox.next;
+                inbox.next += 1;
+                inbox.by_page.insert(key, seq);
+                inbox.frames.insert(seq, frame);
+                while inbox.frames.len() > 1
+                    && (inbox.frames.len() > MAILBOX_FRAMES || inbox.bytes > MAILBOX_BYTES)
+                {
+                    let Some((_, old)) = inbox.frames.pop_first() else {
+                        break;
+                    };
+                    inbox.bytes -= old.pixels.len();
+                    inbox.by_page.remove(&(old.page, old.scale.to_bits()));
+                }
+            }
+            Event::PageFailed(page) => {
+                let Some(count) = inbox.pages else {
+                    return false;
+                };
+                if page < count && inbox.failed.len() < MAILBOX_FAILED {
+                    inbox.failed.insert(page);
+                }
+            }
+        }
+        !std::mem::replace(&mut inbox.waking, true)
+    }
+
+    /// Everything waiting, in the order to handle it: the opening, frames
+    /// oldest first, failed pages, the end. Answers the wake-up.
+    pub fn drain(&self) -> Vec<Event> {
+        let mut inbox = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        inbox.waking = false;
+        let mut events = Vec::new();
+        events.extend(inbox.opened.take());
+        let frames = std::mem::take(&mut inbox.frames);
+        inbox.by_page.clear();
+        inbox.bytes = 0;
+        events.extend(frames.into_values().map(Event::Page));
+        events.extend(
+            std::mem::take(&mut inbox.failed)
+                .into_iter()
+                .map(Event::PageFailed),
+        );
+        events.extend(inbox.ended.take());
+        events
+    }
+
+    /// Entries held (frames, failed pages, control events), for tests.
+    #[cfg(test)]
+    fn held(&self) -> (usize, usize, usize) {
+        let inbox = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            inbox.frames.len(),
+            inbox.failed.len(),
+            usize::from(inbox.opened.is_some()) + usize::from(inbox.ended.is_some()),
+        )
     }
 }
 
@@ -300,6 +415,104 @@ mod tests {
         asked.send(&[(3, 1.0)]);
         asked.clear();
         assert!(asked.send(&[(3, 1.0)]));
+    }
+
+    fn opened(pages: usize) -> Event {
+        Event::Opened(Info {
+            pages: vec![
+                aster_pdf::PageSize {
+                    width: 612.0,
+                    height: 792.0
+                };
+                pages
+            ],
+            encrypted: false,
+        })
+    }
+
+    fn frame(page: usize, scale: f32, fill: u8) -> Event {
+        Event::Page(aster_pdf::Rendered {
+            page,
+            scale,
+            width: 2,
+            height: 2,
+            pixels: vec![fill; 16],
+        })
+    }
+
+    #[test]
+    fn the_mailbox_stays_bounded_under_a_flood() {
+        let mailbox = Mailbox::default();
+        // Before the opening nothing but control events is kept.
+        assert!(!mailbox.push(Event::PageFailed(0)));
+        assert!(!mailbox.push(frame(0, 1.0, 0)));
+        assert_eq!(mailbox.held(), (0, 0, 0));
+        assert!(mailbox.push(opened(50)));
+        let mut wakes = 0;
+        for i in 0..1_000_000usize {
+            // Half of them for pages that do not exist.
+            wakes += usize::from(mailbox.push(Event::PageFailed(i % 100)));
+        }
+        for i in 0..10_000usize {
+            wakes += usize::from(mailbox.push(frame(3, 1.0, (i % 251) as u8)));
+        }
+        // One wake-up was pending since the opening; no more were asked for.
+        assert_eq!(wakes, 0);
+        let (frames, failed, control) = mailbox.held();
+        assert_eq!((frames, failed, control), (1, 50, 1));
+        let events = mailbox.drain();
+        assert!(matches!(events[0], Event::Opened(_)));
+        let Event::Page(newest) = &events[1] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(newest.pixels[0], (9_999 % 251) as u8);
+        assert_eq!(events.len(), 2 + 50);
+        assert!(
+            events[2..]
+                .iter()
+                .all(|e| matches!(e, Event::PageFailed(p) if *p < 50))
+        );
+        // After the drain the next event asks for a wake-up again.
+        assert_eq!(mailbox.held(), (0, 0, 0));
+        assert!(mailbox.push(Event::Stopped));
+    }
+
+    #[test]
+    fn many_pages_and_scales_are_capped_and_the_newest_stay() {
+        let mailbox = Mailbox::default();
+        mailbox.push(opened(10_000));
+        for i in 0..5_000usize {
+            mailbox.push(frame(i, 1.0, 1));
+            mailbox.push(frame(i, 2.0 + i as f32, 2));
+        }
+        let (frames, ..) = mailbox.held();
+        assert!(frames <= MAILBOX_FRAMES, "{frames}");
+        let events = mailbox.drain();
+        let last = events.iter().rev().find_map(|e| match e {
+            Event::Page(f) => Some(f.page),
+            _ => None,
+        });
+        assert_eq!(last, Some(4_999));
+        // The same page at two scales (main and thumbnail) both arrive.
+        mailbox.push(frame(1, 1.0, 1));
+        mailbox.push(frame(1, 0.1, 2));
+        assert_eq!(mailbox.drain().len(), 2);
+        // A big frame is dropped for the bytes, the newest is always kept.
+        let big = |page| {
+            Event::Page(aster_pdf::Rendered {
+                page,
+                scale: 1.0,
+                width: 4096,
+                height: 4096,
+                pixels: vec![0; 4096 * 4096 * 4],
+            })
+        };
+        for page in 0..8 {
+            mailbox.push(big(page));
+        }
+        let (frames, ..) = mailbox.held();
+        assert!(frames <= MAILBOX_BYTES / (4096 * 4096 * 4), "{frames}");
+        assert!(matches!(mailbox.drain().last(), Some(Event::Page(f)) if f.page == 7));
     }
 
     #[test]

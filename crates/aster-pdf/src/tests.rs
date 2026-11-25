@@ -12,6 +12,7 @@ use hayro::RenderCache;
 
 use super::*;
 use crate::builder::{Builder, deflate, one_page, with_picture, zeros_deflated};
+use crate::check::DECODE_BUDGET;
 
 /// Run `f` on a thread with the child's stack, with a time limit.
 fn on_worker_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -744,8 +745,11 @@ fn a_bomb_written_directly_in_a_page_is_refused() {
 
 #[test]
 fn nesting_beyond_the_walk_is_refused_not_skipped() {
+    // Deep, with a stream at the bottom: refused. Without one nothing can
+    // hide in it, and the walk does not go in.
     let mut page = b"/Extra ".to_vec();
     page.extend_from_slice(&b"[".repeat(100));
+    page.extend_from_slice(&direct("", b"0 0"));
     page.extend_from_slice(&b"]".repeat(100));
     assert_eq!(open(page_with(&page)), UNCHECKED);
     let mut page = b"/Extra ".to_vec();
@@ -941,4 +945,106 @@ fn components_count_in_jpeg_pictures() {
                 /BitsPerComponent 8 /Filter /DCTDecode";
     assert_eq!(open(with_picture(dict, &jpeg(8))), IMAGE);
     assert!(open(with_picture(dict, &jpeg(3))).is_ok());
+}
+
+/// Run the check on `bytes` on the child's stack: the outcome, how many
+/// streams were decoded, and how long the check took.
+fn timed_check(
+    bytes: Vec<u8>,
+    limits: Limits,
+    budget: u64,
+) -> (Result<usize, crate::check::Refusal>, Duration) {
+    on_worker_thread(move || {
+        let pdf = hayro::hayro_syntax::Pdf::new_with_password(bytes, "").unwrap();
+        let start = std::time::Instant::now();
+        let outcome = crate::check::check_document_with(&pdf, &limits, budget);
+        (outcome, start.elapsed())
+    })
+}
+
+#[test]
+fn a_stream_shared_by_many_pages_is_decoded_once() {
+    // 500 pages list one stream that is 20 MB decoded; it used to be decoded
+    // again for every page.
+    let packed = zeros_deflated(20 << 20);
+    for listed in [1, 3] {
+        let bytes = crate::builder::shared_content(500, listed, "/Filter /FlateDecode", &packed);
+        let (outcome, time) = timed_check(bytes, Limits::default(), 64 << 20);
+        assert_eq!(outcome, Ok(1), "listed {listed} times");
+        assert!(time < Duration::from_secs(2), "{time:?}");
+    }
+    // The budget refuses the same file when it is too small.
+    let bytes = crate::builder::shared_content(500, 1, "/Filter /FlateDecode", &packed);
+    let (outcome, _) = timed_check(bytes, Limits::default(), 16 << 20);
+    assert_eq!(
+        outcome,
+        Err(crate::check::Refusal::Exceeded(Exceeded::Stream))
+    );
+}
+
+#[test]
+fn pages_listing_a_shared_stream_with_pictures_are_put_together_once() {
+    let content: &[u8] = b"q BI /W 1 /H 1 /BPC 8 /CS /G ID \x80 EI Q";
+    let bytes = crate::builder::shared_content(500, 2, "", content);
+    let (outcome, time) = timed_check(bytes, Limits::default(), 1 << 20);
+    assert_eq!(outcome, Ok(1));
+    assert!(time < Duration::from_secs(2), "{time:?}");
+}
+
+#[test]
+fn deep_nesting_costs_no_more_than_shallow() {
+    let digits = 32 << 20;
+    let mut times = Vec::new();
+    for depth in [1, 63] {
+        let bytes = crate::builder::nested_hex(depth, digits);
+        let (outcome, time) = timed_check(bytes, Limits::default(), DECODE_BUDGET);
+        assert!(outcome.is_ok(), "depth {depth}: {outcome:?}");
+        times.push(time);
+    }
+    assert!(
+        times[1] < times[0] * 4 + Duration::from_millis(100),
+        "depth 1 {:?}, depth 63 {:?}",
+        times[0],
+        times[1]
+    );
+}
+
+#[test]
+fn many_inline_bombs_in_one_stream_spend_the_budget() {
+    // Each picture inflates to 512 KB, under the ceiling for one stream.
+    let packed = zeros_deflated(512 << 10);
+    let mut content = Vec::new();
+    for _ in 0..100 {
+        content.extend_from_slice(b"BI /W 10 /H 10 /BPC 8 /CS /G /F /Fl ID ");
+        content.extend_from_slice(&packed);
+        content.extend_from_slice(b"\nEI\n");
+    }
+    let bytes = crate::builder::shared_content(1, 1, "", &content);
+    let (outcome, _) = timed_check(bytes.clone(), small_streams(), 16 << 20);
+    assert_eq!(
+        outcome,
+        Err(crate::check::Refusal::Exceeded(Exceeded::Stream))
+    );
+    let (outcome, _) = timed_check(bytes, small_streams(), 128 << 20);
+    assert!(outcome.is_ok(), "{outcome:?}");
+}
+
+#[test]
+fn a_bomb_inside_an_object_stream_is_refused() {
+    // The parser reads a stream written inside an object that lives in an
+    // object stream, from the decoded buffer of that object stream. The
+    // checks key what they have seen by the address of the bytes, which
+    // differs between buffers whatever the offsets are.
+    let bomb = hex(&zeros_deflated(8 << 20));
+    let mut inner = b"<< /Other ".to_vec();
+    inner.extend_from_slice(&direct("/Filter [/AHx /Fl]", &bomb));
+    inner.extend_from_slice(b" >>");
+    let bytes = crate::builder::with_object_stream(&inner);
+    assert_eq!(open_with(bytes, small_streams()), STREAM);
+    // Harmless content in the same place opens.
+    let mut inner = b"<< /Other ".to_vec();
+    inner.extend_from_slice(&direct("/Filter /AHx", b"0 0"));
+    inner.extend_from_slice(b" >>");
+    let bytes = crate::builder::with_object_stream(&inner);
+    assert!(open_with(bytes, small_streams()).is_ok());
 }

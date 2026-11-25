@@ -85,9 +85,10 @@ fn fake(script: &str) -> Program {
 }
 
 /// The frames the stand-in sends, as `printf` formats them: a one-page
-/// document of 200 x 100 points, and page 0 started.
-const FAKE_OPENED: &str =
-    r"printf 'O\001\000\000\000\000\000\110\103\000\000\310\102\000'; printf 'S\000\000\000\000';";
+/// document of 200 x 100 points.
+const FAKE_OPENED: &str = r"printf 'O\001\000\000\000\000\000\110\103\000\000\310\102\000';";
+/// Page 0 started (only after it was asked for: anything else is refused).
+const FAKE_STARTED: &str = r"printf 'S\000\000\000\000';";
 /// Wait until the start frame (53 bytes) and a request for one page (13)
 /// have arrived.
 const FAKE_WAIT_FOR_WANT: &str = "head -c 60 >/dev/null;";
@@ -352,7 +353,7 @@ fn a_page_too_thin_to_draw_fails_without_ending_the_child() {
 /// A child that sends a page larger than it should, or one that was not
 /// asked for, is ended like one that crashed.
 fn lying_child(page: &str) -> String {
-    format!("{FAKE_OPENED} {FAKE_WAIT_FOR_WANT} printf '{page}'; exec sleep 30")
+    format!("{FAKE_OPENED} {FAKE_WAIT_FOR_WANT} {FAKE_STARTED} printf '{page}'; exec sleep 30")
 }
 
 #[test]
@@ -364,8 +365,9 @@ fn a_page_larger_than_asked_for_is_refused_before_its_pixels() {
     assert!(matches!(next(&events), Event::Opened(_)));
     let pid = worker.child_id();
     worker.want(vec![(0, 1.0)]);
-    assert!(matches!(next(&events), Event::PageFailed(0)));
     wait_until("the child is still running", 5, || !alive(pid));
+    // The page is not blamed: it is asked again, until the tab stops.
+    assert!(matches!(next(&events), Event::Stopped));
 }
 
 #[test]
@@ -377,8 +379,9 @@ fn a_page_at_a_scale_that_was_not_asked_for_is_refused() {
     assert!(matches!(next(&events), Event::Opened(_)));
     let pid = worker.child_id();
     worker.want(vec![(0, 1.0)]);
-    assert!(matches!(next(&events), Event::PageFailed(0)));
     wait_until("the child is still running", 5, || !alive(pid));
+    // The page is not blamed: it is asked again, until the tab stops.
+    assert!(matches!(next(&events), Event::Stopped));
 }
 
 // L1: the child does not outlive its parent.
@@ -490,7 +493,7 @@ fn a_child_that_hangs_when_opened_again_stops_the_tab() {
     // First time: opens, takes a request, and ends in the middle of a page.
     // The second time it says nothing at all.
     let script = format!(
-        "if [ -e '{m}' ]; then exec sleep 60; fi; : > '{m}'; {FAKE_OPENED} {FAKE_WAIT_FOR_WANT} exit 1",
+        "if [ -e '{m}' ]; then exec sleep 60; fi; : > '{m}'; {FAKE_OPENED} {FAKE_WAIT_FOR_WANT} {FAKE_STARTED} exit 1",
         m = marker.display()
     );
     let limits = Limits {
@@ -650,4 +653,359 @@ fn the_default_memory_is_a_quarter_of_the_machine_at_most_3_gib() {
         let ram: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
         assert_eq!(memory, (3u64 << 30).min(ram / 4));
     }
+}
+
+// A compromised child: whatever it sends, the parent's memory stays bounded
+// and the child does not outlive its tab.
+
+const PYTHON: &str = "/usr/bin/python3";
+
+/// A child that speaks the protocol (three pages of 1000 x 1000 points) and
+/// then misbehaves as `argv[1]` says.
+const EVIL_CHILD: &str = r#"
+import sys, struct, time, os
+mode = sys.argv[1]
+marker = None
+if "=" in mode:
+    mode, marker = mode.split("=", 1)
+inp = sys.stdin.buffer
+out = sys.stdout.buffer
+def read(n):
+    b = b""
+    while len(b) < n:
+        c = inp.read(n - len(b))
+        if not c: sys.exit(0)
+        b += c
+    return b
+def started(p): out.write(b"S" + struct.pack("<I", p))
+def page(p, scale, w, h, body):
+    out.write(b"P" + struct.pack("<IfII", p, scale, w, h)); out.write(body)
+assert read(1) == b"K"
+(n,) = struct.unpack("<I", read(4)); read(n); read(48)
+out.write(b"O" + struct.pack("<I", 3) + struct.pack("<ff", 1000.0, 1000.0) * 3 + b"\0"); out.flush()
+while True:
+    assert read(1) == b"W"
+    (count,) = struct.unpack("<I", read(4))
+    entries = [struct.unpack("<If", read(8)) for _ in range(count)]
+    if entries: break
+if mode == "failed":
+    i = 0
+    while True:
+        out.write(b"".join(b"X" + struct.pack("<I", (i + k) & 0xffffffff) for k in range(100000)))
+        out.flush(); i += 100000
+elif mode == "failed_started":
+    started(0)
+    while True:
+        out.write(b"X" + struct.pack("<I", 0) * 1000); out.flush()
+elif mode == "pages":
+    p, scale = entries[0]
+    w = h = int(1000 * scale)
+    frame = b"P" + struct.pack("<IfII", p, scale, w, h) + b"\x7f" * (w * h * 4)
+    while True:
+        out.write(frame); out.flush()
+elif mode == "twice":
+    p, scale = entries[0]
+    w = h = int(1000 * scale)
+    body = b"\x7f" * (w * h * 4)
+    while True:
+        started(p); page(p, scale, w, h, body); out.flush()
+elif mode == "valid":
+    body = b"\x7f" * (2000 * 2000 * 4)
+    for p, scale in entries:
+        started(p); page(p, scale, 2000, 2000, body); out.flush()
+elif mode == "old":
+    # Honest: answers the first request only after a newer one with page 2.
+    p, scale = entries[0]
+    open(marker, "w").close()
+    while not any(q == 2 for q, _ in entries):
+        assert read(1) == b"W"
+        (count,) = struct.unpack("<I", read(4))
+        entries = [struct.unpack("<If", read(8)) for _ in range(count)]
+    started(p); page(p, scale, 10, 10, b"\0" * 400); out.flush()
+elif mode == "garbage_once":
+    p, scale = entries[0]
+    started(p)
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        out.write(b"X" + struct.pack("<I", 2)); out.flush()
+    else:
+        page(p, scale, 10, 10, b"\0" * 400); out.flush()
+elif mode == "start_range":
+    started(99); out.flush()
+elif mode == "start_unasked":
+    started(1); out.flush()
+elif mode == "page_range":
+    page(99, 1.0, 10, 10, b"\0" * 400); out.flush()
+elif mode == "failed_unasked":
+    started(0); out.write(b"X" + struct.pack("<I", 2)); out.flush()
+time.sleep(60)
+"#;
+
+fn rss_mb() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        >> 10
+}
+
+/// Only one flood at a time: they measure the memory of the whole process.
+static FLOODS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Open a worker whose child is `python3 <script> <mode>`; `None` when there
+/// is no python.
+fn open_evil(
+    script: &std::path::Path,
+    mode: &str,
+    slow: Duration,
+) -> Option<(Worker, Receiver<Event>, tempfile::TempDir)> {
+    if !std::path::Path::new(PYTHON).exists() {
+        eprintln!("skipped: no {PYTHON}");
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.pdf");
+    std::fs::write(&path, b"%PDF-1.7").unwrap();
+    let program = Program {
+        executable: PathBuf::from(PYTHON),
+        arguments: vec!["-I".into(), script.into(), mode.into()],
+    };
+    let (send, receive) = mpsc::channel();
+    let worker = Worker::open_in(
+        &alone(),
+        program,
+        path,
+        String::new(),
+        Limits::default(),
+        move |event| {
+            if !slow.is_zero() {
+                std::thread::sleep(slow);
+            }
+            let _ = send.send(event);
+        },
+    );
+    Some((worker, receive, dir))
+}
+
+fn evil_script(dir: &tempfile::TempDir) -> PathBuf {
+    let script = dir.path().join("evil.py");
+    std::fs::write(&script, EVIL_CHILD).unwrap();
+    script
+}
+
+/// Drain events until `Stopped`, counting them; the child of the first
+/// start must be gone by then.
+fn until_stopped(events: &Receiver<Event>) -> (u64, u64) {
+    let (mut all, mut pages) = (0, 0);
+    loop {
+        match events
+            .recv_timeout(Duration::from_secs(60))
+            .expect("never stopped")
+        {
+            Event::Stopped => return (all + 1, pages),
+            Event::Page(_) => {
+                all += 1;
+                pages += 1;
+            }
+            _ => all += 1,
+        }
+    }
+}
+
+#[test]
+fn a_child_flooding_page_failures_is_killed_at_once() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let Some((worker, events, _dir)) =
+        open_evil(std::path::Path::new(repo_fake), "failed", Duration::ZERO)
+    else {
+        return;
+    };
+    drop(tmp);
+    let before = rss_mb();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let began = Instant::now();
+    let pid = worker.child_id();
+    worker.want(vec![(0, 4.0)]);
+    wait_until("the flooding child was not killed", 2, || !alive(pid));
+    let killed_after = began.elapsed();
+    let (count, pages) = until_stopped(&events);
+    let growth = rss_mb().saturating_sub(before);
+    eprintln!(
+        "[failed flood] killed after {killed_after:?}, {count} events up to Stopped, RSS growth {growth} MB"
+    );
+    assert_eq!(pages, 0);
+    assert!(count < 50, "{count} events");
+    assert!(growth < 300, "RSS grew by {growth} MB");
+    wait_until("a child is left", 5, || worker.child_id() == 0);
+}
+
+#[test]
+fn a_child_flooding_pages_is_killed_at_once() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    // The repository's fake: answers without having started, and the same
+    // request again and again.
+    let repo_fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake/fake_child.py");
+    let Some((worker, events, _dir)) = open_evil(
+        std::path::Path::new(repo_fake),
+        "pages",
+        Duration::from_millis(30),
+    ) else {
+        return;
+    };
+    let before = rss_mb();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let began = Instant::now();
+    let pid = worker.child_id();
+    worker.want(vec![(0, 4.0)]);
+    wait_until("the flooding child was not killed", 2, || !alive(pid));
+    let killed_after = began.elapsed();
+    let (count, pages) = until_stopped(&events);
+    let growth = rss_mb().saturating_sub(before);
+    eprintln!(
+        "[pages flood] killed after {killed_after:?}, {count} events up to Stopped ({pages} pages), RSS growth {growth} MB"
+    );
+    assert_eq!(pages, 0);
+    assert!(growth < 300, "RSS grew by {growth} MB");
+}
+
+#[test]
+fn a_request_answered_twice_ends_the_child() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let script = evil_script(&tmp);
+    let Some((worker, events, _dir)) = open_evil(&script, "twice", Duration::from_millis(30))
+    else {
+        return;
+    };
+    let before = rss_mb();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let began = Instant::now();
+    let pid = worker.child_id();
+    // A page of 1000 x 1000 points at 4: 64 MB, answered legally once.
+    worker.want(vec![(0, 4.0)]);
+    wait_until("the child was not killed", 5, || !alive(pid));
+    let killed_after = began.elapsed();
+    let (count, pages) = until_stopped(&events);
+    let growth = rss_mb().saturating_sub(before);
+    eprintln!(
+        "[answered twice] killed after {killed_after:?}, {count} events up to Stopped ({pages} pages), RSS growth {growth} MB"
+    );
+    // One page per child at most, and the tab stops after the restarts.
+    assert!(pages <= 10, "{pages} pages");
+    assert!(growth < 300, "RSS grew by {growth} MB");
+}
+
+#[test]
+fn dropping_the_worker_ends_a_child_that_floods_valid_pages() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let script = evil_script(&tmp);
+    // A busy consumer, and a child with 300 legal answers of 16 MB (4.8 GB
+    // in all) ready to send.
+    let Some((worker, events, _dir)) = open_evil(&script, "valid", Duration::from_millis(100))
+    else {
+        return;
+    };
+    let before = rss_mb();
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.want((0..300).map(|k| (0, 2.0 + k as f32 * 0.001)).collect());
+    let mut taken = 0;
+    while taken < 4 {
+        if matches!(next(&events), Event::Page(_)) {
+            taken += 1;
+        }
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let during = rss_mb().saturating_sub(before);
+    let dropped = Instant::now();
+    drop(worker);
+    wait_until("the child outlived its tab", 2, || !alive(pid));
+    eprintln!(
+        "[valid flood] RSS growth while flooding {during} MB, child gone {:?} after the drop",
+        dropped.elapsed()
+    );
+    assert!(during < 300, "RSS grew by {during} MB");
+}
+
+#[test]
+fn an_answer_for_a_page_that_does_not_exist_or_was_not_asked_for_ends_the_child() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let script = evil_script(&tmp);
+    for mode in [
+        "start_range",
+        "start_unasked",
+        "page_range",
+        "failed_unasked",
+    ] {
+        let Some((worker, events, _dir)) = open_evil(&script, mode, Duration::ZERO) else {
+            return;
+        };
+        assert!(matches!(next(&events), Event::Opened(_)), "{mode}");
+        let pid = worker.child_id();
+        // Only page 0 is asked for.
+        worker.want(vec![(0, 1.0)]);
+        wait_until(&format!("{mode}: the child was not killed"), 2, || {
+            !alive(pid)
+        });
+        if mode == "failed_started" {
+            // Its first failure was a legal one: reported, and the next
+            // child has nothing to render.
+            assert!(matches!(next(&events), Event::PageFailed(0)), "{mode}");
+        } else {
+            let (_, pages) = until_stopped(&events);
+            assert_eq!(pages, 0, "{mode}");
+        }
+    }
+}
+
+#[test]
+fn an_honest_answer_to_an_old_request_is_not_refused() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let script = evil_script(&tmp);
+    let read = tmp.path().join("read");
+    let mode = format!("old={}", read.display());
+    let Some((worker, events, _dir)) = open_evil(&script, &mode, Duration::ZERO) else {
+        return;
+    };
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.want(vec![(0, 1.0)]);
+    // The child has the first request before the newer ones come.
+    wait_until("the child did not read the request", 5, || read.exists());
+    // Forty newer requests, then the one that makes the child answer.
+    for k in 0..40 {
+        worker.want(vec![(1, 1.0 + k as f32 * 0.01)]);
+    }
+    worker.want(vec![(2, 1.0)]);
+    assert!(matches!(next(&events), Event::Page(p) if p.page == 0));
+    assert!(alive(pid), "the honest child was killed");
+    assert_eq!(worker.child_id(), pid);
+}
+
+#[test]
+fn a_child_that_lied_does_not_make_its_page_fail() {
+    let _lock = FLOODS.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let script = evil_script(&tmp);
+    let marker = tmp.path().join("lied");
+    let mode = format!("garbage_once={}", marker.display());
+    let Some((worker, events, _dir)) = open_evil(&script, &mode, Duration::ZERO) else {
+        return;
+    };
+    assert!(matches!(next(&events), Event::Opened(_)));
+    let pid = worker.child_id();
+    worker.want(vec![(0, 1.0)]);
+    // The first child answers with garbage while on page 0 and is killed;
+    // the page is asked of the next, which draws it.
+    assert!(matches!(next(&events), Event::Page(p) if p.page == 0));
+    wait_until("the first child is still there", 2, || !alive(pid));
 }

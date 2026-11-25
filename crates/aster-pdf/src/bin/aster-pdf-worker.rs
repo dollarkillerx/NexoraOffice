@@ -104,5 +104,99 @@ fn selftest(path: Option<&std::ffi::OsString>, with_fonts: bool) -> i32 {
         "spawn allowed",
         "spawn denied",
     );
+    // What the profile used to allow and must not: the environment and the
+    // process list through sysctl, metadata of paths outside the font
+    // directories, readlink, the IOKit user clients.
+    // SAFETY (all unsafe below): plain system calls with buffers we own.
+    #[cfg(target_os = "macos")]
+    {
+        let parent = unsafe { libc::getppid() };
+        let sysctl_size = |mib: &mut [libc::c_int]| -> bool {
+            let mut size: libc::size_t = 1 << 16;
+            let mut buf = vec![0u8; size];
+            let result = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    buf.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            result == 0
+        };
+        verdict(
+            sysctl_size(&mut [libc::CTL_KERN, libc::KERN_PROCARGS2, parent]),
+            "procargs allowed",
+            "procargs denied",
+        );
+        verdict(
+            sysctl_size(&mut [libc::CTL_KERN, libc::KERN_PROCARGS2, unsafe {
+                libc::getpid()
+            }]),
+            "own procargs allowed",
+            "own procargs denied",
+        );
+        verdict(
+            sysctl_size(&mut [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL, 0]),
+            "proclist allowed",
+            "proclist denied",
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        verdict(
+            std::fs::metadata(format!("{home}/Library/Keychains/login.keychain-db")).is_ok(),
+            "stat allowed",
+            "stat denied",
+        );
+        verdict(
+            std::fs::metadata("/etc").is_ok(),
+            "stat etc allowed",
+            "stat etc denied",
+        );
+        verdict(
+            std::fs::read_link("/etc").is_ok(),
+            "readlink allowed",
+            "readlink denied",
+        );
+        verdict(
+            std::fs::read_dir("/Library/Fonts/..").is_ok(),
+            "list parent allowed",
+            "list parent denied",
+        );
+        verdict(iokit_open(), "iokit allowed", "iokit denied");
+    }
     0
+}
+
+/// Try to open IOKit user clients (the surface and the GPU); true if any
+/// of them opens.
+#[cfg(target_os = "macos")]
+fn iokit_open() -> bool {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_uint, c_void};
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main: c_uint, matching: *mut c_void) -> c_uint;
+        fn IOServiceOpen(service: c_uint, task: c_uint, kind: u32, conn: *mut c_uint) -> c_int;
+    }
+    unsafe extern "C" {
+        static mach_task_self_: c_uint;
+    }
+    let mut opened = false;
+    for class in ["IOSurfaceRoot", "AGXAccelerator", "IOHIDSystem"] {
+        let name = CString::new(class).unwrap();
+        // SAFETY: IOKit calls with valid arguments; a zero service is
+        // rejected by IOServiceOpen.
+        unsafe {
+            let service = IOServiceGetMatchingService(0, IOServiceMatching(name.as_ptr()));
+            let mut connection: c_uint = 0;
+            if service != 0 && IOServiceOpen(service, mach_task_self_, 0, &mut connection) == 0 {
+                opened = true;
+            }
+        }
+    }
+    opened
 }

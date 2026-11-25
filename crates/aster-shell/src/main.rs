@@ -4096,11 +4096,22 @@ fn start_pdf(ui: &AppWindow, shell: &mut Shell, path: PathBuf, password: String)
     let token = shell.next_pdf_token;
     shell.next_pdf_token += 1;
     let weak = ui.as_weak();
+    // Events wait in a mailbox, coalesced; at most one wake-up of the event
+    // loop is pending, however fast the worker reports.
+    let mailbox = std::sync::Arc::new(pdf::Mailbox::default());
     let worker = pdf::open(path.clone(), password, move |event| {
+        if !mailbox.push(event) {
+            return;
+        }
+        let mailbox = mailbox.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             deliver(
                 ui,
-                Box::new(move |ui, shell| pdf_event(ui, shell, token, event)),
+                Box::new(move |ui, shell| {
+                    for event in mailbox.drain() {
+                        pdf_event(ui, shell, token, event);
+                    }
+                }),
             );
         });
     });

@@ -425,7 +425,8 @@ fn legend_entries(chart: &DrawnChart, texts: &ChartTexts<'_>) -> Vec<Entry> {
             out.push(Entry {
                 text: name_of(series, texts),
                 color: series.color,
-                line: matches!(plot.kind, PlotKind::Line { .. } | PlotKind::Scatter),
+                line: matches!(plot.kind, PlotKind::Line { .. })
+                    || (matches!(plot.kind, PlotKind::Scatter) && !series.no_line),
             });
         }
     }
@@ -510,7 +511,7 @@ pub(crate) fn render_chart(
         .iter()
         .find(|plot| matches!(plot.kind, PlotKind::Pie { .. }));
     if let Some(plot) = pie {
-        draw_pie(&mut p, plot, area, background);
+        draw_pie(&mut p, plot, area, background, text_color);
     } else {
         draw_axes_chart(&mut p, chart, area, style, text_color, label_color);
     }
@@ -633,12 +634,24 @@ fn draw_legend(
     }
 }
 
-fn draw_pie(p: &mut Painter<'_>, plot: &DrawnPlot, area: Rect, background: Rgba8) {
+fn draw_pie(
+    p: &mut Painter<'_>,
+    plot: &DrawnPlot,
+    area: Rect,
+    background: Rgba8,
+    text_color: Rgba8,
+) {
     let s = p.s();
     let PlotKind::Pie { hole, first_angle } = plot.kind else {
         return;
     };
-    let radius = (area.width().min(area.height()) / 2.0 - 4.0 * s).max(4.0);
+    // Room for labels outside the slices that are too narrow for one.
+    let labelled = plot
+        .series
+        .iter()
+        .any(|x| x.labels.value || x.labels.percent || x.labels.category);
+    let room = if labelled { 0.8 } else { 1.0 };
+    let radius = ((area.width().min(area.height()) / 2.0 - 4.0 * s) * room).max(4.0);
     let center = Point::new((area.x0 + area.x1) / 2.0, (area.y0 + area.y1) / 2.0);
     // A pie has one ring; a doughnut one per series.
     let rings: Vec<&DrawnSeries> = if hole.is_some() {
@@ -675,7 +688,7 @@ fn draw_pie(p: &mut Painter<'_>, plot: &DrawnPlot, area: Rect, background: Rgba8
             }
             // A label at the middle of the slice.
             let wants = series.labels.value || series.labels.percent || series.labels.category;
-            if wants && labels_drawn < MAX_DATA_LABELS && sweep > 0.12 {
+            if wants && labels_drawn < MAX_DATA_LABELS {
                 let mut parts: Vec<String> = Vec::new();
                 if series.labels.category
                     && let Some((_, name)) = plot
@@ -692,16 +705,31 @@ fn draw_pie(p: &mut Painter<'_>, plot: &DrawnPlot, area: Rect, background: Rgba8
                     parts.push(format!("{:.0}%", v / total * 100.0));
                 }
                 let middle = angle + sweep / 2.0;
-                let r = (outer + inner) / 2.0 * if inner > 0.0 { 1.0 } else { 0.68 };
+                // Inside a wide slice or a ring; outside a narrow one.
+                let inside = inner > 0.0 || sweep > 0.5;
+                let r = if inside {
+                    (outer + inner) / 2.0 * if inner > 0.0 { 1.0 } else { 0.68 }
+                } else {
+                    outer + 6.0 * s
+                };
                 let at = Point::new(center.x + r * middle.cos(), center.y + r * middle.sin());
-                let on = if luminance(color) > 0.5 {
+                let on = if !inside {
+                    text_color
+                } else if luminance(color) > 0.5 {
                     [0x26, 0x26, 0x26, 0xff]
                 } else {
                     [0xff; 4]
                 };
                 let label = p.text(&parts.join(" "), 11.0, false, on);
                 let (lw, lh) = (f64::from(label.width()), f64::from(label.height()));
-                p.put(&label, at.x - lw / 2.0, at.y - lh / 2.0);
+                let x = if inside {
+                    at.x - lw / 2.0
+                } else if middle.cos() >= 0.0 {
+                    at.x
+                } else {
+                    at.x - lw
+                };
+                p.put(&label, x, at.y - lh / 2.0);
                 labels_drawn += 1;
             }
             angle += sweep;
@@ -760,7 +788,24 @@ fn draw_axes_chart(
     });
     // Scales of the value axes (and of x for a scatter chart).
     let (ylo, yhi) = extent(&primary, false).unwrap_or((0.0, 1.0));
-    let y_scale = nice_scale(ylo, yhi, chart.y.as_ref(), true);
+    let mut y_scale = nice_scale(ylo, yhi, chart.y.as_ref(), true);
+    if percent {
+        // A percent stack always runs from nothing to the whole, unless
+        // the file says otherwise.
+        let axis = chart.y.as_ref();
+        y_scale = Scale {
+            lo: axis.and_then(|a| a.min).unwrap_or(0.0),
+            hi: axis.and_then(|a| a.max).unwrap_or(1.0),
+            step: axis.and_then(|a| a.major_unit).unwrap_or(0.1),
+            reversed: axis.is_some_and(|a| a.reversed),
+        };
+        if y_scale.hi <= y_scale.lo
+            || y_scale.step <= 0.0
+            || (y_scale.hi - y_scale.lo) / y_scale.step > 100.0
+        {
+            y_scale = nice_scale(ylo, yhi, None, true);
+        }
+    }
     let x_scale = scatter.then(|| {
         let (lo, hi) = extent(&primary, true).unwrap_or((0.0, 1.0));
         nice_scale(lo, hi, chart.x.as_ref(), true)

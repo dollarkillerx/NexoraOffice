@@ -51,6 +51,32 @@ fn char_at(page: usize, i: usize) -> (f64, f64) {
     at(page, x, y)
 }
 
+#[test]
+fn copied_text_has_no_spaces_at_line_ends() {
+    // Lines padded with spaces that have boxes, like a printed text file.
+    let text = "ab    \ncd   ";
+    let boxes = text
+        .chars()
+        .enumerate()
+        .map(|(i, c)| (c != '\n').then_some([i as f32 * 10.0, 10.0, i as f32 * 10.0 + 10.0, 30.0]))
+        .collect();
+    let mut view = PdfView::new(vec![(400.0, 300.0)]);
+    view.resize(1000, 800, 1.0);
+    view.set_zoom(Zoom::Percent(100.0));
+    assert!(view.set_text(
+        0,
+        TextLayer {
+            text: text.to_string(),
+            boxes
+        }
+    ));
+    let (x, y) = at(0, 5.0, 20.0);
+    view.press_text(x, y, 1);
+    let (x, y) = at(0, 85.0, 20.0);
+    assert!(view.drag_text(x, y));
+    assert_eq!(view.selected_text(), "ab\ncd");
+}
+
 fn px(p: &Pixmap, x: f64, y: f64) -> [u8; 3] {
     let c = p.sample(x as u16, y as u16);
     [c.r, c.g, c.b]

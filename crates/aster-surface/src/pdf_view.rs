@@ -881,6 +881,12 @@ impl PdfView {
                     piece.push(c);
                 }
             }
+            // No spaces before a line break or at the end of the piece.
+            let piece = piece
+                .split('\n')
+                .map(|line| line.trim_end_matches(' '))
+                .collect::<Vec<_>>()
+                .join("\n");
             if piece.is_empty() {
                 continue;
             }

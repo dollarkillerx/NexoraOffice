@@ -87,6 +87,7 @@ impl Document {
                 last_run: Vec::new(),
             };
             interpret_page(page_ref, &mut context, &mut collector);
+            collector.trim_spaces();
             (collector.text, collector.boxes)
         }))
         .map_err(|_| ())?;
@@ -133,13 +134,19 @@ impl Collector<'_> {
         true
     }
 
-    /// Put a line break in, in place of spaces that end the line.
-    fn newline(&mut self) -> bool {
-        while self.text.ends_with(' ') && matches!(self.boxes.last(), Some(None)) {
+    /// Drop the spaces at the end of the text, whether put in for a gap or
+    /// drawn as glyphs (a text file printed to PDF pads its lines with them).
+    fn trim_spaces(&mut self) {
+        while self.text.ends_with(' ') {
             self.text.pop();
             self.boxes.pop();
             self.chars -= 1;
         }
+    }
+
+    /// Put a line break in, in place of spaces that end the line.
+    fn newline(&mut self) -> bool {
+        self.trim_spaces();
         if self.text.is_empty() || self.text.ends_with('\n') {
             return true;
         }
@@ -592,6 +599,22 @@ mod tests {
         for pair in first.windows(2) {
             assert!(pair[1][0] >= pair[0][0]);
         }
+    }
+
+    #[test]
+    fn drawn_spaces_at_the_end_of_a_line_are_dropped() {
+        // Lines padded with real space glyphs, as a text file printed to PDF
+        // does; spaces inside a line stay.
+        let t = text_of(text_page(
+            "0 0 300 100",
+            "",
+            b"BT /F1 12 Tf 10 80 Td (one two      ) Tj 0 -20 Td (three    ) Tj \
+              0 -20 Td (four   ) Tj ET",
+        ));
+        assert_eq!(t.text, "one two\nthree\nfour");
+        assert_eq!(t.boxes.len(), t.text.chars().count());
+        assert!(t.boxes[..7].iter().all(|b| b.is_some() || *b == t.boxes[3]));
+        assert_eq!(t.boxes[7], None);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice, FilterChoice } from "tokens.slint";
 import { FilterList } from "filter_list.slint";
+import { ChoiceList } from "choice_list.slint";
 import { TabStrip } from "tabstrip.slint";
 import { Toolbar } from "toolbar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -332,6 +333,13 @@ export component AppWindow inherits Window {
     callback filter-sort(/* descending */ bool);
     callback filter-toggle(int);
     callback filter-apply();
+    // The list of the active cell's drop-down arrow: opened by the arrow,
+    // a value chosen.
+    callback dropdown-choose(int);
+    in property <[string]> dropdown-items;
+    in property <length> dropdown-x;
+    in property <length> dropdown-y;
+    in property <length> dropdown-width;
     // Where the open filter list goes, logical pixels in the document
     // pane, and what it offers.
     in property <length> filter-x;
@@ -408,6 +416,10 @@ export component AppWindow inherits Window {
     callback preview-released();
 
     // Give the keyboard to the document surface.
+    public function show-dropdown-list() {
+        dropdown-popup.show();
+    }
+
     public function show-filter-list() {
         filter-popup.show();
     }
@@ -1593,6 +1605,23 @@ export component AppWindow inherits Window {
                                     scroll-event(event) => {
                                         root.scrolled(event.delta-x, event.delta-y, self.mouse-x);
                                         return accept;
+                                    }
+                                }
+                            }
+
+                            dropdown-popup := PopupWindow {
+                                x: max(0px, min(root.dropdown-x, parent.width - self.width));
+                                y: root.dropdown-y;
+                                width: max(root.dropdown-width, 160px);
+                                close-policy: PopupClosePolicy.close-on-click-outside;
+                                MenuFrame { }
+
+                                ChoiceList {
+                                    items: root.dropdown-items;
+                                    chosen(index) => {
+                                        dropdown-popup.close();
+                                        root.dropdown-choose(index);
+                                        scope.focus();
                                     }
                                 }
                             }

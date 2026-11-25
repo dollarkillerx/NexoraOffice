@@ -448,6 +448,12 @@ impl crate::model::Workbook {
         }
         for (index, host) in self.sheets.iter_mut().enumerate() {
             let name = host.name.clone();
+            // A list read from cells follows them.
+            for rule in &mut host.validations {
+                if let crate::validation::ListSource::Formula(formula) = &mut rule.source {
+                    *formula = adjust(formula, Some(&name), &target, lines);
+                }
+            }
             for row in host.rows_mut().iter_mut() {
                 for cell in &mut row.cells {
                     let Some(formula) = &cell.formula else {
@@ -502,6 +508,18 @@ impl crate::model::Workbook {
             axis.remove(lines.at, lines.count);
         }
         host.comments = crate::comment::moved(std::mem::take(&mut host.comments), lines);
+        // List rules follow their cells; a rule left with none goes.
+        host.validations = std::mem::take(&mut host.validations)
+            .into_iter()
+            .filter_map(|mut rule| {
+                rule.ranges = rule
+                    .ranges
+                    .iter()
+                    .filter_map(|range| lines.moved_range(*range))
+                    .collect();
+                (!rule.ranges.is_empty()).then_some(rule)
+            })
+            .collect();
         // The filter's block and what it filters move with the lines.
         if let Some(filter) = &mut host.auto_filter {
             match lines.moved_range(filter.range) {

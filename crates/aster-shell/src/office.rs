@@ -502,6 +502,10 @@ pub enum Refusal {
     /// A threaded comment, which changes (and moves with a sort) only in
     /// Excel.
     Threaded,
+    /// An entry the cell's list rule does not allow: what the rule says
+    /// (empty for the default message), and whether the entry was kept
+    /// (a warning or information rule) or is still being typed (stop).
+    NotOnList { message: String, kept: bool },
 }
 
 impl History {
@@ -777,6 +781,56 @@ impl SheetTab {
         let cell = self.view.workbook_mut().entry_cell(sheet, at, entry, look);
         let changes = self.view.workbook_mut().set_cells(sheet, vec![(at, cell)]);
         self.record(changes, styles_before)
+    }
+
+    /// [`commit`](Self::commit) for what a user finishes by pressing Enter,
+    /// Tab or an arrow, or by clicking another cell: an entry that a list
+    /// rule with the stop alert does not allow is not taken. It stays in
+    /// the cell's editor and [`Refusal::NotOnList`] says why. With a
+    /// warning or information alert it is kept and the notice says so.
+    pub fn commit_checked(&mut self, language: &str) -> Vec<Change> {
+        let Some((at, text)) = self
+            .view
+            .editor()
+            .map(|editor| (editor.at, editor.text().to_owned()))
+        else {
+            return self.commit(language);
+        };
+        let sheet = self.view.sheet_index();
+        let refused = self
+            .view
+            .workbook()
+            .check_entry(sheet, at, &text)
+            .err()
+            .map(|rule| (rule.style, rule.error.clone()));
+        let Some((style, message)) = refused else {
+            return self.commit(language);
+        };
+        if style == aster_sheets::ErrorStyle::Stop {
+            self.refusal = Some(Refusal::NotOnList {
+                message,
+                kept: false,
+            });
+            return Vec::new();
+        }
+        let changes = self.commit(language);
+        self.refusal = Some(Refusal::NotOnList {
+            message,
+            kept: true,
+        });
+        changes
+    }
+
+    /// Put a value chosen from a drop-down list into the active cell, as if
+    /// it were typed. One undo step.
+    pub fn choose_from_list(&mut self, text: &str, language: &str) -> Vec<Change> {
+        let at = self.view.selected();
+        let at = self
+            .view
+            .sheet()
+            .and_then(|sheet| sheet.merge_at(at))
+            .map_or(at, |merge| merge.first);
+        self.type_cells(at, &[vec![text.to_owned()]], language)
     }
 
     /// Empty the selected cells, keeping their formats. One undo step.
@@ -3603,6 +3657,55 @@ mod tests {
         assert_eq!(tab.sort(false), Err(Refusal::Threaded));
         tab.view.select(at("D6"));
         assert_eq!(tab.set_comment(None), Err(Refusal::Threaded));
+    }
+
+    #[test]
+    fn a_warning_rule_keeps_what_a_stop_rule_refuses() {
+        use aster_sheets::{ErrorStyle, ListSource, Validation};
+        let mut tab = tab();
+        let mut rule = Validation {
+            ranges: vec![CellRange::parse("B2").unwrap()],
+            source: ListSource::Items(vec!["a".into(), "b".into()]),
+            allow_blank: false,
+            show_arrow: false,
+            show_error: true,
+            style: ErrorStyle::Warning,
+            error_title: String::new(),
+            error: "只能填 a 或 b".into(),
+        };
+        tab.view.workbook_mut().sheets[0]
+            .validations
+            .push(rule.clone());
+        tab.view.select(at("B2"));
+        assert!(
+            tab.view.dropdown_button_point().is_none(),
+            "no arrow when the rule hides it"
+        );
+        tab.view.begin_edit(EditMode::Enter, Some("z".to_owned()));
+        let changes = tab.commit_checked("en");
+        assert!(!changes.is_empty() && !tab.view.is_editing(), "kept");
+        assert_eq!(
+            tab.refusal,
+            Some(Refusal::NotOnList {
+                message: "只能填 a 或 b".into(),
+                kept: true
+            })
+        );
+        // The same rule as a stop: refused, and still being typed.
+        rule.style = ErrorStyle::Stop;
+        tab.view.workbook_mut().sheets[0].validations[0] = rule;
+        tab.view.select(at("B2"));
+        tab.view.begin_edit(EditMode::Enter, Some("q".to_owned()));
+        assert!(tab.commit_checked("en").is_empty());
+        assert!(tab.view.is_editing());
+        // Pressing on, keys and clicks do nothing while it is open.
+        assert!(!tab.view.key(aster_surface::sheet_view::SheetKey::Down));
+        assert_eq!(tab.view.selected(), at("B2"));
+        // Anything is fine for a cell outside the rule.
+        tab.view.cancel_edit();
+        tab.view.select(at("C2"));
+        tab.view.begin_edit(EditMode::Enter, Some("q".to_owned()));
+        assert!(!tab.commit_checked("en").is_empty());
     }
 
     #[test]

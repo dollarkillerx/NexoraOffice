@@ -215,6 +215,8 @@ struct Shell {
     shown_cell: CellLook,
     /// The autofilter list open on screen: the column and what it offers.
     filter_list: Option<office::FilterList>,
+    /// The drop-down list open on screen: its cell and its values.
+    dropdown: Option<(aster_sheets::CellRef, Vec<String>)>,
     /// The cell under the pointer, to show its note.
     hover_cell: Option<aster_sheets::CellRef>,
     /// Lays out a small document's first preview on this thread, so the
@@ -288,6 +290,7 @@ impl Shell {
             shown_cell: CellLook::default(),
             filter_list: None,
             hover_cell: None,
+            dropdown: None,
             opening: Vec::new(),
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
@@ -1712,6 +1715,15 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
                 Some(office::Refusal::Merged) => notice = strings.sort_merged.to_owned(),
                 Some(office::Refusal::NoData) => notice = strings.filter_empty.to_owned(),
                 Some(office::Refusal::Threaded) => notice = strings.comment_threaded.to_owned(),
+                Some(office::Refusal::NotOnList { message, kept }) => {
+                    notice = if !message.is_empty() {
+                        message.clone()
+                    } else if *kept {
+                        strings.list_kept.to_owned()
+                    } else {
+                        strings.list_refused.to_owned()
+                    };
+                }
                 None => {
                     if let Some(count) = tab.find.replaced {
                         notice = i18n::fill(strings.notice_replaced, "count", &group_digits(count));
@@ -4076,6 +4088,43 @@ fn open_filter_list(ui: &AppWindow, shell: &mut Shell, col: u32) {
     ui.invoke_show_filter_list();
 }
 
+/// Open the list of the active cell's drop-down arrow, under the arrow.
+fn open_dropdown(ui: &AppWindow, shell: &mut Shell) {
+    let Some(tab) = shell.active_sheet() else {
+        return;
+    };
+    if tab.view.is_editing() {
+        return;
+    }
+    let sheet = tab.view.sheet_index();
+    let at = tab.view.selected();
+    let (Some(rule), Some((left, right, bottom))) = (
+        tab.view.workbook().validation_at(sheet, at),
+        tab.view.dropdown_button_point(),
+    ) else {
+        return;
+    };
+    let Some(items) = tab.view.workbook().list_items(sheet, rule) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let cell_left = tab.view.cell_box(at).map_or(left, |b| b.0);
+    let scale = ui.window().scale_factor();
+    ui.set_dropdown_x(cell_left as f32 / scale);
+    ui.set_dropdown_y(bottom as f32 / scale + 2.0);
+    ui.set_dropdown_width(((right - cell_left) as f32 / scale).max(0.0));
+    ui.set_dropdown_items(model(
+        items
+            .iter()
+            .map(|i| i.as_str().into())
+            .collect::<Vec<SharedString>>(),
+    ));
+    shell.dropdown = Some((at, items));
+    ui.invoke_show_dropdown_list();
+}
+
 /// The values of the open filter list, and its "select all" box.
 fn show_filter_choices(ui: &AppWindow, list: &office::FilterList) {
     let strings = ui.global::<Strings>();
@@ -4171,11 +4220,14 @@ fn sheet_key_pressed(
     if let Some(mode) = tab.view.editor().map(|editor| editor.mode) {
         let edit_mode = mode == EditMode::Edit;
         let changed = if is(Key::Escape) {
+            if matches!(tab.refusal, Some(office::Refusal::NotOnList { .. })) {
+                tab.refusal = None;
+            }
             tab.view.cancel_edit()
         } else if is(Key::Return) && alt {
             tab.view.edit(|editor| editor.insert("\n")).is_some()
         } else if is(Key::Return) || tab_key {
-            let changes = tab.commit(language);
+            let changes = tab.commit_checked(language);
             if let Some(tab) = shell.active_sheet() {
                 tab.view.step(tab_key, shift || backtab);
             }
@@ -4195,7 +4247,7 @@ fn sheet_key_pressed(
                 return true;
             }
             // Typing a new entry: the arrows keep it and move on.
-            let changes = tab.commit(language);
+            let changes = tab.commit_checked(language);
             if let Some(tab) = shell.active_sheet()
                 && let Some(key) = viewer_key(text).and_then(|k| office::sheet_key(k, false, false))
             {
@@ -4248,6 +4300,9 @@ fn sheet_key_pressed(
     } else if is(Key::Backspace) || is(Key::Delete) {
         let changes = tab.clear_selection();
         after_sheet_change(ui, shell, changes);
+        return true;
+    } else if alt && is(Key::DownArrow) {
+        open_dropdown(ui, shell);
         return true;
     } else if let Some(key) = viewer_key(text).and_then(|k| office::sheet_key(k, shift, primary)) {
         tab.view.key_extending(key, shift);
@@ -4884,12 +4939,16 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                     open_filter_list(&ui, shell, col);
                     return;
                 }
+                if tab.view.dropdown_button_hit(x, y) {
+                    open_dropdown(&ui, shell);
+                    return;
+                }
                 let Some(tab) = shell.active_sheet() else {
                     return;
                 };
                 // A click elsewhere keeps what was being typed.
                 let changes = if tab.view.is_editing() {
-                    tab.commit(language)
+                    tab.commit_checked(language)
                 } else {
                     Vec::new()
                 };
@@ -6226,6 +6285,21 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         after_sheet_change(&ui, shell, changes);
     }));
+    ui.on_dropdown_choose(handler!(|ui, shell, index| {
+        let language = shell.language.tag();
+        let Some((_, items)) = shell.dropdown.take() else {
+            return;
+        };
+        let Some(item) = usize::try_from(index).ok().and_then(|i| items.get(i)) else {
+            return;
+        };
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = tab.choose_from_list(item, language);
+        after_sheet_change(&ui, shell, changes);
+    }));
+
     ui.on_filter_toggle(handler!(|ui, shell, index| {
         let Some(list) = &mut shell.filter_list else {
             return;
@@ -7871,6 +7945,101 @@ mod ui_tests {
         ui.invoke_sheet_comment_delete();
         with_sheet(&app, |tab| {
             assert!(tab.view.sheet().unwrap().comments.contains_key(&at("B2")));
+        });
+    }
+
+    #[test]
+    fn a_list_cell_has_an_arrow_that_offers_values_and_refuses_others() {
+        use aster_sheets::{ErrorStyle, ListSource, Validation};
+        let app = app();
+        let ui = &app.ui;
+        let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+        with_sheet(&app, |tab| {
+            tab.view.workbook_mut().sheets[0]
+                .validations
+                .push(Validation {
+                    ranges: vec![aster_sheets::CellRange::parse("B2:B4").unwrap()],
+                    source: ListSource::Items(vec!["是".into(), "否".into(), "待定".into()]),
+                    allow_blank: true,
+                    show_arrow: true,
+                    show_error: true,
+                    style: ErrorStyle::Stop,
+                    error_title: String::new(),
+                    error: String::new(),
+                });
+            tab.view.select(at("D6"));
+        });
+        // Away from the rule: no arrow.
+        assert!(with_sheet(&app, |tab| tab.view.dropdown_button_point()).is_none());
+        with_sheet(&app, |tab| tab.view.select(at("B2")));
+        refresh_viewer(ui, &mut app.shell.borrow_mut());
+        present(ui, &mut app.shell.borrow_mut());
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = ui.window().scale_factor();
+        let (x0, x1, bottom) =
+            with_sheet(&app, |tab| tab.view.dropdown_button_point()).expect("an arrow on B2");
+        let arrow = (
+            origin.x + ((x0 + x1) / 2.0) as f32 / scale,
+            origin.y + bottom as f32 / scale - 6.0,
+        );
+        drag(ui, &[arrow]);
+        assert_eq!(ui.get_dropdown_items().row_count(), 3);
+        let row = ElementHandle::find_by_accessible_label(ui, "待定")
+            .next()
+            .expect("a row for the third value");
+        click(&row);
+        let value = |tab: &SheetTab, cell: &str| {
+            tab.view
+                .sheet()
+                .and_then(|s| s.cell(at(cell)))
+                .map(|c| tab.view.workbook().input_text(c))
+        };
+        assert_eq!(
+            with_sheet(&app, |tab| value(tab, "B2")).as_deref(),
+            Some("待定")
+        );
+        // One undo step.
+        with_sheet(&app, |tab| {
+            tab.undo();
+            assert_eq!(value(tab, "B2"), None);
+            tab.redo();
+        });
+        // Typing a value that is not on the list: Enter is refused with a
+        // message, the entry stays open and the selection stays.
+        with_sheet(&app, |tab| tab.view.select(at("B3")));
+        ui.invoke_focus_document();
+        type_text(ui, "也许");
+        type_text(ui, &char::from(Key::Return).to_string());
+        with_sheet(&app, |tab| {
+            assert!(tab.view.is_editing(), "the entry stays open");
+            assert_eq!(tab.view.selected(), at("B3"));
+            assert_eq!(value(tab, "B3"), None);
+        });
+        let refused = app.shell.borrow().language.strings().list_refused;
+        assert_eq!(ui.get_status_notice(), refused);
+        // Fixed to a value on the list, Enter takes it and moves down.
+        for _ in 0..2 {
+            type_text(ui, &char::from(Key::Backspace).to_string());
+        }
+        type_text(ui, "否");
+        type_text(ui, &char::from(Key::Return).to_string());
+        with_sheet(&app, |tab| {
+            assert!(!tab.view.is_editing());
+            assert_eq!(value(tab, "B3").as_deref(), Some("否"));
+            assert_eq!(tab.view.selected(), at("B4"));
+        });
+        // Escape drops a refused entry and the notice.
+        type_text(ui, "x");
+        type_text(ui, &char::from(Key::Return).to_string());
+        assert!(with_sheet(&app, |tab| tab.view.is_editing()));
+        type_text(ui, &char::from(Key::Escape).to_string());
+        with_sheet(&app, |tab| {
+            assert!(!tab.view.is_editing());
+            assert_eq!(value(tab, "B4"), None);
+            assert!(tab.refusal.is_none());
         });
     }
 

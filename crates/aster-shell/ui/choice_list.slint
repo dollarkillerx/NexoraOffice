@@ -1,0 +1,28 @@
+import { Tokens } from "tokens.slint";
+import { MenuRow } from "widgets.slint";
+
+// What a cell's drop-down arrow opens: the values its list rule offers,
+// one per row, scrolled when there are many.
+export component ChoiceList inherits VerticalLayout {
+    in property <[string]> items;
+    callback chosen(int);
+    padding: Tokens.space-xs + 2px;
+
+    Flickable {
+        height: min(root.items.length * (Tokens.control-height + 4px), 8 * (Tokens.control-height + 4px));
+        content-height: root.items.length * (Tokens.control-height + 4px);
+        for item[index] in root.items: MenuRow {
+            y: index * (Tokens.control-height + 4px);
+            width: parent.width;
+            text: item;
+            accessible-role: button;
+            accessible-label: item;
+            accessible-action-default => {
+                root.chosen(index);
+            }
+            clicked => {
+                root.chosen(index);
+            }
+        }
+    }
+}

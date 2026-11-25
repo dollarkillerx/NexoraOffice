@@ -144,6 +144,9 @@ pub struct Sheet {
     pub auto_filter: Option<crate::filter::AutoFilter>,
     /// Comments, by cell.
     pub comments: std::collections::BTreeMap<CellRef, crate::comment::Comment>,
+    /// List rules (data validation), in file order; the first that covers
+    /// a cell applies.
+    pub validations: Vec<crate::validation::Validation>,
 }
 
 impl Sheet {
@@ -362,6 +365,7 @@ pub struct SheetBuilder {
     pub hidden_sizes: std::collections::BTreeMap<(bool, u32), f64>,
     pub auto_filter: Option<crate::filter::AutoFilter>,
     pub comments: std::collections::BTreeMap<CellRef, crate::comment::Comment>,
+    pub validations: Vec<crate::validation::Validation>,
 }
 
 impl SheetBuilder {
@@ -382,6 +386,7 @@ impl SheetBuilder {
             hidden_sizes: std::collections::BTreeMap::new(),
             auto_filter: None,
             comments: std::collections::BTreeMap::new(),
+            validations: Vec::new(),
         }
     }
 
@@ -460,6 +465,7 @@ impl SheetBuilder {
             hidden_sizes: self.hidden_sizes,
             auto_filter: self.auto_filter,
             comments: self.comments,
+            validations: self.validations,
         }
     }
 }

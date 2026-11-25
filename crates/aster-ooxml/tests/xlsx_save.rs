@@ -1266,3 +1266,48 @@ fn a_threaded_comment_is_read_and_kept_while_a_note_is_added() {
     assert!(again.sheets[0].comments[&at("B2")].threaded);
     assert_eq!(again.sheets[0].comments[&at("D4")].text, "旁注");
 }
+
+#[test]
+fn list_rules_are_read_and_follow_inserted_rows_while_other_rules_are_left_alone() {
+    use aster_sheets::ListSource;
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    // The whole-number rule is not modelled; the list on A2 is.
+    let rules = &book.sheets[0].validations;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0].ranges,
+        [aster_sheets::CellRange::parse("A2").unwrap()]
+    );
+    assert_eq!(rules[0].source, ListSource::Formula("$A$1:$A$3".into()));
+    assert!(rules[0].show_arrow);
+    assert!(book.sheets[0].has_dropdown(at("A2")));
+    assert_eq!(
+        book.list_items(0, &book.sheets[0].validations[0]),
+        Some(vec!["1".into(), "2".into(), "3".into()])
+    );
+    // Saved untouched when nothing about it changed.
+    let saved = save(source.clone(), &book, &Changes::default()).unwrap();
+    assert!(differences(&source, &saved).is_empty());
+    // A row inserted above: the model's rule and the file's agree.
+    let mut changes = Changes::default();
+    restructure(
+        &mut book,
+        &mut changes,
+        aster_sheets::structure::Lines {
+            columns: false,
+            at: 0,
+            count: 1,
+            insert: true,
+        },
+    );
+    assert_eq!(
+        book.sheets[0].validations[0].ranges,
+        [aster_sheets::CellRange::parse("A3").unwrap()]
+    );
+    let saved = save(source, &book, &changes).unwrap();
+    let again = Xlsx.read(saved.clone()).unwrap();
+    assert_eq!(again.sheets[0].validations, book.sheets[0].validations);
+    let xml = part(&saved, "xl/worksheets/sheet1.xml");
+    assert!(xml.contains("sqref=\"A3\""), "{xml}");
+}

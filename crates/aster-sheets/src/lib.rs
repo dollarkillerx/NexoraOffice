@@ -32,6 +32,7 @@ pub mod sheets;
 pub mod sort;
 pub mod structure;
 pub mod style;
+pub mod validation;
 
 pub use address::{CellRange, CellRef, MAX_COLUMNS, MAX_ROWS, column_name};
 pub use axis::Axis;
@@ -48,3 +49,4 @@ pub use model::{
 pub use restyle::StyleEdit;
 pub use sheets::NameProblem;
 pub use style::{Borders, CellStyle, Font, HAlign, Line, LineStyle, Rgba, VAlign};
+pub use validation::{ErrorStyle, ListSource, Validation};

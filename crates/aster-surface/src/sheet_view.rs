@@ -804,6 +804,31 @@ impl SheetView {
         Some((left * s, top * s, right * s, bottom * s))
     }
 
+    /// The drop-down arrow of the active cell, if it has one and nothing
+    /// is being typed: left, right and bottom edges, physical pixels from
+    /// the view's top left (where to open its list).
+    pub fn dropdown_button_point(&self) -> Option<(f64, f64, f64)> {
+        let sheet = self.sheet()?;
+        let at = self.selected();
+        if self.editor.is_some() || !sheet.has_dropdown(at) {
+            return None;
+        }
+        let (x0, y0, x1, y1) = self.cell_box(at)?;
+        let s = self.s();
+        let button = filter_button(x1 / s, y1 / s, (x1 - x0) / s, (y1 - y0) / s)?;
+        Some((button.x0 * s, button.x1 * s, button.y1 * s))
+    }
+
+    /// Whether a point (physical pixels) is on the active cell's
+    /// drop-down arrow.
+    pub fn dropdown_button_hit(&self, x: f64, y: f64) -> bool {
+        let Some((x0, x1, bottom)) = self.dropdown_button_point() else {
+            return false;
+        };
+        let size = x1 - x0;
+        (x0..=x1).contains(&x) && (bottom - size..=bottom).contains(&y)
+    }
+
     /// Where the fill handle is, physical pixels from the view's top left.
     pub fn fill_handle_point(&self) -> (f64, f64) {
         let range = self.selection();
@@ -923,6 +948,10 @@ impl SheetView {
     /// sheet whose header it is on; with `extend`, stretches the selection
     /// to there. Returns whether the selection changed.
     pub fn press(&mut self, x: f64, y: f64, extend: bool) -> bool {
+        // An entry the sheet refused stays open until it is fixed.
+        if self.editor.is_some() {
+            return false;
+        }
         let Some(hit) = self.hit(x, y) else {
             return false;
         };
@@ -1047,6 +1076,9 @@ impl SheetView {
     /// Move the selection, or with `extend` its far corner (Shift with the
     /// arrow keys). Returns whether anything moved.
     pub fn key_extending(&mut self, key: SheetKey, extend: bool) -> bool {
+        if self.editor.is_some() {
+            return false;
+        }
         let Some(sheet) = self.sheet() else {
             return false;
         };
@@ -1103,6 +1135,9 @@ impl SheetView {
     /// Excel when several cells are selected; with one cell selected, it
     /// moves down or right (up or left when `back`).
     pub fn step(&mut self, across: bool, back: bool) -> bool {
+        if self.editor.is_some() {
+            return false;
+        }
         let range = self.selection();
         if range.first == range.last {
             let key = match (across, back) {
@@ -1747,6 +1782,34 @@ impl SheetView {
                         self.draw_filter_button(rect, filter.filters(col));
                     }
                 }
+            }
+        }
+
+        // The drop-down arrow of the active cell, when a list rule gives
+        // it one.
+        let active = self.selected();
+        if self.editor.is_none() && view.contains(active) && sheet.has_dropdown(active) {
+            let area = sheet.merge_at(active);
+            let (last_col_of, last_row_of) =
+                area.map_or((active.col, active.row), |m| (m.last.col, m.last.row));
+            let right = x_of(last_col_of + 1) / s;
+            let bottom = y_of(last_row_of + 1) / s;
+            let (width, height) = (
+                (active.col..=last_col_of)
+                    .map(|c| sheet.columns.size(c))
+                    .sum::<f64>(),
+                (active.row..=last_row_of)
+                    .map(|r| sheet.row_sizes.size(r))
+                    .sum::<f64>(),
+            );
+            if let Some(button) = filter_button(right, bottom, width, height) {
+                let rect = Rect::new(
+                    (button.x0 * s).round(),
+                    (button.y0 * s).round(),
+                    (button.x1 * s).round(),
+                    (button.y1 * s).round(),
+                );
+                self.draw_filter_button(rect, false);
             }
         }
 

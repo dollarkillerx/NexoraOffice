@@ -792,11 +792,12 @@ fn worksheet(
                 drawing = tag.attr("id");
                 reader.skip()?;
             }
-            Ev::Open(tag)
-                if tag.is("conditionalFormatting")
-                    || tag.is("dataValidations")
-                    || tag.is("extLst") =>
-            {
+            Ev::Open(tag) if tag.is("dataValidation") => {
+                if let Some(rule) = list_validation(&mut reader, &tag)? {
+                    builder.validations.push(rule);
+                }
+            }
+            Ev::Open(tag) if tag.is("conditionalFormatting") || tag.is("extLst") => {
                 reader.skip()?
             }
             Ev::Eof => break,
@@ -822,6 +823,63 @@ fn worksheet(
             .map(|(row, size)| (row, row + 1, size)),
     );
     Ok((builder, drawing))
+}
+
+/// A `<dataValidation>` of type `list`: where it applies and where its
+/// values come from. Rules of other types are read past, not modelled.
+fn list_validation(
+    reader: &mut XmlReader<'_>,
+    tag: &Tag<'_>,
+) -> Result<Option<aster_sheets::Validation>> {
+    let is_list = tag.attr("type").as_deref() == Some("list");
+    let ranges: Vec<CellRange> = tag
+        .attr("sqref")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(CellRange::parse)
+        .collect();
+    let style = match tag.attr("errorStyle").as_deref() {
+        Some("warning") => aster_sheets::ErrorStyle::Warning,
+        Some("information") => aster_sheets::ErrorStyle::Information,
+        _ => aster_sheets::ErrorStyle::Stop,
+    };
+    let mut formula = String::new();
+    each_child(reader, |reader, child| {
+        if child.is("formula1") {
+            formula = reader.text()?;
+            Ok(())
+        } else {
+            reader.skip()
+        }
+    })?;
+    if !is_list || ranges.is_empty() {
+        return Ok(None);
+    }
+    let source = match formula
+        .trim()
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(items) => aster_sheets::ListSource::Items(
+            items
+                .replace("\"\"", "\"")
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
+        ),
+        None => aster_sheets::ListSource::Formula(formula.trim().to_owned()),
+    };
+    Ok(Some(aster_sheets::Validation {
+        ranges,
+        source,
+        allow_blank: tag.attr_bool("allowBlank").unwrap_or(false),
+        // The attribute says to hide the arrow.
+        show_arrow: !tag.attr_bool("showDropDown").unwrap_or(false),
+        show_error: tag.attr_bool("showErrorMessage").unwrap_or(false),
+        style,
+        error_title: tag.attr("errorTitle").unwrap_or_default(),
+        error: tag.attr("error").unwrap_or_default(),
+    }))
 }
 
 /// The notes of a comments part, by cell: author and text.

@@ -353,3 +353,86 @@ fn lists_and_levels_are_written() {
     let body = again.slides[0].shapes[1].text.as_ref().unwrap();
     assert_eq!(body.paragraphs[1].bullet.as_deref(), Some("2."));
 }
+
+#[test]
+fn a_new_paragraph_ends_with_its_own_end_mark() {
+    let source = blank::presentation(&NAMES);
+    let mut presentation = read(&source);
+    type_into(&mut presentation, 0, "ctrTitle", "第一行");
+    {
+        let shape = presentation.slides[0]
+            .shapes
+            .iter_mut()
+            .find(|s| s.placeholder.as_ref().is_some_and(|p| p.kind == "ctrTitle"))
+            .unwrap();
+        let body = shape.text.as_mut().unwrap();
+        let end = body.end();
+        body.insert(end, "\n第二行");
+    }
+    let saved = save(source, &presentation).unwrap();
+    let xml = text(&saved, "ppt/slides/slide1.xml");
+    assert!(!xml.contains("</a:r><a:rPr"), "{xml}");
+    let mut from = 0;
+    while let Some(at) = xml[from..].find("</a:p>") {
+        let end = from + at;
+        let before = &xml[..end];
+        let open = before.rfind("<a:").unwrap();
+        let tag = &before[open..];
+        // The last element before `</a:p>` is an end mark, or one that
+        // closes inside it.
+        assert!(
+            tag.starts_with("<a:endParaRPr") || before.ends_with("</a:endParaRPr>"),
+            "paragraph ends with {tag}"
+        );
+        from = end + "</a:p>".len();
+    }
+    assert_eq!(title_of(&read(&saved), 0), "第一行\n第二行");
+}
+
+#[test]
+fn editing_a_slide_does_not_change_its_copy() {
+    let source = blank::presentation(&NAMES);
+    let mut presentation = read(&source);
+    type_into(&mut presentation, 0, "ctrTitle", "Original");
+    let first = save(source, &presentation).unwrap();
+    let mut presentation = read(&first);
+    let mut copy = presentation.slides[0].clone();
+    let mut info = (**copy.source.as_ref().unwrap()).clone();
+    info.copy = true;
+    copy.source = Some(Arc::new(info));
+    presentation.slides.push(copy);
+    type_into(&mut presentation, 0, "ctrTitle", " edited");
+    let saved = save(first, &presentation).unwrap();
+    let again = read(&saved);
+    assert_eq!(again.slides.len(), 2);
+    assert_eq!(title_of(&again, 0), "Original edited");
+    assert_eq!(title_of(&again, 1), "Original");
+}
+
+#[test]
+fn new_slides_have_a_paragraph_in_every_text_body() {
+    let source = blank::presentation(&NAMES);
+    let mut presentation = read(&source);
+    let one = presentation.layouts[1].slide.clone();
+    let two = presentation.layouts[2].slide.clone();
+    presentation.slides.push(one);
+    presentation.slides.push(two);
+    let saved = save(source, &presentation).unwrap();
+    for part in ["ppt/slides/slide2.xml", "ppt/slides/slide3.xml"] {
+        let xml = text(&saved, part);
+        let mut rest = xml.as_str();
+        let mut bodies = 0;
+        while let Some(at) = rest.find("<p:txBody>") {
+            let tail = &rest[at..];
+            let end = tail.find("</p:txBody>").unwrap();
+            let body = &tail[..end];
+            assert!(
+                body.contains("<a:p>") || body.contains("<a:p "),
+                "{part}: {body}"
+            );
+            bodies += 1;
+            rest = &tail[end..];
+        }
+        assert!(bodies > 0, "{part} has text bodies");
+    }
+}

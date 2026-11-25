@@ -419,10 +419,10 @@ pub fn save(source: Vec<u8>, presentation: &Presentation) -> Result<Vec<u8>> {
                 };
                 let base = match source {
                     Some(source) => {
-                        let (_, text) = text_of(&parts.get(&source.part)?);
+                        let (_, text) = text_of(&parts.package.read(&source.part)?);
                         let source_rels = rels_name(&source.part);
-                        rels.text = if parts.has(&source_rels) {
-                            text_of(&parts.get(&source_rels)?).1
+                        rels.text = if parts.package.has(&source_rels) {
+                            text_of(&parts.package.read(&source_rels)?).1
                         } else {
                             String::new()
                         };
@@ -1150,6 +1150,7 @@ fn paragraphs_xml(
 
 fn paragraph_xml(paragraph: &Paragraph, baseline: &Levels, a: &str, ea: Option<&str>) -> String {
     if let Some(source) = &paragraph.source
+        && !source.xml.is_empty()
         && paragraph.same_as(&source.original)
         && run_ends_same(paragraph)
         && paragraph
@@ -1432,7 +1433,7 @@ fn end_xml(end: &Run, look: &LevelLook, a: &str, ea: Option<&str>) -> String {
     let source = end.source.as_deref();
     match source {
         Some(source) if !source.props.is_empty() && end.same_look(&source.original) => {
-            return source.props.clone();
+            return rename(&source.props, "endParaRPr");
         }
         _ => {}
     }

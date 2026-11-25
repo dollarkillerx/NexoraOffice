@@ -1780,7 +1780,11 @@ fn children_until(
     let mut all = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        pids.insert(worker.child_id());
+        // 0 means no child at this instant: between one child and the next.
+        let pid = worker.child_id();
+        if pid != 0 {
+            pids.insert(pid);
+        }
         match events.recv_timeout(Duration::from_millis(5)) {
             Ok(event) => {
                 let end = done(&event);

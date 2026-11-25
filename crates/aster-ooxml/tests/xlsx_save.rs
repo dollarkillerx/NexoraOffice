@@ -1311,3 +1311,219 @@ fn list_rules_are_read_and_follow_inserted_rows_while_other_rules_are_left_alone
     let xml = part(&saved, "xl/worksheets/sheet1.xml");
     assert!(xml.contains("sqref=\"A3\""), "{xml}");
 }
+
+// --- Print areas ---
+
+fn area(text: &str) -> aster_sheets::CellRange {
+    aster_sheets::CellRange::parse(text).unwrap()
+}
+
+#[test]
+fn a_files_print_area_is_read_and_kept_byte_for_byte() {
+    let source = linked();
+    let book = Xlsx.read(source.clone()).unwrap();
+    assert_eq!(book.sheets[0].print_area, [area("A1:C5")]);
+    assert!(book.sheets[1].print_area.is_empty());
+    // Nothing asked for: every part is the same.
+    let saved = save(source.clone(), &book, &Changes::default()).unwrap();
+    assert!(differences(&source, &saved).is_empty());
+    // The G4 workbook, written by Excel, has one too.
+    let g4 = Xlsx.read(g4()).unwrap();
+    assert_eq!(g4.sheets[0].print_area, [area("A1:E6")]);
+    // One that is not an area is no print area here, and stays in the file.
+    let odd = String::from_utf8(part(&source, "xl/workbook.xml").into_bytes())
+        .unwrap()
+        .replace("数据!$A$1:$C$5", "OFFSET(数据!$A$1,0,0,2,2)");
+    let odd = replace_part(&source, "xl/workbook.xml", &odd);
+    let book = Xlsx.read(odd.clone()).unwrap();
+    assert!(book.sheets[0].print_area.is_empty());
+    let saved = save(odd.clone(), &book, &Changes::default()).unwrap();
+    assert!(differences(&odd, &saved).is_empty());
+}
+
+/// The package with one part's text replaced.
+fn replace_part(source: &[u8], name: &str, text: &str) -> Vec<u8> {
+    let mut package = Package::open(source.to_vec()).unwrap();
+    let mut replaced = std::collections::HashMap::new();
+    replaced.insert(name.to_lowercase(), text.as_bytes().to_vec());
+    package
+        .rewrite_adding(&replaced, &Default::default(), &[])
+        .unwrap()
+}
+
+#[test]
+fn a_new_print_area_replaces_the_old_one_and_only_the_workbook_part_changes() {
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    book.sheets[0].print_area = vec![area("B2:D4"), area("F1:F3")];
+    let mut changes = Changes::default();
+    changes.print_areas.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    assert_eq!(
+        differences(&source, &saved),
+        BTreeSet::from(["xl/workbook.xml".to_owned()])
+    );
+    let workbook = part(&saved, "xl/workbook.xml");
+    assert!(
+        workbook.contains(
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="0">数据!$B$2:$D$4,数据!$F$1:$F$3</definedName>"#
+        ),
+        "{workbook}"
+    );
+    // The other name is as it was.
+    assert!(workbook.contains(r#"<definedName name="区域">数据!$A$2:$A$4</definedName>"#));
+    assert_eq!(
+        Xlsx.read(saved).unwrap().sheets[0].print_area,
+        [area("B2:D4"), area("F1:F3")]
+    );
+}
+
+#[test]
+fn a_print_area_is_added_to_a_sheet_that_had_none_and_cleared_again() {
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    book.sheets[1].print_area = vec![area("A1:B1")];
+    let mut changes = Changes::default();
+    changes.print_areas.insert(1);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let workbook = part(&saved, "xl/workbook.xml");
+    assert!(
+        workbook.contains(
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="1">汇总!$A$1:$B$1</definedName></definedNames>"#
+        ),
+        "{workbook}"
+    );
+    // The first sheet's was not touched.
+    assert!(workbook.contains(
+        r#"<definedName name="_xlnm.Print_Area" localSheetId="0">数据!$A$1:$C$5</definedName>"#
+    ));
+    // Clear both: the names go, the named range stays.
+    let mut book = Xlsx.read(saved.clone()).unwrap();
+    book.sheets[0].print_area.clear();
+    book.sheets[1].print_area.clear();
+    let mut changes = Changes::default();
+    changes.print_areas.extend([0, 1]);
+    let cleared = save(saved, &book, &changes).unwrap();
+    let workbook = part(&cleared, "xl/workbook.xml");
+    assert!(!workbook.contains("Print_Area"), "{workbook}");
+    assert!(workbook.contains(r#"<definedName name="区域">"#));
+    // And with nothing left in the list, the list goes.
+    let mut book = Xlsx.read(cleared.clone()).unwrap();
+    book.names.clear();
+    let bare = replace_part(
+        &cleared,
+        "xl/workbook.xml",
+        &workbook.replace(
+            r#"<definedName name="区域">数据!$A$2:$A$4</definedName>"#,
+            "",
+        ),
+    );
+    let mut book = Xlsx.read(bare.clone()).unwrap();
+    book.sheets[0].print_area = vec![area("A1:A2")];
+    let mut changes = Changes::default();
+    changes.print_areas.insert(0);
+    let saved = save(bare, &book, &changes).unwrap();
+    let workbook = part(&saved, "xl/workbook.xml");
+    assert!(
+        workbook.contains(r#"</sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">数据!$A$1:$A$2</definedName></definedNames></workbook>"#),
+        "{workbook}"
+    );
+    book.sheets[0].print_area.clear();
+    let saved = save(saved, &book, &changes).unwrap();
+    assert!(!part(&saved, "xl/workbook.xml").contains("definedNames"));
+}
+
+#[test]
+fn a_workbook_with_no_list_of_names_gets_one_in_its_place_in_the_schema() {
+    let source = bare();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    book.sheets[0].print_area = vec![area("A1:B2")];
+    let mut changes = Changes::default();
+    changes.print_areas.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let workbook = part(&saved, "xl/workbook.xml");
+    let name = format!(
+        "<x:definedNames><x:definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\">{}!$A$1:$B$2</x:definedName></x:definedNames>",
+        aster_sheets::sheets::qualifier(&book.sheets[0].name)
+    );
+    assert!(workbook.contains(&name), "{workbook}");
+    // (This workbook writes its elements with the prefix `x:`; so does the
+    // new one.)
+    let sheets_end = workbook.find("</x:sheets>").unwrap();
+    assert_eq!(workbook.find(&name), Some(sheets_end + "</x:sheets>".len()));
+    assert_eq!(
+        Xlsx.read(saved).unwrap().sheets[0].print_area,
+        [area("A1:B2")]
+    );
+}
+
+#[test]
+fn the_print_area_moves_with_rows_and_follows_renames_and_new_sheets() {
+    use aster_sheets::structure::Lines;
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    // A row inserted inside the area widens it; the saved name says so.
+    let lines = Lines {
+        columns: false,
+        at: 2,
+        count: 2,
+        insert: true,
+    };
+    restructure(&mut book, &mut changes, lines);
+    assert_eq!(book.sheets[0].print_area, [area("A1:C7")]);
+    changes.print_areas.insert(0);
+    let saved = save(source.clone(), &book, &changes).unwrap();
+    let workbook = part(&saved, "xl/workbook.xml");
+    assert!(
+        workbook.contains(r#"localSheetId="0">数据!$A$1:$C$7</definedName>"#),
+        "{workbook}"
+    );
+    assert_eq!(
+        Xlsx.read(saved.clone()).unwrap().sheets[0].print_area,
+        [area("A1:C7")]
+    );
+    // Renamed: the name of the sheet in the area is the new one.
+    let mut book = Xlsx.read(saved.clone()).unwrap();
+    let mut changes = Changes::default();
+    for cell in book.rename_sheet(0, "Q1 数据") {
+        changes.cells.insert(cell);
+        changes.edited.insert(cell);
+    }
+    changes.formulas_changed = true;
+    book.sheets[0].print_area = vec![area("A1:A9")];
+    changes.print_areas.insert(0);
+    let renamed = save(saved, &book, &changes).unwrap();
+    let workbook = part(&renamed, "xl/workbook.xml");
+    assert!(
+        workbook.contains(r#"localSheetId="0">'Q1 数据'!$A$1:$A$9</definedName>"#),
+        "{workbook}"
+    );
+    assert_eq!(
+        Xlsx.read(renamed).unwrap().sheets[0].print_area,
+        [area("A1:A9")]
+    );
+}
+
+#[test]
+fn deleting_all_of_the_print_area_takes_the_name_away() {
+    use aster_sheets::structure::Lines;
+    let source = linked();
+    let mut book = Xlsx.read(source.clone()).unwrap();
+    let mut changes = Changes::default();
+    book.sheets[0].print_area = vec![area("A2:C3")];
+    restructure(
+        &mut book,
+        &mut changes,
+        Lines {
+            columns: false,
+            at: 1,
+            count: 2,
+            insert: false,
+        },
+    );
+    assert!(book.sheets[0].print_area.is_empty());
+    changes.print_areas.insert(0);
+    let saved = save(source, &book, &changes).unwrap();
+    assert!(!part(&saved, "xl/workbook.xml").contains("Print_Area"));
+}

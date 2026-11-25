@@ -28,6 +28,7 @@ pub mod formula;
 pub mod hints;
 pub mod input;
 pub mod model;
+pub mod print_area;
 pub mod restyle;
 pub mod sheets;
 pub mod sort;

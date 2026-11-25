@@ -74,6 +74,9 @@ pub struct Changes {
     /// Sheets whose notes changed: their comments part and boxes are
     /// written again.
     pub comments: BTreeSet<usize>,
+    /// Sheets whose print area changed: their `_xlnm.Print_Area` name is
+    /// written again from the sheet's `print_area`.
+    pub print_areas: BTreeSet<usize>,
 }
 
 /// The widths and heights to write for sheet `index`, from the model's
@@ -354,7 +357,7 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
 
     // Defined names (print areas, filters, named ranges) follow the lines,
     // then the sheets.
-    if !changes.structure.is_empty() || plan.changed() {
+    if !changes.structure.is_empty() || plan.changed() || !changes.print_areas.is_empty() {
         let mut bytes = package.read(&main)?;
         for (index, lines) in &changes.structure {
             if let Some(target) = plan.file_names.get(*index) {
@@ -452,6 +455,22 @@ pub fn save(source: Vec<u8>, workbook: &Workbook, changes: &Changes) -> Result<V
                     }
                 }
             }
+        }
+        // The print areas as the model has them, whatever the lines and
+        // sheets did to the file's: written last, with the sheets' names and
+        // places as they are now.
+        let edits: Vec<(usize, Option<String>)> = changes
+            .print_areas
+            .iter()
+            .filter_map(|&index| {
+                let sheet = workbook.sheets.get(index)?;
+                let formula = (!sheet.print_area.is_empty())
+                    .then(|| aster_sheets::print_area::format(&sheet.name, &sheet.print_area));
+                Some((index, formula))
+            })
+            .collect();
+        if !edits.is_empty() {
+            bytes = sheets::print_areas_xml(&bytes, &edits);
         }
         replaced.insert(key(&main), bytes);
     }

@@ -333,6 +333,8 @@ pub struct Step {
     sheets: Option<Box<SheetStep>>,
     /// Whole rows' and columns' own formats changed: sheet, change.
     line_formats: Vec<(usize, aster_sheets::restyle::LineFormat)>,
+    /// The print area set or cleared: sheet, before, after.
+    print_areas: Vec<(usize, Vec<CellRange>, Vec<CellRange>)>,
 }
 
 /// An autofilter put on, changed or taken off: sheet, before, after.
@@ -434,6 +436,7 @@ struct Marks {
     rows: Vec<u32>,
     line_formats: Vec<(bool, u32)>,
     frozen: bool,
+    print_area: bool,
     filter: bool,
     comments: bool,
 }
@@ -526,6 +529,7 @@ impl History {
             && step.sheets.is_none()
             && step.line_formats.is_empty()
             && step.frozen.is_empty()
+            && step.print_areas.is_empty()
             && step.filter.is_none()
             && step.comments.is_empty()
         {
@@ -616,6 +620,8 @@ pub struct SheetTab {
     pub line_formats_changed: BTreeSet<(usize, bool, u32)>,
     /// Sheets whose frozen rows and columns changed since then.
     pub frozen_changed: BTreeSet<usize>,
+    /// Sheets whose print area changed since then, or moved with lines.
+    pub print_areas_changed: BTreeSet<usize>,
     /// Sheets whose autofilter changed since then.
     pub filter_changed: BTreeSet<usize>,
     /// Sheets whose notes changed since then.
@@ -691,6 +697,7 @@ impl SheetTab {
             rows_changed: BTreeSet::new(),
             line_formats_changed: BTreeSet::new(),
             frozen_changed: BTreeSet::new(),
+            print_areas_changed: BTreeSet::new(),
             filter_changed: BTreeSet::new(),
             comments_changed: BTreeSet::new(),
             structure: Vec::new(),
@@ -1254,6 +1261,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            print_areas: Vec::new(),
             filter: None,
             comments: Vec::new(),
         });
@@ -1308,6 +1316,7 @@ impl SheetTab {
             rows: self.rows_changed.clone(),
             line_styles: self.line_formats_changed.clone(),
             frozen: self.frozen_changed.clone(),
+            print_areas: self.print_areas_changed.clone(),
             filters: self.filter_changed.clone(),
             comments: self.comments_changed.clone(),
             structure: self.structure.clone(),
@@ -1403,6 +1412,7 @@ impl SheetTab {
             self.rows_changed.clear();
             self.line_formats_changed.clear();
             self.frozen_changed.clear();
+            self.print_areas_changed.clear();
             self.filter_changed.clear();
             self.comments_changed.clear();
         }
@@ -1431,6 +1441,7 @@ impl SheetTab {
                 ..change.lines
             };
             self.moved(change.sheet, back, &change.others);
+            self.mark_print_area_moved(change);
             if back.insert {
                 self.restored(change.sheet, change.lines);
             }
@@ -1442,6 +1453,9 @@ impl SheetTab {
         self.set_line_formats(&step, true);
         for &(sheet, before, _) in &step.frozen {
             self.set_frozen(sheet, before);
+        }
+        for (sheet, before, _) in &step.print_areas {
+            self.put_print_area(*sheet, before.clone());
         }
         if let Some(filter) = &step.filter {
             self.set_filter(filter.0, filter.1.clone());
@@ -1482,6 +1496,7 @@ impl SheetTab {
         if let Some(change) = &step.lines {
             self.put_book(&change.after);
             self.moved(change.sheet, change.lines, &change.others);
+            self.mark_print_area_moved(change);
             self.mark_inherited(change.sheet, change.lines, &change.inherited);
             if change.lines.insert {
                 self.restored(change.sheet, change.lines);
@@ -1494,6 +1509,9 @@ impl SheetTab {
         self.set_line_formats(&step, false);
         for &(sheet, _, after) in &step.frozen {
             self.set_frozen(sheet, after);
+        }
+        for (sheet, _, after) in &step.print_areas {
+            self.put_print_area(*sheet, after.clone());
         }
         if let Some(filter) = &step.filter {
             self.set_filter(filter.0, filter.2.clone());
@@ -1556,16 +1574,18 @@ impl SheetTab {
         let after = self.book();
         self.moved(sheet, lines, &others);
         self.mark_inherited(sheet, lines, &inherited);
+        let restructure = Restructure {
+            sheet,
+            lines,
+            before,
+            after,
+            others,
+            inherited,
+        };
+        self.mark_print_area_moved(&restructure);
         self.history.push(Step {
             styles_before: self.view.workbook().styles.len(),
-            lines: Some(Box::new(Restructure {
-                sheet,
-                lines,
-                before,
-                after,
-                others,
-                inherited,
-            })),
+            lines: Some(Box::new(restructure)),
             ..Step::default()
         });
         self.reload_calc();
@@ -1887,6 +1907,9 @@ impl SheetTab {
         if noted {
             self.comments_changed.insert(index);
         }
+        if !sheet.print_area.is_empty() {
+            self.print_areas_changed.insert(index);
+        }
     }
 
     /// Whether sheet `index` could be called `name`.
@@ -2151,6 +2174,7 @@ impl SheetTab {
         for set in [
             &mut self.merges_changed,
             &mut self.frozen_changed,
+            &mut self.print_areas_changed,
             &mut self.filter_changed,
             &mut self.comments_changed,
         ] {
@@ -2185,6 +2209,7 @@ impl SheetTab {
         marks.rows = lines(&mut self.rows_changed);
         marks.merges = self.merges_changed.remove(&index);
         marks.frozen = self.frozen_changed.remove(&index);
+        marks.print_area = self.print_areas_changed.remove(&index);
         marks.filter = self.filter_changed.remove(&index);
         marks.comments = self.comments_changed.remove(&index);
         marks.line_formats = self
@@ -2210,6 +2235,9 @@ impl SheetTab {
         }
         if marks.frozen {
             self.frozen_changed.insert(index);
+        }
+        if marks.print_area {
+            self.print_areas_changed.insert(index);
         }
         if marks.filter {
             self.filter_changed.insert(index);
@@ -2368,6 +2396,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            print_areas: Vec::new(),
             filter: None,
             comments: Vec::new(),
         });
@@ -2750,6 +2779,56 @@ impl SheetTab {
         self.frozen_changed.insert(sheet);
     }
 
+    /// Print only `areas` of the active sheet (none: all of it). One undo
+    /// step. Returns whether anything changed.
+    pub fn set_print_area(&mut self, areas: Vec<CellRange>) -> bool {
+        let sheet = self.view.sheet_index();
+        let Some(current) = self.view.sheet() else {
+            return false;
+        };
+        if current.kind != aster_sheets::SheetKind::Worksheet || current.print_area == areas {
+            return false;
+        }
+        let before = current.print_area.clone();
+        self.put_print_area(sheet, areas.clone());
+        self.history.push(Step {
+            styles_before: self.view.workbook().styles.len(),
+            print_areas: vec![(sheet, before, areas)],
+            ..Step::default()
+        });
+        true
+    }
+
+    /// "Set Print Area": what is selected.
+    pub fn set_print_area_to_selection(&mut self) -> bool {
+        let selection = self.view.selection();
+        self.set_print_area(vec![selection])
+    }
+
+    pub fn clear_print_area(&mut self) -> bool {
+        self.set_print_area(Vec::new())
+    }
+
+    fn put_print_area(&mut self, sheet: usize, areas: Vec<CellRange>) {
+        if let Some(target) = self.view.workbook_mut().sheets.get_mut(sheet) {
+            target.print_area = areas;
+        }
+        self.print_areas_changed.insert(sheet);
+    }
+
+    /// Rows or columns went in or out (or the move was undone or done
+    /// again): a print area, before or after, is for saving to write.
+    fn mark_print_area_moved(&mut self, change: &Restructure) {
+        let has = |book: &Book| {
+            book.sheets
+                .get(change.sheet)
+                .is_some_and(|sheet| !sheet.print_area.is_empty())
+        };
+        if has(&change.before) || has(&change.after) {
+            self.print_areas_changed.insert(change.sheet);
+        }
+    }
+
     fn set_line_formats(&mut self, step: &Step, undo: bool) {
         for &(sheet, change) in &step.line_formats {
             let style = if undo { change.before } else { change.after };
@@ -2857,6 +2936,7 @@ impl SheetTab {
             sheets: None,
             line_formats: Vec::new(),
             frozen: Vec::new(),
+            print_areas: Vec::new(),
             filter: None,
             comments: Vec::new(),
         });
@@ -4087,6 +4167,105 @@ mod tests {
             },
         )]
         .into()
+    }
+
+    #[test]
+    fn the_print_area_is_set_undone_moved_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("印刷.xlsx");
+        std::fs::write(&file, blank_workbook("ja")).unwrap();
+        let Ok(Loaded::Workbook(workbook, source)) = load(&file) else {
+            panic!("a blank workbook loads");
+        };
+        let tokens = theme::Tokens::of(theme::ThemeMode::Light);
+        let mut tab = SheetTab::new(workbook, source, Some(file.clone()), &tokens);
+        let area = |text: &str| CellRange::parse(text).unwrap();
+        let save = |tab: &mut SheetTab| {
+            let job = tab.begin_save().unwrap();
+            let written = job.write(&file).unwrap();
+            tab.finish_save(&job, &file, Some(written));
+            let mut package = aster_ooxml::Package::open(std::fs::read(&file).unwrap()).unwrap();
+            String::from_utf8(package.read("xl/workbook.xml").unwrap()).unwrap()
+        };
+        let reopened = || {
+            let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+                panic!("the saved file loads");
+            };
+            again.sheets[0].print_area.clone()
+        };
+        assert!(!tab.clear_print_area(), "none to clear");
+        assert!(!tab.is_modified());
+        // From the selection.
+        tab.view.select(at("B2"));
+        tab.view.extend_to(at("D5"));
+        assert!(tab.set_print_area_to_selection());
+        assert_eq!(tab.view.sheet().unwrap().print_area, [area("B2:D5")]);
+        assert!(tab.is_modified());
+        assert!(!tab.set_print_area_to_selection(), "the same again");
+        let name = tab.view.sheet().unwrap().name.clone();
+        let xml = save(&mut tab);
+        assert!(
+            xml.contains(&format!(
+                r#"<definedName name="_xlnm.Print_Area" localSheetId="0">{name}!$B$2:$D$5</definedName>"#
+            )),
+            "{xml}"
+        );
+        assert_eq!(reopened(), [area("B2:D5")]);
+        // Rows in front push it down; the file follows.
+        tab.view.select(at("A1"));
+        tab.change_lines(false, true).unwrap();
+        assert_eq!(tab.view.sheet().unwrap().print_area, [area("B3:D6")]);
+        let xml = save(&mut tab);
+        assert!(
+            xml.contains(&format!("{name}!$B$3:$D$6</definedName>")),
+            "{xml}"
+        );
+        assert_eq!(reopened(), [area("B3:D6")]);
+        // Undoing the rows brings the area back, in the model and the file.
+        tab.undo();
+        assert_eq!(tab.view.sheet().unwrap().print_area, [area("B2:D5")]);
+        let xml = save(&mut tab);
+        assert!(
+            xml.contains(&format!("{name}!$B$2:$D$5</definedName>")),
+            "{xml}"
+        );
+        // Deleting all the rows of it ends it; undo has it back.
+        tab.view.select(at("B2"));
+        tab.view.extend_to(at("B5"));
+        tab.change_lines(false, false).unwrap();
+        assert!(tab.view.sheet().unwrap().print_area.is_empty());
+        let xml = save(&mut tab);
+        assert!(!xml.contains("Print_Area"), "{xml}");
+        assert!(reopened().is_empty());
+        tab.undo();
+        assert_eq!(tab.view.sheet().unwrap().print_area, [area("B2:D5")]);
+        assert!(save(&mut tab).contains("Print_Area"));
+        // Clear it, then undo and redo that.
+        assert!(tab.clear_print_area());
+        assert!(tab.view.sheet().unwrap().print_area.is_empty());
+        let xml = save(&mut tab);
+        assert!(!xml.contains("Print_Area"), "{xml}");
+        tab.undo();
+        assert_eq!(tab.view.sheet().unwrap().print_area, [area("B2:D5")]);
+        tab.redo();
+        assert!(tab.view.sheet().unwrap().print_area.is_empty());
+        tab.undo();
+        let xml = save(&mut tab);
+        assert!(xml.contains("Print_Area"), "{xml}");
+        // A copy of the sheet takes the area along, and is saved with it.
+        let copy = tab.copy_sheet(0, None).unwrap();
+        assert_eq!(tab.view.workbook().sheets[copy].print_area, [area("B2:D5")]);
+        let xml = save(&mut tab);
+        assert_eq!(xml.matches("_xlnm.Print_Area").count(), 2, "{xml}");
+        let Ok(Loaded::Workbook(again, _)) = load(&file) else {
+            panic!("the saved file loads");
+        };
+        assert_eq!(again.sheets[1].print_area, [area("B2:D5")]);
+        // Deleting the sheet takes its name along.
+        tab.delete_sheet(0).unwrap();
+        let xml = save(&mut tab);
+        assert_eq!(xml.matches("_xlnm.Print_Area").count(), 1, "{xml}");
+        assert!(xml.contains(r#"localSheetId="0""#), "{xml}");
     }
 
     #[test]

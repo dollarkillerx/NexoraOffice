@@ -977,13 +977,15 @@ impl Shell {
             }
             (Some(Content::Slides(_)), command) => slides_ui::run(self, command),
             (Some(Content::Sheet(tab)), Command::Undo | Command::Redo) => {
+                // A step may change no cell (a print area, frozen panes).
+                let version = tab.history.version();
                 let changes = if command == Command::Undo {
                     tab.undo()
                 } else {
                     tab.redo()
                 };
                 tab.recalc(&changes);
-                !changes.is_empty()
+                tab.history.version() != version
             }
             (
                 Some(Content::Markdown(editor)),
@@ -4332,6 +4334,7 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_cell_content(content.into());
         ui.set_viewer_note(note.into());
         ui.set_sheet_filtered(view.sheet().is_some_and(|s| s.auto_filter.is_some()));
+        ui.set_sheet_has_print_area(view.sheet().is_some_and(|s| !s.print_area.is_empty()));
         ui.set_cell_has_comment(tab.comment().is_some());
         show_comment(ui, shell);
         return;
@@ -6858,6 +6861,27 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         }
         after_sheet_change(&ui, shell, changes);
     }));
+    ui.on_sheet_print_area(handler!(|ui, shell, set| {
+        let language = shell.language.tag();
+        let Some(tab) = shell.active_sheet() else {
+            return;
+        };
+        let changes = if tab.view.is_editing() {
+            tab.commit(language)
+        } else {
+            Vec::new()
+        };
+        tab.recalc(&changes);
+        if set {
+            tab.set_print_area_to_selection();
+        } else {
+            tab.clear_print_area();
+        }
+        if shell.sync_modified() {
+            refresh_tabs(&ui, shell);
+        }
+        after_sheet_change(&ui, shell, changes);
+    }));
     ui.on_hint_choose(handler!(|ui, shell, row| {
         choose_hint(&ui, shell, usize::try_from(row).ok());
     }));
@@ -8468,6 +8492,43 @@ mod ui_tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(texts, ["Apple", "apple pie", "apple", "APPLE"]);
+    }
+
+    #[test]
+    fn the_data_menu_sets_and_clears_the_print_area() {
+        let app = app();
+        let ui = &app.ui;
+        let at = |c: &str| aster_sheets::CellRef::parse(c).unwrap();
+        with_sheet(&app, |tab| {
+            tab.view.select(at("B2"));
+            tab.view.extend_to(at("C4"));
+        });
+        {
+            let mut shell = app.shell.borrow_mut();
+            refresh_viewer(ui, &mut shell);
+        }
+        assert!(!ui.get_sheet_has_print_area());
+        ui.invoke_sheet_print_area(true);
+        assert!(ui.get_sheet_has_print_area());
+        with_sheet(&app, |tab| {
+            let area = aster_sheets::CellRange::parse("B2:C4").unwrap();
+            assert_eq!(tab.view.sheet().unwrap().print_area, [area]);
+            assert!(tab.is_modified());
+        });
+        // Undo takes it away, redo puts it back, the item follows.
+        ui.invoke_edit_undo();
+        assert!(!ui.get_sheet_has_print_area());
+        ui.invoke_edit_redo();
+        assert!(ui.get_sheet_has_print_area());
+        // A typed entry in progress is entered first.
+        ui.invoke_focus_document();
+        type_text(ui, "7");
+        ui.invoke_sheet_print_area(false);
+        assert!(!ui.get_sheet_has_print_area());
+        with_sheet(&app, |tab| {
+            assert!(tab.view.sheet().unwrap().print_area.is_empty());
+            assert!(!tab.view.is_editing());
+        });
     }
 
     /// A drag with the left button through `points` (window coordinates).

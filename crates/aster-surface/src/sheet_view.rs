@@ -1506,6 +1506,24 @@ impl SheetView {
             self.ctx.pop_layer();
         }
 
+        // The print area: a dashed outline in each pane it reaches.
+        if !sheet.print_area.is_empty() {
+            for row_span in &rows {
+                for col_span in &columns {
+                    let pane = pane_of(row_span, col_span);
+                    for area in &sheet.print_area {
+                        let rect = Rect::new(
+                            pane.x(sheet, area.first.col, s).round() - line,
+                            pane.y(sheet, area.first.row, s).round() - line,
+                            pane.x(sheet, area.last.col + 1, s).round(),
+                            pane.y(sheet, area.last.row + 1, s).round(),
+                        );
+                        self.draw_dashed_outline(rect, pane.clip, line, style.header_text);
+                    }
+                }
+            }
+        }
+
         // Where the frozen part ends.
         self.ctx.set_paint(color(style.header_text));
         if frozen_cols > 0 && split_x < w {
@@ -2098,6 +2116,49 @@ impl SheetView {
         }
     }
 
+    /// A rectangle's four edges as dashes, `width` thick, only where they
+    /// cross `clip`: a print area of a million rows costs what is on
+    /// screen.
+    fn draw_dashed_outline(&mut self, rect: Rect, clip: Rect, width: f64, paint: Rgba8) {
+        let dash = 4.0 * width;
+        let period = dash + 3.0 * width;
+        self.ctx.push_clip_layer(&clip.to_path(0.1));
+        self.ctx.set_paint(color(paint));
+        let mut edge = |horizontal: bool, fixed: f64, from: f64, to: f64| {
+            let (lo, hi) = if horizontal {
+                (clip.x0, clip.x1)
+            } else {
+                (clip.y0, clip.y1)
+            };
+            let (across_lo, across_hi) = if horizontal {
+                (clip.y0, clip.y1)
+            } else {
+                (clip.x0, clip.x1)
+            };
+            if fixed + width < across_lo || fixed > across_hi {
+                return;
+            }
+            let start = from.max(lo - period);
+            let mut p = from + ((start - from) / period).floor().max(0.0) * period;
+            let end = to.min(hi + period);
+            while p < end {
+                let q = (p + dash).min(to);
+                let piece = if horizontal {
+                    Rect::new(p, fixed, q, fixed + width)
+                } else {
+                    Rect::new(fixed, p, fixed + width, q)
+                };
+                self.ctx.fill_rect(&piece);
+                p += period;
+            }
+        };
+        edge(true, rect.y0, rect.x0, rect.x1);
+        edge(true, rect.y1 - width, rect.x0, rect.x1);
+        edge(false, rect.x0, rect.y0, rect.y1);
+        edge(false, rect.x1 - width, rect.y0, rect.y1);
+        self.ctx.pop_layer();
+    }
+
     fn finish(&mut self) -> &Pixmap {
         self.ctx.flush();
         self.ctx.render(&mut self.pixmap, &mut self.resources);
@@ -2516,6 +2577,65 @@ mod tests {
         assert_eq!(near, [0xd9, 0x2d, 0x20, 0xff], "the corner is red");
         let far = pixel(&mut view, x1 - 3.0, y0 + 12.0);
         assert_ne!(far, [0xd9, 0x2d, 0x20, 0xff]);
+    }
+
+    #[test]
+    fn the_print_area_is_outlined_with_dashes() {
+        let mut book = Arc::unwrap_or_clone(workbook());
+        book.sheets[0].print_area = vec![CellRange::parse("B2:C3").unwrap()];
+        let mut view = SheetView::new(Arc::new(book));
+        view.set_sheet(0);
+        view.resize(600, 400, 1.0);
+        let style = view.style;
+        let (x0, y0, x1, y1) = {
+            let (a, b, _, _) = view.cell_box(CellRef::new(1, 1)).unwrap();
+            let (_, _, c, d) = view.cell_box(CellRef::new(2, 2)).unwrap();
+            (a, b, c, d)
+        };
+        // Along the top edge some pixels are the outline's colour and some
+        // are not: dashes, not a solid line, and not nothing.
+        let top: Vec<[u8; 4]> = (x0 as u32 + 1..x1 as u32 - 1)
+            .map(|x| pixel(&mut view, f64::from(x), y0 - 1.0))
+            .collect();
+        let dark = top.iter().filter(|p| **p == style.header_text).count();
+        assert!(
+            dark > 4 && dark < top.len() - 4,
+            "{dark} of {} pixels",
+            top.len()
+        );
+        // The same on the left edge, and none far from the area.
+        let left = (y0 as u32 + 1..y1 as u32 - 1)
+            .filter(|y| pixel(&mut view, x0 - 1.0, f64::from(*y)) == style.header_text)
+            .count();
+        assert!(left > 2);
+        let away = pixel(&mut view, x1 + 40.0, y0 - 1.0);
+        assert_ne!(away, style.header_text);
+        // A sheet without one has no outline.
+        let mut book = Arc::unwrap_or_clone(workbook());
+        book.sheets[0].print_area.clear();
+        let mut plain = SheetView::new(Arc::new(book));
+        plain.set_sheet(0);
+        plain.resize(600, 400, 1.0);
+        let dark = (x0 as u32 + 1..x1 as u32 - 1)
+            .filter(|x| pixel(&mut plain, f64::from(*x), y0 - 1.0) == style.header_text)
+            .count();
+        assert_eq!(dark, 0);
+    }
+
+    #[test]
+    fn a_print_area_the_height_of_the_sheet_draws_fast_and_stays_on_screen() {
+        let mut book = Arc::unwrap_or_clone(workbook());
+        // Whole columns B to C: a million rows tall.
+        book.sheets[0].print_area = vec![CellRange::new(
+            CellRef::new(0, 1),
+            CellRef::new(aster_sheets::MAX_ROWS - 1, 2),
+        )];
+        let mut view = SheetView::new(Arc::new(book));
+        view.set_sheet(0);
+        view.resize(600, 400, 1.0);
+        let started = std::time::Instant::now();
+        view.render();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     /// Styled cells, a frozen row and column, and a picture.

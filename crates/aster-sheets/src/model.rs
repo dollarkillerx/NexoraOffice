@@ -147,6 +147,9 @@ pub struct Sheet {
     /// List rules (data validation), in file order; the first that covers
     /// a cell applies.
     pub validations: Vec<crate::validation::Validation>,
+    /// The areas that print (`_xlnm.Print_Area` of the sheet); empty when
+    /// the whole sheet does.
+    pub print_area: Vec<CellRange>,
 }
 
 impl Sheet {
@@ -466,6 +469,7 @@ impl SheetBuilder {
             auto_filter: self.auto_filter,
             comments: self.comments,
             validations: self.validations,
+            print_area: Vec::new(),
         }
     }
 }

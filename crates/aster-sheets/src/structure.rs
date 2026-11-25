@@ -544,6 +544,13 @@ impl crate::model::Workbook {
                 }
             }
         }
+        // The print area follows the lines, widening when lines go in
+        // inside it and narrowing when some of it is deleted.
+        host.print_area = host
+            .print_area
+            .iter()
+            .filter_map(|area| lines.moved_range(*area))
+            .collect();
         host.hidden_sizes = std::mem::take(&mut host.hidden_sizes)
             .into_iter()
             .filter_map(|((columns, line), size)| {
@@ -737,6 +744,41 @@ mod tests {
         // Nothing before the first line: nothing to take.
         let first = Lines { at: 0, ..lines };
         assert_eq!(book.inherit_format(0, &first), Inherited::default());
+    }
+
+    #[test]
+    fn the_print_area_follows_inserted_and_deleted_lines() {
+        use crate::model::{SheetBuilder, SheetKind, Workbook};
+
+        let area = |text: &str| CellRange::parse(text).unwrap();
+        let mut sheet = SheetBuilder::new("S", SheetKind::Worksheet).finish();
+        sheet.print_area = vec![area("B3:D6"), area("F10:F12")];
+        let mut book = Workbook {
+            sheets: vec![sheet],
+            ..Workbook::default()
+        };
+        let areas = |book: &Workbook| book.sheets[0].print_area.clone();
+        // Rows in front push both down; inside the first they widen it.
+        book.restructure(0, &rows(0, 2, true));
+        assert_eq!(areas(&book), [area("B5:D8"), area("F12:F14")]);
+        book.restructure(0, &rows(6, 1, true));
+        assert_eq!(areas(&book), [area("B5:D9"), area("F13:F15")]);
+        // Deleting some of the first narrows it; all of the second ends it.
+        book.restructure(0, &rows(4, 2, false));
+        assert_eq!(areas(&book), [area("B5:D7"), area("F11:F13")]);
+        book.restructure(0, &rows(10, 3, false));
+        assert_eq!(areas(&book), [area("B5:D7")]);
+        // Columns the same way.
+        book.restructure(0, &cols(0, 1, true));
+        assert_eq!(areas(&book), [area("C5:E7")]);
+        book.restructure(0, &cols(2, 3, false));
+        assert!(areas(&book).is_empty(), "all of it deleted: no print area");
+        // Lines on another sheet leave it alone.
+        book.sheets[0].print_area = vec![area("A1:B2")];
+        book.sheets
+            .push(SheetBuilder::new("T", SheetKind::Worksheet).finish());
+        book.restructure(1, &rows(0, 5, true));
+        assert_eq!(areas(&book), [area("A1:B2")]);
     }
 
     #[test]

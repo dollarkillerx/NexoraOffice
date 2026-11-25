@@ -334,6 +334,8 @@ export component AppWindow inherits Window {
     // The autofilter: put on or taken off; a column's list sorted by it,
     // a value toggled (-1: all), the choice applied.
     callback sheet-filter();
+    // Set the print area from the selection (`true`) or clear it.
+    callback sheet-print-area(bool);
     callback filter-sort(/* descending */ bool);
     callback filter-toggle(int);
     callback filter-apply();
@@ -352,6 +354,7 @@ export component AppWindow inherits Window {
     in property <bool> filter-all-on;
     in property <bool> filter-some-on;
     in property <bool> sheet-filtered;
+    in property <bool> sheet-has-print-area;
     // Hide (or show) the columns (or rows) the selection spans.
     callback sheet-hide(/* columns */ bool, /* hide */ bool);
     // The active cell's note: write or change it, take it away.
@@ -877,6 +880,24 @@ export component AppWindow inherits Window {
                 enabled: root.viewer == 1 && root.can-save;
                 activated => {
                     root.sheet-filter();
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.menu-print-area-set;
+                enabled: root.viewer == 1 && root.can-save;
+                activated => {
+                    root.sheet-print-area(true);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-print-area-clear;
+                enabled: root.viewer == 1 && root.can-save && root.sheet-has-print-area;
+                activated => {
+                    root.sheet-print-area(false);
                 }
             }
         }

@@ -186,6 +186,15 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
     }
     workbook.active_sheet = entries.active.min(workbook.sheets.len() - 1);
     workbook.names = entries.names;
+    // A print area written some way this does not read stays as it is in
+    // the file: the sheet has none here.
+    for (local, formula) in &entries.print_areas {
+        if let Some(sheet) = workbook.sheets.get_mut(*local)
+            && let Some(areas) = aster_sheets::print_area::parse(formula, &sheet.name)
+        {
+            sheet.print_area = areas;
+        }
+    }
     workbook.styles = styles;
     Ok(workbook)
 }
@@ -201,6 +210,9 @@ pub(crate) struct Entries {
     date1904: bool,
     active: usize,
     names: Vec<aster_sheets::model::DefinedName>,
+    /// The `_xlnm.Print_Area` names: the sheet (`localSheetId`) and the
+    /// formula as written.
+    print_areas: Vec<(usize, String)>,
 }
 
 pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
@@ -210,6 +222,7 @@ pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
         date1904: false,
         active: 0,
         names: Vec::new(),
+        print_areas: Vec::new(),
     };
     loop {
         match reader.next()? {
@@ -219,6 +232,13 @@ pub(crate) fn workbook_entries(bytes: &[u8], part: &str) -> Result<Entries> {
                     .and_then(|i| usize::try_from(i).ok());
                 let name = tag.attr("name");
                 let formula = reader.text()?;
+                if name.as_deref() == Some(aster_sheets::print_area::NAME)
+                    && let Some(local) = local
+                {
+                    entries
+                        .print_areas
+                        .push((local, formula.trim().trim_start_matches('=').to_owned()));
+                }
                 // Excel's own names (print areas, filters) and names other
                 // workbooks or lost cells are not for formulas here.
                 if let Some(name) = name

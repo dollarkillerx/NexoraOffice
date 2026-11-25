@@ -247,6 +247,120 @@ fn defined_names(element: &str, plan: &Plan) -> String {
     format!("{tag}{}</{name}>", kept.concat())
 }
 
+/// `workbook.xml` with the print areas of some sheets written: `edits` are
+/// the sheet (its place in the workbook as it is now) and the text of its
+/// `_xlnm.Print_Area` name, or `None` for none. Names of other sheets and
+/// every other byte stay. Where the file has no `<definedNames>` one is made,
+/// where the schema puts it.
+pub(super) fn print_areas_xml(bytes: &[u8], edits: &[(usize, Option<String>)]) -> Vec<u8> {
+    const NAME: &str = aster_sheets::print_area::NAME;
+    let (bom, xml) = split_bom(bytes);
+    let text = String::from_utf8_lossy(xml).into_owned();
+    let tops = top_level(xml);
+    let prefix = tops
+        .iter()
+        .find(|(name, ..)| name == "sheets")
+        .and_then(|(_, start, end)| {
+            let (_, name) = start_tag(&text[*start..*end]);
+            name.rsplit_once(':').map(|(p, _)| format!("{p}:"))
+        })
+        .unwrap_or_default();
+    let item = |index: usize, formula: &str| {
+        format!(
+            "<{prefix}definedName name=\"{NAME}\" localSheetId=\"{index}\">{}</{prefix}definedName>",
+            escape(formula)
+        )
+    };
+    let mut pending: Vec<&(usize, Option<String>)> = edits.iter().collect();
+    let mut kept = Vec::new();
+    let existing = tops.iter().find(|(name, ..)| name == "definedNames");
+    let (open, element_name) = match existing {
+        Some((_, start, end)) => {
+            let (tag, name) = start_tag(&text[*start..*end]);
+            (tag.to_owned(), name.to_owned())
+        }
+        None => (
+            format!("<{prefix}definedNames>"),
+            format!("{prefix}definedNames"),
+        ),
+    };
+    if let Some((_, start, end)) = existing {
+        let element = &text[*start..*end];
+        for (child, raw) in children(element) {
+            if child == "definedName" {
+                let (tag, tag_name) = start_tag(&raw);
+                let local = super::attribute(tag.as_bytes(), "localSheetId")
+                    .and_then(|v| v.parse::<usize>().ok());
+                if super::attribute(tag.as_bytes(), "name").as_deref() == Some(NAME)
+                    && let Some(local) = local
+                    && let Some(at) = pending.iter().position(|(i, _)| *i == local)
+                {
+                    let (_, formula) = pending.remove(at);
+                    if let Some(formula) = formula {
+                        let body = &raw[tag.len()..];
+                        let close_at = body.rfind("</").unwrap_or(body.len());
+                        let open = match tag.strip_suffix("/>") {
+                            Some(head) => format!("{head}>"),
+                            None => tag.to_owned(),
+                        };
+                        let close = if tag.ends_with("/>") || close_at == body.len() {
+                            format!("</{tag_name}>")
+                        } else {
+                            body[close_at..].to_owned()
+                        };
+                        kept.push(format!("{open}{}{close}", escape(formula)));
+                    }
+                    continue;
+                }
+            }
+            kept.push(raw);
+        }
+    }
+    for (index, formula) in pending {
+        if let Some(formula) = formula {
+            kept.push(item(*index, formula));
+        }
+    }
+    let new = if kept.is_empty() {
+        String::new()
+    } else {
+        let open = match open.strip_suffix("/>") {
+            Some(head) => format!("{head}>"),
+            None => open,
+        };
+        format!("{open}{}</{element_name}>", kept.concat())
+    };
+    let (start, end) = match existing {
+        Some((_, start, end)) => (*start, *end),
+        None => {
+            const AFTER: [&str; 10] = [
+                "calcPr",
+                "oleSize",
+                "customWorkbookViews",
+                "pivotCaches",
+                "smartTagPr",
+                "smartTagTypes",
+                "webPublishing",
+                "fileRecoveryPr",
+                "webPublishObjects",
+                "extLst",
+            ];
+            let at = tops
+                .iter()
+                .find(|(name, ..)| AFTER.contains(&name.as_str()))
+                .or_else(|| tops.iter().find(|(name, ..)| name.is_empty()))
+                .map_or(text.len(), |(_, start, _)| *start);
+            (at, at)
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() + new.len());
+    out.extend_from_slice(bom);
+    out.extend_from_slice(&xml[..start]);
+    out.extend_from_slice(new.as_bytes());
+    out.extend_from_slice(&xml[end..]);
+    out
+}
+
 /// A chart part with the sheet names in its data references changed.
 pub(super) fn chart_xml(bytes: &[u8], plan: &Plan) -> Option<Vec<u8>> {
     let (bom, xml) = split_bom(bytes);

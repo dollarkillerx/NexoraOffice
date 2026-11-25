@@ -1174,6 +1174,7 @@ fn apply_tokens(ui: &AppWindow, tokens: &theme::Tokens) {
     t.set_hover(color(c.hover));
     t.set_pressed(color(c.pressed));
     t.set_hairline(color(c.hairline));
+    t.set_outline(color(c.outline));
     t.set_text(color(c.text));
     t.set_text_secondary(color(c.text_secondary));
     t.set_text_tertiary(color(c.text_tertiary));

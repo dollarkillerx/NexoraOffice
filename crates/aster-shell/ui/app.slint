@@ -1680,9 +1680,12 @@ export component AppWindow inherits Window {
                                 width: 220px;
                                 height: comment-body.preferred-height + 2 * Tokens.space-sm;
                                 background: Tokens.surface;
-                                border-color: Tokens.hairline;
+                                border-color: Tokens.outline;
                                 border-width: 1px;
                                 border-radius: Tokens.radius-sm;
+                                drop-shadow-blur: 12px;
+                                drop-shadow-offset-y: 3px;
+                                drop-shadow-color: Tokens.dark ? #00000099 : #00000033;
 
                                 comment-body := Text {
                                     x: Tokens.space-sm;

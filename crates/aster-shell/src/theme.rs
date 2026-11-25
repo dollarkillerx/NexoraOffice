@@ -108,6 +108,9 @@ pub struct Colors {
     pub pressed: Rgba,
     /// Separators between regions.
     pub hairline: Rgba,
+    /// The outline of floating panels (a cell's note, the formula hints):
+    /// firm enough to tell them from the cells they cover.
+    pub outline: Rgba,
     pub text: Rgba,
     pub text_secondary: Rgba,
     pub text_tertiary: Rgba,
@@ -142,6 +145,7 @@ impl Colors {
             hover: INK.with_alpha(0.06),
             pressed: INK.with_alpha(0.11),
             hairline: INK.with_alpha(0.12),
+            outline: INK.with_alpha(0.38),
             text: INK,
             text_secondary: Rgba::rgb(0x5a5a58),
             text_tertiary: Rgba::rgb(0x767674),
@@ -168,6 +172,7 @@ impl Colors {
             hover: PAPER.with_alpha(0.08),
             pressed: PAPER.with_alpha(0.14),
             hairline: PAPER.with_alpha(0.12),
+            outline: PAPER.with_alpha(0.42),
             text: PAPER,
             text_secondary: Rgba::rgb(0xa9a9a6),
             text_tertiary: Rgba::rgb(0x8a8a87),
@@ -193,7 +198,7 @@ impl Colors {
     }
 
     /// Every colour with its token name, for checks that must cover all of them.
-    pub fn named(&self) -> [(&'static str, Rgba); 21] {
+    pub fn named(&self) -> [(&'static str, Rgba); 22] {
         [
             ("surface", self.surface),
             ("sunken", self.sunken),
@@ -202,6 +207,7 @@ impl Colors {
             ("hover", self.hover),
             ("pressed", self.pressed),
             ("hairline", self.hairline),
+            ("outline", self.outline),
             ("text", self.text),
             ("text-secondary", self.text_secondary),
             ("text-tertiary", self.text_tertiary),
@@ -551,6 +557,21 @@ mod tests {
             ] {
                 assert_eq!(value.3, 0xff);
             }
+        }
+    }
+
+    #[test]
+    fn a_floating_panel_stands_out_from_the_cells_under_it() {
+        for mode in MODES {
+            let c = Colors::of(mode);
+            let edge = c.outline.over(c.surface);
+            assert!(
+                contrast(edge, c.surface) >= 1.6,
+                "{mode:?} outline {:?} on {:?}",
+                edge,
+                c.surface
+            );
+            assert!(contrast(edge, c.surface) > contrast(c.hairline.over(c.surface), c.surface));
         }
     }
 

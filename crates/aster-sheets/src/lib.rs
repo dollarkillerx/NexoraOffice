@@ -20,6 +20,7 @@ pub mod axis;
 pub mod calc;
 pub mod clipboard;
 pub mod comment;
+pub mod cond;
 pub mod edit;
 pub mod fill;
 pub mod filter;

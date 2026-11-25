@@ -9,6 +9,7 @@
 //! contract once `aster-model` and `aster-render` exist.
 
 pub mod cell_editor;
+mod cond_icons;
 mod glyphs;
 pub mod host;
 pub mod md_picture;

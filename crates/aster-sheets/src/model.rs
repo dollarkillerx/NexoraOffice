@@ -150,6 +150,9 @@ pub struct Sheet {
     /// The areas that print (`_xlnm.Print_Area` of the sheet); empty when
     /// the whole sheet does.
     pub print_area: Vec<CellRange>,
+    /// Conditional formats, in file order; how they apply is by their
+    /// rules' priorities. Drawn, not edited; saving keeps the file's own.
+    pub cond_formats: Vec<crate::cond::CondFormat>,
 }
 
 impl Sheet {
@@ -369,6 +372,7 @@ pub struct SheetBuilder {
     pub auto_filter: Option<crate::filter::AutoFilter>,
     pub comments: std::collections::BTreeMap<CellRef, crate::comment::Comment>,
     pub validations: Vec<crate::validation::Validation>,
+    pub cond_formats: Vec<crate::cond::CondFormat>,
 }
 
 impl SheetBuilder {
@@ -390,6 +394,7 @@ impl SheetBuilder {
             auto_filter: None,
             comments: std::collections::BTreeMap::new(),
             validations: Vec::new(),
+            cond_formats: Vec::new(),
         }
     }
 
@@ -470,6 +475,7 @@ impl SheetBuilder {
             comments: self.comments,
             validations: self.validations,
             print_area: Vec::new(),
+            cond_formats: self.cond_formats,
         }
     }
 }
@@ -523,8 +529,14 @@ impl Workbook {
 
     /// The cell's content as the grid shows it. `None` for nothing to show.
     pub fn display(&self, cell: &Cell) -> Option<Display> {
+        self.display_with(cell, None)
+    }
+
+    /// As [`Workbook::display`], with a number format other than the
+    /// cell's own (a conditional format's).
+    pub fn display_with(&self, cell: &Cell, over: Option<&Format>) -> Option<Display> {
         let style = self.styles.get(cell.style as usize);
-        let format = style.map(|s| &*s.format);
+        let format = over.or_else(|| style.map(|s| &*s.format));
         let (text, kind) = match &cell.value {
             Value::Empty => (
                 format!("={}", cell.formula.as_ref()?),

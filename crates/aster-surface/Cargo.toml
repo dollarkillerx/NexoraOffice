@@ -24,4 +24,5 @@ krilla = { workspace = true }
 [dev-dependencies]
 png = { workspace = true }
 tempfile = { workspace = true }
+aster-calc = { workspace = true }
 aster-ooxml = { workspace = true }

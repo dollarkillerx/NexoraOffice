@@ -679,6 +679,7 @@ impl SheetTab {
             .as_deref()
             .map(|path| aster_storage::Fingerprint::of(path, &source));
         let mut view = SheetView::new(Arc::new(workbook));
+        view.set_expr_engine(Box::new(aster_calc::ExprProbe::new()));
         view.set_style(sheet_style(tokens));
         let mut history = History::default();
         history.mark_saved();

@@ -17,6 +17,8 @@ use aster_sheets::{
     SheetKind, Shown, VAlign, Value, Workbook,
 };
 
+mod cond;
+
 use crate::drawingml::{Theme, parse_hex, read_theme};
 use crate::error::{Error, Result};
 use crate::package::{Kind, Package};
@@ -64,9 +66,13 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
         }
         _ => Theme::default(),
     };
-    let (styles, normal_font) = match target_of("styles") {
+    let (styles, normal_font, dxfs, indexed) = match target_of("styles") {
         Some(part) if package.has(&part) => styles(&package.read(&part)?, &part, &theme)?,
-        _ => (Vec::new(), Font::default()),
+        _ => (Vec::new(), Font::default(), Vec::new(), Vec::new()),
+    };
+    let colors = Colors {
+        theme: &theme,
+        indexed,
     };
     let digit = digit_width(&normal_font);
 
@@ -99,6 +105,8 @@ pub fn read_package(package: &mut Package) -> Result<Workbook> {
                     strings: &strings,
                     styles: &styles,
                     digit,
+                    dxfs: &dxfs,
+                    colors: &colors,
                 };
                 let (mut builder, drawing) = worksheet(&bytes, &target, entry.name, &context)?;
                 let rels = package.relationships(&target)?;
@@ -370,11 +378,19 @@ impl Colors<'_> {
     }
 }
 
-fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<(Vec<CellStyle>, Font)> {
+type Styles = (
+    Vec<CellStyle>,
+    Font,
+    Vec<Arc<aster_sheets::cond::Dxf>>,
+    Vec<Rgba>,
+);
+
+fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<Styles> {
     // Custom palettes come after the formats in the file but apply to them,
     // so look for one first.
     let indexed = indexed_colors(bytes, part)?;
     let colors = Colors { theme, indexed };
+    let mut dxfs = Vec::new();
     let mut parts = StyleParts {
         custom: HashMap::new(),
         fonts: Vec::new(),
@@ -429,9 +445,10 @@ fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<(Vec<CellStyle>, Fo
                 normal_font = xfs.first().map_or(0, |xf| xf.font);
             }
             Ev::Open(tag) if tag.is("cellXfs") => parts.xfs = cell_xfs(&mut reader)?,
-            Ev::Open(tag) if tag.is("dxfs") || tag.is("colors") || tag.is("extLst") => {
-                reader.skip()?
+            Ev::Open(tag) if tag.is("dxfs") => {
+                dxfs = cond::read_dxfs(&mut reader, &colors, &parts.custom)?;
             }
+            Ev::Open(tag) if tag.is("colors") || tag.is("extLst") => reader.skip()?,
             Ev::Eof => break,
             _ => {}
         }
@@ -484,7 +501,7 @@ fn styles(bytes: &[u8], part: &str, theme: &Theme) -> Result<(Vec<CellStyle>, Fo
         .or(parts.fonts.first())
         .map(|font| (**font).clone())
         .unwrap_or_default();
-    Ok((styles, normal))
+    Ok((styles, normal, dxfs, colors.indexed))
 }
 
 /// `<colors><indexedColors>`: a workbook's own 64-colour palette.
@@ -673,6 +690,8 @@ fn column_px(width: f64, digit: f64) -> f64 {
 }
 
 struct SheetContext<'a> {
+    dxfs: &'a [Arc<aster_sheets::cond::Dxf>],
+    colors: &'a Colors<'a>,
     strings: &'a [Arc<str>],
     styles: &'a [CellStyle],
     /// Digit width of the Normal font, pixels.
@@ -817,9 +836,19 @@ fn worksheet(
                     builder.validations.push(rule);
                 }
             }
-            Ev::Open(tag) if tag.is("conditionalFormatting") || tag.is("extLst") => {
-                reader.skip()?
+            Ev::Open(tag) if tag.is("conditionalFormatting") => {
+                if builder.cond_formats.len() < cond::MAX_FORMATS {
+                    builder.cond_formats.extend(cond::read_format(
+                        &mut reader,
+                        &tag,
+                        context.dxfs,
+                        context.colors,
+                    )?);
+                } else {
+                    reader.skip()?;
+                }
             }
+            Ev::Open(tag) if tag.is("extLst") => reader.skip()?,
             Ev::Eof => break,
             _ => {}
         }

@@ -13,10 +13,11 @@
 
 use std::sync::Arc;
 
+use aster_sheets::cond::ExprEngine;
 use aster_sheets::{CalcEngine, CalcError, Cancel, CellRef, Computed, Edit, Value, Workbook};
 use formualizer::common::{ExcelError, ExcelErrorKind};
 use formualizer::eval::engine::CancelToken;
-use formualizer::{DateSystem, LiteralValue, WorkbookConfig};
+use formualizer::{ASTNode, DateSystem, LiteralValue, WorkbookConfig};
 
 type Engine = formualizer::Workbook;
 
@@ -293,6 +294,303 @@ impl CalcEngine for Formualizer {
         }
         Ok(out)
     }
+}
+
+/// Evaluates single formulas over the values a workbook holds, for
+/// conditional formats (see [`aster_sheets::cond`]): the formula is read
+/// and worked out in the context of a cell, without being put in one, so
+/// `ROW()` and relative references mean what they do there.
+///
+/// The engine behind it holds values only (the calculated results of the
+/// formula cells). It is filled on first use and, after
+/// [`ExprEngine::invalidate`], brought up to date row by row: each row of
+/// the workbook is summed up in a hash, and only rows whose hash is not
+/// the one remembered are written again. Changing a few cells of a
+/// million costs a pass of hashing, not a reload. A workbook with more
+/// than [`ExprProbe::MAX_CELLS`] cells is not loaded and no formula is
+/// evaluated.
+#[derive(Default)]
+pub struct ExprProbe {
+    loaded: Option<Loaded>,
+    /// Cells may have changed since the engine was filled.
+    stale: bool,
+    /// The workbook is too big to load.
+    refused: bool,
+    parsed: std::collections::HashMap<String, Option<Arc<ASTNode>>>,
+}
+
+/// What the engine holds of one row: a hash of its values and the columns
+/// they span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowState {
+    hash: u64,
+    first: u32,
+    last: u32,
+}
+
+/// Rows of a sheet to write again, and rows that went.
+type Work<'a> = (Vec<&'a aster_sheets::Row>, Vec<(u32, RowState)>);
+
+struct Loaded {
+    engine: Engine,
+    date_system: DateSystem,
+    /// Sheet names, and the rows of each as the engine has them.
+    sheets: Vec<(String, std::collections::BTreeMap<u32, RowState>)>,
+    names: Vec<aster_sheets::model::DefinedName>,
+}
+
+fn hash_row(row: &aster_sheets::Row) -> RowState {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let (mut first, mut last) = (u32::MAX, 0u32);
+    for cell in &row.cells {
+        cell.col.hash(&mut hasher);
+        match &cell.value {
+            Value::Empty => continue,
+            Value::Number(n) => (1u8, n.to_bits()).hash(&mut hasher),
+            Value::Text(t) => (2u8, &**t).hash(&mut hasher),
+            Value::Bool(b) => (3u8, *b).hash(&mut hasher),
+            Value::Error(e) => (4u8, &**e).hash(&mut hasher),
+        }
+        first = first.min(cell.col);
+        last = last.max(cell.col);
+    }
+    RowState {
+        hash: hasher.finish(),
+        first,
+        last,
+    }
+}
+
+impl ExprProbe {
+    /// The most cells (with a value) a workbook may have for formulas of
+    /// conditional formats to be evaluated.
+    pub const MAX_CELLS: usize = 4_000_000;
+    /// The most formulas whose parse is kept.
+    const MAX_PARSED: usize = 10_000;
+    /// The longest formula parsed, characters.
+    const MAX_FORMULA: usize = 8_192;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn new_engine(workbook: &Workbook) -> (Engine, DateSystem) {
+        let date_system = if workbook.date1904 {
+            DateSystem::Excel1904
+        } else {
+            DateSystem::Excel1900
+        };
+        let mut config = WorkbookConfig::ephemeral();
+        config.eval = config.eval.with_date_system(date_system);
+        (Engine::new_with_config(config), date_system)
+    }
+
+    fn load(workbook: &Workbook) -> Option<Loaded> {
+        if workbook
+            .sheets
+            .iter()
+            .map(|s| s.cell_count())
+            .sum::<usize>()
+            > Self::MAX_CELLS
+        {
+            return None;
+        }
+        let (mut engine, date_system) = Self::new_engine(workbook);
+        let mut states = Vec::with_capacity(workbook.sheets.len());
+        for sheet in &workbook.sheets {
+            engine.add_sheet(&sheet.name).ok()?;
+            if let Some(used) = sheet.used_range() {
+                engine.ensure_sheet_capacity(
+                    &sheet.name,
+                    used.last.row as usize + 1,
+                    used.last.col as usize + 1,
+                );
+            }
+            let mut rows = std::collections::BTreeMap::new();
+            for row in sheet.rows() {
+                write_row(&mut engine, &sheet.name, row);
+                rows.insert(row.index, hash_row(row));
+            }
+            states.push((sheet.name.clone(), rows));
+        }
+        define_names(&mut engine, workbook);
+        Some(Loaded {
+            engine,
+            date_system,
+            sheets: states,
+            names: workbook.names.clone(),
+        })
+    }
+
+    /// Bring the engine's values up to the workbook's: the rows that
+    /// differ are written again, or, when most do, it starts over.
+    fn sync(&mut self, workbook: &Workbook) {
+        let Some(loaded) = &mut self.loaded else {
+            return;
+        };
+        let same_shape = loaded.sheets.len() == workbook.sheets.len()
+            && loaded
+                .sheets
+                .iter()
+                .zip(&workbook.sheets)
+                .all(|((name, _), sheet)| *name == sheet.name)
+            && loaded.names == workbook.names;
+        if !same_shape {
+            self.loaded = Self::load(workbook);
+            self.refused = self.loaded.is_none();
+            return;
+        }
+        // Rows to write again, and rows that went, per sheet.
+        let mut work: Vec<Work<'_>> = Vec::new();
+        let mut changed = 0usize;
+        let mut total = 0usize;
+        for ((_, known), sheet) in loaded.sheets.iter().zip(&workbook.sheets) {
+            let mut rewrite = Vec::new();
+            let mut seen = 0usize;
+            for row in sheet.rows() {
+                let state = hash_row(row);
+                seen += 1;
+                if known.get(&row.index) != Some(&state) {
+                    rewrite.push(row);
+                }
+            }
+            let gone: Vec<(u32, RowState)> = known
+                .iter()
+                .filter(|(index, _)| sheet.row(**index).is_none())
+                .map(|(index, state)| (*index, *state))
+                .collect();
+            changed += rewrite.len() + gone.len();
+            total += seen.max(known.len());
+            work.push((rewrite, gone));
+        }
+        // A row inserted shifts most of them: starting over is quicker.
+        if changed > 256 && changed * 4 > total {
+            self.loaded = Self::load(workbook);
+            self.refused = self.loaded.is_none();
+            return;
+        }
+        for (((name, known), sheet), (rewrite, gone)) in
+            loaded.sheets.iter_mut().zip(&workbook.sheets).zip(work)
+        {
+            for (index, state) in gone {
+                clear_row(&mut loaded.engine, name, index, state);
+                known.remove(&index);
+            }
+            for row in rewrite {
+                if let Some(old) = known.get(&row.index) {
+                    clear_row(&mut loaded.engine, name, row.index, *old);
+                }
+                write_row(&mut loaded.engine, &sheet.name, row);
+                known.insert(row.index, hash_row(row));
+            }
+        }
+    }
+
+    fn parse(&mut self, formula: &str) -> Option<Arc<ASTNode>> {
+        if let Some(found) = self.parsed.get(formula) {
+            return found.clone();
+        }
+        if self.parsed.len() >= Self::MAX_PARSED {
+            self.parsed.clear();
+        }
+        let ast = (formula.chars().count() <= Self::MAX_FORMULA)
+            .then(|| formualizer::parse::parser::parse(format!("={formula}")).ok())
+            .flatten()
+            .map(Arc::new);
+        self.parsed.insert(formula.to_owned(), ast.clone());
+        ast
+    }
+}
+
+/// A row's values into the engine, runs of neighbours in one call each.
+fn write_row(engine: &mut Engine, sheet: &str, row: &aster_sheets::Row) {
+    let mut run: Vec<LiteralValue> = Vec::new();
+    let mut run_start = 0u32;
+    let mut next_col = 0u32;
+    let flush = |engine: &mut Engine, run: &mut Vec<LiteralValue>, start: u32| {
+        if run.is_empty() {
+            return;
+        }
+        let values = vec![std::mem::take(run)];
+        let _ = engine.set_values(sheet, row.index + 1, start + 1, &values);
+    };
+    for cell in &row.cells {
+        let Some(value) = literal(&cell.value) else {
+            continue;
+        };
+        if run.is_empty() || cell.col != next_col {
+            flush(engine, &mut run, run_start);
+            run_start = cell.col;
+        }
+        run.push(value);
+        next_col = cell.col + 1;
+    }
+    flush(engine, &mut run, run_start);
+}
+
+/// What a row held, emptied.
+fn clear_row(engine: &mut Engine, sheet: &str, index: u32, state: RowState) {
+    if state.first > state.last {
+        return;
+    }
+    let width = (state.last - state.first + 1) as usize;
+    let values = vec![vec![LiteralValue::Empty; width]];
+    let _ = engine.set_values(sheet, index + 1, state.first + 1, &values);
+}
+
+impl ExprEngine for ExprProbe {
+    fn evaluate(
+        &mut self,
+        workbook: &Workbook,
+        sheet: usize,
+        formula: &str,
+        at: CellRef,
+    ) -> Option<Value> {
+        use formualizer::eval::interpreter::Interpreter;
+        use formualizer::eval::reference::{CellRef as Cell, Coord};
+
+        let ast = self.parse(formula)?;
+        if self.loaded.is_none() && !self.refused {
+            self.loaded = Self::load(workbook);
+            self.refused = self.loaded.is_none();
+            self.stale = false;
+        } else if self.stale {
+            self.sync(workbook);
+            self.stale = false;
+        }
+        let loaded = self.loaded.as_ref()?;
+        let name = &workbook.sheets.get(sheet)?.name;
+        let id = loaded.engine.engine().sheet_id(name)?;
+        let cell = Cell::new(id, Coord::new(at.row, at.col, true, true));
+        let interpreter = Interpreter::new_with_cell(loaded.engine.engine(), name, cell);
+        let value = interpreter.evaluate_ast(&ast).ok()?.into_literal();
+        literal_value(value, loaded.date_system)
+    }
+
+    fn invalidate(&mut self) {
+        self.stale = true;
+        // A workbook that was too big may have shrunk.
+        self.refused = false;
+    }
+}
+
+/// A formula's result as a model value; an empty one is `Empty`, which
+/// compares as 0 or empty text where that is wanted.
+fn literal_value(value: LiteralValue, date_system: DateSystem) -> Option<Value> {
+    Some(match value {
+        LiteralValue::Number(n) => Value::Number(n),
+        LiteralValue::Int(n) => Value::Number(n as f64),
+        LiteralValue::Text(text) => Value::Text(Arc::from(text)),
+        LiteralValue::Boolean(b) => Value::Bool(b),
+        LiteralValue::Error(error) => Value::Error(Arc::from(error.kind.to_string())),
+        LiteralValue::Empty | LiteralValue::Pending => Value::Empty,
+        LiteralValue::Array(rows) => {
+            let first = rows.into_iter().next()?.into_iter().next()?;
+            return literal_value(first, date_system);
+        }
+        other => Value::Number(other.as_serial_number_for(date_system)?),
+    })
 }
 
 #[cfg(test)]
@@ -627,5 +925,175 @@ mod tests {
             .unwrap();
         let b2 = results.iter().find(|c| c.at == CellRef::new(1, 1)).unwrap();
         assert_eq!(b2.value, Value::Number(1.0));
+    }
+
+    #[test]
+    fn a_probe_evaluates_formulas_in_the_context_of_a_cell() {
+        let mut workbook = workbook();
+        // Calculated results stand in the cells, as the view holds them.
+        let results = results(&workbook);
+        workbook = workbook.with_results(&results).0;
+        let mut probe = ExprProbe::new();
+        let mut eval = |sheet: usize, formula: &str, cell: &str| {
+            probe.evaluate(&workbook, sheet, formula, CellRef::parse(cell).unwrap())
+        };
+        // The cell's own row and column.
+        assert_eq!(eval(1, "ROW()", "C7"), Some(Value::Number(7.0)));
+        assert_eq!(eval(1, "MOD(ROW(),2)=0", "C8"), Some(Value::Bool(true)));
+        assert_eq!(eval(1, "COLUMN()", "C7"), Some(Value::Number(3.0)));
+        // Cells and ranges, here and on another sheet.
+        assert_eq!(eval(1, "$A$1+B1", "E1"), Some(Value::Number(7.0)));
+        assert_eq!(eval(1, "SUM($A$1:$B$1)", "E1"), Some(Value::Number(7.0)));
+        assert_eq!(eval(1, "'価格表'!B2>100", "E1"), Some(Value::Bool(true)));
+        assert_eq!(
+            eval(1, "AND($A$1>1,$B$1<10)", "E1"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            eval(1, "COUNTIF($A$1:$B$1,\">3\")", "E1"),
+            Some(Value::Number(1.0))
+        );
+        // A text function over a value, and an error as a value.
+        assert_eq!(eval(0, "LEN(A1)", "D1"), Some(Value::Number(2.0)));
+        assert!(matches!(eval(1, "1/0", "E1"), Some(Value::Error(_))));
+        // What does not parse is not a value.
+        assert_eq!(eval(1, "SUM((", "E1"), None);
+        assert_eq!(eval(7, "1", "E1"), None);
+    }
+
+    #[test]
+    fn a_probe_reads_again_after_a_change_and_refuses_what_is_too_long() {
+        let mut workbook = workbook();
+        let mut probe = ExprProbe::new();
+        let cell = CellRef::parse("E1").unwrap();
+        assert_eq!(
+            probe.evaluate(&workbook, 1, "A1", cell),
+            Some(Value::Number(2.0))
+        );
+        workbook.set_cells(
+            1,
+            vec![(
+                CellRef::parse("A1").unwrap(),
+                Some(Cell::new(0, Value::Number(8.0))),
+            )],
+        );
+        // Not seen until the probe is told.
+        assert_eq!(
+            probe.evaluate(&workbook, 1, "A1", cell),
+            Some(Value::Number(2.0))
+        );
+        probe.invalidate();
+        assert_eq!(
+            probe.evaluate(&workbook, 1, "A1", cell),
+            Some(Value::Number(8.0))
+        );
+        let long = format!("1{}", "+1".repeat(ExprProbe::MAX_FORMULA));
+        assert_eq!(probe.evaluate(&workbook, 1, &long, cell), None);
+    }
+
+    #[test]
+    fn a_probe_loads_a_big_sheet_in_reasonable_time() {
+        let mut sheet = SheetBuilder::new("大", SheetKind::Worksheet);
+        for row in 0..200_000u32 {
+            for col in 0..5u32 {
+                sheet.push(row, Cell::new(col, Value::Number(f64::from(row + col))));
+            }
+        }
+        let workbook = Workbook {
+            sheets: vec![sheet.finish()],
+            ..Workbook::default()
+        };
+        let mut probe = ExprProbe::new();
+        let started = std::time::Instant::now();
+        let at = CellRef::parse("G1").unwrap();
+        assert_eq!(
+            probe.evaluate(&workbook, 0, "SUM(A1:E3)", at),
+            Some(Value::Number(45.0))
+        );
+        let loading = started.elapsed();
+        // Later formulas cost nothing like it.
+        let started = std::time::Instant::now();
+        for row in 0..500u32 {
+            let at = CellRef::new(row, 6);
+            let formula = format!("A{}>5", row + 1);
+            assert!(probe.evaluate(&workbook, 0, &formula, at).is_some());
+        }
+        let evaluating = started.elapsed();
+        eprintln!("one million cells: load {loading:?}, 500 formulas {evaluating:?}");
+        assert!(loading.as_secs_f64() < 10.0);
+        assert!(evaluating.as_secs_f64() < 2.0);
+    }
+
+    #[test]
+    fn a_probe_follows_edits_by_writing_only_the_rows_that_changed() {
+        let mut sheet = SheetBuilder::new("大", SheetKind::Worksheet);
+        for row in 0..200_000u32 {
+            sheet.push(row, Cell::new(0, Value::Number(f64::from(row))));
+            sheet.push(row, Cell::new(1, Value::Number(1.0)));
+        }
+        let mut workbook = Workbook {
+            sheets: vec![sheet.finish()],
+            ..Workbook::default()
+        };
+        let mut probe = ExprProbe::new();
+        let at = CellRef::parse("D1").unwrap();
+        let value = |probe: &mut ExprProbe, workbook: &Workbook, formula: &str| {
+            probe.evaluate(workbook, 0, formula, at)
+        };
+        assert_eq!(
+            value(&mut probe, &workbook, "A100+B100"),
+            Some(Value::Number(100.0))
+        );
+        // A cell changed, one added in a new row, a row's cells cleared.
+        workbook.set_cells(
+            0,
+            vec![
+                (CellRef::new(99, 0), Some(Cell::new(0, Value::Number(5.0)))),
+                (
+                    CellRef::new(300_000, 2),
+                    Some(Cell::new(2, Value::Number(7.0))),
+                ),
+                (CellRef::new(5, 0), None),
+                (CellRef::new(5, 1), None),
+            ],
+        );
+        probe.invalidate();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            value(&mut probe, &workbook, "A100+B100"),
+            Some(Value::Number(6.0))
+        );
+        let synced = started.elapsed();
+        assert_eq!(
+            value(&mut probe, &workbook, "C300001"),
+            Some(Value::Number(7.0))
+        );
+        assert_eq!(
+            value(&mut probe, &workbook, "A6+B6+1"),
+            Some(Value::Number(1.0))
+        );
+        assert_eq!(value(&mut probe, &workbook, "A7"), Some(Value::Number(6.0)));
+        eprintln!("sync of 400000 cells after an edit: {synced:?}");
+        assert!(synced.as_secs_f64() < 0.5, "{synced:?}");
+        // Lines inserted: most rows moved, the probe starts again and is right.
+        workbook.restructure(
+            0,
+            &aster_sheets::structure::Lines {
+                columns: false,
+                at: 0,
+                count: 3,
+                insert: true,
+            },
+        );
+        probe.invalidate();
+        assert_eq!(
+            value(&mut probe, &workbook, "A103"),
+            Some(Value::Number(5.0))
+        );
+        assert_eq!(
+            value(&mut probe, &workbook, "A104"),
+            Some(Value::Number(100.0))
+        );
+        assert_eq!(value(&mut probe, &workbook, "A1"), Some(Value::Empty));
     }
 }

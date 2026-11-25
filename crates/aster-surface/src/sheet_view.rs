@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aster_sheets::cond::{Conditional, Effect, ExprEngine, NoEngine};
 use aster_sheets::{
     Anchor, Cell, CellRange, CellRef, DisplayKind, HAlign, Line, LineStyle, MAX_COLUMNS, MAX_ROWS,
     Picture, Placement, Rgba, Sheet, VAlign, Workbook, column_name,
@@ -21,6 +22,7 @@ use vello_cpu::peniko::{Color, Fill};
 use vello_cpu::{Glyph, Pixmap, RenderContext, Resources};
 
 use crate::cell_editor::{CellEditor, EditMode};
+use crate::cond_icons::draw_icon;
 use crate::picture::{ImageCache, draw_image};
 use crate::preview::draw_text;
 use crate::text_surface::ImeEvent;
@@ -36,6 +38,8 @@ const PX_PER_POINT: f32 = 96.0 / 72.0;
 const TEXT_FIT: f32 = 0.9;
 /// One indent level: three spaces of the default font.
 const INDENT: f64 = 9.0;
+/// What an icon of a conditional format takes at a cell's left edge.
+const ICON_ROOM: f64 = 16.0;
 const HEADER_HEIGHT: f64 = 22.0;
 /// Space between a cell's edge and its text.
 const PAD: f64 = 4.0;
@@ -203,6 +207,13 @@ pub struct SheetView {
     /// Where the caret was last drawn, for the input method's candidate
     /// window: x, y, width, height, physical pixels.
     ime_area: (f64, f64, f64, f64),
+    /// What conditional formats do to cells, kept until a cell changes.
+    cond: Conditional,
+    /// Evaluates the formulas of conditional formats; without one those
+    /// rules do not apply.
+    expr: Option<Box<dyn ExprEngine + Send>>,
+    /// The effects on the pane being drawn.
+    effects: HashMap<CellRef, Arc<Effect>>,
 }
 
 /// A cell's text, laid out.
@@ -290,6 +301,9 @@ impl SheetView {
             revision: 0,
             caret_on: true,
             ime_area: (0.0, 0.0, 1.0, 1.0),
+            cond: Conditional::new(),
+            expr: None,
+            effects: HashMap::new(),
         };
         view.decorated = decorations(&view.workbook);
         view.any_decorated = view.decorated.contains(&true);
@@ -317,8 +331,24 @@ impl SheetView {
         self.workbook = workbook;
         self.decorated = decorations(&self.workbook);
         self.any_decorated = self.decorated.contains(&true);
-        self.cells.clear();
+        self.cells_changed();
         self.drawn = None;
+    }
+
+    /// Give the view an engine for the formulas of conditional formats.
+    pub fn set_expr_engine(&mut self, engine: Box<dyn ExprEngine + Send>) {
+        self.expr = Some(engine);
+        self.cells_changed();
+        self.revision += 1;
+    }
+
+    /// Cells changed: what was laid out and what rules did is out of date.
+    fn cells_changed(&mut self) {
+        self.cells.clear();
+        self.cond.clear();
+        if let Some(engine) = &mut self.expr {
+            engine.invalidate();
+        }
     }
 
     fn is_visible(&self, index: usize) -> bool {
@@ -409,7 +439,7 @@ impl SheetView {
     /// The workbook, to change cells. Laid-out texts are dropped, since any
     /// cell may have changed.
     pub fn workbook_mut(&mut self) -> &mut Workbook {
-        self.cells.clear();
+        self.cells_changed();
         self.revision += 1;
         Arc::make_mut(&mut self.workbook)
     }
@@ -516,7 +546,7 @@ impl SheetView {
     pub fn sheet_inserted(&mut self, index: usize) {
         self.places
             .insert(index.min(self.places.len()), Place::default());
-        self.cells.clear();
+        self.cells_changed();
         self.revision += 1;
     }
 
@@ -528,7 +558,7 @@ impl SheetView {
         if self.sheet >= self.workbook.sheets.len() {
             self.sheet = self.workbook.sheets.len().saturating_sub(1);
         }
-        self.cells.clear();
+        self.cells_changed();
         self.revision += 1;
     }
 
@@ -1205,14 +1235,35 @@ impl SheetView {
         if self.cells.len() >= CACHE_LIMIT {
             self.cells.clear();
         }
-        let laid = self.workbook.display(cell).map(|display| {
+        // What conditional formats do to the cell, found when its pane was
+        // drawn.
+        let effect = self.effects.get(&at).cloned();
+        let over = effect.as_deref().map(|e| &e.dxf);
+        let shown = if effect.as_deref().is_some_and(|e| e.hide_value) {
+            None
+        } else {
+            self.workbook
+                .display_with(cell, over.and_then(|d| d.format.as_deref()))
+        };
+        let laid = shown.map(|display| {
             let style = self.workbook.style(cell.style);
             let font = &style.font;
+            let fill = over.and_then(|d| d.fill).or(style.fill);
             let color = match display.kind {
                 DisplayKind::Uncomputed => self.style.secondary,
-                _ => readable(font.color, style.fill, &self.style),
+                _ => readable(
+                    over.and_then(|d| d.font_color).or(font.color),
+                    fill,
+                    &self.style,
+                ),
             };
-            let indent = f64::from(style.indent) * INDENT;
+            let mut indent = f64::from(style.indent) * INDENT;
+            // An icon sits at the left edge: text that starts there makes
+            // room.
+            if effect.as_deref().is_some_and(|e| e.icon.is_some()) && display.align == HAlign::Left
+            {
+                indent += ICON_ROOM;
+            }
             let s = f64::from(self.scale);
             let wrap = style.wrap;
             let text = if wrap {
@@ -1225,10 +1276,10 @@ impl SheetView {
                 family: family(font.name.as_deref()),
                 size: font.size * PX_PER_POINT * TEXT_FIT,
                 color,
-                bold: font.bold,
-                italic: font.italic,
-                underline: font.underline,
-                strike: font.strike,
+                bold: over.and_then(|d| d.bold).unwrap_or(font.bold),
+                italic: over.and_then(|d| d.italic).unwrap_or(font.italic),
+                underline: over.and_then(|d| d.underline).unwrap_or(font.underline),
+                strike: over.and_then(|d| d.strike).unwrap_or(font.strike),
                 rise: 0.0,
             };
             let wrap_width = wrap.then(|| ((width - (2.0 * PAD + indent) * s).max(s)) as f32);
@@ -1600,6 +1651,24 @@ impl SheetView {
         let view = CellRange::new(pane.first, pane.last);
         self.ctx.push_clip_layer(&clip.to_path(0.1));
 
+        // What conditional formats do to the cells of this pane.
+        self.effects.clear();
+        if !sheet.cond_formats.is_empty() {
+            let mut engine = self.expr.take();
+            let found = match engine.as_deref_mut() {
+                Some(engine) => self.cond.effects(workbook, self.sheet, view, engine),
+                None => self.cond.effects(workbook, self.sheet, view, &mut NoEngine),
+            };
+            self.expr = engine;
+            self.effects = found.into_iter().collect();
+        }
+        let mut conditional: Vec<(CellRef, Arc<Effect>)> = self
+            .effects
+            .iter()
+            .map(|(at, effect)| (*at, effect.clone()))
+            .collect();
+        conditional.sort_by_key(|(at, _)| *at);
+
         if sheet.show_grid {
             self.ctx.set_paint(color(style.grid));
             for col in first_col..=last_col + 1 {
@@ -1681,6 +1750,23 @@ impl SheetView {
                 self.ctx.fill_rect(&snapped(CellRange::single(at)));
             }
         }
+        // Conditional fills (a rule's, or a colour scale's) over the cell's
+        // own.
+        for (at, effect) in &conditional {
+            let Some(fill) = effect.dxf.fill else {
+                continue;
+            };
+            if sheet.columns.size(at.col) == 0.0 || sheet.row_sizes.size(at.row) == 0.0 {
+                continue;
+            }
+            let area = match merges.iter().find(|merge| merge.contains(*at)) {
+                Some(merge) if merge.first == *at => *merge,
+                Some(_) => continue,
+                None => CellRange::single(*at),
+            };
+            self.ctx.set_paint(color(fill));
+            self.ctx.fill_rect(&snapped(area));
+        }
         for &(at, index) in &decorated {
             let Some(cell_style) = workbook.styles.get(index as usize) else {
                 continue;
@@ -1709,6 +1795,56 @@ impl SheetView {
                     && !inner(side)
                 {
                     self.draw_border(border, side, rect, line);
+                }
+            }
+        }
+
+        // Conditional borders, then data bars and icons under the text.
+        for (at, effect) in &conditional {
+            if sheet.columns.size(at.col) == 0.0 || sheet.row_sizes.size(at.row) == 0.0 {
+                continue;
+            }
+            if merges
+                .iter()
+                .any(|merge| merge.contains(*at) && merge.first != *at)
+            {
+                continue;
+            }
+            let rect = snapped(CellRange::single(*at));
+            let borders = &effect.dxf.borders;
+            for (side, border) in [
+                (Side::Top, borders.top),
+                (Side::Bottom, borders.bottom),
+                (Side::Left, borders.left),
+                (Side::Right, borders.right),
+            ] {
+                if let Some(border) = border {
+                    self.draw_border(border, side, rect, line);
+                }
+            }
+            if let Some(bar) = effect.bar {
+                let inset = (2.0 * s).round();
+                let width = ((rect.width() - 2.0 * inset - line) * f64::from(bar.fraction)).round();
+                if width >= 1.0 && rect.height() > 2.0 * inset + line {
+                    let mut shade = bar.color;
+                    shade[3] = 0xc0;
+                    self.ctx.set_paint(color(shade));
+                    self.ctx.fill_rect(&Rect::new(
+                        rect.x0 + inset,
+                        rect.y0 + inset,
+                        rect.x0 + inset + width,
+                        rect.y1 - inset - line,
+                    ));
+                }
+            }
+            if let Some(icon) = effect.icon {
+                let side = (rect.height() - 4.0 * s)
+                    .min(14.0 * s)
+                    .min(rect.width() - 4.0 * s);
+                if side >= 6.0 {
+                    let x = rect.x0 + (2.0 * s).round();
+                    let y = rect.y0 + (rect.height() - line - side) / 2.0;
+                    draw_icon(&mut self.ctx, icon, Rect::new(x, y, x + side, y + side));
                 }
             }
         }
@@ -2416,6 +2552,9 @@ fn lay_out(
         rules: Rules::for_language(language),
     })
 }
+
+#[cfg(test)]
+mod cond_tests;
 
 #[cfg(test)]
 mod tests {

@@ -277,6 +277,9 @@ impl Workbook {
                 *formula = retarget(formula, &old, Some(name));
             }
         }
+        for format in &mut copy.cond_formats {
+            format.map_formulas(|formula| retarget(formula, &old, Some(name)));
+        }
         if touched {
             copy.refresh();
         }
@@ -366,6 +369,9 @@ impl Workbook {
                         touched = true;
                     }
                 }
+            }
+            for format in &mut sheet.cond_formats {
+                format.map_formulas(|formula| retarget(formula, from, to));
             }
             if touched {
                 sheet.refresh();

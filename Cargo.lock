@@ -484,6 +484,7 @@ dependencies = [
 name = "aster-surface"
 version = "0.0.1"
 dependencies = [
+ "aster-calc",
  "aster-image",
  "aster-markdown",
  "aster-ooxml",

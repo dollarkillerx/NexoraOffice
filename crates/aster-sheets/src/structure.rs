@@ -520,6 +520,12 @@ impl crate::model::Workbook {
                 (!rule.ranges.is_empty()).then_some(rule)
             })
             .collect();
+        // Conditional formats follow their cells; one left with none goes.
+        let name = host.name.clone();
+        host.cond_formats = std::mem::take(&mut host.cond_formats)
+            .iter()
+            .filter_map(|format| format.moved(&name, lines))
+            .collect();
         // The filter's block and what it filters move with the lines.
         if let Some(filter) = &mut host.auto_filter {
             match lines.moved_range(filter.range) {

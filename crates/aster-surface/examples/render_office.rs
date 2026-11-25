@@ -40,6 +40,7 @@ fn main() {
         let workbook = aster_ooxml::Xlsx.read(bytes).expect("decode");
         let sheets = workbook.sheets.len();
         let mut view = SheetView::new(Arc::new(workbook));
+        view.set_expr_engine(Box::new(aster_calc::ExprProbe::new()));
         view.resize(WIDTH, HEIGHT, SCALE);
         for index in 0..sheets {
             view.set_sheet(index);

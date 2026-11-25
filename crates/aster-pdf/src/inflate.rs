@@ -272,15 +272,23 @@ pub fn ascii_85(input: &[u8], limit: usize) -> Decoded {
     Decoded::Data(out)
 }
 
-/// Width and height from a JPEG's frame headers: the largest of every
-/// frame header before the first scan. `None` when there is none.
-pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
+/// Width, height and number of components of a picture.
+pub type Size = (u32, u32, u32);
+
+/// Samples in a picture: its pixels times its components.
+fn samples((width, height, components): Size) -> u128 {
+    u128::from(width) * u128::from(height) * u128::from(components)
+}
+
+/// Width, height and components from a JPEG's frame headers: the largest of
+/// every frame header before the first scan. `None` when there is none.
+pub fn jpeg_size(data: &[u8]) -> Option<Size> {
     let mut at = 2;
     if !data.starts_with(&[0xFF, 0xD8]) {
         // Some writers put junk before the start marker.
         at = data.windows(2).position(|w| w == [0xFF, 0xD8])? + 2;
     }
-    let mut largest: Option<(u32, u32)> = None;
+    let mut largest: Option<Size> = None;
     while at + 4 <= data.len() {
         if data[at] != 0xFF {
             at += 1;
@@ -301,12 +309,13 @@ pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
         let length = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
         let frame = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
         if frame {
-            let header = data.get(at + 5..at + 9)?;
+            // Precision (1), height (2), width (2), components (1).
+            let header = data.get(at + 5..at + 10)?;
             let height = u32::from(u16::from_be_bytes([header[0], header[1]]));
             let width = u32::from(u16::from_be_bytes([header[2], header[3]]));
-            let pixels = |s: (u32, u32)| u64::from(s.0) * u64::from(s.1);
-            if largest.is_none_or(|l| pixels((width, height)) > pixels(l)) {
-                largest = Some((width, height));
+            let size = (width, height, u32::from(header[4]).max(1));
+            if largest.is_none_or(|l| samples(size) > samples(l)) {
+                largest = Some(size);
             }
         }
         at += 2 + length.max(2);
@@ -314,20 +323,20 @@ pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
     largest
 }
 
-/// Width and height from a JPEG 2000 codestream's SIZ segment, which must
-/// follow its start marker. A JP2 file is walked box by box to its `jp2c`
-/// box; the image header (`ihdr`) counts too, the larger of the two wins.
-pub fn jpx_size(data: &[u8]) -> Option<(u32, u32)> {
+/// Width, height and components from a JPEG 2000 codestream's SIZ segment,
+/// which must follow its start marker. A JP2 file is walked box by box to
+/// its `jp2c` box; the image header (`ihdr`) counts too, the larger of the
+/// two wins.
+pub fn jpx_size(data: &[u8]) -> Option<Size> {
     if data.starts_with(&[0xFF, 0x4F, 0xFF, 0x51]) {
         return siz(data);
     }
-    let mut header: Option<(u32, u32)> = None;
-    let mut codestream: Option<(u32, u32)> = None;
+    let mut header: Option<Size> = None;
+    let mut codestream: Option<Size> = None;
     walk_boxes(data, 0, &mut header, &mut codestream)?;
     let codestream = codestream?;
-    let pixels = |s: (u32, u32)| u64::from(s.0) * u64::from(s.1);
     Some(match header {
-        Some(h) if pixels(h) > pixels(codestream) => h,
+        Some(h) if samples(h) > samples(codestream) => h,
         _ => codestream,
     })
 }
@@ -335,8 +344,8 @@ pub fn jpx_size(data: &[u8]) -> Option<(u32, u32)> {
 fn walk_boxes(
     data: &[u8],
     depth: usize,
-    header: &mut Option<(u32, u32)>,
-    codestream: &mut Option<(u32, u32)>,
+    header: &mut Option<Size>,
+    codestream: &mut Option<Size>,
 ) -> Option<()> {
     if depth > 4 {
         return None;
@@ -362,7 +371,8 @@ fn walk_boxes(
             b"ihdr" => {
                 let h = u32::from_be_bytes(content.get(0..4)?.try_into().ok()?);
                 let w = u32::from_be_bytes(content.get(4..8)?.try_into().ok()?);
-                *header = Some((w, h));
+                let c = u16::from_be_bytes(content.get(8..10)?.try_into().ok()?);
+                *header = Some((w, h, u32::from(c).max(1)));
             }
             b"jp2c" if codestream.is_none() => {
                 if !content.starts_with(&[0xFF, 0x4F, 0xFF, 0x51]) {
@@ -380,16 +390,18 @@ fn walk_boxes(
     Some(())
 }
 
-/// The image size in the SIZ segment that follows the SOC marker at the
-/// start of `data`.
-fn siz(data: &[u8]) -> Option<(u32, u32)> {
+/// The image size and component count in the SIZ segment that follows the
+/// SOC marker at the start of `data`.
+fn siz(data: &[u8]) -> Option<Size> {
     // SOC (2), SIZ marker (2), Lsiz (2), Rsiz (2), then Xsiz, Ysiz, XOsiz,
-    // YOsiz (4 each).
-    let siz = data.get(8..24)?;
+    // YOsiz (4 each), the tile sizes and offsets (16), Csiz (2).
+    let siz = data.get(8..42)?;
     let word = |i: usize| u32::from_be_bytes([siz[i], siz[i + 1], siz[i + 2], siz[i + 3]]);
+    let components = u32::from(u16::from_be_bytes([siz[32], siz[33]]));
     Some((
         word(0).saturating_sub(word(8)),
         word(4).saturating_sub(word(12)),
+        components.max(1),
     ))
 }
 
@@ -614,13 +626,19 @@ mod tests {
     #[test]
     fn picture_headers() {
         let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 11, 8];
-        jpeg.extend_from_slice(&[0x01, 0x00, 0x02, 0x00]); // 256 high, 512 wide
-        assert_eq!(jpeg_size(&jpeg), Some((512, 256)));
+        jpeg.extend_from_slice(&[0x01, 0x00, 0x02, 0x00, 3]); // 256 high, 512 wide, 3 components
+        assert_eq!(jpeg_size(&jpeg), Some((512, 256, 3)));
+        // A frame header cut before its component count is not read.
+        assert_eq!(jpeg_size(&jpeg[..jpeg.len() - 1]), None);
         let mut j2k = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 41, 0, 0];
         j2k.extend_from_slice(&40000u32.to_be_bytes());
         j2k.extend_from_slice(&30000u32.to_be_bytes());
-        j2k.extend_from_slice(&[0; 8]);
-        assert_eq!(jpx_size(&j2k), Some((40000, 30000)));
+        j2k.extend_from_slice(&[0; 8]); // image offsets
+        j2k.extend_from_slice(&[0; 16]); // tile size and offsets
+        j2k.extend_from_slice(&4u16.to_be_bytes()); // components
+        assert_eq!(jpx_size(&j2k), Some((40000, 30000, 4)));
+        // A SIZ segment cut before its component count is not read.
+        assert_eq!(jpx_size(&j2k[..j2k.len() - 1]), None);
         // A decoy SIZ before the real codestream counts for nothing: the
         // codestream in the jp2c box is what is read.
         let mut decoy = vec![0xFF, 0x51, 0, 41, 0, 0];
@@ -634,7 +652,7 @@ mod tests {
         jp2.extend_from_slice(&((j2k.len() + 8) as u32).to_be_bytes());
         jp2.extend_from_slice(b"jp2c");
         jp2.extend_from_slice(&j2k);
-        assert_eq!(jpx_size(&jp2), Some((40000, 30000)));
+        assert_eq!(jpx_size(&jp2), Some((40000, 30000, 4)));
         // Data that is neither a codestream nor boxes is not read.
         assert_eq!(jpx_size(&decoy), None);
         // Two frame headers in a JPEG: the larger counts.
@@ -643,7 +661,7 @@ mod tests {
         ];
         two.extend_from_slice(&[0xFF, 0xC2, 0, 11, 8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0]);
         two.extend_from_slice(&[0xFF, 0xDA, 0, 2]);
-        assert_eq!(jpeg_size(&two), Some((65535, 65535)));
+        assert_eq!(jpeg_size(&two), Some((65535, 65535, 1)));
         // A page information segment: number 1, type 48, no references,
         // page 1, length 19, then 60000 x 50000.
         let mut jb2 = vec![0, 0, 0, 1, 48, 0, 1, 0, 0, 0, 19];

@@ -372,7 +372,9 @@ fn a_decoy_size_in_jpeg_2000() {
     let mut real = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 41, 0, 0];
     real.extend_from_slice(&60000u32.to_be_bytes());
     real.extend_from_slice(&60000u32.to_be_bytes());
-    real.extend_from_slice(&[0; 8]);
+    // Offsets, tile size and offsets, one component.
+    real.extend_from_slice(&[0; 24]);
+    real.extend_from_slice(&1u16.to_be_bytes());
     let mut decoy = vec![0xFF, 0x51, 0, 41, 0, 0];
     decoy.extend_from_slice(&8u32.to_be_bytes());
     decoy.extend_from_slice(&8u32.to_be_bytes());
@@ -578,4 +580,365 @@ fn large_render_requests_are_scaled_down() {
         height: 14_400.0,
     };
     assert!(14_400.0 * fitted_scale(strip, 4.0, 16_000_000) <= 16_384.0);
+}
+
+/// A modest ceiling, so that bombs in tests can be small.
+fn small_streams() -> Limits {
+    Limits {
+        max_stream_bytes: 1 << 20,
+        ..Limits::default()
+    }
+}
+
+/// `data` as ASCII hex, one digit at a time with blanks between. The parser
+/// reads a stream written inside a dictionary by skipping its data as if it
+/// were more entries; hex like this is made of words it can skip, which
+/// binary data and plain hex are not.
+fn hex(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, byte) in data.iter().enumerate() {
+        out.extend_from_slice(format!("{:X} {:X} ", byte >> 4, byte & 15).as_bytes());
+        if i % 16 == 15 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// A valid cross-reference table, except that the entry of object 5 (which
+/// nothing refers to) points at object 1. Reading it makes the parser
+/// rebuild its table by scanning the file. Object 6, the page's content,
+/// is missing from the original table: only the rebuilt one has it.
+fn repair_bypass(content: &[u8]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = [0usize; 7];
+    let mut object = |out: &mut Vec<u8>, n: usize, body: &[u8]| {
+        offsets[n] = out.len();
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    object(&mut out, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    object(&mut out, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    object(
+        &mut out,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 6 0 R >>",
+    );
+    object(
+        &mut out,
+        4,
+        b"<< /Length 18 >>\nstream\n0 g 0 0 10 10 re f\nendstream",
+    );
+    let mut six = format!(
+        "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+        content.len()
+    )
+    .into_bytes();
+    six.extend_from_slice(content);
+    six.extend_from_slice(b"\nendstream");
+    object(&mut out, 6, &six);
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for n in [1, 2, 3, 4, 1] {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[n]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_stream_that_only_a_repaired_table_has_is_checked() {
+    // A small content stream in the same shape opens and draws: the file
+    // itself is sound.
+    let pages = render_all(repair_bypass(&deflate(b"0 g 0 0 10 10 re f")), 1.0).unwrap();
+    assert!(pages[0].is_some());
+    // The same, with a bomb as the content.
+    let bytes = repair_bypass(&zeros_deflated(8 << 20));
+    assert_eq!(open_with(bytes, small_streams()), STREAM);
+}
+
+/// A one-page document whose page dictionary is `page` (after the parent
+/// and the media box).
+fn page_with(page: &[u8]) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let pages = b.reserve();
+    let mut body =
+        format!("<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] ").into_bytes();
+    body.extend_from_slice(page);
+    body.extend_from_slice(b" >>");
+    let page = b.add(body);
+    b.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    b.finish(catalog)
+}
+
+/// A stream written directly in a dictionary or an array.
+fn direct(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< /Length {} {dict} >>\nstream\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+#[test]
+fn streams_written_inside_other_objects_are_the_parsers_too() {
+    // What the check has to cover: the parser reads such a stream, and
+    // draws with it (its data must be words it can skip, see `hex`).
+    let red = b"1 0 0 rg 0 0 200 100 re B";
+    for form in ["dict", "array"] {
+        let mut page = b"/Contents ".to_vec();
+        let stream = direct("", red);
+        if form == "array" {
+            page.extend_from_slice(b"[ ");
+            page.extend_from_slice(&stream);
+            page.extend_from_slice(b" ]");
+        } else {
+            page.extend_from_slice(&stream);
+        }
+        let pages = render_all(page_with(&page), 1.0).unwrap();
+        let (width, _, pixels) = pages[0].as_ref().expect(form);
+        let middle = (50 * *width as usize + 100) * 4;
+        assert_eq!(&pixels[middle..middle + 3], &[255, 0, 0], "{form}");
+    }
+}
+
+#[test]
+fn a_bomb_written_directly_in_a_page_is_refused() {
+    let bomb = hex(&zeros_deflated(8 << 20));
+    let filters = "/Filter [/AHx /Fl]";
+    // As the content stream, alone and in an array.
+    let mut page = b"/Contents ".to_vec();
+    page.extend_from_slice(&direct(filters, &bomb));
+    assert_eq!(open_with(page_with(&page), small_streams()), STREAM);
+    let mut page = b"/Contents [ ".to_vec();
+    page.extend_from_slice(&direct(filters, &bomb));
+    page.extend_from_slice(b" ]");
+    assert_eq!(open_with(page_with(&page), small_streams()), STREAM);
+    // Nested in resources, under dictionaries and arrays.
+    let mut page = b"/Resources << /Other [ [ << /Deeper ".to_vec();
+    page.extend_from_slice(&direct(filters, &bomb));
+    page.extend_from_slice(b" >> ] ] >>");
+    assert_eq!(open_with(page_with(&page), small_streams()), STREAM);
+    // A picture with a huge size, written as a direct XObject.
+    let mut page = b"/Resources << /XObject << /Im1 ".to_vec();
+    page.extend_from_slice(&direct(
+        "/Type /XObject /Subtype /Image /Width 200000 /Height 200000 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /AHx",
+        b"0 0",
+    ));
+    page.extend_from_slice(b" >> >>");
+    assert_eq!(open(page_with(&page)), IMAGE);
+    // A stream inside the dictionary of a stream.
+    let mut dict = String::from("/Extra ");
+    dict.push_str(&String::from_utf8(direct("/Filter /AHx", b"0 0")).unwrap());
+    let plain = open(content(&dict, b"0 g 0 0 10 10 re f"));
+    assert!(plain.is_ok(), "{plain:?}");
+}
+
+#[test]
+fn nesting_beyond_the_walk_is_refused_not_skipped() {
+    let mut page = b"/Extra ".to_vec();
+    page.extend_from_slice(&b"[".repeat(100));
+    page.extend_from_slice(&b"]".repeat(100));
+    assert_eq!(open(page_with(&page)), UNCHECKED);
+    let mut page = b"/Extra ".to_vec();
+    page.extend_from_slice(&b"[".repeat(20));
+    page.extend_from_slice(&b"]".repeat(20));
+    assert!(open(page_with(&page)).is_ok());
+}
+
+#[test]
+fn object_headers_in_the_raw_bytes_are_found() {
+    let data = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n12 3 obj [] endobj\n7 0obj null\n\
+                 obj 0 obj 99999999999 0 obj 5 obj";
+    let found = crate::check::header_ids(data, &Limits::default()).unwrap();
+    let found: Vec<(u32, i32)> = found.iter().map(|i| (i.obj_number, i.gen_number)).collect();
+    assert_eq!(found, vec![(1, 0), (12, 3), (7, 0)]);
+    let few = Limits {
+        max_objects: 2,
+        ..Limits::default()
+    };
+    assert_eq!(
+        crate::check::header_ids(data, &few),
+        Err(Exceeded::Objects.into())
+    );
+}
+
+/// A page whose contents are these streams, in this order of listing
+/// (`order` indexes into `streams`).
+fn page_of_streams(streams: &[&[u8]], order: &[usize]) -> Vec<u8> {
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let pages = b.reserve();
+    let numbers: Vec<usize> = streams.iter().map(|s| b.stream("", s)).collect();
+    let list: Vec<String> = order
+        .iter()
+        .map(|i| format!("{} 0 R", numbers[*i]))
+        .collect();
+    let page = b.add(format!(
+        "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents [{}] >>",
+        list.join(" ")
+    ));
+    b.set(
+        pages,
+        format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+    );
+    b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    b.finish(catalog)
+}
+
+#[test]
+fn an_inline_picture_split_across_content_streams_is_refused() {
+    let head: &[u8] = b"q 200 0 0 100 0 0 cm BI /W 100 /H 100 /BPC 8 /CS /G /F /Fl";
+    let mut tail = b"ID ".to_vec();
+    tail.extend_from_slice(&zeros_deflated(8 << 20));
+    tail.extend_from_slice(b"\nEI Q");
+    // In one stream the bomb is found.
+    let mut whole = head.to_vec();
+    whole.push(b' ');
+    whole.extend_from_slice(&tail);
+    assert_eq!(
+        open_with(page_of_streams(&[&whole], &[0]), small_streams()),
+        STREAM
+    );
+    // Split between two, the parser puts them together.
+    assert_eq!(
+        open_with(page_of_streams(&[head, &tail], &[0, 1]), small_streams()),
+        STREAM
+    );
+    // A split that is harmless opens.
+    let small = b"ID \x80 EI Q";
+    let split = page_of_streams(
+        &[b"q 10 0 0 10 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G", small],
+        &[0, 1],
+    );
+    assert!(open_with(split, small_streams()).is_ok());
+}
+
+#[test]
+fn content_streams_that_add_up_to_too_much_are_refused() {
+    // Each is 600 KB once decoded, under the ceiling of 1 MB; listed three
+    // times the parser holds 1.8 MB of them.
+    let packed = zeros_deflated(600 << 10);
+    let mut b = Builder::default();
+    let catalog = b.reserve();
+    let pages = b.reserve();
+    let content = b.stream("/Filter /FlateDecode", &packed);
+    let list = |n: usize| vec![format!("{content} 0 R"); n].join(" ");
+    let with = |b: &mut Builder, n: usize| {
+        let page = b.add(format!(
+            "<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 200 100] /Contents [{}] >>",
+            list(n)
+        ));
+        b.set(
+            pages,
+            format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"),
+        );
+        b.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+        b.finish(catalog)
+    };
+    let one = with(&mut b, 1);
+    assert!(open_with(one, small_streams()).is_ok());
+    let three = with(&mut b, 3);
+    assert_eq!(open_with(three, small_streams()), STREAM);
+}
+
+#[test]
+fn filters_follow_the_parsers_two_branches() {
+    let cases: [(&str, usize, Option<u8>); 5] = [
+        // One name, its parameters in a dictionary.
+        (
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 >>",
+            1,
+            Some(12),
+        ),
+        // /DP before /DecodeParms.
+        (
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 >> /DP << /Predictor 11 >>",
+            1,
+            Some(11),
+        ),
+        // A /F the parser does not know sends it to the array branch, where
+        // the parameters come from an array.
+        (
+            "/F /Unknown /Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 >>] \
+             /DP << /Predictor 11 >>",
+            1,
+            Some(12),
+        ),
+        // ... and a name in /Filter there has no array to be read from.
+        (
+            "/F /Unknown /Filter /FlateDecode /DP << /Predictor 11 >>",
+            0,
+            None,
+        ),
+        // An array of one: parameters in step with the names.
+        (
+            "/Filter [/Bogus /FlateDecode] /DecodeParms [<< /Predictor 11 >> << /Predictor 13 >>]",
+            1,
+            Some(13),
+        ),
+    ];
+    for (dict, count, predictor) in cases {
+        let bytes = content(dict, b"0 g");
+        let pdf = Pdf::new(bytes).unwrap();
+        let mut seen = 0;
+        for object in pdf.objects() {
+            let hayro::hayro_syntax::object::Object::Stream(stream) = object else {
+                continue;
+            };
+            if !stream.dict().contains_key(b"Filter") {
+                continue;
+            }
+            seen += 1;
+            let ours = crate::check::filters_and_params(&stream);
+            assert_eq!(ours.len(), stream.filters().len(), "{dict}");
+            assert_eq!(ours.len(), count, "{dict}");
+            let got = ours.first().and_then(|(_, p)| p.get::<u8>(b"Predictor"));
+            assert_eq!(got, predictor, "{dict}");
+        }
+        assert_eq!(seen, 1, "{dict}");
+    }
+}
+
+/// A JPEG 2000 codestream: `width` x `height`, `components` components.
+fn j2k(width: u32, height: u32, components: u16) -> Vec<u8> {
+    let mut out = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 41, 0, 0];
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&[0; 24]);
+    out.extend_from_slice(&components.to_be_bytes());
+    out
+}
+
+#[test]
+fn components_count_in_jpeg_pictures() {
+    // 81 million pixels, under the limit of 100 million; with 16 components
+    // more than four samples for each pixel the limit allows.
+    let dict = "/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray \
+                /BitsPerComponent 8 /Filter /JPXDecode";
+    assert_eq!(open(with_picture(dict, &j2k(9000, 9000, 16))), IMAGE);
+    assert!(open(with_picture(dict, &j2k(9000, 9000, 3))).is_ok());
+    // A SIZ segment without its component count cannot be read.
+    let cut = j2k(9000, 9000, 3);
+    assert_eq!(open(with_picture(dict, &cut[..cut.len() - 1])), UNCHECKED);
+    // The same for the frame header of a JPEG.
+    let jpeg = |components: u8| {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8];
+        jpeg.extend_from_slice(&9000u16.to_be_bytes());
+        jpeg.extend_from_slice(&9000u16.to_be_bytes());
+        jpeg.extend_from_slice(&[components, 1, 0x11, 0, 0xFF, 0xDA, 0, 2, 0xFF, 0xD9]);
+        jpeg
+    };
+    let dict = "/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray \
+                /BitsPerComponent 8 /Filter /DCTDecode";
+    assert_eq!(open(with_picture(dict, &jpeg(8))), IMAGE);
+    assert!(open(with_picture(dict, &jpeg(3))).is_ok());
 }

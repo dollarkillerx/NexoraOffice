@@ -253,6 +253,9 @@ struct Shell {
     next_pdf_token: u64,
     /// The PDF page and zoom the toolbar and status bar show.
     shown_pdf: Option<(usize, u32)>,
+    /// The PDF tab in front, as far as the workers know: the one not
+    /// suspended.
+    fronted_pdf: Option<TabId>,
     /// Runs once typing has paused, to bring the preview up to date.
     preview_timer: Timer,
     /// Runs once typing has paused, to search again with the find bar open.
@@ -324,6 +327,7 @@ impl Shell {
             pdf_loads: HashMap::new(),
             next_pdf_token: 1,
             shown_pdf: None,
+            fronted_pdf: None,
             preview_timer: Timer::default(),
             find_timer: Timer::default(),
             recent: RecentFiles::default(),
@@ -403,6 +407,28 @@ impl Shell {
 
     /// The tab in front is about to change: a composition must not be left
     /// behind in a document that can no longer receive its commit.
+    /// Keep only the PDF tab in front rendering: the one that was in front
+    /// frees its pixels and pauses its worker, the new one wakes up. Called
+    /// wherever the tab in front may have changed (`present` runs after
+    /// every such change).
+    fn sync_pdf_front(&mut self) {
+        let now = self
+            .tabs
+            .active_id()
+            .filter(|id| matches!(self.contents.get(id), Some(Content::Pdf(_))));
+        if now == self.fronted_pdf {
+            return;
+        }
+        if let Some(Content::Pdf(tab)) = self.fronted_pdf.and_then(|id| self.contents.get_mut(&id))
+        {
+            tab.suspend();
+        }
+        if let Some(Content::Pdf(tab)) = now.and_then(|id| self.contents.get_mut(&id)) {
+            tab.resume();
+        }
+        self.fronted_pdf = now;
+    }
+
     fn leave_active_document(&mut self) {
         match self.active_content() {
             Some(Content::Writer(view)) if view.surface.is_composing() => {
@@ -1821,7 +1847,11 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             ui.set_status_zoom(format!("{}%", tab.view.zoom_percent()).into());
             ui.set_zoom_enabled(true);
             ui.set_status_format("PDF".into());
-            ui.set_status_notice(SharedString::new());
+            ui.set_status_notice(if tab.stopped() {
+                strings.pdf_stopped.into()
+            } else {
+                SharedString::new()
+            });
         }
         None => {
             ui.set_status_zoom(SharedString::new());
@@ -1948,6 +1978,7 @@ fn schedule_count(ui: &AppWindow, shell: &mut Shell) {
 /// candidate window. A Markdown tab also gets its preview drawn, and the two
 /// views lined up.
 fn present(ui: &AppWindow, shell: &mut Shell) {
+    shell.sync_pdf_front();
     if slides_ui::present_show(ui, shell) {
         return;
     }
@@ -4124,7 +4155,7 @@ fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Ev
                 let title = i18n::fill(strings.open_failed, "name", &files::display_name(&path));
                 show_dialog(ui, shell, 2, title, pdf::error_message(error, strings));
             }
-            Event::Page(_) | Event::PageFailed(_) => {}
+            Event::Page(_) | Event::PageFailed(_) | Event::Stopped => {}
         }
         return;
     }
@@ -4140,8 +4171,15 @@ fn pdf_event(ui: &AppWindow, shell: &mut Shell, token: u64, event: aster_pdf::Ev
         // The tab was closed meanwhile.
         return;
     };
-    if tab.take(event) && active == Some(id) {
-        present(ui, shell);
+    let gave_up = matches!(event, Event::Failed(_) | Event::Stopped);
+    let changed = tab.take(event);
+    if active == Some(id) {
+        if changed {
+            present(ui, shell);
+        }
+        if gave_up {
+            refresh_status(ui, shell);
+        }
     }
 }
 

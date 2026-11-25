@@ -43,6 +43,13 @@ const THUMBS_AROUND: usize = 12;
 /// How far a rendering's scale may differ from the wanted one and still be
 /// used as it is.
 const SCALE_TOLERANCE: f32 = 0.02;
+/// Most bytes of rendered pixels a view holds, main pages and thumbnails
+/// together.
+pub const PIXEL_BUDGET: usize = 256 << 20;
+/// Page sizes are clamped to this range, in points (PDF viewers allow at most
+/// 14 400, 200 inches), so layout stays finite whatever the file claims.
+const PAGE_MIN: f32 = 1.0;
+const PAGE_MAX: f32 = 14_400.0;
 /// Scroll by this much (logical pixels) when the arrow keys are used.
 pub const LINE_STEP: f64 = 48.0;
 
@@ -83,11 +90,28 @@ impl Default for PdfStyle {
     }
 }
 
+/// A page size from the file made safe: finite and within a sane range.
+fn clamp_page(points: f32) -> f32 {
+    if points.is_nan() {
+        PAGE_MIN
+    } else {
+        points.clamp(PAGE_MIN, PAGE_MAX)
+    }
+}
+
 /// A rendering of a page, and the scale (pixels per point) it was made at.
 #[derive(Clone)]
 struct Shot {
     scale: f32,
     pixmap: Arc<Pixmap>,
+    /// When it was last drawn (or arrived): `PdfView::clock`.
+    used: u64,
+}
+
+impl Shot {
+    fn bytes(&self) -> usize {
+        usize::from(self.pixmap.width()) * usize::from(self.pixmap.height()) * 4
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +129,10 @@ struct Drawn {
 pub struct PdfView {
     /// Page sizes in points, as shown.
     pages: Vec<(f32, f32)>,
+    /// Per page: how much smaller the laid-out size is than the real one
+    /// (1 unless the size was clamped). The worker renders the real page, so
+    /// the scale it is sent is the layout scale times this.
+    factors: Vec<f32>,
     /// Top of each page in layout units (points at zoom 1), and the total.
     tops: Vec<f64>,
     zoom: Zoom,
@@ -120,6 +148,17 @@ pub struct PdfView {
     shots: HashMap<usize, Shot>,
     thumbs: HashMap<usize, Shot>,
     failed: HashSet<usize>,
+    /// Bumped on every arrival and drawing, to find what was drawn least
+    /// recently.
+    clock: u64,
+    budget: usize,
+    /// Pages next to the visible ones that found no room when they arrived,
+    /// with the bytes the visible ones held then: not asked for again until
+    /// that changes.
+    declined: HashMap<usize, usize>,
+    /// The pixels were given up (background tab): the drawing buffers are
+    /// made again at the next frame.
+    released: bool,
     shaper: Shaper,
     numbers: HashMap<(usize, bool), Arc<Paragraph>>,
     ctx: RenderContext,
@@ -136,12 +175,24 @@ impl PdfView {
     pub fn new(pages: Vec<(f32, f32)>) -> Self {
         let mut shaper = Shaper::new();
         shaper.set_han_fallbacks(&HAN_FALLBACK_FAMILIES);
+        let factors: Vec<f32> = pages
+            .iter()
+            .map(|&(w, h)| {
+                let factor = (clamp_page(w) / w).min(clamp_page(h) / h);
+                if factor.is_finite() && factor > 0.0 {
+                    factor
+                } else {
+                    1.0
+                }
+            })
+            .collect();
         let pages: Vec<(f32, f32)> = pages
             .into_iter()
-            .map(|(w, h)| (w.max(1.0), h.max(1.0)))
+            .map(|(w, h)| (clamp_page(w), clamp_page(h)))
             .collect();
         let mut view = Self {
             pages,
+            factors,
             tops: Vec::new(),
             zoom: Zoom::FitWidth,
             scroll_x: 0.0,
@@ -155,6 +206,10 @@ impl PdfView {
             shots: HashMap::new(),
             thumbs: HashMap::new(),
             failed: HashSet::new(),
+            clock: 0,
+            budget: PIXEL_BUDGET,
+            declined: HashMap::new(),
+            released: false,
             shaper,
             numbers: HashMap::new(),
             ctx: RenderContext::new(1, 1),
@@ -166,6 +221,90 @@ impl PdfView {
         };
         view.lay_out();
         view
+    }
+
+    /// Bytes of rendered pixels held now (a picture shared by a main page and
+    /// a thumbnail is counted once).
+    pub fn pixel_bytes(&self) -> usize {
+        Self::unique_bytes(self.shots.values().chain(self.thumbs.values()))
+    }
+
+    /// Bytes of what is on screen now: main pages in the window and
+    /// thumbnails in the strip.
+    pub fn visible_bytes(&self) -> usize {
+        let pages = self.visible();
+        let thumbs = if self.shows_strip() {
+            self.visible_thumbs()
+        } else {
+            0..0
+        };
+        let main = self.shots.iter().filter(|(p, _)| pages.contains(p));
+        let strip = self.thumbs.iter().filter(|(p, _)| thumbs.contains(p));
+        Self::unique_bytes(main.chain(strip).map(|(_, shot)| shot))
+    }
+
+    fn unique_bytes<'a>(shots: impl Iterator<Item = &'a Shot>) -> usize {
+        let mut seen: Vec<*const Pixmap> = Vec::new();
+        let mut total = 0;
+        for shot in shots {
+            let at = Arc::as_ptr(&shot.pixmap);
+            if !seen.contains(&at) {
+                seen.push(at);
+                total += shot.bytes();
+            }
+        }
+        total
+    }
+
+    /// Change the byte budget for rendered pixels.
+    pub fn set_pixel_budget(&mut self, bytes: usize) {
+        self.budget = bytes;
+        self.enforce_budget();
+    }
+
+    /// Let go of every rendering and of the drawing buffers (a tab in the
+    /// background). Pages are asked for again when the view is shown.
+    pub fn drop_pixels(&mut self) {
+        self.shots.clear();
+        self.thumbs.clear();
+        self.numbers.clear();
+        self.ctx = RenderContext::new(1, 1);
+        self.pixmap = Pixmap::new(1, 1);
+        self.released = true;
+        self.declined.clear();
+        self.drawn = None;
+        self.version += 1;
+    }
+
+    /// Drop the least recently drawn renderings until the budget holds. What
+    /// is on screen stays, even if it alone is over the budget (a page is at
+    /// most 16 Mpx, and few pages are on screen at once).
+    fn enforce_budget(&mut self) {
+        let pages = self.visible();
+        let strip = if self.shows_strip() {
+            self.visible_thumbs()
+        } else {
+            0..0
+        };
+        while self.pixel_bytes() > self.budget {
+            let oldest = self
+                .shots
+                .iter()
+                .filter(|(page, _)| !pages.contains(page))
+                .map(|(page, shot)| (shot.used, false, *page))
+                .chain(
+                    self.thumbs
+                        .iter()
+                        .filter(|(page, _)| !strip.contains(page))
+                        .map(|(page, shot)| (shot.used, true, *page)),
+                )
+                .min();
+            match oldest {
+                Some((_, false, page)) => self.shots.remove(&page),
+                Some((_, true, page)) => self.thumbs.remove(&page),
+                None => break,
+            };
+        }
     }
 
     fn lay_out(&mut self) {
@@ -616,16 +755,18 @@ impl PdfView {
         let current = self.current();
         let mut pages: Vec<usize> = around.collect();
         pages.sort_by_key(|p| p.abs_diff(current));
+        let on_screen = self.visible_bytes();
         for page in pages {
-            if self.failed.contains(&page) {
+            if self.failed.contains(&page) || self.declined.get(&page) == Some(&on_screen) {
                 continue;
             }
-            let fresh = self
-                .shots
-                .get(&page)
-                .is_some_and(|shot| (shot.scale / ppp - 1.0).abs() <= SCALE_TOLERANCE);
+            // A thumbnail made at this scale does as well.
+            let fresh = [&self.shots, &self.thumbs].iter().any(|held| {
+                held.get(&page)
+                    .is_some_and(|shot| (shot.scale / ppp - 1.0).abs() <= SCALE_TOLERANCE)
+            });
             if !fresh {
-                wanted.push((page, ppp));
+                wanted.push((page, ppp * self.factors[page]));
             }
         }
         if self.shows_strip() {
@@ -633,7 +774,15 @@ impl PdfView {
                 if self.failed.contains(&page) || self.thumbs.contains_key(&page) {
                     continue;
                 }
-                wanted.push((page, self.thumb_scale(page)));
+                // A main rendering at the thumbnail's scale does as well.
+                let scale = self.thumb_scale(page);
+                let made = self
+                    .shots
+                    .get(&page)
+                    .is_some_and(|shot| (shot.scale / scale - 1.0).abs() <= SCALE_TOLERANCE);
+                if !made {
+                    wanted.push((page, scale * self.factors[page]));
+                }
             }
         }
         wanted
@@ -659,10 +808,18 @@ impl PdfView {
         if page >= self.count() {
             return false;
         }
+        // Back to the scale of the laid-out size.
+        let scale = scale / self.factors[page];
         let (Ok(w), Ok(h)) = (u16::try_from(width), u16::try_from(height)) else {
             return false;
         };
         if pixels.len() != usize::from(w) * usize::from(h) * 4 || w == 0 || h == 0 {
+            return false;
+        }
+        if pixels.len() > self.budget {
+            // Too big to keep at all: shown blank rather than asked for
+            // again and again.
+            self.mark_failed(page);
             return false;
         }
         // Same bytes, no copy; the copy is for a buffer whose capacity is
@@ -681,16 +838,21 @@ impl PdfView {
                 })
                 .collect(),
         };
+        self.clock += 1;
         let shot = Shot {
             scale,
             pixmap: Arc::new(Pixmap::from_parts_with_opacity(pixels, w, h, false)),
+            used: self.clock,
         };
         let is_thumb =
             self.shows_strip() && (scale / self.thumb_scale(page) - 1.0).abs() <= SCALE_TOLERANCE;
         let main = (scale / self.pixels_per_point() as f32 - 1.0).abs() <= SCALE_TOLERANCE;
-        if is_thumb && !main {
-            self.thumbs.insert(page, shot);
-        } else {
+        if is_thumb {
+            // At the same scale as a main page it serves as both (one
+            // picture, counted once).
+            self.thumbs.insert(page, shot.clone());
+        }
+        if main || !is_thumb {
             // A page at another scale than now (the zoom changed since it
             // was asked for) is still better than a blank page.
             let better = self.shots.get(&page).is_none_or(|old| {
@@ -702,6 +864,12 @@ impl PdfView {
             }
         }
         self.forget_far();
+        self.enforce_budget();
+        if !self.shots.contains_key(&page) && !self.thumbs.contains_key(&page) {
+            // No room beside what is on screen.
+            let on_screen = self.visible_bytes();
+            self.declined.insert(page, on_screen);
+        }
         self.version += 1;
         true
     }
@@ -744,6 +912,11 @@ impl PdfView {
         if !self.needs_render() {
             return &self.pixmap;
         }
+        if self.released {
+            self.released = false;
+            self.ctx = RenderContext::new(self.width.max(1), self.height.max(1));
+            self.pixmap = Pixmap::new(self.width.max(1), self.height.max(1));
+        }
         self.drawn = Some(self.state());
         let (w, h) = (f64::from(self.width), f64::from(self.height));
         let s = self.s();
@@ -762,10 +935,16 @@ impl PdfView {
             self.ctx.fill_rect(&rect.inflate(hairline, hairline));
             self.ctx.set_paint(Color::WHITE);
             self.ctx.fill_rect(&rect);
-            if let Some(shot) = self.shots.get(&index).cloned() {
-                draw_image(&mut self.ctx, &shot.pixmap, rect, None, Affine::IDENTITY);
-            } else if let Some(thumb) = self.thumbs.get(&index).cloned() {
-                draw_image(&mut self.ctx, &thumb.pixmap, rect, None, Affine::IDENTITY);
+            self.clock += 1;
+            let clock = self.clock;
+            if let Some(shot) = self.shots.get_mut(&index) {
+                shot.used = clock;
+                let pixmap = shot.pixmap.clone();
+                draw_image(&mut self.ctx, &pixmap, rect, None, Affine::IDENTITY);
+            } else if let Some(thumb) = self.thumbs.get_mut(&index) {
+                thumb.used = clock;
+                let pixmap = thumb.pixmap.clone();
+                draw_image(&mut self.ctx, &pixmap, rect, None, Affine::IDENTITY);
             }
         }
 
@@ -783,13 +962,16 @@ impl PdfView {
                 let rect = self.thumb_rect(index);
                 self.ctx.set_paint(Color::WHITE);
                 self.ctx.fill_rect(&rect);
-                let shot = self
-                    .thumbs
-                    .get(&index)
-                    .or_else(|| self.shots.get(&index))
-                    .cloned();
+                self.clock += 1;
+                let clock = self.clock;
+                let shot = match self.thumbs.get_mut(&index) {
+                    Some(shot) => Some(shot),
+                    None => self.shots.get_mut(&index),
+                };
                 if let Some(shot) = shot {
-                    draw_image(&mut self.ctx, &shot.pixmap, rect, None, Affine::IDENTITY);
+                    shot.used = clock;
+                    let pixmap = shot.pixmap.clone();
+                    draw_image(&mut self.ctx, &pixmap, rect, None, Affine::IDENTITY);
                 }
                 let selected = index == current;
                 if selected {
@@ -998,6 +1180,31 @@ mod tests {
         assert!(view.shots.contains_key(&40));
         // Wrong sizes are refused.
         assert!(!view.insert(1, ppp, 10, 10, vec![0; 12]));
+    }
+
+    #[test]
+    fn what_is_on_screen_is_not_dropped_for_the_budget() {
+        let mut view = PdfView::new(vec![(100.0, 100.0); 6]);
+        // Without the strip; pages 0 and 1 are on screen, page 2 is the one
+        // after.
+        view.set_strip(false);
+        view.resize(1000, 1800, 1.0);
+        let on = view.visible();
+        let next = on.end;
+        assert!(on.len() >= 2 && next < 6, "{on:?}");
+        let ppp = view.pixels_per_point() as f32;
+        let one = 10 * 10 * 4;
+        view.set_pixel_budget(one);
+        for page in on.clone().rev() {
+            view.insert(page, ppp, 10, 10, vec![0; one]);
+        }
+        // Over the budget with the visible pages alone: all stay.
+        assert_eq!(view.pixel_bytes(), on.len() * one);
+        // A page beside them finds no room, and is not asked for again.
+        view.insert(next, ppp, 10, 10, vec![0; one]);
+        assert!(!view.shots.contains_key(&next));
+        assert!(view.wanted().iter().all(|(p, _)| *p != next));
+        assert_eq!(view.pixel_bytes(), on.len() * one);
     }
 
     #[test]

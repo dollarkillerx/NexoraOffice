@@ -113,6 +113,9 @@ pub fn run_if_child(args: &[OsString]) -> Option<i32> {
     if args.first().is_none_or(|a| a != SUBCOMMAND) {
         return None;
     }
+    // Before anything opens a file or starts a thread: nothing the parent
+    // left open may be used from here.
+    crate::sandbox::close_inherited_descriptors();
     Some(main(&args[1..]))
 }
 
@@ -125,6 +128,7 @@ pub fn main(args: &[OsString]) -> i32 {
         return 2;
     };
     enforce_budget(budget);
+    watch_parent();
     let path = PathBuf::from(path);
     let worker = std::thread::Builder::new()
         .name("pdf".into())
@@ -136,6 +140,37 @@ pub fn main(args: &[OsString]) -> i32 {
     }
 }
 
+/// End at once when the parent is gone: nobody is left to read the answers
+/// or to kill this process. Standard input closing is the main sign (see
+/// `serve`); this also catches a parent that died while its pipes stayed
+/// open in another process.
+#[cfg(unix)]
+fn watch_parent() {
+    // SAFETY: `getppid` takes no arguments and cannot fail.
+    let parent = unsafe { libc::getppid() };
+    let _ = std::thread::Builder::new()
+        .name("pdf-parent".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                // SAFETY: as above.
+                if unsafe { libc::getppid() } != parent {
+                    gone();
+                }
+            }
+        });
+}
+
+/// On other systems only the closing of standard input tells.
+#[cfg(not(unix))]
+fn watch_parent() {}
+
+/// The parent is gone: end now, even in the middle of a page.
+fn gone() -> ! {
+    // SAFETY: `_exit` ends the process at once; it takes no pointers.
+    unsafe { libc::_exit(0) }
+}
+
 fn serve(path: &Path, budget: u64) -> i32 {
     let mut input = io::stdin();
     let mut output = io::stdout().lock();
@@ -143,21 +178,9 @@ fn serve(path: &Path, budget: u64) -> i32 {
         Ok(ToChild::Start { password, limits }) => (password, limits.into_limits(budget)),
         _ => return 2,
     };
-    let opened =
-        read_file(path, &limits).and_then(|bytes| Document::open(bytes, &password, limits));
-    drop(password);
-    let document = match opened {
-        Ok(document) => document,
-        Err(error) => {
-            let _ = write_frame(&mut output, &FromChild::Failed(error));
-            return 0;
-        }
-    };
-    if write_frame(&mut output, &FromChild::Opened(document.info().clone())).is_err() {
-        return 0;
-    }
-    // Requests are read on a thread of their own, so a new one can replace
-    // the old while a page renders.
+    // Requests are read on a thread of their own, from the start: a new one
+    // replaces the old while a page renders, and the end of the input (the
+    // parent is gone) ends the process, whatever it is doing.
     let (requests, inbox) = mpsc::channel();
     let reader = std::thread::Builder::new()
         .name("pdf-requests".into())
@@ -167,8 +190,39 @@ fn serve(path: &Path, budget: u64) -> i32 {
                     break;
                 }
             }
+            gone();
         });
     if reader.is_err() {
+        return 0;
+    }
+    // The file is read before the sandbox, which then only allows reading
+    // the font directories (the fonts module reads them lazily).
+    let bytes = match read_file(path, &limits) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = write_frame(&mut output, &FromChild::Failed(error));
+            return 0;
+        }
+    };
+    let font_dirs = crate::sandbox::font_dirs();
+    let font_dirs: Vec<&Path> = font_dirs.iter().map(PathBuf::as_path).collect();
+    if let Err(_reason) = crate::sandbox::restrict(&font_dirs)
+        && cfg!(target_os = "macos")
+    {
+        // Never go on without the sandbox where there is one.
+        let _ = write_frame(&mut output, &FromChild::Failed(OpenError::Crashed));
+        return 0;
+    }
+    let opened = Document::open(bytes, &password, limits);
+    drop(password);
+    let document = match opened {
+        Ok(document) => document,
+        Err(error) => {
+            let _ = write_frame(&mut output, &FromChild::Failed(error));
+            return 0;
+        }
+    };
+    if write_frame(&mut output, &FromChild::Opened(document.info().clone())).is_err() {
         return 0;
     }
     let cache = RenderCache::new();
@@ -470,6 +524,17 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<ToChild> {
 
 /// An answer, as the parent reads it. `max_pixels` bounds a page.
 pub fn read_answer(input: &mut impl Read, max_pixels: u64) -> io::Result<FromChild> {
+    read_answer_with(input, max_pixels, |_, _, _, _| true)
+}
+
+/// Like [`read_answer`], but `accept(page, scale, width, height)` is asked
+/// about a page before its pixels are read or allocated; a `false` is an
+/// error, and the caller ends the child.
+pub fn read_answer_with(
+    input: &mut impl Read,
+    max_pixels: u64,
+    mut accept: impl FnMut(usize, f32, u32, u32) -> bool,
+) -> io::Result<FromChild> {
     match read_u8(input)? {
         b'O' => {
             let count = read_u32(input)?;
@@ -501,7 +566,10 @@ pub fn read_answer(input: &mut impl Read, max_pixels: u64) -> io::Result<FromChi
             let height = read_u32(input)?;
             let pixels = u64::from(width) * u64::from(height);
             // A page is never larger than the limit (plus rounding).
-            if width > MAX_SIDE || height > MAX_SIDE || pixels > max_pixels + max_pixels / 50 + 4096
+            if width > MAX_SIDE
+                || height > MAX_SIDE
+                || pixels > max_pixels + max_pixels / 50 + 4096
+                || !accept(page, scale, width, height)
             {
                 return Err(bad());
             }

@@ -29,7 +29,43 @@ pub struct PdfTab {
     worker: Worker,
     /// What was last asked of the worker, so the same list is not sent on
     /// every frame.
-    asked: Vec<(usize, f32)>,
+    asked: Asked,
+    /// The tab is in the background: no pixels are held and none are taken.
+    suspended: bool,
+    /// The worker gave up (or failed after opening): undrawn pages stay
+    /// blank.
+    stopped: bool,
+}
+
+/// The requests the worker has been sent and not answered yet.
+#[derive(Default)]
+struct Asked(Vec<(usize, f32)>);
+
+impl Asked {
+    /// Take note of `wanted`; false if it is what is already asked.
+    fn send(&mut self, wanted: &[(usize, f32)]) -> bool {
+        if self.0 == wanted {
+            return false;
+        }
+        self.0 = wanted.to_vec();
+        true
+    }
+
+    /// A rendering of `page` at `scale` arrived: that request is answered. A
+    /// page wanted again later (another zoom) is a new request.
+    fn delivered(&mut self, page: usize, scale: f32) {
+        self.0
+            .retain(|(p, s)| !(*p == page && (s / scale - 1.0).abs() < 1e-4));
+    }
+
+    /// Nothing more will come for `page`.
+    fn forget(&mut self, page: usize) {
+        self.0.retain(|(p, _)| *p != page);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl PdfTab {
@@ -48,7 +84,9 @@ impl PdfTab {
             token,
             info,
             worker,
-            asked: Vec::new(),
+            asked: Asked::default(),
+            suspended: false,
+            stopped: false,
         }
     }
 
@@ -58,28 +96,64 @@ impl PdfTab {
 
     /// Ask the worker for the pages the view needs now, if that changed.
     pub fn request(&mut self) {
-        let wanted = self.view.wanted();
-        if wanted != self.asked {
-            self.worker.want(wanted.clone());
-            self.asked = wanted;
+        if self.stopped || self.suspended {
+            return;
         }
+        let wanted = self.view.wanted();
+        if self.asked.send(&wanted) {
+            self.worker.want(wanted);
+        }
+    }
+
+    /// The tab goes to the background: free the pixels, stop rendering.
+    pub fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        self.view.drop_pixels();
+        self.worker.suspend();
+        self.asked.clear();
+    }
+
+    /// The tab is in front again: the next `request` asks for the pages.
+    pub fn resume(&mut self) {
+        if !self.suspended {
+            return;
+        }
+        self.suspended = false;
+        self.worker.resume();
+        self.asked.clear();
+    }
+
+    /// Whether the worker gave up on this file.
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// A page from the worker. Returns whether the view changed.
     pub fn take(&mut self, event: Event) -> bool {
         match event {
             Event::Page(page) => {
-                // Asked again next time if it is still wanted at another scale.
-                self.asked.clear();
-                self.view
-                    .insert(page.page, page.scale, page.width, page.height, page.pixels)
+                self.asked.delivered(page.page, page.scale);
+                // Pages still on their way when the tab went away are dropped.
+                !self.suspended
+                    && self
+                        .view
+                        .insert(page.page, page.scale, page.width, page.height, page.pixels)
             }
             Event::PageFailed(page) => {
-                self.asked.clear();
+                self.asked.forget(page);
                 self.view.mark_failed(page);
                 true
             }
-            Event::Opened(_) | Event::Failed(_) => false,
+            // The worker has given up, or the file failed after it opened.
+            Event::Failed(_) | Event::Stopped => {
+                self.stopped = true;
+                self.asked.clear();
+                true
+            }
+            Event::Opened(_) => false,
         }
     }
 
@@ -202,6 +276,38 @@ mod tests {
         assert!(is_pdf(Path::new("/a/b.pdf")));
         assert!(!is_pdf(Path::new("pdf")));
         assert!(!is_pdf(Path::new("a.pdfx")));
+    }
+
+    #[test]
+    fn requests_are_sent_once_and_again_when_wanted_again() {
+        let mut asked = Asked::default();
+        let wanted = vec![(0, 1.0), (1, 1.0), (0, 0.1)];
+        assert!(asked.send(&wanted));
+        assert!(!asked.send(&wanted));
+        // Page 0 arrives at 1.0: the list still wanted minus it is not new.
+        asked.delivered(0, 1.0);
+        let rest = vec![(1, 1.0), (0, 0.1)];
+        assert!(!asked.send(&rest));
+        asked.delivered(1, 1.0);
+        asked.delivered(0, 0.1);
+        assert!(!asked.send(&[]));
+        // Page 0 wanted again at another zoom: a new request.
+        assert!(asked.send(&[(0, 2.0)]));
+        // A page that failed is not waited for.
+        asked.forget(0);
+        assert!(!asked.send(&[]));
+        // After a pause everything is sent again.
+        asked.send(&[(3, 1.0)]);
+        asked.clear();
+        assert!(asked.send(&[(3, 1.0)]));
+    }
+
+    #[test]
+    fn stopped_text_exists_in_every_language() {
+        for language in crate::i18n::Language::ALL {
+            let text = language.strings().pdf_stopped;
+            assert!(!text.is_empty() && !text.contains('{'), "{text}");
+        }
     }
 
     #[test]

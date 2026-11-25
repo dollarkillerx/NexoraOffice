@@ -20,6 +20,7 @@ pub mod check;
 pub mod child;
 pub mod fonts;
 pub mod inflate;
+pub mod sandbox;
 pub mod worker;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -32,7 +33,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
 pub use check::Refusal;
-pub use worker::{Program, Worker};
+pub use worker::{Pool, Program, Worker};
 
 /// Ceilings on what a file may ask for.
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +50,8 @@ pub struct Limits {
     pub max_image_pixels: u64,
     /// Pixels in one rendered page; larger requests are rendered smaller.
     pub max_render_pixels: u64,
-    /// Memory the child process may allocate.
+    /// Memory all child processes together may allocate. A [`worker::Pool`]
+    /// gives each of its children an equal share.
     pub max_memory_bytes: u64,
     /// Time to open and check a file.
     pub open_time: Duration,
@@ -67,7 +69,7 @@ impl Default for Limits {
             // The same as for pictures in other documents (`aster-image`).
             max_image_pixels: 100_000_000,
             max_render_pixels: 16_000_000,
-            max_memory_bytes: 3 << 30,
+            max_memory_bytes: default_memory(),
             open_time: Duration::from_secs(60),
             page_time: Duration::from_secs(20),
         }
@@ -171,6 +173,9 @@ pub enum Event {
     /// A page that cannot be drawn: it failed, took too long or needed too
     /// much memory. It is not asked for again.
     PageFailed(usize),
+    /// The document can no longer be shown: its child process kept ending
+    /// or could not open the file again. Pages not drawn stay blank.
+    Stopped,
 }
 
 /// An open document. Lives on one thread (the parser's caches are not
@@ -256,6 +261,9 @@ impl Document {
         page: usize,
         scale: f32,
     ) -> Result<Option<Pixmap>, ()> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Ok(None);
+        }
         let fitted = self.fitted_scale(page, scale);
         let pages = self.pdf.pages();
         let Some(page_ref) = pages.get(page) else {
@@ -291,10 +299,14 @@ fn has_encrypt_key(bytes: &[u8]) -> bool {
 }
 
 /// `scale`, or less so that the page stays within `max_pixels` and 16 384
-/// pixels a side.
+/// pixels a side. Never more than `scale`: a small request stays small, so
+/// the parent can bound what comes back.
 pub fn fitted_scale(size: PageSize, scale: f32, max_pixels: u64) -> f32 {
+    if !(scale.is_finite() && scale > 0.0) {
+        return scale;
+    }
     let (w, h) = (size.width.max(1.0), size.height.max(1.0));
-    let mut fitted = scale.max(0.01);
+    let mut fitted = scale;
     let side = 16_384.0;
     fitted = fitted.min(side / w).min(side / h);
     let pixels = f64::from(w * fitted) * f64::from(h * fitted);
@@ -302,6 +314,51 @@ pub fn fitted_scale(size: PageSize, scale: f32, max_pixels: u64) -> f32 {
         fitted *= (max_pixels as f64 / pixels).sqrt() as f32;
     }
     fitted
+}
+
+/// The most memory the child processes may use together: a quarter of the
+/// machine's memory, and 3 GiB at most.
+fn default_memory() -> u64 {
+    const CAP: u64 = 3 << 30;
+    physical_memory().map_or(CAP, |ram| CAP.min(ram / 4))
+}
+
+#[cfg(target_os = "macos")]
+fn physical_memory() -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, and `value` and `size` are live
+    // locals of the size that `size` says.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && value > 0).then_some(value)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn physical_memory() -> Option<u64> {
+    // SAFETY: `sysconf` only reads a system constant.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGE_SIZE),
+        )
+    };
+    u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(size).ok()?)
+        .filter(|bytes| *bytes > 0)
+}
+
+#[cfg(not(unix))]
+fn physical_memory() -> Option<u64> {
+    None
 }
 
 /// Stack for threads that call into the parser. Its nesting limits keep

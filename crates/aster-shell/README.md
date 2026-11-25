@@ -1387,31 +1387,51 @@ PDF 文件可以打开查看。这是 PDF 的第一步：只看，不改。批�
 用 [hayro](https://github.com/LaurenzV/hayro) 0.9，一个用 Rust 写的 PDF 光栅化库，Apache-2.0 或 MIT。选它的理由和与 PDFium、MuPDF、pdf-rs 的比较，见给主会话的选型报告。要点：许可证在允许清单里，不用往程序里带 C/C++ 库，它的光栅化用的 vello_cpu 和我们自己的是同一个库。
 
 - **只渲染看得见的页。** 视图（`aster-surface` 的 `pdf_view.rs`）算出窗口里有哪几页，加上前后各一页（以前是两页），再加上看得见的缩略图，按离当前页的远近排好，交给这个标签的子进程。还没到的页先画成白纸；缩放后新的一张还没到时，先把旧的拉伸着画。离窗口远的页不留，内存不随页数增长。
-- **子进程。** 每个 PDF 标签一个 `Worker`（`aster-pdf`）和它自己的子进程：窗口这边只有一个管理线程，文件在子进程里读、检查、解析和渲染，窗口只收到像素。新的请求替换旧的：快速滚动时中间经过的页不会排队渲染。关掉标签，子进程立刻被杀掉。
+- **子进程。** 每个 PDF 标签一个 `Worker`（`aster-pdf`），同时活着的子进程最多 2 个（后台标签的子进程会被结束，回来时再启动，见下）：窗口这边只有一个管理线程，文件在子进程里读、检查、解析和渲染，窗口只收到像素。新的请求替换旧的：快速滚动时中间经过的页不会排队渲染。关掉标签，子进程立刻被杀掉。
 - **字体。** 文件里嵌入的字体直接用。没嵌入的：14 种标准字体用 hayro 自带的 Foxit 字体；中文、日文、韩文按字符集找系统字体（macOS 的宋体、冬青黑体、Apple SD Gothic Neo，Windows 的宋体、MS 明朝、Batang 等，Linux 的 Noto CJK），找到一次就记住。
 - **不做的事。** hayro 不执行 JavaScript，不联网，不打开附件，不跟随任何动作。链接现在点了没有反应，下一步按 `aster_platform::links` 的规则处理。
 
 ### 安全上限
 
-hayro 自己限制了嵌套的深度：数组和字典 512 层，表单和图案互相引用 50 层，交叉引用表的链 256 节，页面树走过的节点不再走。但它解压数据流时**没有上限**，几 KB 的文件就能让它申请几 GB 内存；图片的尺寸也只看文件里写的。所以有两道防线：先检查，再把打开和渲染放进子进程。
+hayro 自己限制了嵌套的深度：数组和字典 512 层，表单和图案互相引用 50 层，交叉引用表的链 256 节，页面树走过的节点不再走。但它解压数据流时没有上限，几 KB 的文件就能让它申请几 GB 内存；图片的尺寸也只看文件里写的。所以有三道防线：先检查，再把打开和渲染放进子进程，子进程在 macOS 上再套一层沙盒。窗口这边另外限制自己收下的像素。
 
-**检查。** 在 hayro 解析完文件之后做，用 `pdf.objects()` 把每个数据流过一遍。查的是 hayro 自己解析出来的字典和数据，不是我们另外扫一遍文件，所以两边看到的是同一个文件：
+**检查。** 在 hayro 解析完文件之后做。查的是 hayro 自己解析出来的字典和数据，不是我们另外扫一遍文件，所以两边看到的是同一个文件：
 
-- 过滤器按 hayro 的读法取：`/F` 排在 `/Filter` 之前，`#xx` 写法的名字先解码，间接引用跟下去，开头的 `/Crypt` 跳过，不认识的名字像 hayro 一样丢掉。
-- 数据用 hayro 按 `/Length` 截出来并解密之后的（`raw_data()`）。加密文件因此也能查，不再需要跳过。
+- 找数据流：用 `pdf.objects()` 过一遍，再加上原始字节里每一个 `N G obj` 头。hayro 在交叉引用表坏掉时会延迟修复，修复之后才出现的数据流，第一遍看不到。所以这一步重复最多 5 轮，直到不再冒出新的对象。
+- 数据流可以直接写在别的对象里面（比如页面字典里）。对每个对象的字典和数组往下走（深度不超过 64，节点数有上限）找出这些数据流；走到头还没走完的，拒绝，不当作没有。
+- 过滤器按 hayro 的读法取：`/F` 排在 `/Filter` 之前，`#xx` 写法的名字先解码，间接引用跟下去，开头的 `/Crypt` 跳过，不认识的名字像 hayro 一样丢掉。参数 `/DP` 和 `/DecodeParms` 的取法也照 hayro 的两个分支，不另外猜。
+- 数据用 hayro 按 `/Length` 截出来并解密之后的（`raw_data()`）。加密文件因此也能查。
 - 过滤器由我们自己的解码器来做，解压结果超过 256 MB 就停：Flate、LZW、RunLength、ASCIIHex、ASCII85，以及 PNG 和 TIFF 预测器。
 - 遇到我们不会解的过滤器、解不开的数据、读不出尺寸的图片，整个文件拒绝，提示“无法安全检查”。
-- 图片的尺寸按 hayro 的读法取（`/W` 在 `/Width` 之前），再加上数据里的真实尺寸：JPEG 取第一个扫描段之前最大的 SOF；JPEG 2000 取紧跟 SOC 的 SIZ，JP2 格式要走过各个 box 找到 `jp2c`，也看 `ihdr`；JBIG2 的页信息；CCITT 的行列数。
-- 内容里的内联图片用 hayro 自己的内容解析器找出来，同样查数据和尺寸。
+- 图片的尺寸按 hayro 的读法取（`/W` 在 `/Width` 之前），再加上数据里的真实尺寸：JPEG 取第一个扫描段之前最大的 SOF；JPEG 2000 取紧跟 SOC 的 SIZ，JP2 格式要走过各个 box 找到 `jp2c`，也看 `ihdr`；JBIG2 的页信息；CCITT 的行列数。JPEG 和 JPEG 2000 还数颜色分量：宽 × 高 × 分量数不超过 4 × 1 亿。
+- 内容里的内联图片用 hayro 自己的内容解析器找出来，同样查数据和尺寸。一页的 `/Contents` 有好几个数据流时，hayro 把它们接起来读（每个流后面补一个空格）。我们用自己解码出来的结果照样接一遍，再找内联图片，所以一张内联图片横跨两个数据流也查得到。接起来的总长超过 256 MB，拒绝。
 
 **子进程。** 打开和渲染都在子进程里：就是同一个可执行文件，带子命令 `--pdf-worker`。页面通过管道送回窗口。
 
-- **内存。** 子进程里用一个会计数的全局分配器，预算 3 GB，一超过就当场退出。所以 hayro 打开文件时就解压的那种对象流炸弹（来不及检查）也只是让子进程结束，窗口和其他文档不受影响。
-- **时间。** 打开最多 60 秒，渲染一页最多 20 秒，超时就杀掉子进程。
-- **渲染中途结束。** 子进程在渲染时结束，就重新启动一个（最多 8 次），那一页画成白纸，以后不再请求。
+- **启动。** 子进程一开始就关掉继承来的文件描述符（只留 0、1、2），窗口进程手里的套接字和文件它用不了。
+- **内存。** 子进程里用一个会计数的全局分配器，一超过预算就当场退出。所以 hayro 打开文件时就解压的那种对象流炸弹（来不及检查）也只是让子进程结束，窗口和其他文档不受影响。总预算默认是 3 GiB 和内存的四分之一里小的那个，由最多 2 个同时活着的子进程平分，每个拿一半。
+- **后台标签。** 切到别的标签后，这个标签的子进程不留着：需要空位时先结束最久没用过的后台标签的子进程，不然在后台待满 60 秒也结束。回到这个标签时重新启动，再打开文件。
+- **时间。** 每次打开（包括重启后重新打开）都计时，最多 60 秒；渲染一页最多 20 秒。超时就杀掉子进程。
+- **请求。** 窗口这边的请求交给一个写线程送进管道，新的替换旧的（以最新的为准）。子进程不读管道时，窗口不会卡住。
+- **尺寸核对。** 窗口这边收到一页之后，先看头部：页面比 ceil(页面尺寸 × 请求的缩放) + 1 大，或者缩放不是请求过的，就在分配像素之前拒绝，并重启子进程。渲染也不会超过请求的尺寸；很小的缩略图缩放不再被抬高。
+- **渲染中途结束。** 子进程在渲染时结束，就重新启动一个（最多 8 次），那一页画成白纸，以后不再请求。有一页画出来之后，重启的次数清零。重启用完，或者重新打开失败，标签里显示一条提示（`pdf_stopped`，八种语言），不再继续。
+- **父进程没了。** 子进程在 stdin 关闭时退出，也看自己的父进程有没有变（getppid 看门狗），窗口进程崩了它也会走，不留孤儿。
 - **panic。** hayro 里出了 panic，子进程以 70 退出，这样它被污染的缓存和锁不会带到下一次渲染。
 - **关标签。** 关掉标签就杀掉子进程。
 - 没用 macOS 的 RLIMIT。
+
+**沙盒（macOS）。** 子进程读完文件、之后解析之前，调用 `sandbox_init` 进入 Seatbelt 沙盒，进入后不能撤销。规则是默认全部拒绝，只放行三样：
+
+```
+(version 1)
+(deny default)
+(allow sysctl-read)
+(allow file-read-metadata)
+(allow file-read* (subpath "/System/Library/Fonts"))
+(allow file-read* (subpath "/Library/Fonts"))
+```
+
+所以子进程不能联网，不能写任何文件，不能启动新进程，只能读系统字体目录。Linux 和 Windows 现在没有沙盒，只有上面的关描述符、预算和时间限制。自测（`aster-pdf/tests/sandbox.rs`）：进沙盒之后，禁止的动作都被拒绝；没嵌入字体的中文页仍然读得到系统字体（有字体目录时画出 2791 个有墨的像素，没有时是 0）。
 
 | 上限 | 值 | 怎么查 |
 | --- | --- | --- |
@@ -1419,11 +1439,37 @@ hayro 自己限制了嵌套的深度：数组和字典 512 层，表单和图案
 | 对象数 | 400 万 | 解析后看 hayro 找到的对象数 |
 | 页数 | 5 万 | 解析后数 |
 | 一个数据流解压后的大小 | 256 MB | 见上面的检查 |
-| 图片的像素 | 1 亿（和其他文档里的图片一样，`aster-image`） | 见上面的检查 |
-| 子进程的内存 | 3 GB | 子进程里数分配，超过就退出 |
+| 一页拼起来的内容流 | 256 MB | 见上面的检查 |
+| 图片的像素 | 1 亿（JPEG 和 JPEG 2000 乘上分量数，不超过 4 亿） | 见上面的检查 |
+| 子进程的内存 | 总预算 min(3 GiB, 内存 / 4)，每个子进程一半 | 子进程里数分配，超过就退出 |
+| 同时活着的子进程 | 2 个 | 后台的先结束；后台满 60 秒也结束 |
 | 打开的时间 | 60 秒 | 超过就杀掉子进程 |
 | 渲染一页的时间 | 20 秒 | 超过就杀掉子进程，这一页画成白纸 |
-| 渲染一页的像素 | 1600 万（以前是 4000 万），每边不超过 16 384 | 放得太大时按比例缩小渲染，再拉伸显示。像素直接从 hayro 的 pixmap 写进管道 |
+| 渲染一页的像素 | 1600 万，每边不超过 16 384 | 放得太大时按比例缩小渲染，再拉伸显示。像素直接从 hayro 的 pixmap 写进管道 |
+| 窗口里每个 PDF 视图的像素 | 256 MB | 超过时先丢最久没画过的，屏幕上正在显示的不丢；后台标签的像素全部丢掉 |
+| 视图里的页面尺寸 | 1 到 14 400 pt | 文件里写的尺寸超出就按边界取 |
+
+### 威胁模型
+
+假设一个恶意的 PDF 能做这些事：让 hayro 崩溃，或者让它耗尽内存和时间；利用 hayro 或字体、图片解码里的漏洞在子进程里执行代码，再试着通过文件系统或网络出去。
+
+| 防的是什么 | 靠什么 |
+| --- | --- |
+| 解压炸弹、巨大的图片、过深的结构 | 检查，拒绝并说明是哪一项 |
+| 内存、CPU 耗尽 | 子进程，加上分配器预算和时间限制；坏了只杀这个子进程 |
+| 读文件、联网、写文件、启动进程（macOS） | 沙盒；之前先关掉继承的描述符 |
+| 子进程送来不合理的页面，吃掉窗口自己的内存 | 窗口这边的头部核对和视图的像素预算 |
+
+下面这些检查不覆盖，只靠子进程的预算、时间限制和沙盒：
+
+- 字体程序（TrueType、CFF、Type 1 等）的解析。
+- 渐变（shading）和函数的计算。
+- JBIG2、CCITT、JPEG 2000 解码器内部的行为。检查只看它们声称的尺寸。
+- 打成 `.app` 之后的程序里这些保护是否照样工作，还没有试过。
+- Linux 和 Windows 没有沙盒。
+- 不经过 Rust 分配器拿的内存（系统库、字体加载等）不计入预算。
+- Seatbelt 不是挡内核漏洞的边界；`sandbox_init` 是 Apple 标为弃用的接口。
+- 沙盒允许读文件的元数据（`file-read-metadata`），所以子进程仍能知道某个路径是否存在、多大，但读不到内容。
 
 ### 新 crate 和依赖
 
@@ -1474,9 +1520,26 @@ hayro 编进程序的数据有它们自己的许可证，`packaging/licenses.py`
   - 指数嵌套（30 层表单，每层画下一层两次）：超过页面时间上限后被杀掉，进程确实没了。
   - 关掉标签：子进程结束。
   - 解压炸弹：由子进程拒绝。
+- **第二次安全审查之后加的回归测试**，按发现的问题分组：
+  - 页面尺寸（H1）：`a_page_larger_than_asked_for_is_refused_before_its_pixels`、`a_page_at_a_scale_that_was_not_asked_for_is_refused`、`a_thumbnail_of_a_huge_page_stays_a_thumbnail`、`a_scale_is_never_raised`、`a_page_too_thin_to_draw_fails_without_ending_the_child`（进程），`large_render_requests_are_scaled_down`（`tests.rs`），`absurd_page_sizes_stay_finite_and_fast`（视图）。
+  - 延迟修复（H2）：`a_stream_that_only_a_repaired_table_has_is_checked`、`object_headers_in_the_raw_bytes_are_found`（`tests.rs`）。
+  - 内联图片横跨内容流（M1）：`an_inline_picture_split_across_content_streams_is_refused`、`content_streams_that_add_up_to_too_much_are_refused`。
+  - 缩略图和正文缩放相同（M2）：`equal_thumbnail_and_main_scale_settles`、`equal_scales_settle_when_the_main_page_is_far_away`（视图）。
+  - 描述符、沙盒、进程池（M3）：`a_simple_page_renders_inside_the_sandbox`、`a_system_font_is_read_inside_the_sandbox`、`inherited_descriptors_are_closed`（`tests/sandbox.rs`）；`a_third_document_sends_the_older_foreground_one_away`、`a_document_in_the_background_goes_before_an_older_one_in_front`、`a_child_in_the_background_ends_after_a_while_and_returns_on_resume`、`each_child_gets_its_share_of_the_memory`、`the_default_memory_is_a_quarter_of_the_machine_at_most_3_gib`（进程）；`pixels_held_never_exceed_the_budget`、`an_image_larger_than_the_budget_is_not_kept`、`drop_pixels_frees_everything_and_the_view_recovers`、`a_full_screen_of_big_pages_settles_within_budget_plus_what_is_visible`（视图预算）。
+  - 父进程没了（L1）：`the_child_ends_when_its_input_closes`、`the_child_ends_when_its_parent_is_gone_though_its_input_is_open`。
+  - 停下来并说明（L2）：`restarts_start_over_after_a_page_is_drawn`、`a_tab_whose_child_keeps_ending_is_stopped_and_says_so`。
+  - 重新打开计时、写线程（L3）：`a_child_that_cannot_open_the_file_again_stops_the_tab`、`a_child_that_hangs_when_opened_again_stops_the_tab`、`requests_do_not_wait_for_a_child_that_reads_nothing`。
+  - 参数和颜色分量（L4）：`filters_follow_the_parsers_two_branches`、`components_count_in_jpeg_pictures`。
+  - 直接写在别的对象里的数据流：`streams_written_inside_other_objects_are_the_parsers_too`、`a_bomb_written_directly_in_a_page_is_refused`、`nesting_beyond_the_walk_is_refused_not_skipped`。
 - **解码器。** Deflate 在上限内外、炸弹停在上限、截断的数据保留已有的部分；LZW 用 PDF 规范里的例子；RunLength、ASCIIHex、ASCII85；JPEG、JPEG 2000、JBIG2 的尺寸读取。
 - **视图**（`pdf_view.rs`）：适合宽度、适合整页、缩放的档位和上下限、缩放时停在原页、只请求窗口附近的页、渲染过的页不再请求、缩放后旧图拉伸着先画、远处的页丢掉、尺寸不对的像素被拒绝、点缩略图跳页、窄窗口不显示缩略图、放大后左右滚、到底时当前页是最后一页。
 - **外壳**：扩展名识别、页码解析、每种错误在八种语言里都有说明、按键。
+
+第二次审查之后在真实窗口里试过（2026-11-25，调试版，`ASTER_DATA_DIR` 指向临时目录）：
+
+- 同时打开 4 个 PDF：始终只有 2 个子进程（各 1.5 GB 预算）。切到别的标签时，后台标签的子进程被结束；切回来时重新启动、重新打开，页面照常画出。
+- 字体不嵌入的中文、日文页面在沙盒里照常显示（系统字体在沙盒里读到了）。
+- 加密文件输入密码打开后，切到别的标签让它的子进程结束，再切回来：用记住的密码重新打开，不再问。
 
 子进程的版本在真实窗口里试过（2026-11-25，调试版，`ASTER_DATA_DIR` 指向临时目录）：
 
@@ -1501,11 +1564,13 @@ hayro 编进程序的数据有它们自己的许可证，`packaging/licenses.py`
 
 ### 留下的问题
 
-- 检查一个数据流时，解压的结果最多在内存里放 256 MB（内联图片要从解压后的内容里找）。一个合法的、解压后很大的内容流，打开时会短暂多用这么多内存。
+- Linux 和 Windows 没有沙盒，也没有试过。
+- 打成 `.app` 之后的程序（沙盒、子进程、字体目录）还没有试过。
+- 检查一个很大的共享数据流时，每个列出它的页面都会解一遍，只受 60 秒的打开时间限制。解压结果最多在内存里放 256 MB，一个合法的、解压后很大的内容流，打开时会短暂多用这么多内存。
+- 几个文件同时打不开时，对话框只留最后一个（外壳原来就这样）。
+- 比 1600 万像素还大的页（高倍放大时）会画得小一些再拉伸，看起来发虚。分块渲染留到以后。
 - hayro 0.9 用 vello_cpu 0.3，我们（为了 Parley 0.13）用 0.2，现在两份都编进程序。以后升级 Parley 时一起统一。
 - 内存是在子进程里数 Rust 分配器的分配来限制的，不是操作系统限制的：不经过 Rust 分配器拿的内存（系统库、字体加载等）不计入。
-- Windows 和 Linux 没有试过。
-- 比 1600 万像素还大的页（高倍放大时）会画得小一些再拉伸，看起来发虚。分块渲染留到以后。
 - macOS 新版本把日文的明朝体放在按需下载的字体里；没下载时，不嵌入字体的日文用冬青黑体显示。
 - 没有标注 `/AP` 外观的批注不显示（hayro 只画有外观的）。第三步写批注时一起补。
 

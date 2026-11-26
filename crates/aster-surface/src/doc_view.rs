@@ -21,6 +21,7 @@ mod compose;
 mod editing;
 mod format;
 mod modify;
+mod objects;
 mod search;
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ pub use aster_writer::{Align, Break, LineSpacing};
 pub use editing::Move;
 pub use format::{DocCommand, FormatState, Tri};
 pub use modify::Unit;
+pub use objects::{Corner, LinkInfo, ObjectInfo};
 pub use search::{DocQuery, MAX_MATCHES, Match};
 pub use text::text_between;
 
@@ -78,6 +80,8 @@ pub struct DocStyle {
     /// Find matches, and the current one.
     pub hit: Rgba8,
     pub current_hit: Rgba8,
+    /// The frame and handles of a selected picture.
+    pub object: Rgba8,
 }
 
 impl Default for DocStyle {
@@ -89,6 +93,7 @@ impl Default for DocStyle {
             selection: [0x7c, 0x5c, 0xe0, 0x59],
             hit: [0xff, 0xeb, 0x3b, 0x80],
             current_hit: [0xff, 0x8c, 0x00, 0xa6],
+            object: [0x7c, 0x5c, 0xe0, 0xff],
         }
     }
 }
@@ -174,6 +179,14 @@ pub struct DocView {
     /// Bumped by every change to the document, undo and redo included.
     revision: u64,
     saved_revision: u64,
+    /// The document as it was when the file was last read or written, to
+    /// tell whether it still differs from the file; `None` when that is
+    /// not known (a document that came back from a recovery record).
+    saved: Option<Document>,
+    /// Whether the document differs from `saved`, worked out for a revision.
+    modified: std::cell::Cell<Option<(u64, bool)>>,
+    /// A picture being resized with its corner handle.
+    resizing: Option<objects::Resize>,
     /// A look chosen with only a caret, for the text typed next.
     pending: Option<RunPatch>,
     compose: Option<compose::Compose>,
@@ -224,12 +237,16 @@ impl DocView {
             history: History::default(),
             revision: 0,
             saved_revision: 0,
+            saved: None,
+            modified: std::cell::Cell::new(None),
+            resizing: None,
             pending: None,
             compose: None,
             last_edit: None,
             prints: Vec::new(),
         };
         view.lay_out();
+        view.saved = Some(view.document.clone());
         view.sel = view.document.start().map(|start| Sel {
             anchor: start.clone(),
             focus: start,
@@ -266,6 +283,8 @@ impl DocView {
         self.press = None;
         self.revision += 1;
         self.saved_revision = self.revision;
+        self.saved = Some(self.document.clone());
+        self.resizing = None;
         self.clamp();
         self.touch();
     }
@@ -853,6 +872,7 @@ impl DocView {
         for r in &selection {
             self.ctx.fill_rect(&on_page(r));
         }
+        self.draw_object(index, rect, ppp);
         if self.caret_shown()
             && let Some(caret) = self
                 .caret_pos()

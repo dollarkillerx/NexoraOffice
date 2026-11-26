@@ -78,17 +78,24 @@ fn main() {
     view.render();
     let mut edit = Vec::new();
     let mut frame = Vec::new();
+    let mut check = Vec::new();
     let mut total = Vec::new();
     for n in 0..60 {
         let started = Instant::now();
         view.type_text(if n % 2 == 0 { "a" } else { "中" });
         edit.push(ms(started));
+        // The shell asks whether the document is modified after every edit,
+        // to mark the tab.
+        let asked = Instant::now();
+        assert!(view.is_modified());
+        check.push(ms(asked));
         let painted = Instant::now();
         view.render();
         frame.push(ms(painted));
         total.push(ms(started));
     }
     println!("edit and layout: {}", stats(edit));
+    println!("is_modified after each key: {}", stats(check));
     println!("frame: {}", stats(frame));
     println!("key press, layout and frame: {}", stats(total));
     // Enter and Backspace, which move the paragraphs after the caret.

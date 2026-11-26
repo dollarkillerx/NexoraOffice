@@ -1187,3 +1187,4 @@ fn the_sample_document_opens_reads_finds_and_paints() {
 }
 
 mod edit_tests;
+mod object_tests;

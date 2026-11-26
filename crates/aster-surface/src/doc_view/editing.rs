@@ -87,7 +87,7 @@ impl DocView {
         self.set_sel(anchor, focus)
     }
 
-    fn set_sel(&mut self, anchor: Pos, focus: Pos) -> bool {
+    pub(super) fn set_sel(&mut self, anchor: Pos, focus: Pos) -> bool {
         let new = Sel { anchor, focus };
         if self.sel.as_ref() == Some(&new) {
             return false;
@@ -194,6 +194,10 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        // A click on a picture, or on a handle of the selected one.
+        if !extend && let Some(changed) = self.press_object(x, y) {
+            return changed;
+        }
         let Some(pos) = self.pos_at(x, y) else {
             return false;
         };
@@ -223,6 +227,9 @@ impl DocView {
     /// The pointer moved with the button down: extend what the press began
     /// to the point, by the same unit. Returns whether the picture changed.
     pub fn drag(&mut self, x: f64, y: f64) -> bool {
+        if let Some(changed) = self.drag_object(x, y) {
+            return changed;
+        }
         let Some(press) = self.press.clone() else {
             return false;
         };
@@ -269,9 +276,11 @@ impl DocView {
         self.drag(x, y) || moved
     }
 
-    /// The button went up.
-    pub fn release(&mut self) {
+    /// The button went up. Returns whether a picture was being resized (the
+    /// resize is then a step of undo).
+    pub fn release(&mut self) -> bool {
         self.press = None;
+        self.finish_resize()
     }
 
     // --- The keys ---

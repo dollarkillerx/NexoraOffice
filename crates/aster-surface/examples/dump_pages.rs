@@ -4,8 +4,8 @@
 //!
 //! `cargo run --release -p aster-surface --example dump_pages -- file.docx [first [last]]`
 
-use aster_layout::Layouter;
 use aster_layout::Item;
+use aster_layout::Layouter;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -34,9 +34,8 @@ fn main() {
                 }
                 let a = &lines[t.lines.start];
                 let b = &lines[t.lines.end - 1];
-                let text: String = t
-                    .paragraph
-                    .text()[t.paragraph.line_start_offset(t.lines.start)..]
+                let text: String = t.paragraph.text()
+                    [t.paragraph.line_start_offset(t.lines.start)..]
                     .chars()
                     .take(40)
                     .collect();

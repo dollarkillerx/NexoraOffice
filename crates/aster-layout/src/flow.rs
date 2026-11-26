@@ -520,16 +520,21 @@ impl Flow<'_, '_> {
             return;
         }
         let at = self.pages.len() - 1;
-        let step = (self.line_hint * 0.5).max(1.0);
+        let mut step = (self.line_hint * 0.5).max(1.0);
         let mut height = (total / columns as f32).max(step);
         let mut tries = 0;
-        while height < full - EPS && tries < 12 {
+        while height < full - EPS && tries < 10 {
             let cap = Cap { page: at, height };
             if self.replace_section(&snapshot, index, sec, &range, Some(cap)) {
                 return;
             }
             tries += 1;
             height += step;
+            // Each try places the whole section again: when a few lines'
+            // worth did not do, take bigger steps.
+            if tries >= 3 {
+                step *= 2.0;
+            }
         }
         // Not even: the way it was.
         self.replace_section(&snapshot, index, sec, &range, None);
@@ -549,8 +554,9 @@ impl Flow<'_, '_> {
 
     /// Whether balancing holds the current column shallower than the page.
     fn capped(&self) -> bool {
-        self.cap
-            .is_some_and(|c| self.pages.len() == c.page + 1 && self.col_bottom() < self.real_bottom())
+        self.cap.is_some_and(|c| {
+            self.pages.len() == c.page + 1 && self.col_bottom() < self.real_bottom()
+        })
     }
 
     /// How far down the current column may be filled.

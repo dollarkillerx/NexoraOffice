@@ -13,8 +13,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aster_text::{
-    Align as TextAlign, Decor, Extra, InlineObject, LineRule, Rules, Shaper, Spacing, Span, Spec,
-    Stroke, Style, TabAlign, TabStop,
+    Above, Align as TextAlign, Decor, Extra, InlineObject, LineRule, Natural, Rules, Scaling,
+    Shaper, Spacing, Span, Spec, Stroke, Style, TabAlign, TabStop,
 };
 use aster_writer::{
     Align, Break, Drawing, Inline, LineSpacing, PageField, Paragraph, RunLook, Settings, Suffix,
@@ -58,6 +58,8 @@ pub(crate) struct Env<'a> {
     pub page: Option<&'a PageValues>,
     /// Tallest an object in a line may be, points.
     pub max_object: f32,
+    /// What text is on, where the paragraph itself has no shading (a cell's).
+    pub background: Option<[u8; 4]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +92,15 @@ pub(crate) struct Shaped {
     pub backs: Vec<(Range<usize>, [u8; 4])>,
     /// The text has tabs (and so maybe leaders).
     pub has_tabs: bool,
+    /// Readings above ranges of the text.
+    pub rubies: Vec<RubyMark>,
+}
+
+/// A reading drawn above a range of shaped text.
+pub(crate) struct RubyMark {
+    pub range: Range<usize>,
+    pub text: String,
+    pub style: Style,
 }
 
 impl Shaped {
@@ -170,6 +181,7 @@ pub(crate) fn context(para: &Paragraph, env: &Env<'_>) -> u64 {
     env.settings.language.hash(&mut hasher);
     env.grid.map(f32::to_bits).hash(&mut hasher);
     env.max_object.to_bits().hash(&mut hasher);
+    env.background.hash(&mut hasher);
     for run in &para.runs {
         if let Some(text) = replacement(run, env) {
             text.hash(&mut hasher);
@@ -188,11 +200,33 @@ fn stroke_of(style: UnderlineStyle) -> Stroke {
     match style {
         UnderlineStyle::Double => Stroke::Double,
         UnderlineStyle::Thick => Stroke::Thick,
+        UnderlineStyle::Dotted => Stroke::Dotted,
+        UnderlineStyle::Dashed => Stroke::Dashed,
+        UnderlineStyle::Wave => Stroke::Wave,
         _ => Stroke::Single,
     }
 }
 
-fn text_style(families: &mut Families, look: &RunLook, small: bool) -> Style {
+/// Automatic colour: black, or white on a dark background.
+fn automatic(look: &RunLook, background: Option<[u8; 4]>) -> [u8; 4] {
+    let back = look.highlight.or(look.shading).or(background);
+    match back {
+        Some([r, g, b, a])
+            if a > 0
+                && (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) < 100.0 =>
+        {
+            [255, 255, 255, 255]
+        }
+        _ => [0, 0, 0, 255],
+    }
+}
+
+fn text_style(
+    families: &mut Families,
+    look: &RunLook,
+    small: bool,
+    background: Option<[u8; 4]>,
+) -> Style {
     let mut size = look.size.max(1.0);
     let mut rise = look.raise;
     match look.position {
@@ -212,7 +246,7 @@ fn text_style(families: &mut Families, look: &RunLook, small: bool) -> Style {
     Style {
         family: families.get(look),
         size: size.max(1.0),
-        color: look.color.unwrap_or([0, 0, 0, 255]),
+        color: look.color.unwrap_or_else(|| automatic(look, background)),
         bold: look.bold,
         italic: look.italic,
         underline: false,
@@ -237,6 +271,11 @@ struct Builder<'a, 'e> {
     spans: Vec<Span>,
     pieces: Vec<Piece>,
     decor: Vec<Decor>,
+    natural: Vec<Natural>,
+    above: Vec<Above>,
+    scaling: Vec<Scaling>,
+    rubies: Vec<RubyMark>,
+    background: Option<[u8; 4]>,
     spacing: Vec<Spacing>,
     objects: Vec<InlineObject>,
     drawings: Vec<(usize, Arc<Drawing>)>,
@@ -380,15 +419,46 @@ impl Builder<'_, '_> {
             copy: copy && end - start == orig.len(),
         });
         if small_runs.is_empty() {
-            let style = text_style(self.families, look, false);
+            let style = text_style(self.families, look, false, self.background);
             self.span(start..end, style);
         } else {
             for (range, small) in small_runs {
-                let style = text_style(self.families, look, small);
+                let style = text_style(self.families, look, small, self.background);
                 self.span(range, style);
             }
         }
         self.decorate(start..end, look);
+        if let Inline::Ruby(ruby) = &run.kind
+            && end > start
+            && !hidden
+        {
+            let mut style = text_style(self.families, look, false, self.background);
+            style.size = ruby.size.max(1.0);
+            style.rise = 0.0;
+            self.above.push(Above {
+                range: start..end,
+                height: ruby.size.max(1.0) * 1.2,
+            });
+            self.rubies.push(RubyMark {
+                range: start..end,
+                text: ruby.text.clone(),
+                style,
+            });
+        }
+        if (look.scale - 1.0).abs() > 0.001 && end > start {
+            self.scaling.push(Scaling {
+                range: start..end,
+                factor: look.scale,
+            });
+        }
+        if let Some(ratio) = self.families.ratio(look, &self.text[start..end])
+            && end > start
+        {
+            self.natural.push(Natural {
+                range: start..end,
+                ratio,
+            });
+        }
         if look.spacing != 0 && end > start {
             self.spacing.push(Spacing {
                 range: start..end,
@@ -413,11 +483,24 @@ pub(crate) fn shape(
     width: f32,
     env: &Env<'_>,
 ) -> Shaped {
+    for run in &para.runs {
+        families.ensure(shaper, &run.look);
+    }
+    families.ensure(shaper, &para.base);
+    families.ensure(shaper, &para.mark);
+    if let Some(label) = &para.label {
+        families.ensure(shaper, &label.look);
+    }
     let mut builder = Builder {
         text: String::new(),
         spans: Vec::new(),
         pieces: Vec::new(),
         decor: Vec::new(),
+        natural: Vec::new(),
+        above: Vec::new(),
+        scaling: Vec::new(),
+        rubies: Vec::new(),
+        background: para.props.shading.or(env.background),
         spacing: Vec::new(),
         objects: Vec::new(),
         drawings: Vec::new(),
@@ -439,9 +522,16 @@ pub(crate) fn shape(
         };
         let label_end = builder.text.len();
         builder.text.push_str(suffix);
-        let style = text_style(builder.families, &label.look, false);
+        let style = text_style(builder.families, &label.look, false, builder.background);
         builder.span(0..builder.text.len(), style);
         builder.decorate(0..label_end, &label.look);
+        if let Some(ratio) = builder.families.ratio(&label.look, &builder.text) {
+            let end = builder.text.len();
+            builder.natural.push(Natural {
+                range: 0..end,
+                ratio,
+            });
+        }
     }
     let prefix = builder.text.len();
     let mut at = 0;
@@ -457,7 +547,8 @@ pub(crate) fn shape(
     } else {
         &para.base
     };
-    let base = text_style(builder.families, base_look, false);
+    let builder_base_natural = builder.families.ratio(base_look, "");
+    let base = text_style(builder.families, base_look, false, builder.background);
     let text = std::mem::take(&mut builder.text);
     let has_tabs = text.contains('\t');
 
@@ -511,22 +602,13 @@ pub(crate) fn shape(
     stops.sort_by(|a, b| a.position.total_cmp(&b.position));
 
     let grid = if props.snap_to_grid { env.grid } else { None };
-    let line = match (props.line, grid) {
-        (LineSpacing::Multiple(m), Some(pitch)) if m > 1.0 => LineRule::AtLeast(pitch * m),
-        (LineSpacing::Multiple(m), Some(pitch)) => {
-            let _ = m;
-            LineRule::AtLeast(pitch)
-        }
-        (LineSpacing::Multiple(m), None) => LineRule::Multiple(m.max(0.0)),
-        (LineSpacing::AtLeast(v), _) => LineRule::AtLeast(pt(v)),
-        (LineSpacing::Exactly(v), _) => LineRule::Exactly(pt(v)),
+    let line = match props.line {
+        LineSpacing::Multiple(m) => LineRule::Multiple(m.max(0.0)),
+        LineSpacing::AtLeast(v) => LineRule::AtLeast(pt(v)),
+        LineSpacing::Exactly(v) => LineRule::Exactly(pt(v)),
     };
-    let grid_fit = match (props.line, grid) {
-        (LineSpacing::Multiple(m), Some(pitch)) if m <= 1.0 => Some(pitch),
-        (LineSpacing::Exactly(_), _) => None,
-        (_, Some(pitch)) => Some(pitch),
-        _ => None,
-    };
+    let grid_fit = grid;
+    let base_natural = builder_base_natural;
     let text_width = width.max(1.0);
     let spec = Spec {
         text: &text,
@@ -548,6 +630,10 @@ pub(crate) fn shape(
         spacing: &builder.spacing,
         decor: &builder.decor,
         line,
+        natural: &builder.natural,
+        above: &builder.above,
+        scaling: &builder.scaling,
+        base_natural,
         grid: grid_fit,
         distribute: props.align == Align::Distribute,
         snap: false,
@@ -566,6 +652,7 @@ pub(crate) fn shape(
         breaks: builder.breaks,
         backs: builder.backs,
         has_tabs,
+        rubies: builder.rubies,
     }
 }
 

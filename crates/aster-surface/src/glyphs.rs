@@ -63,14 +63,33 @@ pub fn draw_face(
     color: Color,
     glyphs: &[Glyph],
 ) {
+    draw_face_scaled(ctx, resources, face, color, glyphs, 1.0);
+}
+
+/// The same with the glyphs stretched horizontally by `x_scale` (their
+/// positions are the caller's business).
+pub fn draw_face_scaled(
+    ctx: &mut RenderContext,
+    resources: &mut Resources,
+    face: &Face<'_>,
+    color: Color,
+    glyphs: &[Glyph],
+    x_scale: f32,
+) {
     if glyphs.is_empty() {
         return;
     }
     // The glyph transform works in layout space, where y grows downwards: a
     // positive slant needs a negative skew to lean the tops to the right.
-    let transform = face
+    let skew = face
         .skew
         .map(|degrees| Affine::skew(-f64::from(degrees.to_radians().tan()), 0.0));
+    let transform = match (skew, (x_scale - 1.0).abs() > 0.001) {
+        (skew, true) => Some(
+            Affine::scale_non_uniform(f64::from(x_scale), 1.0) * skew.unwrap_or(Affine::IDENTITY),
+        ),
+        (skew, false) => skew,
+    };
 
     ctx.set_paint(color);
     let mut builder = ctx

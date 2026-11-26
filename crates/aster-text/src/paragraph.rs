@@ -190,6 +190,34 @@ pub enum Stroke {
     Double,
     /// Twice as thick.
     Thick,
+    Dotted,
+    Dashed,
+    Wave,
+}
+
+/// How a decoration is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LineKind {
+    #[default]
+    Solid,
+    Dotted,
+    Dashed,
+    Wave,
+}
+
+/// Room kept above a range, for what is drawn there (a ruby).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Above {
+    pub range: Range<usize>,
+    /// Logical pixels above the range's own ascent.
+    pub height: f32,
+}
+
+/// A range stretched or squeezed horizontally.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scaling {
+    pub range: Range<usize>,
+    pub factor: f32,
 }
 
 /// Underline and strikethrough for a range, with more choice than
@@ -203,6 +231,13 @@ pub struct Decor {
     pub strike: Stroke,
     /// The underline's colour; `None` for the text's.
     pub color: Option<Rgba>,
+}
+
+/// The natural line height of a range, as a multiple of its font size.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Natural {
+    pub range: Range<usize>,
+    pub ratio: f32,
 }
 
 /// What a word processor adds to a paragraph. Lengths are in logical pixels
@@ -225,6 +260,16 @@ pub struct Extra<'a> {
     /// Sorted, not overlapping.
     pub decor: &'a [Decor],
     pub line: LineRule,
+    /// For ranges whose font the machine does not have: how many times the
+    /// font size a line of it is high (the font the document names has these
+    /// metrics, not the substitute). Sorted, not overlapping.
+    pub natural: &'a [Natural],
+    /// Room above ranges, sorted.
+    pub above: &'a [Above],
+    /// Horizontal stretch of ranges, sorted.
+    pub scaling: &'a [Scaling],
+    /// The same for an empty line.
+    pub base_natural: Option<f32>,
     /// Lines are rounded up to whole multiples of this, the text centred
     /// (the grid of East Asian documents).
     pub grid: Option<f32>,
@@ -250,6 +295,10 @@ impl Default for Extra<'_> {
             spacing: &[],
             decor: &[],
             line: LineRule::Legacy,
+            natural: &[],
+            above: &[],
+            scaling: &[],
+            base_natural: None,
             grid: None,
             distribute: false,
             snap: true,
@@ -319,6 +368,9 @@ pub struct DrawRun<'a> {
     /// Slant to draw with, in degrees: the face's own made-up italic, or one
     /// added because italic was asked for and the face has none.
     pub skew: Option<f32>,
+    /// Horizontal stretch of the glyphs themselves (their positions are
+    /// already stretched).
+    pub x_scale: f32,
     pub glyphs: Vec<Glyph>,
 }
 
@@ -331,6 +383,7 @@ pub struct Decoration {
     pub y: f32,
     pub thickness: f32,
     pub color: Rgba,
+    pub kind: LineKind,
 }
 
 /// Per cluster: which face, which glyphs, which style.
@@ -342,6 +395,8 @@ struct Look {
     style: usize,
     /// Width and height of the inline object this cluster stands for.
     object: Option<[f32; 2]>,
+    /// Horizontal stretch.
+    xscale: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +446,29 @@ pub struct Paragraph {
 pub struct Shaper {
     font_cx: FontContext,
     layout_cx: LayoutContext<NoBrush>,
+    /// The weight class of fonts seen, by blob and index.
+    weights: std::collections::HashMap<(u64, u32), Option<u16>>,
+}
+
+/// The `usWeightClass` of a font file (an OpenType font or a collection).
+fn font_weight(data: &[u8], index: u32) -> Option<u16> {
+    let be16 = |o: usize| data.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let be32 = |o: usize| {
+        data.get(o..o + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut base = 0usize;
+    if data.get(0..4) == Some(b"ttcf") {
+        base = be32(12 + 4 * index as usize)? as usize;
+    }
+    let tables = be16(base + 4)? as usize;
+    for i in 0..tables {
+        let record = base + 12 + 16 * i;
+        if data.get(record..record + 4) == Some(b"OS/2") {
+            return be16(be32(record + 8)? as usize + 4);
+        }
+    }
+    None
 }
 
 impl Default for Shaper {
@@ -424,6 +502,7 @@ impl Shaper {
         Self {
             font_cx,
             layout_cx: LayoutContext::default(),
+            weights: std::collections::HashMap::new(),
         }
     }
 
@@ -443,12 +522,17 @@ impl Shaper {
         }
     }
 
+    /// Whether the machine has a font family of this name.
+    pub fn has_family(&mut self, name: &str) -> bool {
+        self.font_cx.collection.family_id(name).is_some()
+    }
+
     pub fn lay_out(&mut self, spec: &Spec<'_>) -> Paragraph {
         self.lay_out_with(spec, &Extra::default())
     }
 
     /// The font metrics `style` has: what an empty line of it is as high as.
-    fn probe(&mut self, spec: &Spec<'_>) -> Option<(f32, f32, f32)> {
+    fn probe(&mut self, spec: &Spec<'_>, ratio: Option<f32>) -> Option<(f32, f32, f32)> {
         let probe = Spec {
             text: " ",
             spans: &[],
@@ -457,7 +541,10 @@ impl Shaper {
         };
         let laid = self.lay_out_with(&probe, &Extra::default());
         let face = laid.faces.first()?;
-        Some((face.ascent, face.descent, face.leading))
+        Some(scaled_metrics(
+            (face.ascent, face.descent, face.leading),
+            ratio.map(|r| r * spec.base.size * spec.scale),
+        ))
     }
 
     /// Lay out a paragraph with what a word processor adds to a plain one;
@@ -533,12 +620,32 @@ impl Shaper {
             for run in line.runs() {
                 let metrics = run.font_metrics();
                 let synthesis = run.synthesis();
+                // Bold asked for, and a font that is not: thicken it.
+                let style_index = style_at(run.text_range().start);
+                let wants_bold = if style_index == 0 {
+                    spec.base.bold
+                } else {
+                    spec.spans[style_index - 1].style.bold
+                };
+                let east_asian_run = text[run.text_range()].chars().any(|c| c as u32 >= 0x2e80);
+                let font = run.font();
+                let coords_set = !run.normalized_coords().is_empty();
+                let too_light = wants_bold && !coords_set && {
+                    let key = (font.data.id(), font.index);
+                    let weight = *self
+                        .weights
+                        .entry(key)
+                        .or_insert_with(|| font_weight(font.data.data(), font.index));
+                    // The bold of East Asian serif fonts is faint at body sizes:
+                    // thicken it as for a font without one.
+                    weight.is_some_and(|w| w < 600 || (w < 800 && east_asian_run))
+                };
                 let face_index = faces.len();
                 faces.push(Face {
                     font: run.font().clone(),
                     size: run.font_size(),
                     coords: bytemuck::cast_slice::<_, i16>(run.normalized_coords()).to_vec(),
-                    embolden: synthesis.embolden(),
+                    embolden: synthesis.embolden() || too_light,
                     skew: synthesis.skew(),
                     ascent: metrics.ascent,
                     descent: metrics.descent,
@@ -562,7 +669,7 @@ impl Shaper {
                         .ok()
                         .map(|index| &extra.objects[index]);
                     let start = glyphs.len();
-                    if object.is_none() {
+                    if object.is_none() && !first.is_control() {
                         glyphs.extend(cluster.glyphs().map(|g| ShapedGlyph {
                             id: g.id,
                             x: g.x,
@@ -571,12 +678,22 @@ impl Shaper {
                         }));
                     }
                     let style = style_at(range.start);
+                    let xscale = {
+                        let after = extra
+                            .scaling
+                            .partition_point(|n| n.range.start <= range.start);
+                        after
+                            .checked_sub(1)
+                            .map(|i| &extra.scaling[i])
+                            .filter(|n| n.range.contains(&range.start))
+                            .map_or(1.0, |n| n.factor.clamp(0.1, 10.0))
+                    };
                     let advance = if newline {
                         0
                     } else if let Some(object) = object {
                         to_fx(object.width * scale)
                     } else {
-                        to_fx(cluster.advance())
+                        to_fx(cluster.advance() * xscale)
                     };
                     found.push((
                         Cluster {
@@ -595,6 +712,7 @@ impl Shaper {
                             glyphs: start..glyphs.len(),
                             style,
                             object: object.map(|o| [o.width * scale, o.height * scale]),
+                            xscale,
                         },
                     ));
                 }
@@ -625,6 +743,7 @@ impl Shaper {
                     glyphs: 0..0,
                     style: style_at(start),
                     object: None,
+                    xscale: 1.0,
                 });
             }
         };
@@ -693,12 +812,27 @@ impl Shaper {
                     object = object.max(height);
                 }
                 if let Some(face) = look.face.map(|f| &paragraph.faces[f]) {
-                    ascent = ascent.max(face.ascent);
-                    descent = descent.max(face.descent);
-                    leading = leading.max(face.leading);
+                    let at = paragraph.clusters[index].text.start;
+                    let after = extra.natural.partition_point(|n| n.range.start <= at);
+                    let target = after
+                        .checked_sub(1)
+                        .map(|i| &extra.natural[i])
+                        .filter(|n| n.range.contains(&at))
+                        .map(|n| n.ratio * style.size * scale);
+                    let (fa, fd, fl) =
+                        scaled_metrics((face.ascent, face.descent, face.leading), target);
+                    let above_at = extra.above.partition_point(|n| n.range.start <= at);
+                    let room = above_at
+                        .checked_sub(1)
+                        .map(|i| &extra.above[i])
+                        .filter(|n| n.range.contains(&at))
+                        .map_or(0.0, |n| n.height * scale);
+                    ascent = ascent.max(fa);
+                    descent = descent.max(fd);
+                    leading = leading.max(fl);
                     let rise = style.rise * scale;
-                    up = up.max(face.ascent + rise);
-                    down = down.max(face.descent - rise);
+                    up = up.max(fa + rise + room);
+                    down = down.max(fd - rise);
                 }
             }
             if size == 0.0 {
@@ -739,7 +873,7 @@ impl Shaper {
             let probed = if matches!(rule, LineRule::Legacy) {
                 None
             } else {
-                self.probe(spec)
+                self.probe(spec, extra.base_natural)
             };
             let (height, baseline) = match probed {
                 None => {
@@ -782,6 +916,18 @@ impl Shaper {
     }
 }
 
+/// Ascent, descent and line gap scaled so that they add up to `target`.
+fn scaled_metrics(m: (f32, f32, f32), target: Option<f32>) -> (f32, f32, f32) {
+    let sum = m.0 + m.1 + m.2;
+    match target {
+        Some(t) if sum > 0.0 && t > 0.0 => {
+            let f = t / sum;
+            (m.0 * f, m.1 * f, m.2 * f)
+        }
+        _ => m,
+    }
+}
+
 /// The height of a line and where its baseline is in it, from the largest
 /// ascent (with what is raised), descent and line gap on it.
 fn line_extent(
@@ -794,6 +940,22 @@ fn line_extent(
     scale: f32,
 ) -> (f32, f32) {
     let natural = ascent + descent + leading;
+    if let Some(pitch) = grid
+        && pitch > 0.0
+        && !matches!(rule, LineRule::Exactly(_))
+    {
+        // A line takes whole grid lines, a multiple multiplies that, and the
+        // text is in the middle.
+        let rows = ((natural - 0.02) / pitch).ceil().max(1.0);
+        let base = rows * pitch;
+        let height = match rule {
+            LineRule::Multiple(m) => base * m.max(0.0),
+            LineRule::AtLeast(v) => base.max(v * scale),
+            _ => base,
+        };
+        let baseline = (height - natural) / 2.0 + ascent + leading / 2.0;
+        return (round(height), round(baseline));
+    }
     let (height, baseline) = match rule {
         LineRule::Legacy => (natural, ascent + leading / 2.0),
         LineRule::Multiple(multiple) => {
@@ -814,7 +976,7 @@ fn line_extent(
             (height, height - descent * shrink)
         }
     };
-    grid_fit(grid, round(height), round(baseline))
+    (round(height), round(baseline))
 }
 
 /// Round a line up to whole grid lines, the text in the middle.
@@ -904,13 +1066,17 @@ impl Paragraph {
                 let color = self.styles[look.style].color;
                 let skew = self.skew(look, face);
                 let same = runs.last().is_some_and(|run| {
-                    std::ptr::eq(run.face, face) && run.color == color && run.skew == skew
+                    std::ptr::eq(run.face, face)
+                        && run.color == color
+                        && run.skew == skew
+                        && run.x_scale == look.xscale
                 });
                 if !same {
                     runs.push(DrawRun {
                         face,
                         color,
                         skew,
+                        x_scale: look.xscale,
                         glyphs: Vec::new(),
                     });
                 }
@@ -920,10 +1086,10 @@ impl Paragraph {
                 for glyph in &self.glyphs[look.glyphs.clone()] {
                     run.glyphs.push(Glyph {
                         id: glyph.id,
-                        x: pen + glyph.x,
+                        x: pen + glyph.x * look.xscale,
                         y: baseline + glyph.y,
                     });
-                    pen += glyph.advance;
+                    pen += glyph.advance * look.xscale;
                 }
             }
         }
@@ -974,18 +1140,20 @@ impl Paragraph {
                 let baseline = line.baseline - style.rise * self.scale;
                 let decor = self.decor_at(cluster.text.start);
                 let color = style.color;
-                let mut add = |offset: f32, size: f32, color: Rgba| {
+                let mut add = |offset: f32, size: f32, color: Rgba, kind: LineKind| {
                     let decoration = Decoration {
                         x0,
                         x1,
                         y: baseline - offset,
                         thickness: size.max(min_thickness),
                         color,
+                        kind,
                     };
                     // Join with the piece just before on the same line.
                     if let Some(last) = out.iter_mut().rev().take(4).find(|last| {
                         last.y == decoration.y
                             && last.color == decoration.color
+                            && last.kind == decoration.kind
                             && (last.x1 - decoration.x0).abs() < 1.0
                     }) {
                         last.x1 = decoration.x1;
@@ -994,10 +1162,15 @@ impl Paragraph {
                     }
                 };
                 if style.underline {
-                    add(face.underline_offset, face.underline_size, color);
+                    add(
+                        face.underline_offset,
+                        face.underline_size,
+                        color,
+                        LineKind::Solid,
+                    );
                 }
                 if style.strike {
-                    add(face.strike_offset, face.strike_size, color);
+                    add(face.strike_offset, face.strike_size, color, LineKind::Solid);
                 }
                 if let Some(decor) = decor {
                     let (offset, size) = (face.underline_offset, face.underline_size);
@@ -1006,25 +1179,29 @@ impl Paragraph {
                         .all(char::is_whitespace);
                     let underline_color = decor.color.unwrap_or(color);
                     if !(decor.words_only && blank) {
+                        let c = underline_color;
                         match decor.underline {
                             Stroke::None => {}
-                            Stroke::Single => add(offset, size, underline_color),
-                            Stroke::Thick => add(offset, size * 2.0, underline_color),
+                            Stroke::Single => add(offset, size, c, LineKind::Solid),
+                            Stroke::Thick => add(offset, size * 2.0, c, LineKind::Solid),
+                            Stroke::Dotted => add(offset, size, c, LineKind::Dotted),
+                            Stroke::Dashed => add(offset, size, c, LineKind::Dashed),
+                            Stroke::Wave => add(offset - size, size, c, LineKind::Wave),
                             Stroke::Double => {
-                                add(offset, size, underline_color);
-                                add(offset - size * 2.0, size, underline_color);
+                                add(offset, size, c, LineKind::Solid);
+                                add(offset - size * 2.0, size, c, LineKind::Solid);
                             }
                         }
                     }
                     let (offset, size) = (face.strike_offset, face.strike_size);
                     match decor.strike {
                         Stroke::None => {}
-                        Stroke::Single => add(offset, size, color),
-                        Stroke::Thick => add(offset, size * 2.0, color),
                         Stroke::Double => {
-                            add(offset + size, size, color);
-                            add(offset - size, size, color);
+                            add(offset + size, size, color, LineKind::Solid);
+                            add(offset - size, size, color, LineKind::Solid);
                         }
+                        Stroke::Thick => add(offset, size * 2.0, color, LineKind::Solid),
+                        _ => add(offset, size, color, LineKind::Solid),
                     }
                 }
             }
@@ -1106,6 +1283,44 @@ impl Paragraph {
             }
             if x0 < x1 {
                 out.push([x0, line.top, x1, line.top + line.height]);
+            }
+        }
+        out
+    }
+
+    /// Rectangles covering a byte range, one per line, as high as the
+    /// text's own fonts (ascent to descent) rather than the line.
+    pub fn text_rects_in(&self, range: Range<usize>, lines: Range<usize>) -> Vec<[f32; 4]> {
+        let mut out = Vec::new();
+        if range.is_empty() {
+            return out;
+        }
+        for line in self.lines_in(lines) {
+            let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
+            let (mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY);
+            for placed in &line.placed {
+                let cluster = &self.clusters[placed.index];
+                if cluster.newline
+                    || cluster.text.end <= range.start
+                    || cluster.text.start >= range.end
+                {
+                    continue;
+                }
+                let look = &self.looks[placed.index];
+                let left = line.left + from_fx(placed.x);
+                x0 = x0.min(left);
+                x1 = x1.max(left + from_fx(placed.advance));
+                let rise = self.styles[look.style].rise * self.scale;
+                let (a, d) = match (look.face, look.object) {
+                    (_, Some([_, h])) => (h, 0.0),
+                    (Some(f), _) => (self.faces[f].ascent, self.faces[f].descent),
+                    _ => (0.0, 0.0),
+                };
+                y0 = y0.min(line.baseline - rise - a);
+                y1 = y1.max(line.baseline - rise + d);
+            }
+            if x0 < x1 && y0 < y1 {
+                out.push([x0, y0, x1, y1]);
             }
         }
         out

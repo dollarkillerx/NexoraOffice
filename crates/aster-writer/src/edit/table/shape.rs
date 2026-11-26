@@ -121,8 +121,8 @@ fn grow_rect(table: &Table, rows: (usize, usize), columns: (usize, usize)) -> Op
     // outgrow the table.
     for _ in 0..(table.rows.len() + table.columns.len() + 2) * 2 {
         let mut changed = false;
-        for r in r0..=r1 {
-            let row = &table.rows[r];
+        let (first, last) = (r0, r1);
+        for (r, row) in table.rows.iter().enumerate().take(last + 1).skip(first) {
             let mut at = row.grid_before as usize;
             for cell in &row.cells {
                 let (start, end) = (at, at + cell.span.max(1) as usize);
@@ -240,8 +240,7 @@ pub fn merge_cells(doc: &mut Document, from: &Pos, to: &Pos) -> Pos {
     let mut content: Vec<Block> = Vec::new();
     let mut markers: Vec<Run> = Vec::new();
     let mut first_index = 0;
-    for r in r0..=r1 {
-        let row = &mut table.rows[r];
+    for (r, row) in table.rows.iter_mut().enumerate().take(r1 + 1).skip(r0) {
         let indexes: Vec<usize> = overlapping(row, c0, c1).map(|(i, _)| i).collect();
         let (Some(&i0), Some(&i1)) = (indexes.first(), indexes.last()) else {
             continue;

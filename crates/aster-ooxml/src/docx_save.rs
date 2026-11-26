@@ -20,16 +20,21 @@
 //!   and every row that is as read (cells with the same spans, merges,
 //!   borders, shading, margins and alignment) are copied; rows made here, and
 //!   rows whose cell structure changed (a merge that moved with the row
-//!   above it removed), are written from the model, the second kind keeping
-//!   their start tag and `trPr`. Columns added or removed: `tblPr` is kept
-//!   (its width follows the grid when it was the grid's sum), the grid and
-//!   every row are written from the model with their start tag and `trPr`,
-//!   and each cell's content is written as any block (paragraphs as read are
-//!   copied). A cell written from the model has a `tcPr` of `tcW`,
-//!   `gridSpan`, `vMerge`, `tcBorders`, `shd`, `tcMar` and `vAlign` from the
-//!   model: other cell properties the file had there (`cnfStyle`, `noWrap`,
-//!   `textDirection`) and the borders and shading the table style gives are
-//!   written as direct formatting of the final values. A table made here
+//!   above it removed, a height set), are written from the model over their
+//!   original bytes. Columns added or removed, widths or the indent changed
+//!   (`table.rs`): `tblPr` is kept (a width in twips follows the grid, the
+//!   indent is the model's), the grid is written again, and so is every row.
+//!   A row or cell that was read and is written again keeps its start tag
+//!   and the `trPr` and `tcPr` children the model has no field for
+//!   (`cnfStyle`, `noWrap`, `hideMark`, `tcFitText`, `textDirection` and the
+//!   like) and the modeled ones that are as they were, byte for byte; width,
+//!   span, merge, borders, shading, margins and vertical alignment are
+//!   written again where they differ from what was read. The content of a
+//!   cell that is as read is its own bytes; paragraphs moved in from other
+//!   cells (a merge) are copied from theirs. A cell made here has a `tcPr`
+//!   of `tcW`, `gridSpan`, `vMerge`, `tcBorders`, `shd`, `tcMar` and
+//!   `vAlign` from the model; the borders and shading the table style gives
+//!   are written as direct formatting of the final values. A table made here
 //!   writes `tblPr` (style, width, borders where every cell has the same,
 //!   alignment, indent, layout, cell margins, `tblLook`), `tblGrid` and its
 //!   rows the same way.
@@ -50,16 +55,27 @@
 //!   differs from the paragraph's base look.
 //!
 //! **Pictures.** A picture made here (or pasted from another place, with no
-//! usable source) is written as `<w:drawing><wp:inline>` with the image
-//! stored as `word/media/imageN.<ext>` (the extension from the image's first
-//! bytes), once for each distinct content, a relationship from the main
-//! part, a `Default` content type for the extension if the package has none,
-//! the `wp`, `a`, `pic` and `r` namespaces declared on the root element if it
-//! lacks them, a `wp:docPr` id above every id in the main part and the other
-//! story parts, and the crop as `a:srcRect`. A floating picture without a
-//! source is written in the line. A picture that was read and has another
-//! size keeps its element with only `wp:extent` and `a:ext` patched; its
-//! other changes (crop, description) are not written.
+//! usable source) is written as `<w:drawing>` with a `wp:inline`, or a
+//! `wp:anchor` when it floats (position, wrap, `behindDoc` and the room
+//! around it from the model), with the image stored as
+//! `word/media/imageN.<ext>` (the extension from the image's first bytes),
+//! once for each distinct content (and not at all where the file already
+//! has a picture with the same bytes: that relationship is used), a
+//! relationship from the main part, a `Default` content type for the
+//! extension if the package has none, the `wp`, `a`, `pic` and `r`
+//! namespaces declared on the root element if it lacks them, a `wp:docPr` id
+//! above every id in the main part and the other story parts, and the crop
+//! as `a:srcRect`. A picture that was read and has another size, position
+//! or wrap keeps its element with only those parts written again
+//! (`drawing.rs`): the extent (`wp:extent` and `a:ext`), the position
+//! elements (the reference the file named stays where the model's is the
+//! same), the wrap element, `behindDoc` and the distances; going from the
+//! line to floating or back builds the other element from the same parts.
+//! The graphic and everything under it (effects, outlines, adjustments) is
+//! copied byte for byte. A drawing read from the file that is there twice (a
+//! copy pasted into the same file) is written from the same bytes with a
+//! `wp:docPr` id of its own and uses the same image part. Its other changes
+//! (crop, description) are not written.
 //!
 //! What cannot be written from the model, because it only exists as the
 //! bytes of a file, is kept by copying those bytes: drawings that were read,

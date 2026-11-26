@@ -1,4 +1,5 @@
-//! Tables: making one, and adding and removing rows and columns.
+//! Tables: making one, adding and removing rows and columns, merging and
+//! splitting cells, and sizes (see `shape` for the last three).
 //!
 //! **Which table.** Row and column operations take two positions, the ends
 //! of a selection. The table is the innermost one that holds the first

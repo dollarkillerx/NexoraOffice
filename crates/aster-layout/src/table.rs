@@ -20,6 +20,7 @@ pub(crate) struct RowLayout {
     pub top: f32,
     pub height: f32,
     pub exact: bool,
+    pub cant_split: bool,
     pub header: bool,
 }
 
@@ -37,6 +38,8 @@ pub(crate) struct CellLayout {
     pub shading: Option<Rgba>,
     pub borders: [Option<Border>; 4],
     align: CellAlign,
+    /// Its row and its place in the row's cells.
+    at: (usize, usize),
 }
 
 pub(crate) struct TableLayout {
@@ -105,7 +108,7 @@ impl TableLayout {
     }
 
     /// The lines of a row's cells as `(top, bottom)` in the row's height.
-    fn pieces_of_row(&self, row: usize) -> Vec<(f32, f32)> {
+    pub(crate) fn pieces_of_row(&self, row: usize) -> Vec<(f32, f32)> {
         let layout = &self.rows[row];
         let mut out = Vec::new();
         for ci in self.owner[row].iter().flatten() {
@@ -138,8 +141,13 @@ impl Stack {
                     }
                 }
                 Entry::Table(table, _, top) => {
-                    for row in &table.rows {
-                        out.push((top + row.top, top + row.top + row.height));
+                    for (r, row) in table.rows.iter().enumerate() {
+                        let at = top + row.top;
+                        let inner = table.pieces_of_row(r);
+                        if inner.is_empty() {
+                            out.push((at, at + row.height));
+                        }
+                        out.extend(inner.into_iter().map(|(a, b)| (at + a, at + b)));
                     }
                 }
             }
@@ -227,6 +235,15 @@ impl Cx<'_> {
                     .filter(|&ci| cells[ci].col0 == col && cells[ci].cols == span);
                 let id = if let Some(start) = continued {
                     cells[start].rows += 1;
+                    if let Some(table_path) = path {
+                        // What the covered cell shows is the start cell's: a
+                        // place in it is a place there.
+                        let (sr, sc) = cells[start].at;
+                        let mut key = table_path.0.clone();
+                        key.extend([r as u32, c as u32]);
+                        self.redirects
+                            .push((Path(key), table_path.cell_block(sr, sc, 0)));
+                    }
                     start
                 } else {
                     let [ml, mt, mr, mb] = cell.margins.map(|m| pt(m).max(0.0));
@@ -254,6 +271,7 @@ impl Cx<'_> {
                         shading: cell.shading,
                         borders: cell.borders,
                         align: cell.align,
+                        at: (r, c),
                     });
                     cells.len() - 1
                 };
@@ -300,6 +318,7 @@ impl Cx<'_> {
                 top,
                 height: heights[r],
                 exact: matches!(row.height, RowHeight::Exactly(_)),
+                cant_split: row.cant_split,
                 header: row.header,
             });
             top += heights[r];
@@ -337,20 +356,25 @@ impl Cx<'_> {
         ec: &EmitCtx,
         out: &mut Out<'_>,
     ) {
+        // Rows, or the parts of them, that lie in `s0..s1`.
         let slices: Vec<Slice> = table
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.top >= s0 && row.top < s1)
+            .filter(|(_, row)| {
+                (row.top >= s0 && row.top < s1)
+                    || (row.top < s0 && row.top + row.height > s0 + 0.01)
+            })
             .map(|(r, row)| Slice {
                 row: r,
-                c0: 0.0,
-                c1: row.height,
+                c0: (s0 - row.top).max(0.0).min(row.height),
+                c1: (s1 - row.top).min(row.height).max(0.0),
                 repeat: false,
             })
+            .filter(|s| s.c1 > s.c0 || s.c0 == 0.0)
             .collect();
         if let Some(first) = slices.first() {
-            let y = oy + table.rows[first.row].top;
+            let y = oy + table.rows[first.row].top + first.c0;
             self.emit_row_slices(table, &slices, ox, y, ec, out);
         }
     }

@@ -180,6 +180,7 @@ impl Layouter {
             grid: None,
             max_object: 1.0,
             background: None,
+            redirects: Vec::new(),
             page_values: None,
         };
         let mut flow = Flow {
@@ -813,7 +814,11 @@ impl Flow<'_, '_> {
                     break;
                 }
             } else if line < nlines {
-                self.advance(false);
+                // Stopped for a drawing in the way: go on below it, in the
+                // same column.
+                if bump.is_none() {
+                    self.advance(false);
+                }
             } else {
                 break;
             }
@@ -905,15 +910,18 @@ impl Flow<'_, '_> {
             }
             let at_top = self.col_empty && batch.iter().all(|s| s.repeat);
             let capacity = self.col_bottom() - self.region().top;
-            if c0 == 0.0 && !at_top && row.height <= capacity {
+            let target = c0 + avail.max(0.0);
+            let c1 = layout.cut(r, c0, target);
+            // A row that may be split goes on as far as a line of its cells
+            // fits; one that may not, or of which no line fits, moves whole.
+            let splits = !row.cant_split && c1 <= target + EPS && c1 > c0 + EPS;
+            if c0 == 0.0 && !at_top && row.height <= capacity && !splits {
                 self.flush_rows(&layout, &mut batch, ox, batch_y);
                 self.advance(false);
                 batch_y = self.y;
                 self.repeat_headers(&layout, header_rows, r, &mut batch);
                 continue;
             }
-            let target = c0 + avail.max(0.0);
-            let c1 = layout.cut(r, c0, target);
             if !at_top && (avail <= EPS || c1 <= c0 + EPS) {
                 self.flush_rows(&layout, &mut batch, ox, batch_y);
                 self.advance(false);
@@ -1178,7 +1186,8 @@ impl Flow<'_, '_> {
                 items: layers.into_items(),
             });
         }
-        Layout::new(pages, self.frags, self.outline)
+        let redirects = std::mem::take(&mut self.cx.redirects);
+        Layout::new(pages, self.frags, self.outline, redirects)
     }
 }
 

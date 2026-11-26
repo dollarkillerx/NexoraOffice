@@ -38,11 +38,18 @@ pub struct Layout {
     pub pages: Vec<Page>,
     pub(crate) frags: Vec<Frag>,
     by_path: HashMap<Path, Vec<usize>>,
+    /// Covered cells of vertical merges: the cell, and the start of the merge.
+    redirects: HashMap<Path, Path>,
     outline: Vec<OutlineEntry>,
 }
 
 impl Layout {
-    pub(crate) fn new(pages: Vec<Page>, frags: Vec<Frag>, outline: Vec<OutlineEntry>) -> Self {
+    pub(crate) fn new(
+        pages: Vec<Page>,
+        frags: Vec<Frag>,
+        outline: Vec<OutlineEntry>,
+        redirects: Vec<(Path, Path)>,
+    ) -> Self {
         let mut by_path: HashMap<Path, Vec<usize>> = HashMap::new();
         for (index, frag) in frags.iter().enumerate() {
             if !frag.repeat {
@@ -53,6 +60,7 @@ impl Layout {
             pages,
             frags,
             by_path,
+            redirects: redirects.into_iter().collect(),
             outline,
         }
     }
@@ -63,7 +71,23 @@ impl Layout {
     }
 
     /// The fragment of `pos`'s paragraph that has its place, and the line.
+    /// The place a position stands for: itself, or for a cell a vertical
+    /// merge covers, the start of the merge.
+    fn resolve<'a>(&self, pos: &'a Pos) -> std::borrow::Cow<'a, Pos> {
+        if self.by_path.contains_key(&pos.path) || self.redirects.is_empty() {
+            return std::borrow::Cow::Borrowed(pos);
+        }
+        // The cell is the path up to some `[row, cell]`, then anything.
+        for n in (2..pos.path.0.len()).rev() {
+            if let Some(start) = self.redirects.get(&Path(pos.path.0[..n].to_vec())) {
+                return std::borrow::Cow::Owned(Pos::new(start.clone(), 0));
+            }
+        }
+        std::borrow::Cow::Borrowed(pos)
+    }
+
     fn locate(&self, pos: &Pos) -> Option<(usize, usize)> {
+        let pos = &*self.resolve(pos);
         let indexes = self.by_path.get(&pos.path)?;
         let first = &self.frags[*indexes.first()?];
         let off = first.shaped.to_shaped(pos.offset);
@@ -86,6 +110,7 @@ impl Layout {
     /// Where the caret is at `pos`; `None` for a path that is not in the
     /// body or has not been placed.
     pub fn caret(&self, pos: &Pos) -> Option<Caret> {
+        let pos = &*self.resolve(pos);
         let (index, line) = self.locate(pos)?;
         let frag = &self.frags[index];
         let paragraph = &frag.shaped.paragraph;

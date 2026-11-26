@@ -731,9 +731,14 @@ impl Shaper {
                 };
                 let font = run.font();
                 let coords_set = !run.normalized_coords().is_empty();
-                // A face that is bold is drawn as it is; only where the
-                // family has none that is (Heiti SC, Kaiti SC, whose bold
-                // faces the system does not report as bold) is it thickened.
+                // Bold asked for and the face is not bold: thicken it. The
+                // bold faces of East Asian fonts (Songti SC's, Hiragino
+                // Sans GB's) are real but faint at body sizes, drawn as they
+                // are they hardly differ from the regular, so they are
+                // thickened too; only the heaviest faces are left alone.
+                // What counts is the face the glyphs are really drawn
+                // with, a fallback font included.
+                let east_asian_run = text[run.text_range()].chars().any(|c| c as u32 >= 0x2e80);
                 let too_light = wants_bold && !coords_set && {
                     let key = (font.data.id(), font.index);
                     let weight = *self
@@ -741,7 +746,8 @@ impl Shaper {
                         .entry(key)
                         .or_insert_with(|| font_weight(font.data.data(), font.index));
                     let chosen = run.font_attrs().weight.value();
-                    weight.is_some_and(|w| w < 600) && chosen < 600.0
+                    let class = weight.map_or(chosen, |w| chosen.max(f32::from(w)));
+                    class < 600.0 || (class < 800.0 && east_asian_run)
                 };
                 let face_index = faces.len();
                 faces.push(Face {
@@ -2019,15 +2025,13 @@ mod extra_tests {
     }
 
     #[test]
-    fn a_real_bold_face_is_not_thickened_again() {
+    fn bold_east_asian_text_is_thickened_unless_the_face_is_very_heavy() {
         let mut shaper = Shaper::new();
-        // Songti SC has a bold of its own (and a black, which is not it).
-        if let Some((thickened, _)) = bold_of(&mut shaper, "Songti SC") {
-            assert!(!thickened);
-        }
-        // Heiti SC has none: the regular is thickened by hand.
-        if let Some((thickened, _)) = bold_of(&mut shaper, "Heiti SC") {
-            assert!(thickened);
+        // Songti SC's bold is real but faint, and Heiti SC has none.
+        for family in ["Songti SC", "Heiti SC"] {
+            if let Some((thickened, _)) = bold_of(&mut shaper, family) {
+                assert!(thickened, "{family}");
+            }
         }
     }
 
@@ -2041,9 +2045,9 @@ mod extra_tests {
         // Asking again does no harm.
         shaper.prefer_real_bold("Kaiti SC");
         let (after, face) = bold_of(&mut shaper, "Kaiti SC").unwrap();
-        // The regular was thickened; now a face of its own is not.
-        assert!(before && !after, "{before} {after}");
+        // Bold text now has a face of its own to start from.
         let _ = (regular, face);
+        assert!(before && after, "{before} {after}");
         // A family that is not there is left alone.
         shaper.prefer_real_bold("No Such Family");
     }

@@ -199,10 +199,10 @@ struct Head {
 
 fn read_settings(root: &Node<'_>) -> Head {
     let mut settings = Settings::default();
-    if let Some(tab) = root.child("defaultTabStop").and_then(|n| n.int("val")) {
-        if tab > 0 {
-            settings.default_tab = tab.min(31_680) as Twips;
-        }
+    if let Some(tab) = root.child("defaultTabStop").and_then(|n| n.int("val"))
+        && tab > 0
+    {
+        settings.default_tab = tab.min(31_680) as Twips;
     }
     settings.even_and_odd_headers = root.toggle("evenAndOddHeaders").unwrap_or(false);
     settings.compress_punctuation = root

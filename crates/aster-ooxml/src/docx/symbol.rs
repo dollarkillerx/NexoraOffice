@@ -5,9 +5,15 @@
 /// Fonts whose characters are looked up here.
 pub fn is_symbol_font(name: &str) -> bool {
     let name = name.trim();
-    ["Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings"]
-        .iter()
-        .any(|font| name.eq_ignore_ascii_case(font))
+    [
+        "Symbol",
+        "Wingdings",
+        "Wingdings 2",
+        "Wingdings 3",
+        "Webdings",
+    ]
+    .iter()
+    .any(|font| name.eq_ignore_ascii_case(font))
 }
 
 /// The Unicode character that `c` in `font` stands for, when the table

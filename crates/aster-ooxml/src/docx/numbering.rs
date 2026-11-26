@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 
-use aster_writer::{
-    Align, List, ListLevel, NumberFormat, Numbering, RunPatch, Suffix, Twips,
-};
+use aster_writer::{Align, List, ListLevel, NumberFormat, Numbering, RunPatch, Suffix, Twips};
 
 use super::dom::Node;
 use super::props::{Env, parse_ppr, parse_rpr};
@@ -65,12 +63,17 @@ pub fn number_format(name: &str) -> NumberFormat {
             NumberFormat::DecimalEnclosedCircle
         }
         "decimalFullWidth" | "decimalFullWidth2" => NumberFormat::DecimalFullWidth,
-        "chineseCounting" | "japaneseCounting" | "chineseCountingThousand" | "taiwaneseCounting"
-        | "taiwaneseCountingThousand" | "koreanCounting" => NumberFormat::ChineseCounting,
+        "chineseCounting"
+        | "japaneseCounting"
+        | "chineseCountingThousand"
+        | "taiwaneseCounting"
+        | "taiwaneseCountingThousand"
+        | "koreanCounting" => NumberFormat::ChineseCounting,
         "chineseLegalSimplified" | "japaneseLegal" | "koreanLegal" => NumberFormat::ChineseLegal,
-        "ideographDigital" | "japaneseDigitalTenThousand" | "taiwaneseDigital" | "koreanDigital" => {
-            NumberFormat::IdeographDigital
-        }
+        "ideographDigital"
+        | "japaneseDigitalTenThousand"
+        | "taiwaneseDigital"
+        | "koreanDigital" => NumberFormat::IdeographDigital,
         "ideographTraditional" => NumberFormat::IdeographTraditional,
         "ideographZodiac" | "ideographZodiacTraditional" => NumberFormat::IdeographZodiac,
         "aiueoFullWidth" | "aiueo" => NumberFormat::Aiueo,
@@ -99,7 +102,10 @@ fn parse_level(node: &Node<'_>, env: &Env, size: f32) -> LevelDef {
     if let Some(v) = node.child("numFmt").and_then(Node::val) {
         level.format = number_format(&v);
     }
-    let mut text = node.child("lvlText").and_then(Node::val).unwrap_or_default();
+    let mut text = node
+        .child("lvlText")
+        .and_then(Node::val)
+        .unwrap_or_default();
     level.suffix = match node.child("suff").and_then(Node::val).as_deref() {
         Some("space") => Suffix::Space,
         Some("nothing") => Suffix::Nothing,
@@ -209,7 +215,9 @@ pub fn read_lists(root: &Node<'_>, styles: &Styles, env: &Env, size: f32) -> Lis
                 }
                 def.levels[at] = Some(parse_level(lvl, env, size));
             }
-            abstracts.entry(id.clamp(0, i64::from(u32::MAX)) as u32).or_insert(def);
+            abstracts
+                .entry(id.clamp(0, i64::from(u32::MAX)) as u32)
+                .or_insert(def);
         } else if node.is("num") {
             let (Some(id), Some(abs)) = (
                 node.int("numId"),
@@ -257,8 +265,10 @@ pub fn read_lists(root: &Node<'_>, styles: &Styles, env: &Env, size: f32) -> Lis
             if let (Some(start), Some((level, _))) = (start, levels[*at].as_mut()) {
                 level.restart = Some(*start);
             } else if let Some(start) = start {
-                let mut level = ListLevel::default();
-                level.restart = Some(*start);
+                let level = ListLevel {
+                    restart: Some(*start),
+                    ..ListLevel::default()
+                };
                 levels[*at] = Some((level, None));
             }
         }

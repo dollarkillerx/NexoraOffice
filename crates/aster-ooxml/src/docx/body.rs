@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aster_writer::{
-    Block, Break, Inline, Link, OBJECT, PageField, Paragraph, ParaSource, Ruby, Run, RunLook,
+    Block, Break, Inline, Link, OBJECT, PageField, ParaSource, Paragraph, Ruby, Run, RunLook,
     RunSource,
 };
 
@@ -210,7 +210,11 @@ impl Reader<'_> {
         let Some(rpr) = rpr else {
             return (look, None);
         };
-        if let Some(style) = rpr.style.as_deref().and_then(|s| self.styles.character_chain(s)) {
+        if let Some(style) = rpr
+            .style
+            .as_deref()
+            .and_then(|s| self.styles.character_chain(s))
+        {
             style.apply(&mut look);
         }
         rpr.apply(&mut look);

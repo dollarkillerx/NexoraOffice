@@ -203,9 +203,17 @@ impl Styles {
                     .and_then(Node::val)
                     .unwrap_or_else(|| id.clone()),
                 kind,
-                based_on: node.child("basedOn").and_then(Node::val).map(|v| env.intern(&v)),
-                next: node.child("next").and_then(Node::val).map(|v| env.intern(&v)),
-                default: node.attr("default").is_some_and(|v| matches!(v.trim(), "1" | "true" | "on")),
+                based_on: node
+                    .child("basedOn")
+                    .and_then(Node::val)
+                    .map(|v| env.intern(&v)),
+                next: node
+                    .child("next")
+                    .and_then(Node::val)
+                    .map(|v| env.intern(&v)),
+                default: node
+                    .attr("default")
+                    .is_some_and(|v| matches!(v.trim(), "1" | "true" | "on")),
                 hidden: node.toggle("hidden").unwrap_or(false)
                     || node.toggle("semiHidden").unwrap_or(false),
                 quick: node.toggle("qFormat").unwrap_or(false),
@@ -247,7 +255,10 @@ impl Styles {
         let mut out = vec![start];
         let mut at = start;
         while out.len() < MAX_CHAIN {
-            let Some(parent) = self.raw[at].based_on.as_deref().and_then(|id| self.index_of(id))
+            let Some(parent) = self.raw[at]
+                .based_on
+                .as_deref()
+                .and_then(|id| self.index_of(id))
             else {
                 break;
             };

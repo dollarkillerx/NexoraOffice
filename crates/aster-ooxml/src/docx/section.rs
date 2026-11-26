@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aster_writer::{
-    CellAlign, Columns, DocGrid, GridKind, Margins, Marginals, Section, SectionStart, Twips,
+    CellAlign, Columns, DocGrid, GridKind, Marginals, Margins, Section, SectionStart, Twips,
 };
 
 use super::dom::Node;
@@ -21,7 +21,10 @@ pub fn grid_pitch(sect: &Node<'_>) -> Option<Twips> {
         grid.attr("type").as_deref(),
         Some("lines" | "linesAndChars" | "snapToChars")
     )
-    .then(|| grid.int("linePitch").map_or(360, |p| p.clamp(1, 31_680) as Twips))
+    .then(|| {
+        grid.int("linePitch")
+            .map_or(360, |p| p.clamp(1, 31_680) as Twips)
+    })
 }
 
 fn length(node: &Node<'_>, names: &[&str]) -> Option<Twips> {
@@ -80,7 +83,8 @@ impl Reader<'_> {
                 .map(|col| {
                     (
                         col.int("w").map_or(0, |w| w.clamp(0, 1_000_000) as Twips),
-                        col.int("space").map_or(0, |w| w.clamp(0, 1_000_000) as Twips),
+                        col.int("space")
+                            .map_or(0, |w| w.clamp(0, 1_000_000) as Twips),
                     )
                 })
                 .collect();
@@ -88,7 +92,9 @@ impl Reader<'_> {
                 columns.count = listed.len() as u32;
                 columns.widths = listed;
             } else {
-                columns.count = c.int("num").map_or(1, |n| n.clamp(1, MAX_COLUMNS as i64) as u32);
+                columns.count = c
+                    .int("num")
+                    .map_or(1, |n| n.clamp(1, MAX_COLUMNS as i64) as u32);
             }
             section.columns = columns;
         }

@@ -104,7 +104,11 @@ fn keeps_space(name: &[u8]) -> bool {
 
 /// The root element of a part.
 pub fn parse<'a>(bytes: &'a [u8], part: &'a str) -> Result<Node<'a>> {
-    let bom = if bytes.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
+    let bom = if bytes.starts_with(b"\xEF\xBB\xBF") {
+        3
+    } else {
+        0
+    };
     let mut reader = XmlReader::new(bytes, part);
     let mut stack: Vec<Node<'a>> = Vec::new();
     let mut count = 0usize;
@@ -226,7 +230,10 @@ mod tests {
         let bytes = xml.as_bytes();
         let root = parse(bytes, "t.xml").unwrap();
         assert!(root.is("a"));
-        assert_eq!(&xml[root.start..root.end], &xml[xml.find("<w:a").unwrap()..]);
+        assert_eq!(
+            &xml[root.start..root.end],
+            &xml[xml.find("<w:a").unwrap()..]
+        );
         let b = root.child("b").unwrap();
         assert_eq!(&xml[b.start..b.end], "<w:b x=\"1\"/>");
         let c = root.child("c").unwrap();

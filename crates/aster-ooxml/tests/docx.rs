@@ -40,7 +40,10 @@ fn the_codec_names_its_extensions_and_refuses_other_kinds() {
     ]);
     let err = Docx.read(presentation).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::WrongKind);
-    assert_eq!(Docx.read(b"junk".to_vec()).unwrap_err().kind(), ErrorKind::NotZip);
+    assert_eq!(
+        Docx.read(b"junk".to_vec()).unwrap_err().kind(),
+        ErrorKind::NotZip
+    );
 }
 
 #[test]
@@ -99,13 +102,21 @@ fn run_children_become_text_tabs_breaks_and_hyphens() {
     let paragraph = p(&document, 0);
     assert_eq!(
         kinds(paragraph),
-        ["text", "text", "text", "tab", "tab", "line", "page", "column", "line", "text", "text", "text"]
+        [
+            "text", "text", "text", "tab", "tab", "line", "page", "column", "line", "text", "text",
+            "text"
+        ]
     );
     assert_eq!(
         run_texts(paragraph),
-        ["a", " b ", "c", "\t", "\t", "\n", OBJECT, OBJECT, "\n", "\u{2011}", "\u{ad}", "z"]
+        [
+            "a", " b ", "c", "\t", "\t", "\n", OBJECT, OBJECT, "\n", "\u{2011}", "\u{ad}", "z"
+        ]
     );
-    assert_eq!(paragraph.text(), "a b c\t\t\n\u{FFFC}\u{FFFC}\n\u{2011}\u{ad}z");
+    assert_eq!(
+        paragraph.text(),
+        "a b c\t\t\n\u{FFFC}\u{FFFC}\n\u{2011}\u{ad}z"
+    );
 }
 
 #[test]
@@ -151,7 +162,6 @@ fn a_run_of_one_thing_is_one_run_and_several_things_are_several_runs() {
     assert!(paragraph.runs[1].same_look(&paragraph.runs[3]));
 }
 
-
 #[test]
 fn hyperlinks_give_their_runs_a_link() {
     let document = doc(
@@ -167,7 +177,10 @@ fn hyperlinks_give_their_runs_a_link() {
         Some("Go")
     );
     assert_eq!(target(1).as_deref(), Some("#top"));
-    assert_eq!(target(2).as_deref(), Some("https://example.org/a?x=1&y=2#part"));
+    assert_eq!(
+        target(2).as_deref(),
+        Some("https://example.org/a?x=1&y=2#part")
+    );
     assert_eq!(target(3), None);
 }
 
@@ -177,10 +190,19 @@ fn page_fields_become_page_numbers() {
         r#"<w:p><w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>4</w:t></w:r><w:r><w:t>5</w:t></w:r></w:fldSimple><w:fldSimple w:instr="NUMPAGES"><w:r><w:t>9</w:t></w:r></w:fldSimple><w:fldSimple w:instr="SECTIONPAGES"><w:r><w:t>2</w:t></w:r></w:fldSimple><w:fldSimple w:instr="DATE"><w:r><w:t>today</w:t></w:r></w:fldSimple></w:p>"#,
     );
     let paragraph = p(&document, 0);
-    assert_eq!(kinds(paragraph), ["pagenumber", "marker", "pagenumber", "pagenumber", "text"]);
+    assert_eq!(
+        kinds(paragraph),
+        ["pagenumber", "marker", "pagenumber", "pagenumber", "text"]
+    );
     assert_eq!(paragraph.runs[0].kind, Inline::PageNumber(PageField::Page));
-    assert_eq!(paragraph.runs[2].kind, Inline::PageNumber(PageField::PageCount));
-    assert_eq!(paragraph.runs[3].kind, Inline::PageNumber(PageField::SectionPages));
+    assert_eq!(
+        paragraph.runs[2].kind,
+        Inline::PageNumber(PageField::PageCount)
+    );
+    assert_eq!(
+        paragraph.runs[3].kind,
+        Inline::PageNumber(PageField::SectionPages)
+    );
     assert_eq!(paragraph.runs[0].text, "4");
     assert_eq!(paragraph.runs[4].text, "today");
 }
@@ -204,7 +226,15 @@ fn complex_fields_keep_their_code_as_markers_and_show_their_result() {
     // are the end of one field and the start of the next.
     assert_eq!(
         kinds(paragraph),
-        ["marker", "pagenumber", "marker", "text", "marker", "pagenumber", "marker"]
+        [
+            "marker",
+            "pagenumber",
+            "marker",
+            "text",
+            "marker",
+            "pagenumber",
+            "marker"
+        ]
     );
     assert_eq!(paragraph.runs[1].kind, Inline::PageNumber(PageField::Page));
     assert_eq!(paragraph.text(), "3Ann7");
@@ -227,20 +257,33 @@ fn nested_fields_and_fields_across_paragraphs_do_not_lose_their_place() {
         field("PAGE", "<w:r><w:t>2</w:t></w:r>")
     ));
     let first = p(&document, 0);
-    assert!(first.runs.iter().any(|r| r.kind == Inline::PageNumber(PageField::Page)));
+    assert!(
+        first
+            .runs
+            .iter()
+            .any(|r| r.kind == Inline::PageNumber(PageField::Page))
+    );
     assert_eq!(first.text(), "8afterout");
     // The result of a table of contents is text, whichever paragraph it is in.
     assert_eq!(p(&document, 1).text(), "entry one");
     assert_eq!(p(&document, 2).text(), "entry two");
     // After the end of that field a page field is still a page number.
-    assert!(p(&document, 3).runs.iter().any(|r| matches!(r.kind, Inline::PageNumber(_))));
+    assert!(
+        p(&document, 3)
+            .runs
+            .iter()
+            .any(|r| matches!(r.kind, Inline::PageNumber(_)))
+    );
 }
 
 #[test]
 fn hyperlink_fields_link_their_result() {
     let document = read(&format!(
         "<w:p>{}</w:p>",
-        field(r#"HYPERLINK "https://example.org/x" \o "tip""#, "<w:r><w:t>site</w:t></w:r>")
+        field(
+            r#"HYPERLINK "https://example.org/x" \o "tip""#,
+            "<w:r><w:t>site</w:t></w:r>"
+        )
     ));
     let run = p(&document, 0)
         .runs
@@ -266,7 +309,9 @@ fn things_kept_but_not_shown_are_zero_width_markers() {
     // Neighbouring markers are one marker, and a marker never takes room.
     assert_eq!(
         kinds(paragraph),
-        ["marker", "text", "marker", "text", "marker", "text", "text", "marker", "text"]
+        [
+            "marker", "text", "marker", "text", "marker", "text", "text", "marker", "text"
+        ]
     );
     let part = common_part(&bytes, "word/document.xml");
     let first = paragraph.runs[0].source.clone().unwrap();
@@ -312,14 +357,15 @@ fn ruby_keeps_its_base_text_and_its_reading() {
 
 #[test]
 fn page_number_runs_made_of_pgnum_in_a_header() {
-    let document = doc(r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rIdH"/></w:sectPr>"#)
-        .marginal(
-            "rIdH",
-            "header",
-            "header1.xml",
-            r#"<w:p><w:r><w:pgNum/></w:r></w:p>"#,
-        )
-        .read();
+    let document =
+        doc(r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rIdH"/></w:sectPr>"#)
+            .marginal(
+                "rIdH",
+                "header",
+                "header1.xml",
+                r#"<w:p><w:r><w:pgNum/></w:r></w:p>"#,
+            )
+            .read();
     let story = &document.marginals[0];
     let paragraph = story.blocks[0].as_paragraph().unwrap();
     assert_eq!(paragraph.runs[0].kind, Inline::PageNumber(PageField::Page));
@@ -337,12 +383,19 @@ fn check_paragraph_range(part: &[u8], paragraph: &Paragraph) {
         "starts with {:?}",
         &text[..text.len().min(20)]
     );
-    assert!(text.ends_with("</w:p>") || text.ends_with("/>"), "ends with {:?}", &text[text.len().saturating_sub(10)..]);
+    assert!(
+        text.ends_with("</w:p>") || text.ends_with("/>"),
+        "ends with {:?}",
+        &text[text.len().saturating_sub(10)..]
+    );
     assert_eq!(source.runs.len(), paragraph.runs.len());
     for (run, read) in paragraph.runs.iter().zip(&source.runs) {
         assert!(Arc::ptr_eq(run.source.as_ref().unwrap(), read));
         let range = raw(part, &read.range);
-        assert!(range.starts_with('<') && range.ends_with('>'), "run range {range:?}");
+        assert!(
+            range.starts_with('<') && range.ends_with('>'),
+            "run range {range:?}"
+        );
         assert!(read.range.start >= source.range.start && read.range.end <= source.range.end);
         if let Some(parent) = &read.parent {
             assert!(raw(part, parent).starts_with("<w:r"));
@@ -359,10 +412,10 @@ fn check_blocks(part: &[u8], blocks: &[Block], seen: &mut usize) {
                 check_paragraph_range(part, paragraph);
                 *seen += 1;
                 for run in &paragraph.runs {
-                    if let Inline::Drawing(d) = &run.kind {
-                        if let DrawingContent::TextBox(boxed) = &d.content {
-                            check_blocks(part, &boxed.blocks, seen);
-                        }
+                    if let Inline::Drawing(d) = &run.kind
+                        && let DrawingContent::TextBox(boxed) = &d.content
+                    {
+                        check_blocks(part, &boxed.blocks, seen);
                     }
                 }
             }
@@ -410,10 +463,9 @@ fn every_range_of_the_sample_is_its_element() {
         }
     }
     // Text boxes are in the main part and counted too.
-    assert!(document
-        .paragraphs()
-        .iter()
-        .any(|(_, p)| p.runs.iter().any(|r| matches!(&r.kind, Inline::Drawing(d) if matches!(d.content, DrawingContent::TextBox(_))))));
+    assert!(document.paragraphs().iter().any(|(_, p)| p.runs.iter().any(
+        |r| matches!(&r.kind, Inline::Drawing(d) if matches!(d.content, DrawingContent::TextBox(_)))
+    )));
 }
 
 #[test]
@@ -440,7 +492,10 @@ fn a_byte_order_mark_does_not_shift_the_ranges() {
     let part = common_part(&bytes, "word/document.xml");
     assert!(part.starts_with(b"\xEF\xBB\xBF"));
     let source = p(&document, 0).source.clone().unwrap();
-    assert_eq!(raw(&part, &source.range), "<w:p><w:r><w:t>bom</w:t></w:r></w:p>");
+    assert_eq!(
+        raw(&part, &source.range),
+        "<w:p><w:r><w:t>bom</w:t></w:r></w:p>"
+    );
 }
 
 #[test]
@@ -449,7 +504,10 @@ fn an_empty_paragraph_element_has_a_range_too() {
     let bytes = d.bytes();
     let document = d.read();
     let part = common_part(&bytes, "word/document.xml");
-    assert_eq!(raw(&part, &p(&document, 0).source.clone().unwrap().range), "<w:p/>");
+    assert_eq!(
+        raw(&part, &p(&document, 0).source.clone().unwrap().range),
+        "<w:p/>"
+    );
     assert_eq!(
         raw(&part, &p(&document, 1).source.clone().unwrap().range),
         r#"<w:p w:rsidR="00A1"/>"#
@@ -470,4 +528,210 @@ fn alternate_content_inside_a_run_keeps_its_own_range() {
     let range = &paragraph.runs[0].source.clone().unwrap().range;
     assert!(raw(&part, range).starts_with("<mc:AlternateContent>"));
     assert!(raw(&part, range).ends_with("</mc:AlternateContent>"));
+}
+
+// ---------------------------------------------------------------------------
+// The rich sample
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_rich_sample_reads_as_it_was_made() {
+    let d = Docx.read(docx_sample::sample()).unwrap();
+    // Three sections: upright with a grid, two columns, landscape.
+    let sections = d.sections();
+    assert_eq!(sections.len(), 3);
+    let (a, b, c) = (sections[0].1, sections[1].1, &d.last_section);
+    assert_eq!(a.page, (11_906, 16_838));
+    assert_eq!(
+        a.grid,
+        Some(DocGrid {
+            kind: GridKind::Lines,
+            line_pitch: 312
+        })
+    );
+    assert!(a.title_page);
+    assert_eq!(
+        (a.headers.default, a.headers.first, a.footers.default),
+        (Some(0), Some(1), Some(2))
+    );
+    assert_eq!(
+        (b.columns.count, b.columns.separator, b.start),
+        (2, true, SectionStart::Continuous)
+    );
+    assert_eq!(c.page, (16_838, 11_906));
+    assert_eq!(c.columns.count, 1);
+    // Headings through styles.
+    assert_eq!(p(&d, 0).props.style.as_deref(), Some("Title"));
+    let outline: Vec<_> = (1..=3).map(|i| p(&d, i).props.outline_level).collect();
+    assert_eq!(outline, [Some(0), Some(1), Some(2)]);
+    assert!(p(&d, 1).base.bold && p(&d, 1).base.size == 22.0);
+    // Half a line before the first heading, in the grid of its section.
+    assert_eq!(p(&d, 1).props.space_before, 156);
+    // East Asian and Latin text, a first line of two characters (10.5 pt).
+    assert!(p(&d, 4).text().contains("中文段落"));
+    assert!(p(&d, 4).text().contains("日本語"));
+    assert!(p(&d, 4).text().contains("quick brown fox"));
+    assert_eq!(p(&d, 4).props.first_line, 420);
+    assert_eq!(p(&d, 4).base.east_asian_font.as_deref(), Some("宋体"));
+    // Direct formatting.
+    let formatting = p(&d, 5);
+    let by = |text: &str| {
+        formatting
+            .runs
+            .iter()
+            .find(|r| r.text.starts_with(text))
+            .unwrap()
+    };
+    assert!(by("Bold").look.bold && by("italic").look.italic);
+    assert_eq!(
+        by("double").look.underline.unwrap().style,
+        UnderlineStyle::Double
+    );
+    assert_eq!(
+        by("wavy").look.underline.unwrap().style,
+        UnderlineStyle::Wave
+    );
+    assert!(by("strike").look.strike);
+    assert_eq!(by("red").look.color, Some(rgb(0xC00000)));
+    assert_eq!(by("highlight").look.highlight, Some(rgb(0xFFFF00)));
+    assert_eq!(by("sup").look.position, VertAlign::Superscript);
+    assert_eq!(by("sub").look.position, VertAlign::Subscript);
+    assert_eq!(by("18pt").look.size, 18.0);
+    assert_eq!(
+        by("日本語のフォント").look.east_asian_font.as_deref(),
+        Some("MS Mincho")
+    );
+    // Lists.
+    let labels: Vec<_> = (6..=14)
+        .map(|i| p(&d, i).label.as_ref().unwrap().text.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        ["1.", "1.1", "(a)", "1.2", "2.", "5.", "•", "o", "▪"]
+    );
+    assert_eq!(p(&d, 7).props.indent_left, 992);
+    assert!(p(&d, 7).label.as_ref().unwrap().look.bold);
+    // Tabs with leaders and the runs around them.
+    assert_eq!(
+        p(&d, 15)
+            .props
+            .tabs
+            .iter()
+            .map(|t| (t.position, t.align, t.leader))
+            .collect::<Vec<_>>(),
+        [
+            (2000, TabAlign::Left, TabLeader::Dots),
+            (6000, TabAlign::Right, TabLeader::Dots)
+        ]
+    );
+    assert_eq!(p(&d, 15).text(), "Chapter\t12\t34");
+    // Ruby, links.
+    let links = p(&d, 16);
+    let ruby = links
+        .runs
+        .iter()
+        .find_map(|r| match &r.kind {
+            Inline::Ruby(r) => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(ruby.text, "かんじ");
+    let targets: Vec<_> = links
+        .runs
+        .iter()
+        .filter_map(|r| r.link.as_ref().map(|l| l.target.clone()))
+        .collect();
+    assert_eq!(targets, ["https://example.org/aster?a=1&b=2", "#intro"]);
+    // Notes, tracked changes: insertions show, deletions do not.
+    assert_eq!(
+        p(&d, 17).text(),
+        "Note\u{FFFC} and endnote\u{FFFC}. commented inserted  splt"
+    );
+    assert_eq!(d.footnotes.notes[0].id, 2);
+    assert!(
+        d.footnotes.notes[0].blocks[0]
+            .as_paragraph()
+            .unwrap()
+            .text()
+            .contains("footnote text")
+    );
+    assert_eq!(d.endnotes.notes[0].id, 1);
+    assert_eq!(p(&d, 18).text(), "Inside a content control.");
+    assert!(
+        p(&d, 19)
+            .runs
+            .iter()
+            .any(|r| r.kind == Inline::Break(Break::Page))
+    );
+    // Header with page fields.
+    let header = d.marginals[0].blocks[0].as_paragraph().unwrap();
+    let fields: Vec<_> = header
+        .runs
+        .iter()
+        .filter_map(|r| match r.kind {
+            Inline::PageNumber(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields, [PageField::Page, PageField::PageCount]);
+    let footer = d.marginals[2].blocks[0].as_paragraph().unwrap();
+    assert!(
+        footer
+            .runs
+            .iter()
+            .any(|r| r.kind == Inline::PageNumber(PageField::PageCount))
+    );
+    // Floating picture and text box.
+    let drawings: Vec<_> = p(&d, 21)
+        .runs
+        .iter()
+        .filter_map(|r| match &r.kind {
+            Inline::Drawing(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drawings.len(), 2);
+    assert!(matches!(drawings[0].content, DrawingContent::Picture(_)));
+    assert_eq!(drawings[0].float.unwrap().wrap, Wrap::Square);
+    let DrawingContent::TextBox(boxed) = &drawings[1].content else {
+        panic!("a text box")
+    };
+    assert_eq!(boxed.blocks.len(), 2);
+    assert_eq!(drawings[1].float.unwrap().wrap, Wrap::TopAndBottom);
+    // The inline picture is cropped.
+    let Inline::Drawing(inline) = &p(&d, 24).runs[1].kind else {
+        panic!("a picture")
+    };
+    let DrawingContent::Picture(picture) = &inline.content else {
+        panic!("a picture")
+    };
+    assert_eq!(picture.crop, [0.1, 0.05, 0.0, 0.0]);
+    assert_eq!(&picture.image[1..4], b"PNG");
+    // The table.
+    let table = t(&d, 25);
+    assert_eq!(table.columns, [2000, 2000, 2400, 2600]);
+    assert_eq!(table.rows.len(), 4);
+    assert!(table.rows[0].header && table.rows[0].cant_split);
+    assert_eq!(table.rows[1].cells[0].span, 2);
+    assert_eq!(table.rows[1].cells[1].merge, VMerge::Start);
+    assert_eq!(table.rows[2].cells[2].merge, VMerge::Continue);
+    assert_eq!(table.rows[2].height, RowHeight::Exactly(700));
+    assert_eq!(table.rows[2].cells[1].shading, Some(rgb(0xFFC000)));
+    assert_eq!(table.rows[2].cells[1].borders[0], None);
+    assert_eq!(
+        table.rows[1].cells[0].borders[3].unwrap().style,
+        BorderStyle::Double
+    );
+    assert!(table.rows[2].cells[3].blocks[0].as_table().is_some());
+    // The first row's look comes from the table style's conditional format.
+    assert_eq!(table.rows[0].cells[0].shading, Some(rgb(0x4472C4)));
+    let header_cell = table.rows[0].cells[0].blocks[0].as_paragraph().unwrap();
+    assert!(header_cell.base.bold);
+    assert_eq!(header_cell.base.color, Some(rgb(0xFFFFFF)));
+}
+
+#[test]
+fn reading_is_deterministic() {
+    let bytes = docx_sample::sample();
+    assert_eq!(Docx.read(bytes.clone()).unwrap(), Docx.read(bytes).unwrap());
 }

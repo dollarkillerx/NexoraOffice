@@ -221,9 +221,7 @@ fn para(text: &str) -> String {
 }
 
 fn styled(style: &str, text: &str) -> String {
-    format!(
-        r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
-    )
+    format!(r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#)
 }
 
 fn item(num: u32, level: u32, text: &str) -> String {
@@ -259,7 +257,9 @@ fn formatting_paragraph() -> String {
     let run = |props: &str, text: &str| {
         format!(r#"<w:r><w:rPr>{props}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>"#)
     };
-    let mut out = String::from(r#"<w:p><w:pPr><w:keepNext/><w:spacing w:before="120" w:after="60"/></w:pPr>"#);
+    let mut out = String::from(
+        r#"<w:p><w:pPr><w:keepNext/><w:spacing w:before="120" w:after="60"/></w:pPr>"#,
+    );
     out += &run("<w:b/>", "Bold ");
     out += &run("<w:i/>", "italic ");
     out += &run(r#"<w:u w:val="single"/>"#, "underline ");
@@ -358,11 +358,16 @@ fn body() -> String {
         picture_floating(),
         text_box()
     );
-    b += &para("The second paragraph of the two-column section. It has enough words to run over a line or two when it is laid out.");
+    b += &para(
+        "The second paragraph of the two-column section. It has enough words to run over a line or two when it is laid out.",
+    );
     b += &section_two();
 
     // Section three: landscape.
-    b += &format!("<w:p><w:r><w:t xml:space=\"preserve\">Inline picture: </w:t></w:r>{}</w:p>", picture_inline());
+    b += &format!(
+        "<w:p><w:r><w:t xml:space=\"preserve\">Inline picture: </w:t></w:r>{}</w:p>",
+        picture_inline()
+    );
     b += &table();
     b += &para("After the table.");
     b += r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/><w:pgMar w:top="1800" w:right="1440" w:bottom="1800" w:left="1440" w:header="851" w:footer="992" w:gutter="0"/><w:cols w:space="425"/></w:sectPr>"#;
@@ -370,7 +375,11 @@ fn body() -> String {
 }
 
 fn document() -> String {
-    format!("{XML_DECL}<w:document {}><w:body>{}</w:body></w:document>", namespaces(), body())
+    format!(
+        "{XML_DECL}<w:document {}><w:body>{}</w:body></w:document>",
+        namespaces(),
+        body()
+    )
 }
 
 fn core() -> String {
@@ -407,7 +416,9 @@ pub fn zip(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for (name, data) in parts {
-        writer.start_file(name.as_str(), options).expect("start part");
+        writer
+            .start_file(name.as_str(), options)
+            .expect("start part");
         writer.write_all(data).expect("write part");
     }
     writer.finish().expect("finish zip").into_inner()

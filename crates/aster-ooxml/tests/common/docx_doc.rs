@@ -77,7 +77,8 @@ impl Doc {
         self
     }
     pub fn rel(mut self, id: &str, kind: &str, target: &str) -> Self {
-        self.rels.push((id.to_owned(), kind.to_owned(), target.to_owned()));
+        self.rels
+            .push((id.to_owned(), kind.to_owned(), target.to_owned()));
         self
     }
 
@@ -102,10 +103,20 @@ impl Doc {
             }
         };
         optional(&self.styles, "rIdStyles", "styles", "styles.xml");
-        optional(&self.numbering, "rIdNumbering", "numbering", "numbering.xml");
+        optional(
+            &self.numbering,
+            "rIdNumbering",
+            "numbering",
+            "numbering.xml",
+        );
         optional(&self.settings, "rIdSettings", "settings", "settings.xml");
         optional(&self.theme, "rIdTheme", "theme", "theme/theme1.xml");
-        optional(&self.footnotes, "rIdFootnotes", "footnotes", "footnotes.xml");
+        optional(
+            &self.footnotes,
+            "rIdFootnotes",
+            "footnotes",
+            "footnotes.xml",
+        );
         optional(&self.endnotes, "rIdEndnotes", "endnotes", "endnotes.xml");
         for (name, xml) in &self.parts {
             parts.push((name.clone(), xml.clone().into_bytes()));
@@ -199,7 +210,6 @@ pub fn rgb(hex: u32) -> Rgba {
 pub fn raw<'a>(bytes: &'a [u8], range: &std::ops::Range<usize>) -> &'a str {
     std::str::from_utf8(&bytes[range.clone()]).expect("a range of whole characters")
 }
-
 
 /// A part of a package, as the package returns it.
 pub fn common_part(bytes: &[u8], name: &str) -> Vec<u8> {

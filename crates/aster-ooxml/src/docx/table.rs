@@ -42,10 +42,26 @@ impl TblBorders {
     /// What these borders give a cell at this place in the table.
     fn for_cell(&self, first_row: bool, last_row: bool, first_col: bool, last_col: bool) -> Sides {
         [
-            if first_col { self.sides[0] } else { self.inside_v },
-            if first_row { self.sides[1] } else { self.inside_h },
-            if last_col { self.sides[2] } else { self.inside_v },
-            if last_row { self.sides[3] } else { self.inside_h },
+            if first_col {
+                self.sides[0]
+            } else {
+                self.inside_v
+            },
+            if first_row {
+                self.sides[1]
+            } else {
+                self.inside_h
+            },
+            if last_col {
+                self.sides[2]
+            } else {
+                self.inside_v
+            },
+            if last_row {
+                self.sides[3]
+            } else {
+                self.inside_h
+            },
         ]
     }
 }
@@ -266,14 +282,20 @@ impl Reader<'_> {
             .map(|g| {
                 g.each("gridCol")
                     .take(MAX_COLUMNS)
-                    .map(|c| c.int("w").map_or(DEFAULT_COLUMN, |w| w.clamp(0, 1_000_000) as Twips))
+                    .map(|c| {
+                        c.int("w")
+                            .map_or(DEFAULT_COLUMN, |w| w.clamp(0, 1_000_000) as Twips)
+                    })
                     .collect()
             })
             .unwrap_or_default();
         let needed = rows
             .iter()
             .map(|r| {
-                let cells_end = r.cells.last().map_or(r.before as usize, |c| c.col + c.span as usize);
+                let cells_end = r
+                    .cells
+                    .last()
+                    .map_or(r.before as usize, |c| c.col + c.span as usize);
                 cells_end + r.after as usize
             })
             .max()
@@ -286,9 +308,10 @@ impl Reader<'_> {
                 for cell in &row.cells {
                     let Some(w) = cell.width else { continue };
                     let span = cell.span as usize;
-                    for j in cell.col..(cell.col + span).min(needed) {
-                        if j >= have && (span == 1 || widths[j].is_none()) {
-                            widths[j] = Some(w / span as Twips);
+                    let end = (cell.col + span).min(needed);
+                    for (j, slot) in widths.iter_mut().enumerate().take(end).skip(cell.col) {
+                        if j >= have && (span == 1 || slot.is_none()) {
+                            *slot = Some(w / span as Twips);
                         }
                     }
                 }
@@ -378,7 +401,8 @@ impl Reader<'_> {
                 if let Some(cf) = cf {
                     merge_sides(
                         &mut layers,
-                        &cf.borders.for_cell(first_row, last_row, first_col, last_col),
+                        &cf.borders
+                            .for_cell(first_row, last_row, first_col, last_col),
                     );
                     merge_sides(&mut layers, &cf.cell_borders);
                 }
@@ -392,7 +416,10 @@ impl Reader<'_> {
                 let borders = final_sides(&layers);
 
                 let mut shading: Option<Option<Rgba>> = cf.and_then(|f| f.shading);
-                if let Some(s) = pr.and_then(|p| p.child("shd")).and_then(|s| shading_of(s, &self.env)) {
+                if let Some(s) = pr
+                    .and_then(|p| p.child("shd"))
+                    .and_then(|s| shading_of(s, &self.env))
+                {
                     shading = Some(s);
                 }
 
@@ -411,7 +438,10 @@ impl Reader<'_> {
                         }
                     }
                 }
-                let align = match pr.and_then(|p| p.child("vAlign")).and_then(Node::val).as_deref()
+                let align = match pr
+                    .and_then(|p| p.child("vAlign"))
+                    .and_then(Node::val)
+                    .as_deref()
                 {
                     Some("center") => CellAlign::Center,
                     Some("bottom") => CellAlign::Bottom,
@@ -479,7 +509,7 @@ fn cond_mask(look: &Look, row: usize, rows: usize, cell: usize, cells: usize) ->
     }
     if !look.no_h_band && !first_row && !last_row {
         let at = row - usize::from(look.first_row);
-        mask |= if at % 2 == 0 {
+        mask |= if at.is_multiple_of(2) {
             Cond::Band1Horz
         } else {
             Cond::Band2Horz
@@ -488,7 +518,7 @@ fn cond_mask(look: &Look, row: usize, rows: usize, cell: usize, cells: usize) ->
     }
     if !look.no_v_band && !first_col && !last_col {
         let at = cell - usize::from(look.first_col);
-        mask |= if at % 2 == 0 {
+        mask |= if at.is_multiple_of(2) {
             Cond::Band1Vert
         } else {
             Cond::Band2Vert

@@ -9,7 +9,7 @@
 
 use aster_ooxml::docx;
 use aster_writer::{
-    Align, Block, Border, Document, Inline, LineSpacing, Paragraph, ParaProps, Path, Rgba, Run,
+    Align, Block, Border, Document, Inline, LineSpacing, ParaProps, Paragraph, Path, Rgba, Run,
     RunLook, Section, Story, Table, UnderlineStyle, VMerge, VertAlign,
 };
 
@@ -60,7 +60,11 @@ fn dump(document: &Document) {
     let s = &document.settings;
     println!(
         "settings: default tab {}, even/odd headers {}, language {:?}, east asian {:?}, compress punctuation {}",
-        s.default_tab, s.even_and_odd_headers, s.language, s.east_asian_language, s.compress_punctuation
+        s.default_tab,
+        s.even_and_odd_headers,
+        s.language,
+        s.east_asian_language,
+        s.compress_punctuation
     );
     println!(
         "default text: {} / default paragraph: {}",
@@ -70,7 +74,10 @@ fn dump(document: &Document) {
 
     println!();
     for (n, (last, section)) in document.sections().iter().enumerate() {
-        println!("section {n} (ends at body block {last}): {}", section_line(section));
+        println!(
+            "section {n} (ends at body block {last}): {}",
+            section_line(section)
+        );
     }
 
     println!("\nbody ({}):", document.body.part.as_deref().unwrap_or("-"));
@@ -123,7 +130,11 @@ fn section_line(s: &Section) -> String {
         } else {
             format!(" widths {:?}", s.columns.widths)
         },
-        if s.columns.separator { " separator" } else { "" },
+        if s.columns.separator {
+            " separator"
+        } else {
+            ""
+        },
         s.start,
     );
     out += &format!(
@@ -155,7 +166,12 @@ fn section_line(s: &Section) -> String {
 
 fn marginals(m: &aster_writer::Marginals) -> String {
     let at = |v: Option<usize>| v.map_or("-".to_owned(), |v| v.to_string());
-    format!("default {} first {} even {}", at(m.default), at(m.first), at(m.even))
+    format!(
+        "default {} first {} even {}",
+        at(m.default),
+        at(m.first),
+        at(m.even)
+    )
 }
 
 fn blocks(list: &[Block], prefix: &Path, depth: usize) {
@@ -203,7 +219,7 @@ fn border(b: &Option<Border>) -> String {
             "{:?}{}pt{}",
             b.style,
             b.width,
-            b.color.map_or(String::new(), |c| color(c))
+            b.color.map_or(String::new(), color)
         ),
     }
 }
@@ -223,7 +239,11 @@ fn paragraph(p: &Paragraph, path: &Path, depth: usize) {
     }
     println!("{head}");
     let source = p.source.as_ref().map_or("no source".to_owned(), |s| {
-        format!("{:?}{}", s.range, if p.is_as_read() { "" } else { " CHANGED" })
+        format!(
+            "{:?}{}",
+            s.range,
+            if p.is_as_read() { "" } else { " CHANGED" }
+        )
     });
     println!(
         "{}  base: {} | mark: {} | {source}",
@@ -271,7 +291,9 @@ fn run_line(run: &Run, base: &RunLook, depth: usize) {
                 "drawing {}x{} emu, {float}, {content}{}",
                 d.size.0,
                 d.size.1,
-                d.alt.as_ref().map_or(String::new(), |a| format!(", alt {a:?}"))
+                d.alt
+                    .as_ref()
+                    .map_or(String::new(), |a| format!(", alt {a:?}"))
             )
         }
         Inline::Footnote(id) => format!("footnote {id}"),
@@ -303,10 +325,10 @@ fn run_line(run: &Run, base: &RunLook, depth: usize) {
         }
     }
     println!("{line}");
-    if let Inline::Drawing(d) = &run.kind {
-        if let aster_writer::DrawingContent::TextBox(t) = &d.content {
-            blocks(&t.blocks, &Path::default(), depth + 2);
-        }
+    if let Inline::Drawing(d) = &run.kind
+        && let aster_writer::DrawingContent::TextBox(t) = &d.content
+    {
+        blocks(&t.blocks, &Path::default(), depth + 2);
     }
 }
 
@@ -422,16 +444,32 @@ fn look_diff(l: &RunLook, base: &RunLook) -> String {
         out.push(if l.strike { "strike" } else { "!strike" }.to_owned());
     }
     if l.double_strike != base.double_strike {
-        out.push(if l.double_strike { "dstrike" } else { "!dstrike" }.to_owned());
+        out.push(
+            if l.double_strike {
+                "dstrike"
+            } else {
+                "!dstrike"
+            }
+            .to_owned(),
+        );
     }
     if l.color != base.color {
-        out.push(format!("color={}", l.color.map_or("auto".to_owned(), color)));
+        out.push(format!(
+            "color={}",
+            l.color.map_or("auto".to_owned(), color)
+        ));
     }
     if l.highlight != base.highlight {
-        out.push(format!("highlight={}", l.highlight.map_or("none".to_owned(), color)));
+        out.push(format!(
+            "highlight={}",
+            l.highlight.map_or("none".to_owned(), color)
+        ));
     }
     if l.shading != base.shading {
-        out.push(format!("shading={}", l.shading.map_or("none".to_owned(), color)));
+        out.push(format!(
+            "shading={}",
+            l.shading.map_or("none".to_owned(), color)
+        ));
     }
     if l.position != base.position {
         out.push(
@@ -449,7 +487,11 @@ fn look_diff(l: &RunLook, base: &RunLook) -> String {
         (l.hidden, base.hidden, "hidden"),
     ] {
         if a != b {
-            out.push(if a { name.to_owned() } else { format!("!{name}") });
+            out.push(if a {
+                name.to_owned()
+            } else {
+                format!("!{name}")
+            });
         }
     }
     if l.spacing != base.spacing {
@@ -490,9 +532,15 @@ fn table(t: &Table, path: &Path, depth: usize) {
             flags += " cantSplit";
         }
         if row.grid_before > 0 || row.grid_after > 0 {
-            flags += &format!(" gridBefore {} gridAfter {}", row.grid_before, row.grid_after);
+            flags += &format!(
+                " gridBefore {} gridAfter {}",
+                row.grid_before, row.grid_after
+            );
         }
-        println!("{pad}  row {r}: height {:?}{flags} source {:?}", row.height, row.source);
+        println!(
+            "{pad}  row {r}: height {:?}{flags} source {:?}",
+            row.height, row.source
+        );
         for (c, cell) in row.cells.iter().enumerate() {
             let sides: Vec<String> = cell.borders.iter().map(border).collect();
             let merge = match cell.merge {

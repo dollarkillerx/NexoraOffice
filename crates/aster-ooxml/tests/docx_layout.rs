@@ -19,9 +19,19 @@ fn cell(w: u32, props: &str, text: &str) -> String {
 }
 
 fn table(props: &str, grid: &[u32], rows: &[String]) -> String {
-    let grid: String = grid.iter().map(|w| format!(r#"<w:gridCol w:w="{w}"/>"#)).collect();
-    let grid = if grid.is_empty() { String::new() } else { format!("<w:tblGrid>{grid}</w:tblGrid>") };
-    format!("<w:tbl><w:tblPr>{props}</w:tblPr>{grid}{}</w:tbl>", rows.concat())
+    let grid: String = grid
+        .iter()
+        .map(|w| format!(r#"<w:gridCol w:w="{w}"/>"#))
+        .collect();
+    let grid = if grid.is_empty() {
+        String::new()
+    } else {
+        format!("<w:tblGrid>{grid}</w:tblGrid>")
+    };
+    format!(
+        "<w:tbl><w:tblPr>{props}</w:tblPr>{grid}{}</w:tbl>",
+        rows.concat()
+    )
 }
 
 fn row(props: &str, cells: &[String]) -> String {
@@ -51,21 +61,45 @@ fn the_grid_is_the_files_when_it_fits() {
 #[test]
 fn a_missing_or_short_grid_is_worked_out_from_the_cell_widths() {
     let rows = [
-        row("", &[cell(1500, "", "a"), cell(2500, r#"<w:gridSpan w:val="2"/>"#, "b")]),
-        row("", &[cell(1500, "", "c"), cell(1000, "", "d"), cell(1500, "", "e")]),
+        row(
+            "",
+            &[
+                cell(1500, "", "a"),
+                cell(2500, r#"<w:gridSpan w:val="2"/>"#, "b"),
+            ],
+        ),
+        row(
+            "",
+            &[
+                cell(1500, "", "c"),
+                cell(1000, "", "d"),
+                cell(1500, "", "e"),
+            ],
+        ),
     ];
     let none = read(&table("", &[], &rows));
     assert_eq!(t(&none, 0).columns, [1500, 1000, 1500]);
     let short = read(&table("", &[1500], &rows));
     assert_eq!(t(&short, 0).columns, [1500, 1000, 1500]);
     // Cells without widths fall back to a default.
-    let blank = read(&table("", &[], &[row("", &[
-        "<w:tc><w:p/></w:tc>".to_owned(),
-        "<w:tc><w:p/></w:tc>".to_owned(),
-    ])]));
+    let blank = read(&table(
+        "",
+        &[],
+        &[row(
+            "",
+            &[
+                "<w:tc><w:p/></w:tc>".to_owned(),
+                "<w:tc><w:p/></w:tc>".to_owned(),
+            ],
+        )],
+    ));
     assert_eq!(t(&blank, 0).columns.len(), 2);
     // A grid that is wider than the rows is kept.
-    let wide = read(&table("", &[1000, 1000, 1000], &[row("", &[cell(1000, "", "a")])]));
+    let wide = read(&table(
+        "",
+        &[1000, 1000, 1000],
+        &[row("", &[cell(1000, "", "a")])],
+    ));
     assert_eq!(t(&wide, 0).columns.len(), 3);
 }
 
@@ -91,9 +125,18 @@ fn row_properties() {
         "",
         &[1000],
         &[
-            row(r#"<w:cantSplit/><w:tblHeader/><w:trHeight w:val="500" w:hRule="atLeast"/>"#, &[cell(1000, "", "a")]),
-            row(r#"<w:trHeight w:val="300" w:hRule="exact"/>"#, &[cell(1000, "", "b")]),
-            row(r#"<w:trHeight w:val="400"/><w:gridBefore w:val="1"/><w:gridAfter w:val="2"/>"#, &[cell(1000, "", "c")]),
+            row(
+                r#"<w:cantSplit/><w:tblHeader/><w:trHeight w:val="500" w:hRule="atLeast"/>"#,
+                &[cell(1000, "", "a")],
+            ),
+            row(
+                r#"<w:trHeight w:val="300" w:hRule="exact"/>"#,
+                &[cell(1000, "", "b")],
+            ),
+            row(
+                r#"<w:trHeight w:val="400"/><w:gridBefore w:val="1"/><w:gridAfter w:val="2"/>"#,
+                &[cell(1000, "", "c")],
+            ),
             row(r#"<w:tblHeader w:val="0"/>"#, &[cell(1000, "", "d")]),
         ],
     ));
@@ -113,13 +156,35 @@ fn cells_merge_across_and_down() {
         "",
         &[1000, 1000, 1000],
         &[
-            row("", &[cell(2000, r#"<w:gridSpan w:val="2"/><w:vMerge w:val="restart"/>"#, "a"), cell(1000, "", "b")]),
-            row("", &[cell(2000, r#"<w:gridSpan w:val="2"/><w:vMerge/>"#, ""), cell(1000, "", "c")]),
+            row(
+                "",
+                &[
+                    cell(
+                        2000,
+                        r#"<w:gridSpan w:val="2"/><w:vMerge w:val="restart"/>"#,
+                        "a",
+                    ),
+                    cell(1000, "", "b"),
+                ],
+            ),
+            row(
+                "",
+                &[
+                    cell(2000, r#"<w:gridSpan w:val="2"/><w:vMerge/>"#, ""),
+                    cell(1000, "", "c"),
+                ],
+            ),
         ],
     ));
     let rows = &t(&d, 0).rows;
-    assert_eq!((rows[0].cells[0].span, rows[0].cells[0].merge), (2, VMerge::Start));
-    assert_eq!((rows[1].cells[0].span, rows[1].cells[0].merge), (2, VMerge::Continue));
+    assert_eq!(
+        (rows[0].cells[0].span, rows[0].cells[0].merge),
+        (2, VMerge::Start)
+    );
+    assert_eq!(
+        (rows[1].cells[0].span, rows[1].cells[0].merge),
+        (2, VMerge::Continue)
+    );
     assert_eq!(rows[0].cells[1].merge, VMerge::None);
 }
 
@@ -134,13 +199,43 @@ fn borders_layer_from_the_style_through_the_table_to_the_cell() {
         side("insideH", "dashed", 4, "222222"),
         side("insideV", "dotted", 4, "333333"),
     );
-    let table_borders = format!("<w:tblBorders>{}{}</w:tblBorders>", side("top", "double", 12, "AA0000"), side("insideH", "nil", 0, "auto"));
+    let table_borders = format!(
+        "<w:tblBorders>{}{}</w:tblBorders>",
+        side("top", "double", 12, "AA0000"),
+        side("insideH", "nil", 0, "auto")
+    );
     let d = doc(&table(
         &format!(r#"<w:tblStyle w:val="S"/>{table_borders}"#),
         &[1000, 1000],
         &[
-            row("", &[cell(1000, "", "a"), cell(1000, &format!("<w:tcBorders>{}</w:tcBorders>", side("right", "single", 24, "00AA00")), "b")]),
-            row("", &[cell(1000, &format!("<w:tcBorders>{}</w:tcBorders>", side("left", "nil", 0, "auto")), "c"), cell(1000, "", "d")]),
+            row(
+                "",
+                &[
+                    cell(1000, "", "a"),
+                    cell(
+                        1000,
+                        &format!(
+                            "<w:tcBorders>{}</w:tcBorders>",
+                            side("right", "single", 24, "00AA00")
+                        ),
+                        "b",
+                    ),
+                ],
+            ),
+            row(
+                "",
+                &[
+                    cell(
+                        1000,
+                        &format!(
+                            "<w:tcBorders>{}</w:tcBorders>",
+                            side("left", "nil", 0, "auto")
+                        ),
+                        "c",
+                    ),
+                    cell(1000, "", "d"),
+                ],
+            ),
         ],
     ))
     .styles(&styles)
@@ -151,7 +246,10 @@ fn borders_layer_from_the_style_through_the_table_to_the_cell() {
     assert_eq!(b(0, 0, 0).unwrap().color, Some([0x11, 0x11, 0x11, 255]));
     // The table's top border replaces the style's on the top row.
     let top = b(0, 0, 1).unwrap();
-    assert_eq!((top.style, top.width, top.color), (BorderStyle::Double, 1.5, Some([0xAA, 0, 0, 255])));
+    assert_eq!(
+        (top.style, top.width, top.color),
+        (BorderStyle::Double, 1.5, Some([0xAA, 0, 0, 255]))
+    );
     // Between cells: the style's vertical lines; the table says no
     // horizontal ones.
     assert_eq!(b(0, 0, 2).unwrap().style, BorderStyle::Dotted);
@@ -170,18 +268,34 @@ fn borders_layer_from_the_style_through_the_table_to_the_cell() {
 
 #[test]
 fn merged_cells_take_the_bottom_edge_from_where_the_merge_ends() {
-    let borders = format!("<w:tblBorders>{}{}</w:tblBorders>", side("bottom", "single", 16, "000000"), side("insideH", "dashed", 4, "808080"));
+    let borders = format!(
+        "<w:tblBorders>{}{}</w:tblBorders>",
+        side("bottom", "single", 16, "000000"),
+        side("insideH", "dashed", 4, "808080")
+    );
     let d = read(&table(
         &borders,
         &[1000, 1000],
         &[
-            row("", &[cell(1000, r#"<w:vMerge w:val="restart"/>"#, "a"), cell(1000, "", "b")]),
+            row(
+                "",
+                &[
+                    cell(1000, r#"<w:vMerge w:val="restart"/>"#, "a"),
+                    cell(1000, "", "b"),
+                ],
+            ),
             row("", &[cell(1000, "<w:vMerge/>", ""), cell(1000, "", "c")]),
         ],
     ));
     let rows = &t(&d, 0).rows;
-    assert_eq!(rows[0].cells[0].borders[3].unwrap().style, BorderStyle::Single);
-    assert_eq!(rows[0].cells[1].borders[3].unwrap().style, BorderStyle::Dashed);
+    assert_eq!(
+        rows[0].cells[0].borders[3].unwrap().style,
+        BorderStyle::Single
+    );
+    assert_eq!(
+        rows[0].cells[1].borders[3].unwrap().style,
+        BorderStyle::Dashed
+    );
 }
 
 #[test]
@@ -213,10 +327,13 @@ fn a_cell_has_at_least_one_paragraph_and_may_hold_a_table() {
     let d = read(&table(
         "",
         &[2000],
-        &[row("", &[
-            "<w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/></w:tcPr></w:tc>".to_owned(),
-            format!("<w:tc>{inner}<w:p><w:r><w:t>after</w:t></w:r></w:p></w:tc>"),
-        ])],
+        &[row(
+            "",
+            &[
+                "<w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/></w:tcPr></w:tc>".to_owned(),
+                format!("<w:tc>{inner}<w:p><w:r><w:t>after</w:t></w:r></w:p></w:tc>"),
+            ],
+        )],
     ));
     let cells = &t(&d, 0).rows[0].cells;
     assert_eq!(cells[0].blocks.len(), 1);
@@ -239,13 +356,23 @@ fn rows_and_cells_in_content_controls_are_found() {
 
 #[test]
 fn vertical_alignment_of_cells() {
-    let d = read(&table("", &[1000, 1000, 1000], &[row("", &[
-        cell(1000, r#"<w:vAlign w:val="center"/>"#, "a"),
-        cell(1000, r#"<w:vAlign w:val="bottom"/>"#, "b"),
-        cell(1000, "", "c"),
-    ])]));
+    let d = read(&table(
+        "",
+        &[1000, 1000, 1000],
+        &[row(
+            "",
+            &[
+                cell(1000, r#"<w:vAlign w:val="center"/>"#, "a"),
+                cell(1000, r#"<w:vAlign w:val="bottom"/>"#, "b"),
+                cell(1000, "", "c"),
+            ],
+        )],
+    ));
     let cells = &t(&d, 0).rows[0].cells;
-    assert_eq!([cells[0].align, cells[1].align, cells[2].align], [CellAlign::Center, CellAlign::Bottom, CellAlign::Top]);
+    assert_eq!(
+        [cells[0].align, cells[1].align, cells[2].align],
+        [CellAlign::Center, CellAlign::Bottom, CellAlign::Top]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -267,17 +394,31 @@ fn page_size_margins_and_their_defaults() {
     assert_eq!(s.page, (11_906, 16_838));
     assert_eq!(
         s.margins,
-        Margins { top: 1000, right: 1100, bottom: 900, left: 1200, header: 500, footer: 600, gutter: 100 }
+        Margins {
+            top: 1000,
+            right: 1100,
+            bottom: 900,
+            left: 1200,
+            header: 500,
+            footer: 600,
+            gutter: 100
+        }
     );
     // A page size that makes no sense is the default.
-    assert_eq!(last_section(r#"<w:pgSz w:w="0" w:h="-4"/>"#).page, (12_240, 15_840));
+    assert_eq!(
+        last_section(r#"<w:pgSz w:w="0" w:h="-4"/>"#).page,
+        (12_240, 15_840)
+    );
     assert!(s.source.is_some());
 }
 
 #[test]
 fn columns_equal_and_unequal() {
     let s = last_section(r#"<w:cols w:num="3" w:space="360" w:sep="1"/>"#);
-    assert_eq!((s.columns.count, s.columns.space, s.columns.separator), (3, 360, true));
+    assert_eq!(
+        (s.columns.count, s.columns.space, s.columns.separator),
+        (3, 360, true)
+    );
     assert!(s.columns.widths.is_empty());
     let s = last_section(
         r#"<w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="200"/><w:col w:w="5000"/></w:cols>"#,
@@ -285,7 +426,10 @@ fn columns_equal_and_unequal() {
     assert_eq!(s.columns.count, 2);
     assert_eq!(s.columns.widths, [(3000, 200), (5000, 0)]);
     assert_eq!(last_section(r#"<w:cols w:num="0"/>"#).columns.count, 1);
-    assert_eq!(last_section(r#"<w:cols w:num="4000000"/>"#).columns.count, 45);
+    assert_eq!(
+        last_section(r#"<w:cols w:num="4000000"/>"#).columns.count,
+        45
+    );
 }
 
 #[test]
@@ -293,7 +437,14 @@ fn section_type_page_numbers_grid_alignment_and_direction() {
     use SectionStart::*;
     let start = |v: &str| last_section(&format!(r#"<w:type w:val="{v}"/>"#)).start;
     assert_eq!(
-        ["continuous", "nextPage", "evenPage", "oddPage", "nextColumn"].map(start),
+        [
+            "continuous",
+            "nextPage",
+            "evenPage",
+            "oddPage",
+            "nextColumn"
+        ]
+        .map(start),
         [Continuous, NextPage, EvenPage, OddPage, NextColumn]
     );
     assert_eq!(last_section("").start, NextPage);
@@ -305,8 +456,15 @@ fn section_type_page_numbers_grid_alignment_and_direction() {
     assert_eq!(s.page_number_format, NumberFormat::UpperRoman);
     assert_eq!(s.vertical_align, CellAlign::Center);
     assert!(!last_section(r#"<w:textDirection w:val="lrTb"/>"#).vertical_text);
-    let grid = |ty: &str| last_section(&format!(r#"<w:docGrid w:type="{ty}" w:linePitch="360"/>"#)).grid;
-    assert_eq!(grid("lines"), Some(DocGrid { kind: GridKind::Lines, line_pitch: 360 }));
+    let grid =
+        |ty: &str| last_section(&format!(r#"<w:docGrid w:type="{ty}" w:linePitch="360"/>"#)).grid;
+    assert_eq!(
+        grid("lines"),
+        Some(DocGrid {
+            kind: GridKind::Lines,
+            line_pitch: 360
+        })
+    );
     assert_eq!(grid("linesAndChars").unwrap().kind, GridKind::LinesAndChars);
     assert_eq!(grid("snapToChars").unwrap().kind, GridKind::SnapToChars);
     assert_eq!(grid("default"), None);
@@ -341,7 +499,13 @@ fn headers_and_footers_are_stories_and_sections_inherit_them() {
     .read();
     assert_eq!(d.marginals.len(), 5);
     let text = |i: usize| -> String {
-        d.marginals[i].blocks.iter().filter_map(Block::as_paragraph).map(Paragraph::text).collect::<Vec<_>>().join("|")
+        d.marginals[i]
+            .blocks
+            .iter()
+            .filter_map(Block::as_paragraph)
+            .map(Paragraph::text)
+            .collect::<Vec<_>>()
+            .join("|")
     };
     let sections = d.sections();
     let (s0, s1, s2) = (sections[0].1, sections[1].1, &d.last_section);
@@ -394,7 +558,10 @@ fn notes_skip_their_separators_and_refer_to_themselves() {
     let own = d.footnotes.notes[0].blocks[0].as_paragraph().unwrap();
     assert_eq!(own.runs[0].kind, Inline::Footnote(3));
     assert_eq!(own.runs[1].text, " three");
-    assert_eq!(d.endnotes.notes[0].blocks[0].as_paragraph().unwrap().runs[0].kind, Inline::Endnote(1));
+    assert_eq!(
+        d.endnotes.notes[0].blocks[0].as_paragraph().unwrap().runs[0].kind,
+        Inline::Endnote(1)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -406,9 +573,14 @@ fn png() -> Vec<u8> {
 }
 
 fn with_image(body: &str) -> Document {
-    let mut d = doc(body).rel("rIdImg", "image", "media/pic.png").rel("rIdImg2", "image", "media/other.png");
+    let mut d = doc(body).rel("rIdImg", "image", "media/pic.png").rel(
+        "rIdImg2",
+        "image",
+        "media/other.png",
+    );
     d.binary.push(("word/media/pic.png".to_owned(), png()));
-    d.binary.push(("word/media/other.png".to_owned(), vec![9, 9]));
+    d.binary
+        .push(("word/media/other.png".to_owned(), vec![9, 9]));
     d.read()
 }
 
@@ -422,7 +594,11 @@ fn drawing(d: &Document) -> std::sync::Arc<Drawing> {
 fn picture_xml(host: &str, embed: &str, src: &str) -> String {
     format!(
         r#"<w:p><w:r><w:drawing>{host}<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip {embed}/>{src}</pic:blipFill></pic:pic></a:graphicData></a:graphic>{}</w:drawing></w:r></w:p>"#,
-        if host.contains("<wp:anchor") { "</wp:anchor>" } else { "</wp:inline>" }
+        if host.contains("<wp:anchor") {
+            "</wp:anchor>"
+        } else {
+            "</wp:inline>"
+        }
     )
 }
 
@@ -447,9 +623,7 @@ fn an_inline_picture_has_its_bytes_size_alt_and_crop() {
 
 #[test]
 fn pictures_of_the_same_part_share_their_bytes_and_broken_ones_are_placeholders() {
-    let one = |embed: &str| {
-        picture_xml(r#"<wp:inline><wp:extent cx="1" cy="1"/>"#, embed, "")
-    };
+    let one = |embed: &str| picture_xml(r#"<wp:inline><wp:extent cx="1" cy="1"/>"#, embed, "");
     let d = with_image(&format!(
         "{}{}{}{}",
         one(r#"r:embed="rIdImg""#),
@@ -461,9 +635,18 @@ fn pictures_of_the_same_part_share_their_bytes_and_broken_ones_are_placeholders(
         DrawingContent::Picture(p) => Some(p.image.clone()),
         _ => None,
     };
-    assert!(std::sync::Arc::ptr_eq(&image(0).unwrap(), &image(1).unwrap()));
-    assert_eq!(drawing_at(&d, 2).content, DrawingContent::Other("picture".to_owned()));
-    assert_eq!(drawing_at(&d, 3).content, DrawingContent::Other("picture".to_owned()));
+    assert!(std::sync::Arc::ptr_eq(
+        &image(0).unwrap(),
+        &image(1).unwrap()
+    ));
+    assert_eq!(
+        drawing_at(&d, 2).content,
+        DrawingContent::Other("picture".to_owned())
+    );
+    assert_eq!(
+        drawing_at(&d, 3).content,
+        DrawingContent::Other("picture".to_owned())
+    );
 }
 
 fn drawing_at(d: &Document, i: usize) -> std::sync::Arc<Drawing> {
@@ -490,8 +673,20 @@ fn anchors_have_positions_wraps_and_distances() {
         r#"distT="1" distB="2" distL="3" distR="4" behindDoc="1""#,
     );
     let float = drawing(&d).float.unwrap();
-    assert_eq!(float.x, FloatAxis { from: FloatFrom::Margin, at: FloatAt::Center });
-    assert_eq!(float.y, FloatAxis { from: FloatFrom::Paragraph, at: FloatAt::Offset(-12_345) });
+    assert_eq!(
+        float.x,
+        FloatAxis {
+            from: FloatFrom::Margin,
+            at: FloatAt::Center
+        }
+    );
+    assert_eq!(
+        float.y,
+        FloatAxis {
+            from: FloatFrom::Paragraph,
+            at: FloatAt::Offset(-12_345)
+        }
+    );
     assert_eq!(float.wrap, Wrap::Square);
     assert!(float.behind);
     // Left, top, right, bottom.
@@ -503,25 +698,75 @@ fn relative_positions_and_alignments_are_mapped() {
     use FloatFrom::*;
     let from = |axis: &str, name: &str| {
         let (h, v) = if axis == "H" {
-            (format!(r#"<wp:positionH relativeFrom="{name}"><wp:posOffset>7</wp:posOffset></wp:positionH>"#), String::new())
+            (
+                format!(
+                    r#"<wp:positionH relativeFrom="{name}"><wp:posOffset>7</wp:posOffset></wp:positionH>"#
+                ),
+                String::new(),
+            )
         } else {
-            (String::new(), format!(r#"<wp:positionV relativeFrom="{name}"><wp:posOffset>7</wp:posOffset></wp:positionV>"#))
+            (
+                String::new(),
+                format!(
+                    r#"<wp:positionV relativeFrom="{name}"><wp:posOffset>7</wp:posOffset></wp:positionV>"#
+                ),
+            )
         };
         let d = anchor(&h, &v, "<wp:wrapNone/>", "");
         let f = drawing(&d).float.unwrap();
         if axis == "H" { f.x.from } else { f.y.from }
     };
-    let h: Vec<_> = ["page", "margin", "column", "character", "leftMargin", "rightMargin", "insideMargin", "outsideMargin"]
-        .iter().map(|n| from("H", n)).collect();
-    assert_eq!(h, [Page, Margin, Column, Text, Page, Margin, Margin, Margin]);
-    let v: Vec<_> = ["page", "margin", "paragraph", "line", "topMargin", "bottomMargin", "insideMargin"]
-        .iter().map(|n| from("V", n)).collect();
+    let h: Vec<_> = [
+        "page",
+        "margin",
+        "column",
+        "character",
+        "leftMargin",
+        "rightMargin",
+        "insideMargin",
+        "outsideMargin",
+    ]
+    .iter()
+    .map(|n| from("H", n))
+    .collect();
+    assert_eq!(
+        h,
+        [Page, Margin, Column, Text, Page, Margin, Margin, Margin]
+    );
+    let v: Vec<_> = [
+        "page",
+        "margin",
+        "paragraph",
+        "line",
+        "topMargin",
+        "bottomMargin",
+        "insideMargin",
+    ]
+    .iter()
+    .map(|n| from("V", n))
+    .collect();
     assert_eq!(v, [Page, Margin, Paragraph, Text, Page, Margin, Margin]);
     let at = |word: &str| {
-        let d = anchor(&format!(r#"<wp:positionH relativeFrom="page"><wp:align>{word}</wp:align></wp:positionH>"#), "", "<wp:wrapNone/>", "");
+        let d = anchor(
+            &format!(
+                r#"<wp:positionH relativeFrom="page"><wp:align>{word}</wp:align></wp:positionH>"#
+            ),
+            "",
+            "<wp:wrapNone/>",
+            "",
+        );
         drawing(&d).float.unwrap().x.at
     };
-    assert_eq!(["left", "center", "right", "inside", "outside"].map(at), [FloatAt::Start, FloatAt::Center, FloatAt::End, FloatAt::Start, FloatAt::End]);
+    assert_eq!(
+        ["left", "center", "right", "inside", "outside"].map(at),
+        [
+            FloatAt::Start,
+            FloatAt::Center,
+            FloatAt::End,
+            FloatAt::Start,
+            FloatAt::End
+        ]
+    );
 }
 
 #[test]
@@ -535,7 +780,13 @@ fn every_wrap_kind_is_mapped() {
             wrap("<wp:wrapThrough/>"),
             wrap("<wp:wrapTopAndBottom/>"),
         ],
-        [Wrap::None, Wrap::Square, Wrap::Tight, Wrap::Tight, Wrap::TopAndBottom]
+        [
+            Wrap::None,
+            Wrap::Square,
+            Wrap::Tight,
+            Wrap::Tight,
+            Wrap::TopAndBottom
+        ]
     );
 }
 
@@ -581,10 +832,21 @@ fn text_boxes_without_fill_or_line_have_none() {
 fn other_graphics_are_named_placeholders() {
     let content = |inner: &str| drawing(&read(&shape_xml(inner))).content.clone();
     let other = |s: &str| DrawingContent::Other(s.to_owned());
-    assert_eq!(content(r#"<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/>"#), other("chart"));
-    assert_eq!(content(r#"<dgm:relIds xmlns:dgm="d" r:dm="a" r:lo="b"/>"#), other("diagram"));
+    assert_eq!(
+        content(
+            r#"<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/>"#
+        ),
+        other("chart")
+    );
+    assert_eq!(
+        content(r#"<dgm:relIds xmlns:dgm="d" r:dm="a" r:lo="b"/>"#),
+        other("diagram")
+    );
     assert_eq!(content(r#"<wps:wsp><wps:spPr/></wps:wsp>"#), other("shape"));
-    assert_eq!(content(r#"<wpg:wgp xmlns:wpg="g"><wps:wsp/></wpg:wgp>"#), other("group"));
+    assert_eq!(
+        content(r#"<wpg:wgp xmlns:wpg="g"><wps:wsp/></wpg:wgp>"#),
+        other("group")
+    );
 }
 
 #[test]
@@ -613,8 +875,20 @@ fn vml_objects_and_text_boxes() {
     assert_eq!(boxed.fill, Some([255, 255, 0, 255]));
     assert_eq!(boxed.line, None);
     let float = first.float.unwrap();
-    assert_eq!(float.x, FloatAxis { from: FloatFrom::Page, at: FloatAt::Offset(127_000) });
-    assert_eq!(float.y, FloatAxis { from: FloatFrom::Margin, at: FloatAt::Offset(254_000) });
+    assert_eq!(
+        float.x,
+        FloatAxis {
+            from: FloatFrom::Page,
+            at: FloatAt::Offset(127_000)
+        }
+    );
+    assert_eq!(
+        float.y,
+        FloatAxis {
+            from: FloatFrom::Margin,
+            at: FloatAt::Offset(254_000)
+        }
+    );
     assert_eq!(float.wrap, Wrap::Square);
     assert!(float.behind);
     let object = match &p(&d, 0).runs[1].kind {

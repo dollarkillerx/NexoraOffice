@@ -97,7 +97,9 @@ fn label_text(
         let format = if own.legal {
             &NumberFormat::Decimal
         } else {
-            list.levels.get(at).map_or(&NumberFormat::Decimal, |l| &l.format)
+            list.levels
+                .get(at)
+                .map_or(&NumberFormat::Decimal, |l| &l.format)
         };
         out.push_str(&format_number(value, format));
     }
@@ -293,7 +295,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Block, ListRef, Numbering, Paragraph, ParaProps, Run, RunLook, RunPatch, Story, Suffix,
+        Block, ListRef, Numbering, ParaProps, Paragraph, Run, RunLook, RunPatch, Story, Suffix,
     };
 
     fn f(n: u32, format: NumberFormat) -> String {
@@ -482,10 +484,7 @@ mod tests {
         };
         let mut d = document(vec![list], vec![item(1, 0), item(1, 0), item(1, 1)]);
         d.renumber();
-        assert_eq!(
-            labels(&d),
-            ["I.", "II.", "2.1"].map(|s| Some(s.to_owned()))
-        );
+        assert_eq!(labels(&d), ["I.", "II.", "2.1"].map(|s| Some(s.to_owned())));
     }
 
     #[test]
@@ -526,6 +525,40 @@ mod tests {
         assert!(d.body.blocks[0].is(&kept.body.blocks[0]));
         assert!(d.body.blocks[1].is(&kept.body.blocks[1]));
         assert_eq!(labels(&d)[2].as_deref(), Some("3."));
+    }
+
+    #[test]
+    fn a_list_without_levels_and_a_level_beyond_its_levels_do_not_panic() {
+        let empty = List {
+            id: 4,
+            definition: 4,
+            levels: Vec::new(),
+        };
+        let mut d = document(
+            vec![empty, outline()],
+            vec![item(4, 0), item(1, 8), item(1, 8)],
+        );
+        d.renumber();
+        assert_eq!(
+            labels(&d),
+            [
+                Some("1.".to_owned()),
+                Some("1.".to_owned()),
+                Some("1.".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_level_with_no_number_keeps_an_empty_label() {
+        let list = List {
+            id: 1,
+            definition: 1,
+            levels: vec![level(NumberFormat::None, "%1")],
+        };
+        let mut d = document(vec![list], vec![item(1, 0)]);
+        d.renumber();
+        assert_eq!(labels(&d), [Some(String::new())]);
     }
 
     #[test]

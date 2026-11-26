@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aster_writer::{
-    Align, Border, BorderStyle, LineSpacing, ListRef, ParaProps, RunLook, Rgba, TabAlign,
+    Align, Border, BorderStyle, LineSpacing, ListRef, ParaProps, Rgba, RunLook, TabAlign,
     TabLeader, TabStop, Twips, Underline, UnderlineStyle, VertAlign,
 };
 
@@ -207,7 +207,9 @@ fn tinted(color: Rgba, tint: Option<&str>, shade: Option<&str>) -> Rgba {
     if let Some(t) = tint.and_then(|t| u8::from_str_radix(t.trim(), 16).ok()) {
         let t = f32::from(t) / 255.0;
         for c in out.iter_mut().take(3) {
-            *c = (f32::from(*c) * t + 255.0 * (1.0 - t)).round().clamp(0.0, 255.0) as u8;
+            *c = (f32::from(*c) * t + 255.0 * (1.0 - t))
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
     }
     if let Some(s) = shade.and_then(|s| u8::from_str_radix(s.trim(), 16).ok()) {
@@ -222,19 +224,11 @@ fn tinted(color: Rgba, tint: Option<&str>, shade: Option<&str>) -> Rgba {
 /// A colour attribute set (`val`, `themeColor`, `themeTint`, `themeShade`)
 /// on `node`, naming them `val_name` and `theme_name`. `Some(None)` is
 /// automatic.
-fn color_of(
-    node: &Node<'_>,
-    env: &Env,
-    val_name: &str,
-    theme_name: &str,
-) -> Option<Option<Rgba>> {
+fn color_of(node: &Node<'_>, env: &Env, val_name: &str, theme_name: &str) -> Option<Option<Rgba>> {
     let (tint, shade) = if theme_name == "themeColor" {
         (node.attr("themeTint"), node.attr("themeShade"))
     } else {
-        (
-            node.attr("themeFillTint"),
-            node.attr("themeFillShade"),
-        )
+        (node.attr("themeFillTint"), node.attr("themeFillShade"))
     };
     if let Some(theme) = node.attr(theme_name) {
         let color = env.theme.color(scheme_name(&theme));
@@ -289,10 +283,10 @@ fn underline_style(name: &str) -> Option<Option<UnderlineStyle>> {
 
 /// A shading element: the fill (or, for a solid pattern, the colour).
 pub fn shading_of(node: &Node<'_>, env: &Env) -> Option<Option<Rgba>> {
-    if node.attr("val").as_deref() == Some("solid") {
-        if let Some(color) = color_of(node, env, "color", "themeColor") {
-            return Some(color);
-        }
+    if node.attr("val").as_deref() == Some("solid")
+        && let Some(color) = color_of(node, env, "color", "themeColor")
+    {
+        return Some(color);
     }
     color_of(node, env, "fill", "themeFill")
 }
@@ -307,17 +301,17 @@ pub fn parse_rpr(node: &Node<'_>, env: &Env) -> RunProps {
                 let ascii = c.attr("asciiTheme").or_else(|| c.attr("hAnsiTheme"));
                 if let Some(face) = ascii.and_then(|n| env.theme_font(&n)) {
                     p.font = Some(face);
-                } else if let Some(name) = c.attr("ascii").or_else(|| c.attr("hAnsi")) {
-                    if !name.is_empty() {
-                        p.font = Some(env.intern(&name));
-                    }
+                } else if let Some(name) = c.attr("ascii").or_else(|| c.attr("hAnsi"))
+                    && !name.is_empty()
+                {
+                    p.font = Some(env.intern(&name));
                 }
                 if let Some(face) = c.attr("eastAsiaTheme").and_then(|n| env.theme_font(&n)) {
                     p.east_asian_font = Some(face);
-                } else if let Some(name) = c.attr("eastAsia") {
-                    if !name.is_empty() {
-                        p.east_asian_font = Some(env.intern(&name));
-                    }
+                } else if let Some(name) = c.attr("eastAsia")
+                    && !name.is_empty()
+                {
+                    p.east_asian_font = Some(env.intern(&name));
                 }
             }
             b"sz" => p.size = c.int("val").map(|v| (v.clamp(1, 4000) as f32) / 2.0),
@@ -576,9 +570,9 @@ pub fn parse_ppr<'n, 'a>(node: &'n Node<'a>, env: &Env) -> Ppr<'n, 'a> {
                 if let Some(l) = len(&["right", "end"], "rightChars").or(len(&[], "endChars")) {
                     p.right = Some(l);
                 }
-                if let Some(l) = len(&["hanging"], "hangingChars").filter(|l| {
-                    l.twips.is_some_and(|t| t != 0) || l.chars.is_some_and(|c| c != 0)
-                }) {
+                if let Some(l) = len(&["hanging"], "hangingChars")
+                    .filter(|l| l.twips.is_some_and(|t| t != 0) || l.chars.is_some_and(|c| c != 0))
+                {
                     p.first = Some(Len {
                         twips: l.twips.map(|t| -t),
                         chars: l.chars.map(|c| -c),
@@ -596,7 +590,9 @@ pub fn parse_ppr<'n, 'a>(node: &'n Node<'a>, env: &Env) -> Ppr<'n, 'a> {
                 let space = |name: &str, lines: &str, auto: &str| {
                     let t = c.int(name);
                     let l = c.int(lines);
-                    let a = c.attr(auto).is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"));
+                    let a = c
+                        .attr(auto)
+                        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"));
                     (t.is_some() || l.is_some() || c.attr(auto).is_some()).then(|| Space {
                         twips: t.map(clamp_len),
                         lines: l.map(|v| v.clamp(-100_000, 100_000) as i32),
@@ -625,7 +621,9 @@ pub fn parse_ppr<'n, 'a>(node: &'n Node<'a>, env: &Env) -> Ppr<'n, 'a> {
             b"widowControl" => p.widow = Some(c.on()),
             b"snapToGrid" => p.snap = Some(c.on()),
             b"outlineLvl" => {
-                p.outline = c.int("val").map(|v| (0..=8).contains(&v).then_some(v as u8));
+                p.outline = c
+                    .int("val")
+                    .map(|v| (0..=8).contains(&v).then_some(v as u8));
             }
             b"numPr" => {
                 if let Some(v) = c.child("numId").and_then(|n| n.int("val")) {
@@ -732,7 +730,9 @@ mod tests {
 
     #[test]
     fn toggles_and_values() {
-        let p = rpr(r#"<w:b/><w:i w:val="0"/><w:sz w:val="21"/><w:u w:val="dotDash" w:color="FF0000"/><w:strike w:val="off"/>"#);
+        let p = rpr(
+            r#"<w:b/><w:i w:val="0"/><w:sz w:val="21"/><w:u w:val="dotDash" w:color="FF0000"/><w:strike w:val="off"/>"#,
+        );
         assert_eq!(p.bold, Some(true));
         assert_eq!(p.italic, Some(false));
         assert_eq!(p.size, Some(10.5));
@@ -767,7 +767,9 @@ mod tests {
 
     #[test]
     fn spacing_in_lines_and_automatic() {
-        let p = ppr(r#"<w:spacing w:beforeLines="50" w:after="100" w:afterAutospacing="1" w:line="360" w:lineRule="auto"/>"#);
+        let p = ppr(
+            r#"<w:spacing w:beforeLines="50" w:after="100" w:afterAutospacing="1" w:line="360" w:lineRule="auto"/>"#,
+        );
         let props = finalize_para(&p, 10.0, 312);
         assert_eq!(props.space_before, 156);
         assert_eq!(props.space_after, 280);
@@ -778,8 +780,12 @@ mod tests {
 
     #[test]
     fn tabs_clear_what_a_lower_layer_set() {
-        let mut lower = ppr(r#"<w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:leader="dot" w:pos="8000"/></w:tabs>"#);
-        let upper = ppr(r#"<w:tabs><w:tab w:val="clear" w:pos="720"/><w:tab w:val="center" w:pos="4000"/></w:tabs>"#);
+        let mut lower = ppr(
+            r#"<w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:leader="dot" w:pos="8000"/></w:tabs>"#,
+        );
+        let upper = ppr(
+            r#"<w:tabs><w:tab w:val="clear" w:pos="720"/><w:tab w:val="center" w:pos="4000"/></w:tabs>"#,
+        );
         lower.merge(&upper);
         let tabs = finalize_para(&lower, 10.0, 240).tabs;
         assert_eq!(
@@ -791,7 +797,13 @@ mod tests {
 
     #[test]
     fn outline_level_nine_is_body_text() {
-        assert_eq!(finalize_para(&ppr(r#"<w:outlineLvl w:val="9"/>"#), 10.0, 240).outline_level, None);
-        assert_eq!(finalize_para(&ppr(r#"<w:outlineLvl w:val="2"/>"#), 10.0, 240).outline_level, Some(2));
+        assert_eq!(
+            finalize_para(&ppr(r#"<w:outlineLvl w:val="9"/>"#), 10.0, 240).outline_level,
+            None
+        );
+        assert_eq!(
+            finalize_para(&ppr(r#"<w:outlineLvl w:val="2"/>"#), 10.0, 240).outline_level,
+            Some(2)
+        );
     }
 }

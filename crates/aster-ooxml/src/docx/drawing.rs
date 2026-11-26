@@ -125,12 +125,14 @@ impl Reader<'_> {
             .map_or((0, 0), |e| (emu(e.int("cx")), emu(e.int("cy"))));
         let alt = holder
             .child("docPr")
-            .and_then(|d| d.attr("descr").filter(|s| !s.is_empty()).or(d.attr("title")))
+            .and_then(|d| {
+                d.attr("descr")
+                    .filter(|s| !s.is_empty())
+                    .or(d.attr("title"))
+            })
             .filter(|s| !s.is_empty());
         let float = anchor.map(float_of);
-        let data = holder
-            .child("graphic")
-            .and_then(|g| g.child("graphicData"));
+        let data = holder.child("graphic").and_then(|g| g.child("graphicData"));
         let content = match data.and_then(|d| d.children.first()) {
             Some(content) => self.drawing_content(content, part),
             None => DrawingContent::Other("shape".to_owned()),
@@ -362,14 +364,13 @@ fn vml_float(style: &str, node: &Node<'_>) -> Float {
         Some("line") => FloatFrom::Text,
         _ => FloatFrom::Paragraph,
     };
-    let align = |word: Option<String>, offset: Option<i64>, start: &str, end: &str| {
-        match word.as_deref() {
+    let align =
+        |word: Option<String>, offset: Option<i64>, start: &str, end: &str| match word.as_deref() {
             Some(w) if w == start || w == "inside" => FloatAt::Start,
             Some("center") => FloatAt::Center,
             Some(w) if w == end || w == "outside" => FloatAt::End,
             _ => FloatAt::Offset(offset.unwrap_or(0)),
-        }
-    };
+        };
     let wrap = descendant(node, 3, &|n| n.is("wrap"))
         .and_then(|w| w.attr("type"))
         .map_or(Wrap::None, |t| match t.as_str() {

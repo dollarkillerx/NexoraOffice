@@ -100,12 +100,17 @@ fn a_table_style_sits_between_the_paragraph_style_and_the_character_style() {
 fn conditional_table_formats_follow_the_table_look() {
     let styles = r#"<w:style w:type="table" w:styleId="Banded"><w:name w:val="Banded"/><w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="000080"/></w:tcPr></w:tblStylePr><w:tblStylePr w:type="lastRow"><w:rPr><w:i/></w:rPr></w:tblStylePr><w:tblStylePr w:type="firstCol"><w:rPr><w:u w:val="single"/></w:rPr></w:tblStylePr><w:tblStylePr w:type="band1Horz"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="EEEEEE"/></w:tcPr></w:tblStylePr><w:tblStylePr w:type="band2Horz"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="DDDDDD"/></w:tcPr></w:tblStylePr></w:style>"#;
     let row = |n: u32| {
-        format!(r#"<w:tr><w:tc><w:p><w:r><w:t>{n}a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>{n}b</w:t></w:r></w:p></w:tc></w:tr>"#)
+        format!(
+            r#"<w:tr><w:tc><w:p><w:r><w:t>{n}a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>{n}b</w:t></w:r></w:p></w:tc></w:tr>"#
+        )
     };
     let table = |look: &str| {
         format!(
             r#"<w:tbl><w:tblPr><w:tblStyle w:val="Banded"/>{look}</w:tblPr><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>{}{}{}{}</w:tbl>"#,
-            row(0), row(1), row(2), row(3)
+            row(0),
+            row(1),
+            row(2),
+            row(3)
         )
     };
     let document = doc(&format!(
@@ -118,7 +123,10 @@ fn conditional_table_formats_follow_the_table_look() {
     let first = t(&document, 0);
     let shade = |table: &Table, r: usize, c: usize| table.rows[r].cells[c].shading;
     let para = |table: &Table, r: usize, c: usize| -> Paragraph {
-        table.rows[r].cells[c].blocks[0].as_paragraph().unwrap().clone()
+        table.rows[r].cells[c].blocks[0]
+            .as_paragraph()
+            .unwrap()
+            .clone()
     };
     assert_eq!(shade(first, 0, 0), Some(rgb(0x000080)));
     assert!(para(first, 0, 1).base.bold);
@@ -154,7 +162,10 @@ fn run_elements_set_their_properties() {
     );
     let look = look_of(&document);
     let u = look.underline.unwrap();
-    assert_eq!((u.style, u.color), (UnderlineStyle::Wave, Some(rgb(0x00FF00))));
+    assert_eq!(
+        (u.style, u.color),
+        (UnderlineStyle::Wave, Some(rgb(0x00FF00)))
+    );
     assert!(look.double_strike);
     assert_eq!(look.color, None);
     assert_eq!(look.highlight, Some(rgb(0x008080)));
@@ -169,16 +180,31 @@ fn run_elements_set_their_properties() {
 #[test]
 fn underline_names_map_to_kinds_and_none_turns_it_off() {
     let kinds: Vec<UnderlineStyle> = [
-        "single", "words", "double", "thick", "dotted", "dash", "dotDash", "wave", "wavyHeavy",
+        "single",
+        "words",
+        "double",
+        "thick",
+        "dotted",
+        "dash",
+        "dotDash",
+        "wave",
+        "wavyHeavy",
     ]
     .iter()
     .map(|name| {
-        let d = run(&format!(r#"<w:r><w:rPr><w:u w:val="{name}"/></w:rPr><w:t>x</w:t></w:r>"#));
+        let d = run(&format!(
+            r#"<w:r><w:rPr><w:u w:val="{name}"/></w:rPr><w:t>x</w:t></w:r>"#
+        ));
         look_of(&d).underline.unwrap().style
     })
     .collect();
     use UnderlineStyle::*;
-    assert_eq!(kinds, [Single, Words, Double, Thick, Dotted, Dashed, Dashed, Wave, Wave]);
+    assert_eq!(
+        kinds,
+        [
+            Single, Words, Double, Thick, Dotted, Dashed, Dashed, Wave, Wave
+        ]
+    );
     let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:u w:val="single"/></w:rPr></w:style>"#;
     let off = doc(r#"<w:p><w:r><w:rPr><w:u w:val="none"/></w:rPr><w:t>x</w:t></w:r></w:p>"#)
         .styles(styles)
@@ -197,14 +223,26 @@ fn colours_may_come_from_the_theme_with_tint_and_shade() {
         .read();
         look_of(&d).color
     };
-    assert_eq!(color(r#"w:val="123456" w:themeColor="accent1""#), Some(rgb(0xFF0000)));
-    assert_eq!(color(r#"w:val="auto" w:themeColor="text1""#), Some(rgb(0x101010)));
+    assert_eq!(
+        color(r#"w:val="123456" w:themeColor="accent1""#),
+        Some(rgb(0xFF0000))
+    );
+    assert_eq!(
+        color(r#"w:val="auto" w:themeColor="text1""#),
+        Some(rgb(0x101010))
+    );
     assert_eq!(color(r#"w:themeColor="background1""#), Some(rgb(0xF0F0F0)));
     assert_eq!(color(r#"w:themeColor="text2""#), Some(rgb(0x204060)));
     assert_eq!(color(r#"w:themeColor="hyperlink""#), Some(rgb(0x0000FF)));
     // Half way to white, and half way to black.
-    assert_eq!(color(r#"w:themeColor="accent1" w:themeTint="80""#), Some([255, 127, 127, 255]));
-    assert_eq!(color(r#"w:themeColor="accent1" w:themeShade="80""#), Some([128, 0, 0, 255]));
+    assert_eq!(
+        color(r#"w:themeColor="accent1" w:themeTint="80""#),
+        Some([255, 127, 127, 255])
+    );
+    assert_eq!(
+        color(r#"w:themeColor="accent1" w:themeShade="80""#),
+        Some([128, 0, 0, 255])
+    );
 }
 
 const THEME_FONTS: &str = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="x"><a:majorFont><a:latin typeface="MajorLatin"/><a:ea typeface="MajorEa"/><a:font script="Jpan" typeface="MajorJpan"/></a:majorFont><a:minorFont><a:latin typeface="MinorLatin"/><a:ea typeface=""/><a:font script="Jpan" typeface="MinorJpan"/><a:font script="Hans" typeface="MinorHans"/><a:font script="Hant" typeface="MinorHant"/><a:font script="Hang" typeface="MinorHang"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
@@ -228,18 +266,27 @@ fn theme_fonts_are_looked_up_with_the_script_of_the_theme_font_language() {
     let rfonts = r#"w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia""#;
     let lang = |ea: &str| format!(r#"<w:themeFontLang w:val="en-US" w:eastAsia="{ea}"/>"#);
     let found = |ea: &str| fonts(&lang(ea), rfonts);
-    assert_eq!(found("ja-JP"), (Some("MinorLatin".into()), Some("MinorJpan".into())));
+    assert_eq!(
+        found("ja-JP"),
+        (Some("MinorLatin".into()), Some("MinorJpan".into()))
+    );
     assert_eq!(found("zh-CN").1.as_deref(), Some("MinorHans"));
     assert_eq!(found("zh-TW").1.as_deref(), Some("MinorHant"));
     assert_eq!(found("ko-KR").1.as_deref(), Some("MinorHang"));
     // A theme face that is not empty is used as it is.
     assert_eq!(
-        fonts(&lang("ja-JP"), r#"w:asciiTheme="majorHAnsi" w:eastAsiaTheme="majorEastAsia""#),
+        fonts(
+            &lang("ja-JP"),
+            r#"w:asciiTheme="majorHAnsi" w:eastAsiaTheme="majorEastAsia""#
+        ),
         (Some("MajorLatin".into()), Some("MajorEa".into()))
     );
     // The theme wins over a name written beside it.
     assert_eq!(
-        fonts("", r#"w:ascii="Plain" w:asciiTheme="minorHAnsi" w:eastAsia="PlainEa""#),
+        fonts(
+            "",
+            r#"w:ascii="Plain" w:asciiTheme="minorHAnsi" w:eastAsia="PlainEa""#
+        ),
         (Some("MinorLatin".into()), Some("PlainEa".into()))
     );
     assert_eq!(
@@ -258,10 +305,10 @@ fn equal_font_names_share_their_storage() {
         runs[0].look.font.as_ref().unwrap(),
         runs[1].look.font.as_ref().unwrap()
     ));
-    assert!(Arc::ptr_eq(
-        runs[2].style.as_ref().unwrap(),
-        &Arc::from("Same")
-    ) || runs[2].style.as_deref() == Some("Same"));
+    assert!(
+        Arc::ptr_eq(runs[2].style.as_ref().unwrap(), &Arc::from("Same"))
+            || runs[2].style.as_deref() == Some("Same")
+    );
 }
 
 #[test]
@@ -294,7 +341,9 @@ fn settings_are_read() {
 // ---------------------------------------------------------------------------
 
 fn props(ppr: &str) -> ParaProps {
-    let d = read(&format!(r#"<w:p><w:pPr>{ppr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#));
+    let d = read(&format!(
+        r#"<w:p><w:pPr>{ppr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#
+    ));
     p(&d, 0).props.clone()
 }
 
@@ -303,7 +352,16 @@ fn alignment_values() {
     use Align::*;
     let align = |v: &str| props(&format!(r#"<w:jc w:val="{v}"/>"#)).align;
     assert_eq!(
-        ["left", "start", "center", "right", "end", "both", "distribute"].map(align),
+        [
+            "left",
+            "start",
+            "center",
+            "right",
+            "end",
+            "both",
+            "distribute"
+        ]
+        .map(align),
         [Left, Left, Center, Right, Right, Justify, Distribute]
     );
 }
@@ -311,9 +369,15 @@ fn alignment_values() {
 #[test]
 fn indents_in_twips_and_characters() {
     let a = props(r#"<w:ind w:left="720" w:right="360" w:firstLine="200"/>"#);
-    assert_eq!((a.indent_left, a.indent_right, a.first_line), (720, 360, 200));
+    assert_eq!(
+        (a.indent_left, a.indent_right, a.first_line),
+        (720, 360, 200)
+    );
     let b = props(r#"<w:ind w:start="100" w:end="50" w:hanging="300"/>"#);
-    assert_eq!((b.indent_left, b.indent_right, b.first_line), (100, 50, -300));
+    assert_eq!(
+        (b.indent_left, b.indent_right, b.first_line),
+        (100, 50, -300)
+    );
     // Ten and a half points: a character is 210 twips.
     let styles = r#"<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="21"/></w:rPr></w:rPrDefault></w:docDefaults>"#;
     let d = doc(r#"<w:p><w:pPr><w:ind w:firstLineChars="200" w:firstLine="999" w:leftChars="50" w:rightChars="0" w:right="40"/></w:pPr></w:p>"#)
@@ -348,9 +412,8 @@ fn spacing_in_twips_lines_and_automatic() {
 
 #[test]
 fn a_line_is_the_pitch_of_the_sections_grid() {
-    let section = |grid: &str| {
-        format!(r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>{grid}</w:sectPr>"#)
-    };
+    let section =
+        |grid: &str| format!(r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>{grid}</w:sectPr>"#);
     let para = r#"<w:p><w:pPr><w:spacing w:beforeLines="100" w:afterLines="50"/></w:pPr></w:p>"#;
     let d = read(&format!(
         r#"{para}<w:p><w:pPr>{}</w:pPr></w:p>{para}{}"#,
@@ -358,13 +421,21 @@ fn a_line_is_the_pitch_of_the_sections_grid() {
         section("")
     ));
     // The first section has a grid, the second has none.
-    assert_eq!((p(&d, 0).props.space_before, p(&d, 0).props.space_after), (312, 156));
-    assert_eq!((p(&d, 2).props.space_before, p(&d, 2).props.space_after), (240, 120));
+    assert_eq!(
+        (p(&d, 0).props.space_before, p(&d, 0).props.space_after),
+        (312, 156)
+    );
+    assert_eq!(
+        (p(&d, 2).props.space_before, p(&d, 2).props.space_after),
+        (240, 120)
+    );
 }
 
 #[test]
 fn flags_and_outline_levels() {
-    let a = props(r#"<w:keepNext/><w:keepLines/><w:pageBreakBefore/><w:contextualSpacing/><w:widowControl w:val="0"/><w:snapToGrid w:val="0"/><w:outlineLvl w:val="1"/>"#);
+    let a = props(
+        r#"<w:keepNext/><w:keepLines/><w:pageBreakBefore/><w:contextualSpacing/><w:widowControl w:val="0"/><w:snapToGrid w:val="0"/><w:outlineLvl w:val="1"/>"#,
+    );
     assert!(a.keep_next && a.keep_lines && a.page_break_before && a.contextual_spacing);
     assert!(!a.widow_control && !a.snap_to_grid);
     assert_eq!(a.outline_level, Some(1));
@@ -381,7 +452,10 @@ fn borders_between_and_shading() {
     let [left, top, right, bottom] = a.borders;
     assert_eq!(left.unwrap().style, BorderStyle::Double);
     let top = top.unwrap();
-    assert_eq!((top.style, top.width, top.space, top.color), (BorderStyle::Single, 1.0, 2.0, Some(rgb(0xFF0000))));
+    assert_eq!(
+        (top.style, top.width, top.space, top.color),
+        (BorderStyle::Single, 1.0, 2.0, Some(rgb(0xFF0000)))
+    );
     assert_eq!(right.unwrap().width, 1.5);
     assert_eq!(bottom, None);
     assert_eq!(a.border_between.unwrap().style, BorderStyle::Dotted);
@@ -395,8 +469,10 @@ fn tab_stops_are_sorted_and_cleared_stops_are_gone() {
         .styles(styles)
         .read();
     let tabs = &p(&d, 0).props.tabs;
-    let summary: Vec<(i32, TabAlign, TabLeader)> =
-        tabs.iter().map(|t| (t.position, t.align, t.leader)).collect();
+    let summary: Vec<(i32, TabAlign, TabLeader)> = tabs
+        .iter()
+        .map(|t| (t.position, t.align, t.leader))
+        .collect();
     assert_eq!(
         summary,
         [
@@ -548,15 +624,24 @@ fn levels_are_read_with_their_format_text_suffix_and_indents() {
     assert_eq!(first.look.color, Some(Some(rgb(0xFF0000))));
     // Legal numbering shows its numbers in decimal.
     assert!(list.levels[1].legal);
-    assert_eq!(list.levels[2].format, NumberFormat::Other("frobnicate".to_owned()));
+    assert_eq!(
+        list.levels[2].format,
+        NumberFormat::Other("frobnicate".to_owned())
+    );
     // The label's look is the paragraph mark's with the level's patch.
     let label = p(&d, 0).label.clone().unwrap();
     assert_eq!(label.text, "I)");
     assert!(label.look.bold && label.look.color == Some(rgb(0xFF0000)));
     assert_eq!(label.suffix, Suffix::Space);
-    assert_eq!(labels(&d), [Some("I)".into()), Some("第1章".into()), Some("1".into())]);
+    assert_eq!(
+        labels(&d),
+        [Some("I)".into()), Some("第1章".into()), Some("1".into())]
+    );
     // The level's indents are in the paragraph's properties.
-    assert_eq!((p(&d, 0).props.indent_left, p(&d, 0).props.first_line), (600, -300));
+    assert_eq!(
+        (p(&d, 0).props.indent_left, p(&d, 0).props.first_line),
+        (600, -300)
+    );
 }
 
 #[test]
@@ -587,14 +672,25 @@ fn every_number_format_name_is_mapped() {
         ("iroha", NumberFormat::Iroha),
         ("ordinal", NumberFormat::Ordinal),
     ];
-    let levels: String = names.iter().enumerate().map(|(i, (n, _))| lvl(i as u32 % 9, n, "%1", "")).collect();
+    let levels: String = names
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| lvl(i as u32 % 9, n, "%1", ""))
+        .collect();
     // Nine levels at most: one definition per three names.
     let mut defs = String::new();
     let mut nums = String::new();
     for (k, chunk) in names.chunks(8).enumerate() {
-        let lv: String = chunk.iter().enumerate().map(|(i, (n, _))| lvl(i as u32, n, "%1", "")).collect();
+        let lv: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| lvl(i as u32, n, "%1", ""))
+            .collect();
         defs += &format!(r#"<w:abstractNum w:abstractNumId="{k}">{lv}</w:abstractNum>"#);
-        nums += &format!(r#"<w:num w:numId="{}"><w:abstractNumId w:val="{k}"/></w:num>"#, k + 1);
+        nums += &format!(
+            r#"<w:num w:numId="{}"><w:abstractNumId w:val="{k}"/></w:num>"#,
+            k + 1
+        );
     }
     let _ = levels;
     let d = doc("<w:p/>").numbering(&format!("{defs}{nums}")).read();
@@ -615,9 +711,16 @@ fn start_and_overrides() {
         lvl(0, "decimal", "%1.", "").replace(r#"<w:start w:val="1"/>"#, r#"<w:start w:val="3"/>"#),
         lvl(1, "decimal", "%1.%2", "")
     );
-    let d = doc(&format!("{}{}{}{}{}", item(1, 0), item(1, 0), item(2, 0), item(2, 1), item(2, 1)))
-        .numbering(&numbering)
-        .read();
+    let d = doc(&format!(
+        "{}{}{}{}{}",
+        item(1, 0),
+        item(1, 0),
+        item(2, 0),
+        item(2, 1),
+        item(2, 1)
+    ))
+    .numbering(&numbering)
+    .read();
     assert_eq!(d.numbering.get(2).unwrap().levels[0].restart, Some(9));
     assert_eq!(d.numbering.get(1).unwrap().levels[0].restart, None);
     assert_eq!(
@@ -630,9 +733,24 @@ fn start_and_overrides() {
 fn bullets_in_symbol_fonts_become_unicode_without_the_font() {
     let numbering = format!(
         r#"<w:abstractNum w:abstractNumId="0">{}{}{}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
-        lvl(0, "bullet", "&#xF0B7;", r#"<w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr>"#),
-        lvl(1, "bullet", "&#xF0A7;", r#"<w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/><w:color w:val="00AA00"/></w:rPr>"#),
-        lvl(2, "bullet", "o", r#"<w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/></w:rPr>"#),
+        lvl(
+            0,
+            "bullet",
+            "&#xF0B7;",
+            r#"<w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr>"#
+        ),
+        lvl(
+            1,
+            "bullet",
+            "&#xF0A7;",
+            r#"<w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/><w:color w:val="00AA00"/></w:rPr>"#
+        ),
+        lvl(
+            2,
+            "bullet",
+            "o",
+            r#"<w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/></w:rPr>"#
+        ),
     );
     let d = doc(&format!("{}{}{}", item(1, 0), item(1, 1), item(1, 2)))
         .numbering(&numbering)
@@ -644,9 +762,18 @@ fn bullets_in_symbol_fonts_become_unicode_without_the_font() {
     assert_eq!(list.levels[1].look.font, None);
     assert_eq!(list.levels[1].look.color, Some(Some(rgb(0x00AA00))));
     assert_eq!(list.levels[2].text, "o");
-    assert_eq!(list.levels[2].look.font, Some(Some(Arc::from("Courier New"))));
-    assert_eq!(labels(&d), [Some("•".into()), Some("▪".into()), Some("o".into())]);
-    assert_eq!(p(&d, 0).label.as_ref().unwrap().look.font, p(&d, 0).mark.font);
+    assert_eq!(
+        list.levels[2].look.font,
+        Some(Some(Arc::from("Courier New")))
+    );
+    assert_eq!(
+        labels(&d),
+        [Some("•".into()), Some("▪".into()), Some("o".into())]
+    );
+    assert_eq!(
+        p(&d, 0).label.as_ref().unwrap().look.font,
+        p(&d, 0).mark.font
+    );
 }
 
 #[test]
@@ -663,7 +790,10 @@ fn a_list_may_be_defined_by_a_list_style() {
         .numbering(&numbering)
         .styles(styles)
         .read();
-    assert_eq!(d.numbering.get(2).unwrap().levels[0].format, NumberFormat::LowerLetter);
+    assert_eq!(
+        d.numbering.get(2).unwrap().levels[0].format,
+        NumberFormat::LowerLetter
+    );
     assert_eq!(labels(&d), [Some("a)".into()), Some("b)".into())]);
 }
 
@@ -681,7 +811,12 @@ fn links_between_list_definitions_may_form_a_loop() {
 fn num_id_zero_removes_a_list_and_a_style_may_bring_one() {
     let numbering = format!(
         r#"<w:abstractNum w:abstractNumId="0">{}</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
-        lvl(0, "decimal", "%1.", r#"<w:pPr><w:ind w:left="700" w:hanging="350"/></w:pPr>"#)
+        lvl(
+            0,
+            "decimal",
+            "%1.",
+            r#"<w:pPr><w:ind w:left="700" w:hanging="350"/></w:pPr>"#
+        )
     );
     let styles = r#"<w:style w:type="paragraph" w:styleId="Num"><w:name w:val="Num"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>
 <w:style w:type="paragraph" w:styleId="NumInd"><w:name w:val="NumInd"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr><w:ind w:left="1000" w:firstLine="0"/></w:pPr></w:style>"#;
@@ -695,7 +830,16 @@ fn num_id_zero_removes_a_list_and_a_style_may_bring_one() {
     .numbering(&numbering)
     .styles(styles)
     .read();
-    assert_eq!(labels(&d), [Some("1.".into()), None, Some("2.".into()), Some("3.".into()), Some("4.".into())]);
+    assert_eq!(
+        labels(&d),
+        [
+            Some("1.".into()),
+            None,
+            Some("2.".into()),
+            Some("3.".into()),
+            Some("4.".into())
+        ]
+    );
     let ind = |i: usize| (p(&d, i).props.indent_left, p(&d, i).props.first_line);
     // The list's indents where the paragraph sets none.
     assert_eq!(ind(0), (700, -350));

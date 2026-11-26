@@ -52,6 +52,46 @@ fn sync_toolbar(ui: &AppWindow, shell: &mut Shell) {
     }
 }
 
+/// Write what the menus' check marks must show into the properties the
+/// checkable items are bound to (see `mark-filter` in `ui/app.slint`): the
+/// filter of a sheet, the markup, the comments panel and how the selected
+/// picture sits. With `rebuild`, also replace the image the items' icons are
+/// (`menu-epoch`) by one that differs from every earlier one, so that the
+/// native menu builds the items anew and shows these marks even when no
+/// `checked` differs from the last build. Called at the end of every
+/// activation of such an item, whether or not its command did anything.
+pub(crate) fn sync_menu_marks(ui: &AppWindow, rebuild: bool) {
+    ui.set_mark_filter(ui.get_sheet_filtered());
+    ui.set_mark_markup(ui.get_doc_markup());
+    ui.set_mark_comments(ui.get_comments_open());
+    let wrap = ui.get_doc_wrap();
+    ui.set_mark_wrap_0(wrap == 0);
+    ui.set_mark_wrap_1(wrap == 1);
+    ui.set_mark_wrap_2(wrap == 2);
+    ui.set_mark_wrap_3(wrap == 3);
+    ui.set_mark_wrap_4(wrap == 4);
+    ui.set_mark_wrap_5(wrap == 5);
+    if rebuild {
+        thread_local! {
+            static EPOCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let n = EPOCH.get().wrapping_add(1);
+        EPOCH.set(n);
+        // One transparent pixel whose colour counts the activations.
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(1, 1);
+        let [r, g, b, _] = n.to_le_bytes();
+        pixels.make_mut_slice()[0] = slint::Rgba8Pixel { r, g, b, a: 0 };
+        ui.set_menu_epoch(slint::Image::from_rgba8(pixels));
+    }
+}
+
+/// The comments panel's close button.
+pub(crate) fn close_comments(ui: &AppWindow) {
+    ui.set_comments_open(false);
+    sync_menu_marks(ui, true);
+    ui.invoke_focus_document();
+}
+
 /// The pictures' wrap menu, in the order of the window's menu.
 const WRAPS: [PictureLayout; 6] = [
     PictureLayout::Inline,
@@ -77,6 +117,7 @@ pub(crate) fn sync_flags(ui: &AppWindow, shell: &mut Shell) {
         ui.set_doc_markup(true);
         ui.set_doc_has_changes(false);
         ui.set_doc_has_comments(false);
+        sync_menu_marks(ui, false);
         return;
     };
     let composing = tab.view.is_composing();
@@ -105,6 +146,7 @@ pub(crate) fn sync_flags(ui: &AppWindow, shell: &mut Shell) {
     ui.set_doc_markup(view.show_markup());
     ui.set_doc_has_changes(view.has_tracked_changes());
     ui.set_doc_has_comments(!view.comments().is_empty());
+    sync_menu_marks(ui, false);
     let moved = tab.shown_place != place;
     tab.shown_place = place;
     if moved {

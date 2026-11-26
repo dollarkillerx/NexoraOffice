@@ -4624,6 +4624,7 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_cell_content(content.into());
         ui.set_viewer_note(note.into());
         ui.set_sheet_filtered(view.sheet().is_some_and(|s| s.auto_filter.is_some()));
+        writer_ui::sync_menu_marks(ui, false);
         ui.set_sheet_has_print_area(view.sheet().is_some_and(|s| !s.print_area.is_empty()));
         ui.set_cell_has_comment(tab.comment().is_some());
         show_comment(ui, shell);
@@ -6424,6 +6425,24 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         shell.doc_split_for = None;
         ui.invoke_focus_document();
     }));
+    // Not through `handler!`: the marks are made right even when the command
+    // was skipped because the shell was busy.
+    ui.on_menu_marks({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                writer_ui::sync_menu_marks(&ui, true);
+            }
+        }
+    });
+    ui.on_comments_close({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                writer_ui::close_comments(&ui);
+            }
+        }
+    });
     ui.on_review(handler!(|ui, shell, code| {
         writer_ui::review(&ui, shell, code);
     }));
@@ -10976,6 +10995,139 @@ mod ui_tests {
         // And back.
         click_document(&app, first);
         assert_eq!(shown_font_size(&app), "12");
+    }
+
+    /// The six check marks of the picture wrap menu.
+    fn wrap_marks(ui: &AppWindow) -> [bool; 6] {
+        [
+            ui.get_mark_wrap_0(),
+            ui.get_mark_wrap_1(),
+            ui.get_mark_wrap_2(),
+            ui.get_mark_wrap_3(),
+            ui.get_mark_wrap_4(),
+            ui.get_mark_wrap_5(),
+        ]
+    }
+
+    /// Flip the check mark of the wrap item `index` as Slint does when the
+    /// item is chosen (`checked` is set to its opposite before `activated`
+    /// runs). The test window has no native menu to choose from, so this is
+    /// done by hand here, in the properties the items are bound to.
+    fn slint_flips_wrap_mark(ui: &AppWindow, index: usize) {
+        match index {
+            0 => ui.set_mark_wrap_0(!ui.get_mark_wrap_0()),
+            1 => ui.set_mark_wrap_1(!ui.get_mark_wrap_1()),
+            2 => ui.set_mark_wrap_2(!ui.get_mark_wrap_2()),
+            3 => ui.set_mark_wrap_3(!ui.get_mark_wrap_3()),
+            4 => ui.set_mark_wrap_4(!ui.get_mark_wrap_4()),
+            _ => ui.set_mark_wrap_5(!ui.get_mark_wrap_5()),
+        }
+    }
+
+    #[test]
+    fn the_menu_marks_follow_the_state_whatever_the_menu_item_did() {
+        use aster_surface::doc_view::PictureLayout;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "ab");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let size = aster_shell::writer_tab::read_picture(&DOT_PNG).unwrap();
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::place_picture(
+                ui,
+                &mut shell,
+                id,
+                std::path::Path::new("点.png"),
+                Ok((DOT_PNG.to_vec(), size)),
+            );
+        }
+        with_doc(&app, |tab| {
+            let start = tab.view.document().start().unwrap();
+            let mut a = start.clone();
+            let mut b = start;
+            a.offset = 2;
+            b.offset = 2 + aster_writer::OBJECT.len();
+            tab.view.set_selection(a, b);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        let epoch = |ui: &AppWindow| ui.get_menu_epoch().to_rgba8().map(|b| b.as_slice()[0]);
+        // In the line, then square, top and bottom, tight, and tight again
+        // (which changes nothing): one mark, the picture's layout.
+        let layouts = [
+            PictureLayout::Inline,
+            PictureLayout::Square,
+            PictureLayout::Tight,
+            PictureLayout::TopAndBottom,
+        ];
+        for index in [0usize, 1, 3, 2, 2] {
+            let before = epoch(ui);
+            slint_flips_wrap_mark(ui, index);
+            ui.invoke_format(50 + index as i32);
+            ui.invoke_menu_marks();
+            let marks = wrap_marks(ui);
+            assert_eq!(marks.iter().filter(|m| **m).count(), 1, "{marks:?}");
+            assert!(marks[index], "{marks:?} after {index}");
+            assert_eq!(
+                with_doc(&app, |tab| tab.view.picture_layout()),
+                Some(layouts[[0usize, 1, 2, 3].iter().position(|i| *i == index).unwrap()])
+            );
+            assert_ne!(
+                epoch(ui),
+                before,
+                "every activation makes the native items be built anew"
+            );
+        }
+        // With nothing selected, a wrap item asked for anyway is refused and
+        // no mark is left on.
+        with_doc(&app, |tab| {
+            let at = tab.view.document().start().unwrap();
+            tab.view.go_to(&at);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        assert_eq!(wrap_marks(ui), [false; 6]);
+        slint_flips_wrap_mark(ui, 4);
+        ui.invoke_format(54);
+        ui.invoke_menu_marks();
+        assert_eq!(wrap_marks(ui), [false; 6]);
+    }
+
+    #[test]
+    fn the_comments_mark_follows_the_panel_and_its_close_button() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        make_reviewed(&app);
+        assert!(!ui.get_mark_comments());
+        // Chosen in the menu: Slint flips the mark (done by hand here, see
+        // `slint_flips_wrap_mark`), the command opens the panel.
+        let choose = |ui: &AppWindow| {
+            ui.set_mark_comments(!ui.get_mark_comments());
+            ui.invoke_review(7);
+            ui.invoke_menu_marks();
+        };
+        choose(ui);
+        assert!(ui.get_comments_open());
+        assert!(ui.get_mark_comments());
+        // Closed by the panel's own button: the mark goes off.
+        ui.invoke_comments_close();
+        assert!(!ui.get_comments_open());
+        assert!(!ui.get_mark_comments());
+        // And the menu opens it again, and closes it.
+        choose(ui);
+        assert!(ui.get_comments_open());
+        assert!(ui.get_mark_comments());
+        choose(ui);
+        assert!(!ui.get_comments_open());
+        assert!(!ui.get_mark_comments());
+        // The markup item is a mark of its own.
+        assert!(ui.get_mark_markup());
+        ui.set_mark_markup(!ui.get_mark_markup());
+        ui.invoke_review(0);
+        ui.invoke_menu_marks();
+        assert!(!ui.get_mark_markup());
+        assert!(!with_doc(&app, |tab| tab.view.show_markup()));
     }
 
     /// A document with, in its first paragraph, text inserted by Ann and

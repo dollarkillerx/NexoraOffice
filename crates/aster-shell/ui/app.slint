@@ -129,9 +129,40 @@ export component AppWindow inherits Window {
     // The Review menu: 0 show markup, 1 previous change, 2 next, 3 accept
     // this one, 4 reject it, 5 accept all, 6 reject all, 7 the comments panel.
     callback review(int);
+    // The check marks of the menu items with `checkable: true`. Each item is
+    // bound both ways to one of these, and Rust writes the truth into them
+    // (`menu-marks`, called at the end of every such item's `activated`, and
+    // whenever what they show changes). Why:
+    // - Slint itself flips `checked` of a checkable item when it is chosen
+    //   (`MenuFromItemTree::activate`, i-slint-core). With a one-way binding
+    //   (`checked: root.doc-wrap == 1`) that replaces the binding by a
+    //   constant, and the item never follows our state again. Bound both
+    //   ways, the flip lands in a property of ours that Rust then corrects.
+    // - muda also flips the native item's mark on a click, and the winit
+    //   backend replaces a native item only when its entry differs from the
+    //   one of the last build (`menu_entry_looks_same`). A click that leaves
+    //   `checked` as it was (the wrap that is already in effect, a command
+    //   that is refused) would leave the native mark inverted. So every
+    //   checkable item also depends on `menu-epoch`, an image that Rust
+    //   replaces by a different one on each activation: the entry's icon
+    //   differs, the item is built anew, with the mark of these properties.
+    //   (The native checkable item draws no icon, only `icon` is compared.)
+    in-out property <bool> mark-filter;
+    in-out property <bool> mark-markup;
+    in-out property <bool> mark-comments;
+    in-out property <bool> mark-wrap-0;
+    in-out property <bool> mark-wrap-1;
+    in-out property <bool> mark-wrap-2;
+    in-out property <bool> mark-wrap-3;
+    in-out property <bool> mark-wrap-4;
+    in-out property <bool> mark-wrap-5;
+    in property <image> menu-epoch;
+    callback menu-marks();
     // The comments panel: open, the comments, the one the caret is in, and
     // a click on an entry.
     in-out property <bool> comments-open;
+    // The comments panel's close button.
+    callback comments-close();
     in property <[CommentItem]> comments;
     callback comment-clicked(int);
     // A question asking for one line of text: go to line, rename.
@@ -950,10 +981,12 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-filter;
                 checkable: true;
-                checked: root.sheet-filtered;
+                checked <=> root.mark-filter;
+                icon: root.menu-epoch;
                 enabled: root.viewer == 1 && root.can-save;
                 activated => {
                     root.sheet-filter();
+                    root.menu-marks();
                 }
             }
 
@@ -1050,10 +1083,12 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.review-show-markup;
                 checkable: true;
-                checked: root.doc-markup;
+                checked <=> root.mark-markup;
+                icon: root.menu-epoch;
                 enabled: root.doc-editing && (root.doc-has-changes || root.doc-has-comments);
                 activated => {
                     root.review(0);
+                    root.menu-marks();
                 }
             }
 
@@ -1114,10 +1149,12 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.review-comments;
                 checkable: true;
-                checked: root.comments-open;
+                checked <=> root.mark-comments;
+                icon: root.menu-epoch;
                 enabled: root.doc-editing;
                 activated => {
                     root.review(7);
+                    root.menu-marks();
                 }
             }
         }
@@ -1425,10 +1462,12 @@ export component AppWindow inherits Window {
                 MenuItem {
                     title: Strings.wrap-inline;
                     checkable: true;
-                    checked: root.doc-wrap == 0;
+                    checked <=> root.mark-wrap-0;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(50);
+                        root.menu-marks();
                     }
                 }
 
@@ -1437,50 +1476,60 @@ export component AppWindow inherits Window {
                 MenuItem {
                     title: Strings.wrap-square;
                     checkable: true;
-                    checked: root.doc-wrap == 1;
+                    checked <=> root.mark-wrap-1;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(51);
+                        root.menu-marks();
                     }
                 }
 
                 MenuItem {
                     title: Strings.wrap-tight;
                     checkable: true;
-                    checked: root.doc-wrap == 2;
+                    checked <=> root.mark-wrap-2;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(52);
+                        root.menu-marks();
                     }
                 }
 
                 MenuItem {
                     title: Strings.wrap-top-bottom;
                     checkable: true;
-                    checked: root.doc-wrap == 3;
+                    checked <=> root.mark-wrap-3;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(53);
+                        root.menu-marks();
                     }
                 }
 
                 MenuItem {
                     title: Strings.wrap-behind;
                     checkable: true;
-                    checked: root.doc-wrap == 4;
+                    checked <=> root.mark-wrap-4;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(54);
+                        root.menu-marks();
                     }
                 }
 
                 MenuItem {
                     title: Strings.wrap-front;
                     checkable: true;
-                    checked: root.doc-wrap == 5;
+                    checked <=> root.mark-wrap-5;
+                    icon: root.menu-epoch;
                     enabled: root.doc-editing && root.doc-wrap >= 0;
                     activated => {
                         root.format(55);
+                        root.menu-marks();
                     }
                 }
             }
@@ -2314,8 +2363,7 @@ export component AppWindow inherits Window {
                     root.comment-clicked(index);
                 }
                 close => {
-                    root.comments-open = false;
-                    root.focus-document();
+                    root.comments-close();
                 }
                 animate width {
                     duration: 140ms;

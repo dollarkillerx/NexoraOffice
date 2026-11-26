@@ -238,7 +238,7 @@ impl DocView {
     /// The link all the text of `from..to` has, if it is one link.
     fn link_over(&self, from: &Pos, to: &Pos) -> Option<Arc<Link>> {
         let mut found: Option<Arc<Link>> = None;
-        for (path, paragraph) in self.document.paragraphs() {
+        for (path, paragraph) in self.document.paragraphs_in(from.path.story) {
             if path < from.path || path > to.path {
                 continue;
             }

@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use aster_writer::edit::{self, Selection, StepKind};
-use aster_writer::{Block, Break, Document, Path, Pos};
+use aster_writer::{Block, Break, Document, Path, Pos, StoryId};
 
 use super::compose::with_paragraph;
 use super::text::{
@@ -135,21 +135,39 @@ impl DocView {
         if self.compose.is_some() || self.resizing.is_some() || !self.ensure_paragraph() {
             return false;
         }
-        let Some(selection) = self.selection_value() else {
+        let Some(old_selection) = self.selection_value() else {
             return false;
         };
         let before = self.document.clone();
         let mut document = before.clone();
+        // Entered but not made yet: the header or footer is made now, and the
+        // edit is made in it. What undo goes back to is the document without
+        // it and the selection in the body.
+        let mut selection = old_selection.clone();
+        let mut base = None;
+        if let Some(new) = self.new_marginal.clone() {
+            let Some(story) = edit::ensure_marginal(&mut document, new.section, new.kind, new.slot)
+            else {
+                return false;
+            };
+            let Some(start) = document.story_start(story) else {
+                return false;
+            };
+            selection = Selection::caret(start);
+            base = Some(document.clone());
+        }
         let Some(after) = edit(&mut document, &selection) else {
             return false;
         };
-        if check && document == before {
+        // Making the story is not a change a no-op edit may make.
+        if check && document == base.unwrap_or_else(|| before.clone()) {
             return false;
         }
         if self.last_edit.is_some_and(|at| at.elapsed() > PAUSE) {
             self.history.seal();
         }
-        self.history.record(&before, &selection, &after, kind);
+        self.history.record(&before, &old_selection, &after, kind);
+        self.new_marginal = None;
         self.document = document;
         self.last_edit = Some(Instant::now());
         self.revision += 1;
@@ -166,11 +184,25 @@ impl DocView {
                 focus: start,
             }),
         };
+        self.keep_page();
         self.relayout();
         self.press = None;
         self.touch();
         self.reveal_caret();
         true
+    }
+
+    /// After the caret has moved by an edit or by undo: the page matters
+    /// for headers and footers only, and they are on the page the caret was
+    /// (or the first showing them).
+    fn keep_page(&mut self) {
+        if !matches!(
+            self.sel.as_ref().map(|s| s.focus.path.story),
+            Some(StoryId::Marginal(_))
+        ) {
+            self.page = None;
+            self.body_sel = None;
+        }
     }
 
     /// The caret after the selection is taken out (a caret stays).
@@ -227,6 +259,9 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        if self.new_marginal.is_some() {
+            return false;
+        }
         self.apply(None, false, |document, selection| {
             let at = Self::clear_range(document, selection);
             Some(Selection::caret(edit::split_paragraph(document, &at)))
@@ -239,6 +274,9 @@ impl DocView {
         // wait for it to end, as in the Markdown editor; only a commit
         // enters composed text.
         if self.compose.is_some() {
+            return false;
+        }
+        if self.new_marginal.is_some() {
             return false;
         }
         self.apply(None, false, |document, selection| {
@@ -257,10 +295,15 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        // Deleting is for text that is there.
+        if self.new_marginal.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
         let focus = sel.focus.clone();
+        let page = self.page_for(focus.path.story);
         let target = if sel.anchor != sel.focus {
             None
         } else {
@@ -275,7 +318,7 @@ impl DocView {
                 Unit::Word => word_before(&text, at),
                 Unit::Line => self
                     .layout
-                    .line_start(&focus)
+                    .line_start_on(page, &focus)
                     .filter(|start| start.path == focus.path && start.offset < at)
                     .map(|start| start.offset),
                 _ => None,
@@ -304,10 +347,14 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        if self.new_marginal.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
         let focus = sel.focus.clone();
+        let page = self.page_for(focus.path.story);
         let target = if sel.anchor != sel.focus {
             None
         } else {
@@ -322,7 +369,7 @@ impl DocView {
                 Unit::Word => word_after(&text, at),
                 Unit::Line => self
                     .layout
-                    .line_end(&focus)
+                    .line_end_on(page, &focus)
                     .filter(|end| end.path == focus.path && end.offset > at)
                     .map(|end| end.offset),
                 _ => None,
@@ -362,6 +409,11 @@ impl DocView {
         };
         if self.compose.is_some() {
             return false;
+        }
+        // In a header or footer not made yet a tab is a tab; the lists and
+        // tables are the body's.
+        if self.new_marginal.is_some() {
+            return !shift && self.type_text("\t");
         }
         let focus = sel.focus.clone();
         let at_start_of_item = sel.anchor == sel.focus
@@ -540,6 +592,8 @@ impl DocView {
             }),
         };
         self.find = None;
+        self.new_marginal = None;
+        self.keep_page();
         self.relayout();
         self.press = None;
         self.touch();

@@ -560,7 +560,7 @@ fn other_stories(doc: &Document, out: &mut Map<String, Value>) {
     if doc.has_changes() {
         out.insert(
             "tracked_changes".into(),
-            json!("the document has tracked insertions or deletions; the text shown includes deleted text"),
+            json!("the document has tracked insertions or deletions; the text shown has the insertions and leaves out the deleted text"),
         );
     }
 }

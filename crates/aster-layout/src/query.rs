@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use aster_writer::{Path, Pos};
+use aster_writer::{Document, Path, Pos};
 
 use crate::cx::Frag;
 use crate::display::{Page, Rect};
@@ -21,6 +21,16 @@ pub struct OutlineEntry {
     pub pos: Pos,
     /// Index of the page it starts on.
     pub page: usize,
+}
+
+/// Where text with a hyperlink is on a page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkRect {
+    pub page: usize,
+    /// One line of the linked text.
+    pub rect: Rect,
+    /// A URL, or `#name` for a bookmark of the document.
+    pub target: String,
 }
 
 /// Where the caret goes: a bar `height` tall from `top`, at `x`.
@@ -217,6 +227,60 @@ impl Layout {
         out
     }
 
+    /// The rectangles of linked text, one per line of it, in reading order.
+    /// `document` must be the one this was laid out from. Like the other
+    /// queries, only the body's text is covered: links in headers, footers,
+    /// notes and text boxes are not reported.
+    pub fn links(&self, document: &Document) -> Vec<LinkRect> {
+        let mut out = Vec::new();
+        for frag in &self.frags {
+            if frag.repeat {
+                continue;
+            }
+            let Some(paragraph) = document.paragraph(&frag.path) else {
+                continue;
+            };
+            let shaped = &frag.shaped;
+            let mut start = 0;
+            for run in &paragraph.runs {
+                let end = start + run.text.len();
+                if let Some(link) = &run.link
+                    && end > start
+                    && !link.target.is_empty()
+                {
+                    let range = shaped.to_shaped(start)..shaped.to_shaped(end);
+                    for r in shaped.paragraph.rects_in(range, frag.lines.clone()) {
+                        let rect =
+                            Rect::new(frag.x + r[0], frag.y + r[1], frag.x + r[2], frag.y + r[3]);
+                        // The runs of one link are separate runs; one
+                        // rectangle serves for the pieces on a line.
+                        match out.last_mut() {
+                            Some(LinkRect {
+                                page,
+                                rect: last,
+                                target,
+                            }) if *page == frag.page
+                                && *target == link.target
+                                && (last.y0 - rect.y0).abs() < 0.01
+                                && (last.y1 - rect.y1).abs() < 0.01
+                                && (rect.x0 - last.x1).abs() < 0.5 =>
+                            {
+                                last.x1 = last.x1.max(rect.x1);
+                            }
+                            _ => out.push(LinkRect {
+                                page: frag.page,
+                                rect,
+                                target: link.target.clone(),
+                            }),
+                        }
+                    }
+                }
+                start = end;
+            }
+        }
+        out
+    }
+
     /// The first place on the line `pos` is on.
     pub fn line_start(&self, pos: &Pos) -> Option<Pos> {
         let (index, line) = self.locate(pos)?;
@@ -328,5 +392,106 @@ impl Layout {
             return Some((i, n));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aster_writer::{
+        Block, Document, Link, Margins, Paragraph, Path, Pos, Run, RunLook, Section, Story,
+    };
+
+    use crate::Layouter;
+
+    fn look() -> RunLook {
+        RunLook {
+            size: 10.0,
+            ..RunLook::default()
+        }
+    }
+
+    fn linked(text: &str, target: &str) -> Run {
+        Run {
+            link: Some(Arc::new(Link {
+                target: target.into(),
+                tooltip: None,
+            })),
+            ..Run::text(text, look())
+        }
+    }
+
+    fn document(runs: Vec<Run>) -> Document {
+        let paragraph = Paragraph {
+            runs,
+            base: look(),
+            mark: look(),
+            ..Paragraph::default()
+        };
+        let section = Section {
+            page: (6_000, 4_000),
+            margins: Margins {
+                top: 400,
+                right: 400,
+                bottom: 400,
+                left: 400,
+                header: 200,
+                footer: 200,
+                gutter: 0,
+            },
+            ..Section::default()
+        };
+        Document {
+            body: Story {
+                blocks: vec![Block::paragraph(paragraph)],
+                part: None,
+            },
+            last_section: Arc::new(section),
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn linked_text_is_found_with_its_target() {
+        let document = document(vec![
+            Run::text("before ", look()),
+            linked("one", "https://example.org/"),
+            linked(" two", "https://example.org/"),
+            Run::text(" between ", look()),
+            linked("inside", "#chapter"),
+        ]);
+        let layout = Layouter::new().layout(&document);
+        let links = layout.links(&document);
+        // The two runs of the first link are one rectangle.
+        assert_eq!(links.len(), 2, "{links:?}");
+        assert_eq!(links[0].target, "https://example.org/");
+        assert_eq!(links[1].target, "#chapter");
+        let caret = |offset| layout.caret(&Pos::new(Path::body(0), offset)).unwrap();
+        // "before " is 7 bytes, the first link is "one two".
+        let (a, b) = (caret(7), caret(14));
+        let first = &links[0];
+        assert_eq!(first.page, 0);
+        assert!((first.rect.x0 - a.x).abs() < 0.5, "{first:?} {a:?}");
+        assert!((first.rect.x1 - b.x).abs() < 0.5, "{first:?} {b:?}");
+        assert!((first.rect.y0 - a.top).abs() < 0.5);
+        assert!(links[1].rect.x0 > first.rect.x1);
+    }
+
+    #[test]
+    fn linked_text_that_wraps_has_a_rectangle_per_line() {
+        let long = "word ".repeat(40);
+        let document = document(vec![linked(&long, "https://example.org/")]);
+        let layout = Layouter::new().layout(&document);
+        let links = layout.links(&document);
+        assert!(links.len() >= 3, "{links:?}");
+        assert!(links.windows(2).all(|w| w[1].rect.y0 > w[0].rect.y0));
+    }
+
+    #[test]
+    fn a_document_without_links_has_none() {
+        let document = document(vec![Run::text("plain", look())]);
+        let layout = Layouter::new().layout(&document);
+        assert!(layout.links(&document).is_empty());
     }
 }

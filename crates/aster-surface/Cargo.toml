@@ -29,4 +29,6 @@ png = { workspace = true }
 tempfile = { workspace = true }
 aster-calc = { workspace = true }
 aster-ooxml = { workspace = true }
+aster-pdf = { workspace = true }
+hayro = { workspace = true }
 zip = { workspace = true }

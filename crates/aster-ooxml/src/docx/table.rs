@@ -9,7 +9,9 @@ use aster_writer::{
 };
 
 use super::dom::{Node, flatten};
-use super::props::{Env, Sides, merge_sides, parse_border, parse_sides, shading_of};
+use super::props::{
+    Env, Sides, finalize_para, finalize_run, merge_sides, parse_border, parse_sides, shading_of,
+};
 use super::styles::{Cond, CondFormat, final_sides};
 use super::{PartState, Reader};
 
@@ -389,10 +391,9 @@ impl Reader<'_> {
                 let last_row = merged_to[r][c] + 1 == row_count;
                 let first_col = cell.col == 0;
                 let last_col = cell.col + cell.span as usize >= grid;
-                let format = style.map(|s| {
-                    let mask = cond_mask(&look, r, row_count, c, count);
-                    self.cell_format(s, mask)
-                });
+                let mask = cond_mask(&look, r, row_count, c, count);
+                let format = style.map(|s| self.cell_format(s, mask));
+                let layer = style.map(|s| self.cell_layer(s, mask));
                 let cf = format.as_deref();
                 let pr = cell.node.child("tcPr");
 
@@ -462,6 +463,7 @@ impl Reader<'_> {
                     shading: shading.flatten(),
                     margins: cell_margins,
                     align,
+                    layer,
                     source: Some(cell.range.clone()),
                 });
             }
@@ -474,6 +476,25 @@ impl Reader<'_> {
             props,
             source: Some(node.range()),
         })
+    }
+
+    /// What the table style gives the paragraphs of a cell, final, kept for
+    /// the cells that have the same.
+    fn cell_layer(&mut self, style: usize, mask: u16) -> Arc<aster_writer::CellLayer> {
+        if let Some(found) = self.cell_layers.get(&(style, mask)) {
+            return found.clone();
+        }
+        let format = self.cell_format(style, mask);
+        let styles = &self.styles;
+        let run = finalize_run(&[&styles.defaults_run, &format.run]);
+        let mut lower = styles.defaults_para.clone();
+        lower.merge(&format.para);
+        let layer = Arc::new(aster_writer::CellLayer {
+            para: finalize_para(&lower, run.size, 240),
+            run,
+        });
+        self.cell_layers.insert((style, mask), layer.clone());
+        layer
     }
 
     /// The table style's formats for a cell, kept for the cells that have

@@ -131,6 +131,7 @@ struct Reader<'p> {
     /// The headers and footers the last section had.
     inherited: (Marginals, Marginals),
     cell_formats: HashMap<(usize, u16), Arc<CondFormat>>,
+    cell_layers: HashMap<(usize, u16), Arc<aster_writer::CellLayer>>,
     bases: HashMap<(usize, usize), Arc<ParaBase>>,
     /// The first thing that went wrong that the file cannot be shown
     /// without.
@@ -267,6 +268,7 @@ pub fn read_package(package: &mut Package) -> Result<Document> {
         marginal_index: HashMap::new(),
         inherited: (Marginals::default(), Marginals::default()),
         cell_formats: HashMap::new(),
+        cell_layers: HashMap::new(),
         bases: HashMap::new(),
         error: None,
     };

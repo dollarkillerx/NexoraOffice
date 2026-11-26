@@ -29,7 +29,14 @@ use std::sync::Arc;
 
 use crate::{
     Align, Block, Break, Document, Inline, LineSpacing, List, ListLevel, ListRef, NumberFormat,
-    Numbering, Paragraph, Path, Pos, Run, RunLook, RunPatch, Suffix, Twips,
+    Numbering, ParaProps, Paragraph, Path, Pos, Run, RunLook, RunPatch, Suffix, Twips,
+};
+
+pub use link::{insert_link, link_range, set_link};
+pub use picture::{ImageFormat, PictureError, image_format, insert_picture, resize_drawing};
+pub use table::{
+    CellPos, cell_at, check_table, delete_columns, delete_rows, delete_table, insert_columns,
+    insert_rows, insert_table,
 };
 
 /// How far one step of indenting moves a paragraph, in twips (half an inch).
@@ -921,38 +928,94 @@ pub fn set_space_after(doc: &mut Document, from: &Pos, to: &Pos, space: Twips) {
 }
 
 /// Give the paragraphs the range touches the paragraph style `style_id`: its
-/// properties and base look. Where a run's look had what the old base gave it
-/// (it was inherited) it takes the new base's; what the run set stays. A name
-/// that is no paragraph style does nothing.
+/// properties and base look, with what the table style of the cell a
+/// paragraph is in gives it where the style sets nothing ([`style_base`]).
+/// Where a run's look had what the old base gave it (it was inherited) it
+/// takes the new base's; what the run set stays. A name that is no paragraph
+/// style does nothing.
 pub fn set_style(doc: &mut Document, from: &Pos, to: &Pos, style_id: &str) {
     let styles = doc.styles.clone();
-    let Some(style) = styles
+    if !styles
         .get(style_id)
-        .filter(|s| s.kind == crate::StyleKind::Paragraph)
-    else {
+        .is_some_and(|s| s.kind == crate::StyleKind::Paragraph)
+    {
+        return;
+    }
+    let Some((f, t)) = ends(doc, from, to) else {
         return;
     };
-    let wanted = |p: &Paragraph| {
-        let old = styles.paragraph_look(p.props.style.as_deref()).1;
-        p.props != style.para || rebased(&p.base, old, &style.run, &styles.default_run) != p.base
-    };
-    for_paragraphs(
-        doc,
-        from,
-        to,
-        |p| {
-            let old = styles.paragraph_look(p.props.style.as_deref()).1.clone();
-            let base = rebased(&p.base, &old, &style.run, &styles.default_run);
+    for path in paths_between(doc, &f.path, &t.path) {
+        let layer = cell_layer_of(doc, &path);
+        let (props, base) = style_base(&styles, layer.as_deref(), Some(style_id));
+        let wanted = doc
+            .paragraph(&path)
+            .is_some_and(|p| p.props != props || p.base != base);
+        if !wanted {
+            continue;
+        }
+        if let Some(p) = doc.paragraph_mut(&path) {
             for run in &mut p.runs {
                 rebase_look(&mut run.look, &p.base, &base);
             }
             rebase_look(&mut p.mark, &p.base, &base);
             p.base = base;
-            p.props = style.para.clone();
-        },
-        wanted,
-    );
+            p.props = props;
+        }
+    }
     doc.renumber();
+}
+
+/// What the table style of the cell `path` is in gives its paragraphs.
+fn cell_layer_of(doc: &Document, path: &Path) -> Option<Arc<crate::CellLayer>> {
+    let (table, row, cell, _) = path.in_cell()?;
+    doc.block(&table)?
+        .as_table()?
+        .rows
+        .get(row)?
+        .cells
+        .get(cell)?
+        .layer
+        .clone()
+}
+
+/// The properties and the base look a paragraph of style `style` (`None`
+/// for the document's default style) has in a cell whose table style gives
+/// `layer`, built the way the reader builds them: the document defaults,
+/// then the table style, then the paragraph style. What the paragraph style
+/// sets is what differs from the document defaults (the style sheet is
+/// final and does not say which values were written in the style); where it
+/// sets nothing, the table style's value shows through. A style that sets a
+/// value equal to the document default explicitly, against a table style
+/// that sets another, is the one case this gets wrong.
+pub fn style_base(
+    styles: &crate::StyleSheet,
+    layer: Option<&crate::CellLayer>,
+    style: Option<&str>,
+) -> (ParaProps, RunLook) {
+    let (para, run) = styles.paragraph_look(style);
+    let (mut para, mut run) = (para.clone(), run.clone());
+    let Some(layer) = layer else {
+        return (para, run);
+    };
+    macro_rules! layered {
+        ($out:ident, $layer:expr, $defaults:expr; $($f:ident),+) => {
+            $( if $out.$f == $defaults.$f && $layer.$f != $defaults.$f {
+                $out.$f = $layer.$f.clone();
+            } )+
+        };
+    }
+    layered!(
+        run, layer.run, styles.default_run; font, east_asian_font, size, bold, italic, underline,
+        strike, double_strike, color, highlight, shading, position, caps, small_caps, hidden,
+        spacing, scale, raise
+    );
+    layered!(
+        para, layer.para, styles.default_para; align, indent_left, indent_right, first_line,
+        space_before, space_after, line, contextual_spacing, keep_next, keep_lines,
+        page_break_before, widow_control, outline_level, tabs, borders, border_between, shading,
+        snap_to_grid
+    );
+    (para, run)
 }
 
 /// The base look of a paragraph that moves from the style whose look is
@@ -1645,5 +1708,11 @@ impl History {
     }
 }
 
+mod link;
+mod picture;
+mod table;
+
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 mod tests;

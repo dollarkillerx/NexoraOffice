@@ -1,4 +1,4 @@
-import { ListView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { Tokens, Icons, Strings, CommentItem } from "tokens.slint";
 import { IconButton, VHairline } from "widgets.slint";
 
@@ -8,7 +8,20 @@ component CommentRow inherits Rectangle {
     in property <CommentItem> item;
     in property <length> available;
     callback clicked;
+    // The row was chosen from the list itself (see `touch`).
+    callback reveal(length, length);
     height: column.preferred-height + 2 * Tokens.space-sm;
+
+    // The row that the caret's comment is: shown in full when it becomes the
+    // current one, unless the click on it in this list is what made it so.
+    property <bool> current: root.item.current;
+    property <bool> chosen-here;
+    changed current => {
+        if root.current && !root.chosen-here {
+            root.reveal(root.y, root.height);
+        }
+        root.chosen-here = false;
+    }
 
     Rectangle {
         x: Tokens.space-xs;
@@ -61,6 +74,7 @@ component CommentRow inherits Rectangle {
 
     touch := TouchArea {
         clicked => {
+            root.chosen-here = true;
             root.clicked();
         }
     }
@@ -74,6 +88,8 @@ export component CommentsPanel inherits Rectangle {
     in property <[CommentItem]> items;
     callback clicked(int);
     callback close();
+    // How far the list is scrolled (zero or less), for tests.
+    out property <length> offset: list.content-y;
     background: Tokens.panel;
     clip: true;
 
@@ -120,13 +136,27 @@ export component CommentsPanel inherits Rectangle {
             }
         }
 
-        ListView {
+        // Every row is laid out (comments are few), so that the place of a
+        // row is known and the list can scroll to it.
+        list := ScrollView {
             vertical-stretch: 1;
-            for item[index] in root.items: CommentRow {
-                item: item;
-                available: root.panel-width - 1px;
-                clicked => {
-                    root.clicked(index);
+            VerticalLayout {
+                alignment: start;
+                for item[index] in root.items: CommentRow {
+                    item: item;
+                    available: root.panel-width - 1px;
+                    clicked => {
+                        root.clicked(index);
+                    }
+                    reveal(y, height) => {
+                        // Just enough to show it whole; one taller than the
+                        // list shows its top.
+                        if (y + list.content-y < 0) {
+                            list.content-y = -y;
+                        } else if (y + height + list.content-y > list.visible-height) {
+                            list.content-y = max(-y, list.visible-height - y - height);
+                        }
+                    }
                 }
             }
         }

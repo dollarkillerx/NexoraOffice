@@ -163,6 +163,8 @@ export component AppWindow inherits Window {
     in-out property <bool> comments-open;
     // The comments panel's close button.
     callback comments-close();
+    // How far the panel's list is scrolled, for tests.
+    out property <length> comments-scroll: comments-panel.offset;
     in property <[CommentItem]> comments;
     callback comment-clicked(int);
     // A question asking for one line of text: go to line, rename.
@@ -2356,7 +2358,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            CommentsPanel {
+            comments-panel := CommentsPanel {
                 width: root.viewer == 4 && root.comments-open ? self.panel-width : 0px;
                 items: root.comments;
                 clicked(index) => {

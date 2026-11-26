@@ -11130,6 +11130,91 @@ mod ui_tests {
         assert!(!with_doc(&app, |tab| tab.view.show_markup()));
     }
 
+    #[test]
+    fn the_comments_panel_scrolls_to_the_comment_that_was_clicked_in_the_text() {
+        use aster_writer::{
+            Annotation, Block, Comment, Inline, Paragraph, Path, Pos, Run, RunLook,
+        };
+        use std::sync::Arc;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        let look = RunLook {
+            size: 12.0,
+            ..RunLook::default()
+        };
+        let marker = |annotation: Annotation| {
+            let mut run = Run::object(Inline::Marker, look.clone());
+            run.annotation = Some(annotation);
+            run
+        };
+        let count = 12;
+        with_doc(&app, |tab| {
+            tab.view.edit_document(|doc, _| {
+                doc.body.blocks = (0..count)
+                    .map(|i| {
+                        Block::paragraph(Paragraph {
+                            runs: vec![
+                                marker(Annotation::CommentStart(i + 1)),
+                                Run::text(format!("text {i}"), look.clone()),
+                                marker(Annotation::CommentEnd(i + 1)),
+                                marker(Annotation::CommentReference(i + 1)),
+                            ],
+                            base: look.clone(),
+                            mark: look.clone(),
+                            ..Paragraph::default()
+                        })
+                    })
+                    .collect();
+                doc.comments = (0..count)
+                    .map(|i| {
+                        Arc::new(Comment {
+                            id: i + 1,
+                            author: "Cy".into(),
+                            initials: "C".into(),
+                            date: None,
+                            // Rows of different heights.
+                            paragraphs: vec![
+                                "a comment that is long enough to wrap "
+                                    .repeat(1 + (i as usize % 3) * 3),
+                            ],
+                        })
+                    })
+                    .collect();
+                doc.renumber();
+                Some(aster_writer::edit::Selection::caret(Pos::new(
+                    Path::body(0),
+                    0,
+                )))
+            });
+        });
+        writer_ui::after_edit(ui, &mut app.shell.borrow_mut());
+        ui.invoke_review(7);
+        assert_eq!(ui.get_comments().row_count(), count as usize);
+        let settle = || slint::platform::update_timers_and_animations();
+        settle();
+        assert_eq!(ui.get_comments_scroll(), 0.0);
+        let click_comment = |id: i64| {
+            let at = find_point(&app, |view, x, y| view.comment_at(x, y) == Some(id));
+            click_document(&app, at);
+            settle();
+        };
+        // The last comment's row is below the fold: the list goes there.
+        click_comment(count);
+        let down = ui.get_comments_scroll();
+        assert!(down < 0.0, "the list scrolled: {down}");
+        // One that is in view is not scrolled to.
+        click_comment(count - 1);
+        let near = ui.get_comments_scroll();
+        assert!(near >= down && near <= 0.0, "{near} after {down}");
+        // The first: back at the top.
+        click_comment(1);
+        assert_eq!(ui.get_comments_scroll(), 0.0);
+        // And the next one on the first screen leaves it there.
+        click_comment(2);
+        assert_eq!(ui.get_comments_scroll(), 0.0);
+    }
+
     /// A document with, in its first paragraph, text inserted by Ann and
     /// deleted by Bob, and in its second a comment of Cy on "cd".
     fn make_reviewed(app: &App) {

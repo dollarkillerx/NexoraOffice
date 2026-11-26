@@ -178,8 +178,32 @@ fn refresh_comments(ui: &AppWindow, shell: &mut Shell) {
         })
         .collect();
     use slint::Model;
-    if rows == tab.comments_shown && ui.get_comments().row_count() == rows.len() {
-        return;
+    let shown = ui.get_comments();
+    if shown.row_count() == rows.len() {
+        if rows == tab.comments_shown {
+            return;
+        }
+        // Only the one the caret is in has changed: the rows stay, so that
+        // the list keeps its scroll and shows the new current one.
+        let same = rows.len() == tab.comments_shown.len()
+            && rows.iter().zip(&tab.comments_shown).all(|(new, old)| {
+                ShownComment {
+                    current: old.current,
+                    ..new.clone()
+                } == *old
+            });
+        if same {
+            for (index, (new, old)) in rows.iter().zip(&tab.comments_shown).enumerate() {
+                if new.current != old.current
+                    && let Some(mut item) = shown.row_data(index)
+                {
+                    item.current = new.current;
+                    shown.set_row_data(index, item);
+                }
+            }
+            tab.comments_shown = rows;
+            return;
+        }
     }
     let items: Vec<CommentItem> = rows
         .iter()

@@ -1555,7 +1555,14 @@ impl<'a> Saver<'a> {
             return (!element.is_empty() && is_balanced(element)).then(|| element.to_owned());
         }
         let same = self.unchanged(run, origin, base);
-        let src_look = self.effective(origin, base);
+        let mut src_look = self.effective(origin, base);
+        if run.style != origin.style {
+            // A character style given or taken: the look the run had is
+            // compared with what the new style makes of it, so that what
+            // the style itself says is not written again as direct
+            // formatting.
+            src_look = self.restyled(&src_look, &origin.style, &run.style, base);
+        }
         let (start_tag, qname, rpr_old, content) = match &origin.parent {
             None => {
                 if !is_element(element, "r") {
@@ -1660,6 +1667,62 @@ impl<'a> Saver<'a> {
             raise
         );
         look
+    }
+
+    /// `look`, a run's look under character style `from`, as it would be
+    /// under `to`: what `from` set (and the look still has) goes back to the
+    /// base, then what `to` sets is applied to what is left at the base.
+    /// What the run has of its own stays, which is why only values equal to
+    /// the base or to `from` are touched.
+    fn restyled(
+        &self,
+        look: &RunLook,
+        from: &Option<Arc<str>>,
+        to: &Option<Arc<str>>,
+        base: &RunLook,
+    ) -> RunLook {
+        let styles = &self.document.styles;
+        let default = &styles.default_run;
+        let mut out = look.clone();
+        macro_rules! fields {
+            ($($f:ident),+) => {
+                $(
+                    if let Some(style) = from.as_deref().and_then(|id| styles.get(id))
+                        && style.run.$f != default.$f
+                        && out.$f == style.run.$f
+                    {
+                        out.$f = base.$f.clone();
+                    }
+                    if let Some(style) = to.as_deref().and_then(|id| styles.get(id))
+                        && style.run.$f != default.$f
+                        && out.$f == base.$f
+                    {
+                        out.$f = style.run.$f.clone();
+                    }
+                )+
+            };
+        }
+        fields!(
+            font,
+            east_asian_font,
+            size,
+            bold,
+            italic,
+            underline,
+            strike,
+            double_strike,
+            color,
+            highlight,
+            shading,
+            position,
+            caps,
+            small_caps,
+            hidden,
+            spacing,
+            scale,
+            raise
+        );
+        out
     }
 
     fn text_element(&self, text: &str) -> String {

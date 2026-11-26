@@ -6,11 +6,11 @@ use crate::{
     StyleKind, StyleSheet, Table, VMerge, paragraphs_of,
 };
 
-fn look() -> RunLook {
+pub(super) fn look() -> RunLook {
     RunLook::default()
 }
 
-fn text_para(text: &str) -> Paragraph {
+pub(super) fn text_para(text: &str) -> Paragraph {
     Paragraph {
         runs: if text.is_empty() {
             Vec::new()
@@ -21,7 +21,7 @@ fn text_para(text: &str) -> Paragraph {
     }
 }
 
-fn doc_of(texts: &[&str]) -> Document {
+pub(super) fn doc_of(texts: &[&str]) -> Document {
     Document {
         body: Story {
             blocks: texts
@@ -34,20 +34,20 @@ fn doc_of(texts: &[&str]) -> Document {
     }
 }
 
-fn pos(block: usize, offset: usize) -> Pos {
+pub(super) fn pos(block: usize, offset: usize) -> Pos {
     Pos::new(Path::body(block), offset)
 }
 
-fn cpos(table: usize, row: usize, cell: usize, offset: usize) -> Pos {
+pub(super) fn cpos(table: usize, row: usize, cell: usize, offset: usize) -> Pos {
     Pos::new(Path::body(table).cell_block(row, cell, 0), offset)
 }
 
-fn table_at(doc: &Document, block: usize) -> &Table {
+pub(super) fn table_at(doc: &Document, block: usize) -> &Table {
     doc.body.blocks[block].as_table().expect("a table")
 }
 
 /// Every table in the document, nested ones too, satisfies the rules.
-fn assert_valid(doc: &Document) {
+pub(super) fn assert_valid(doc: &Document) {
     fn walk(blocks: &[Block]) {
         for block in blocks {
             if let Block::Table(t) = block {
@@ -64,7 +64,7 @@ fn assert_valid(doc: &Document) {
 }
 
 /// A table whose cells hold their own coordinates as text: `r0c1`.
-fn labelled(rows: usize, columns: usize) -> Table {
+pub(super) fn labelled(rows: usize, columns: usize) -> Table {
     Table {
         columns: vec![1000; columns],
         rows: (0..rows)
@@ -82,14 +82,14 @@ fn labelled(rows: usize, columns: usize) -> Table {
     }
 }
 
-fn with_table(table: Table) -> Document {
+pub(super) fn with_table(table: Table) -> Document {
     let mut doc = doc_of(&["before"]);
     doc.body.blocks.push(Block::table(table));
     doc.body.blocks.push(Block::paragraph(text_para("after")));
     doc
 }
 
-fn cell_texts(table: &Table) -> Vec<Vec<String>> {
+pub(super) fn cell_texts(table: &Table) -> Vec<Vec<String>> {
     table
         .rows
         .iter()
@@ -108,7 +108,7 @@ fn cell_texts(table: &Table) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn strs(rows: &[&[&str]]) -> Vec<Vec<String>> {
+pub(super) fn strs(rows: &[&[&str]]) -> Vec<Vec<String>> {
     rows.iter()
         .map(|r| r.iter().map(|s| (*s).to_owned()).collect())
         .collect()

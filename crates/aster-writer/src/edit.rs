@@ -35,8 +35,11 @@ use crate::{
 pub use link::{insert_link, link_range, set_link};
 pub use picture::{ImageFormat, PictureError, image_format, insert_picture, resize_drawing};
 pub use table::{
-    CellPos, available_width, cell_at, check_table, delete_columns, delete_rows, delete_table,
-    fit_table, insert_columns, insert_rows, insert_table, space_for_block,
+    CellPos, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, available_width,
+    can_merge_cells, can_split_cell, can_unmerge_cell, cell_at, check_table, delete_columns,
+    delete_rows, delete_table, fit_table, insert_columns, insert_rows, insert_table, merge_cells,
+    move_column_border, set_column_width, set_row_height, space_for_block, split_cell,
+    unmerge_cell,
 };
 
 /// How far one step of indenting moves a paragraph, in twips (half an inch).

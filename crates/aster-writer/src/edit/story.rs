@@ -103,19 +103,22 @@ fn note_paragraph(doc: &Document, id: i32) -> (Paragraph, usize) {
         .get(FOOTNOTE_TEXT)
         .is_some_and(|s| s.kind == StyleKind::Paragraph);
     let (props, base) = styles.paragraph_look(has_style.then_some(FOOTNOTE_TEXT));
-    let (mut props, mut base) = (props.clone(), base.clone());
+    let (mut props, base) = (props.clone(), base.clone());
+    // What the style sheet does not give is direct formatting of the runs
+    // and the mark, not of the paragraph's base look, as a file has it.
+    let mut look = base.clone();
     if has_style {
         props.style = Some(Arc::from(FOOTNOTE_TEXT));
     } else {
-        base.size = base.size.min(NOTE_POINTS);
+        look.size = look.size.min(NOTE_POINTS);
         props.space_after = 0;
     }
-    let mark = reference_run(doc, Inline::Footnote(id), &base);
-    let space = Run::text(" ", base.clone());
+    let mark = reference_run(doc, Inline::Footnote(id), &look);
+    let space = Run::text(" ", look.clone());
     let paragraph = Paragraph {
         runs: vec![mark, space],
         props,
-        mark: base.clone(),
+        mark: look,
         base,
         ..Paragraph::default()
     };

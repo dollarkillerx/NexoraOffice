@@ -486,13 +486,21 @@ fn every_edit_saves_and_reads_back() {
         edit(&mut doc);
         assert!(!same_content(&before, &doc), "{name} changed nothing");
         let numbering = doc.numbering.lists.len() != before.numbering.lists.len();
-        let may: &[&str] = if numbering {
-            &["word/numbering.xml"]
+        let mut may: Vec<&str> = if numbering {
+            vec!["word/numbering.xml"]
         } else {
-            &[]
+            Vec::new()
         };
+        // Deleting a reference takes its note with it.
+        let was = read(&bytes);
+        if doc.footnotes.notes.len() != was.footnotes.notes.len() {
+            may.push("word/footnotes.xml");
+        }
+        if doc.endnotes.notes.len() != was.endnotes.notes.len() {
+            may.push("word/endnotes.xml");
+        }
         eprintln!("edit: {name}");
-        check(&bytes, &doc, may);
+        check(&bytes, &doc, &may);
     }
 }
 
@@ -1330,13 +1338,21 @@ fn random_edits_save_and_read_back() {
             continue;
         }
         let numbering = doc.numbering.lists.len() > read(&bytes).numbering.lists.len();
-        let may: &[&str] = if numbering {
-            &["word/numbering.xml"]
+        let mut may: Vec<&str> = if numbering {
+            vec!["word/numbering.xml"]
         } else {
-            &[]
+            Vec::new()
         };
+        // Deleting a reference takes its note with it.
+        let was = read(&bytes);
+        if doc.footnotes.notes.len() != was.footnotes.notes.len() {
+            may.push("word/footnotes.xml");
+        }
+        if doc.endnotes.notes.len() != was.endnotes.notes.len() {
+            may.push("word/endnotes.xml");
+        }
         let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&bytes, &doc, may)));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&bytes, &doc, &may)));
         if let Err(err) = result {
             eprintln!("seed {seed} failed after {steps} edits: {log:#?}");
             std::panic::resume_unwind(err);

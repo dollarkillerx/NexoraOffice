@@ -298,6 +298,8 @@ fn a_footnote_has_a_reference_and_a_note_with_one_empty_paragraph() {
     assert_eq!(n.text(), format!("{OBJECT} "));
     assert_eq!(selection.focus.offset, n.len());
     assert!(n.runs[1].look.size <= 10.0);
+    // Direct formatting: the paragraph's base look is the style sheet's.
+    assert_eq!(n.base, doc.styles.default_run);
     // Typing goes into the note.
     let caret = insert_text(&mut doc, &selection.focus, "Source", None);
     assert_eq!(caret.path.story, StoryId::Footnote(id));
@@ -371,7 +373,7 @@ fn a_footnote_uses_the_documents_note_styles_when_it_has_them() {
 fn deleting_a_reference_takes_its_note_and_undo_brings_it_back() {
     let mut doc = sample();
     let mut history = History::default();
-    let selection = insert_footnote(&mut doc, &body(1, 2)).unwrap();
+    insert_footnote(&mut doc, &body(1, 2)).unwrap();
     assert_eq!(doc.footnotes.notes.len(), 2);
 
     // Backspace after the new reference removes it and its note.
@@ -391,7 +393,6 @@ fn deleting_a_reference_takes_its_note_and_undo_brings_it_back() {
     assert!(same_content(&restored, &before));
     assert_eq!(restored.footnotes.notes.len(), 2);
     assert_eq!(restored_selection.focus, after_reference);
-    let _ = selection;
 
     // A range that covers the reference of note 1 and more.
     let mut doc = sample();

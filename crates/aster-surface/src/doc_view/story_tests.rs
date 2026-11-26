@@ -546,3 +546,33 @@ fn find_stays_in_the_body() {
     // "Head text", "Foot text" and the note's text are not found.
     assert_eq!(count, 0);
 }
+
+#[test]
+fn deleting_a_table_that_holds_the_only_reference_takes_the_note_and_undo_brings_it_back() {
+    use aster_writer::{Cell, Row, Table};
+    let mut document = sample(false);
+    let mut with_ref = paragraph("in the cell");
+    with_ref.runs.push(Run::object(Inline::Footnote(1), look()));
+    document.body.blocks[0] = pb("before");
+    document.body.blocks.insert(
+        1,
+        Block::table(Table {
+            columns: vec![2000],
+            rows: vec![Row {
+                cells: vec![Cell {
+                    blocks: vec![Block::paragraph(with_ref)],
+                    ..Cell::default()
+                }],
+                ..Row::default()
+            }],
+            ..Table::default()
+        }),
+    );
+    let mut view = view_of(document);
+    let inside = Pos::new(Path::body(1).cell_block(0, 0, 0), 2);
+    view.set_selection(inside.clone(), inside);
+    assert!(view.command(DocCommand::DeleteTable));
+    assert!(view.document().footnotes.notes.is_empty());
+    assert!(view.undo());
+    assert_eq!(view.document().footnotes.notes.len(), 1);
+}

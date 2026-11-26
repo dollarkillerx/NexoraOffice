@@ -200,7 +200,7 @@ impl DocView {
                     focus: super::text::sanitized(&self.document, sel.focus)?,
                 })
             })
-            .filter(|sel| sel.focus.path.story.is_body());
+            .filter(|sel| !matches!(sel.focus.path.story, StoryId::Marginal(_)));
         self.new_marginal = None;
         self.page = None;
         let sel = back.or_else(|| {
@@ -237,6 +237,10 @@ impl DocView {
     /// or footer, or in the body while inside a header or footer. `None`
     /// when the press is the body's ordinary one.
     pub(super) fn press_story(&mut self, x: f64, y: f64, clicks: u8, extend: bool) -> Option<bool> {
+        // The canvas around the pages is no part of any story.
+        if !self.is_over_page(x, y) {
+            return None;
+        }
         let (page, px, py) = self.locate(x, y);
         let area = self.area_at(page, px, py);
         let inside = self.in_marginal();

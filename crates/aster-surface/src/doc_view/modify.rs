@@ -159,6 +159,8 @@ impl DocView {
         let Some(after) = edit(&mut document, &selection) else {
             return false;
         };
+        // A note whose last reference the edit took away goes with it.
+        edit::drop_notes_without_references(&before, &mut document);
         // Making the story is not a change a no-op edit may make.
         if check && document == base.unwrap_or_else(|| before.clone()) {
             return false;

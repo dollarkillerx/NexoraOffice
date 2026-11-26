@@ -224,6 +224,23 @@ pub(super) fn drop_lost_notes(doc: &mut Document, candidates: &[NoteRef]) {
     doc.renumber();
 }
 
+/// After an edit that changed `after` from `before`: the notes whose last
+/// reference in the body the edit took away go too. [`delete`](super::delete)
+/// does this itself; this is for the edits that take blocks out (a table with
+/// references in it) and for whatever else may have.
+pub fn drop_notes_without_references(before: &Document, after: &mut Document) {
+    if before.footnotes.notes.is_empty() && before.endnotes.notes.is_empty() {
+        return;
+    }
+    let mut was: Vec<NoteRef> = Vec::new();
+    for (_, p) in before.paragraphs_in(StoryId::Body) {
+        refs_of(p, &mut was);
+    }
+    was.sort_unstable();
+    was.dedup();
+    drop_lost_notes(after, &was);
+}
+
 // ---------------------------------------------------------------------------
 // Headers and footers
 // ---------------------------------------------------------------------------

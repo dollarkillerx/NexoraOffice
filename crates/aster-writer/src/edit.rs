@@ -40,7 +40,10 @@ use crate::{
 
 pub use link::{insert_link, link_range, set_link};
 pub use picture::{ImageFormat, PictureError, image_format, insert_picture, resize_drawing};
-pub use story::{ensure_marginal, existing_marginal, insert_footnote, insert_page_number};
+pub use story::{
+    drop_notes_without_references, ensure_marginal, existing_marginal, insert_footnote,
+    insert_page_number,
+};
 pub use table::{
     CellPos, available_width, cell_at, check_table, delete_columns, delete_rows, delete_table,
     fit_table, insert_columns, insert_rows, insert_table, space_for_block,

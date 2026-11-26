@@ -611,3 +611,39 @@ fn a_cell_in_a_header_has_its_siblings_in_the_header() {
     let top = Path::in_story(StoryId::Marginal(0), 0);
     assert_eq!(doc.siblings(&top).unwrap().len(), 3);
 }
+
+#[test]
+fn a_note_goes_when_the_table_with_its_reference_is_deleted() {
+    let mut doc = sample();
+    // Move the reference into a table cell.
+    let mut with_ref = text_para("in cell");
+    with_ref.runs.push(Run::object(Inline::Footnote(1), look()));
+    doc.body.blocks[0] = Block::paragraph(text_para("before"));
+    doc.body.blocks.insert(
+        1,
+        Block::table(Table {
+            columns: vec![2000],
+            rows: vec![Row {
+                cells: vec![Cell {
+                    blocks: vec![Block::paragraph(with_ref)],
+                    ..Cell::default()
+                }],
+                ..Row::default()
+            }],
+            ..Table::default()
+        }),
+    );
+    let before = doc.clone();
+    let inside = Pos::new(Path::body(1).cell_block(0, 0, 0), 0);
+    delete_table(&mut doc, &inside);
+    // The model operation alone leaves the note; the view's step drops it.
+    assert_eq!(doc.footnotes.notes.len(), 1);
+    drop_notes_without_references(&before, &mut doc);
+    assert!(doc.footnotes.notes.is_empty());
+    // Nothing happens to a note that is still referred to.
+    let mut doc = sample();
+    let before = doc.clone();
+    insert_text(&mut doc, &body(1, 0), "x", None);
+    drop_notes_without_references(&before, &mut doc);
+    assert_eq!(doc.footnotes.notes.len(), 1);
+}

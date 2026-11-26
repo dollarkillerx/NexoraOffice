@@ -2,12 +2,18 @@
 //! it: which place in the text is under a point, where a place is, what a
 //! selection covers, where the arrow keys go.
 //!
-//! Only the body's text is answered for (table cells included): headers,
-//! footers, notes and text boxes are drawn but cannot be pointed at.
+//! The body's text is answered for (table cells included), and so is the
+//! text of headers, footers, footnotes and endnotes: their paragraphs have
+//! paths that name their story ([`aster_writer::StoryId`]). The plain
+//! queries ([`Layout::hit`], [`Layout::caret`], ...) take a place of the
+//! body or a note. A header or footer is shown on many pages, so for the
+//! places in one the `_on` variants take the page; [`Layout::hit_in`] and
+//! [`Layout::story_at`] say which story a point of a page is in. Text boxes
+//! are drawn but cannot be pointed at.
 
 use std::collections::HashMap;
 
-use aster_writer::{Document, Path, Pos};
+use aster_writer::{Document, MarginalSlot, Path, Pos, StoryId};
 
 use crate::cx::Frag;
 use crate::display::{Page, Rect};
@@ -42,6 +48,25 @@ pub struct Caret {
     pub height: f32,
 }
 
+/// What a page shows around its body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageInfo {
+    /// Index into `Document::sections()`.
+    pub section: usize,
+    /// The header and the footer story the page shows, as indexes into
+    /// `Document::marginals`; `None` where the section has none.
+    pub header: Option<usize>,
+    pub footer: Option<usize>,
+    /// Which header and footer of its section the page takes: the
+    /// slot to make one in when there is none.
+    pub slot: MarginalSlot,
+    /// The strip at the top of the page above the body, and the strip at
+    /// the bottom below it (where the notes end). Whether or not there is a
+    /// header or footer in them.
+    pub header_area: Rect,
+    pub footer_area: Rect,
+}
+
 /// A laid-out document.
 pub struct Layout {
     /// At least one.
@@ -51,6 +76,7 @@ pub struct Layout {
     /// Covered cells of vertical merges: the cell, and the start of the merge.
     redirects: HashMap<Path, Path>,
     outline: Vec<OutlineEntry>,
+    infos: Vec<PageInfo>,
 }
 
 impl Layout {
@@ -72,7 +98,40 @@ impl Layout {
             by_path,
             redirects: redirects.into_iter().collect(),
             outline,
+            infos: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_page_info(mut self, infos: Vec<PageInfo>) -> Self {
+        self.infos = infos;
+        self
+    }
+
+    /// What `page` shows around its body.
+    pub fn page_info(&self, page: usize) -> Option<&PageInfo> {
+        self.infos.get(page)
+    }
+
+    /// The story whose area a point of `page` is in: the header or footer
+    /// the page shows when the point is in the strip above or below the
+    /// body, a note when it is over one, else the body. `None` in the
+    /// strip of a header or footer the page does not have (a double-click
+    /// there still means to make one: see [`Layout::page_info`]).
+    pub fn story_at(&self, page: usize, x: f32, y: f32) -> Option<StoryId> {
+        if let Some(info) = self.infos.get(page) {
+            if y < info.header_area.y1 {
+                return info.header.map(StoryId::Marginal);
+            }
+            if y > info.footer_area.y0 {
+                return info.footer.map(StoryId::Marginal);
+            }
+        }
+        let note = self.frags.iter().find(|frag| {
+            frag.page == page
+                && matches!(frag.path.story, StoryId::Footnote(_) | StoryId::Endnote(_))
+                && frag.bounds.contains(x, y)
+        });
+        Some(note.map_or(StoryId::Body, |frag| frag.path.story))
     }
 
     /// Every paragraph with an outline level, in reading order.
@@ -88,8 +147,11 @@ impl Layout {
             return std::borrow::Cow::Borrowed(pos);
         }
         // The cell is the path up to some `[row, cell]`, then anything.
-        for n in (2..pos.path.0.len()).rev() {
-            if let Some(start) = self.redirects.get(&Path(pos.path.0[..n].to_vec())) {
+        for n in (2..pos.path.steps.len()).rev() {
+            if let Some(start) = self
+                .redirects
+                .get(&pos.path.with_steps(pos.path.steps[..n].to_vec()))
+            {
                 return std::borrow::Cow::Owned(Pos::new(start.clone(), 0));
             }
         }
@@ -97,8 +159,26 @@ impl Layout {
     }
 
     fn locate(&self, pos: &Pos) -> Option<(usize, usize)> {
+        self.locate_on(None, pos)
+    }
+
+    /// The fragment and line of a place. A header or footer is on many
+    /// pages: with `page` it is the one on that page.
+    fn locate_on(&self, page: Option<usize>, pos: &Pos) -> Option<(usize, usize)> {
         let pos = &*self.resolve(pos);
-        let indexes = self.by_path.get(&pos.path)?;
+        let all = self.by_path.get(&pos.path)?;
+        let on_page: Vec<usize>;
+        let indexes: &Vec<usize> = match page {
+            Some(page) if matches!(pos.path.story, StoryId::Marginal(_)) => {
+                on_page = all
+                    .iter()
+                    .copied()
+                    .filter(|i| self.frags[*i].page == page)
+                    .collect();
+                &on_page
+            }
+            _ => all,
+        };
         let first = &self.frags[*indexes.first()?];
         let off = first.shaped.to_shaped(pos.offset);
         let line = first.shaped.paragraph.line_of(off);
@@ -117,11 +197,30 @@ impl Layout {
         self.locate(pos).map(|(frag, _)| self.frags[frag].page)
     }
 
+    /// Every page a place can be seen on: the pages that show the story
+    /// for a header or footer, the one page of the line for anything else.
+    pub fn pages_of(&self, pos: &Pos) -> Vec<usize> {
+        if !matches!(pos.path.story, StoryId::Marginal(_)) {
+            return self.page_of(pos).into_iter().collect();
+        }
+        let Some(indexes) = self.by_path.get(&self.resolve(pos).path) else {
+            return Vec::new();
+        };
+        let mut pages: Vec<usize> = indexes.iter().map(|i| self.frags[*i].page).collect();
+        pages.dedup();
+        pages
+    }
+
     /// Where the caret is at `pos`; `None` for a path that is not in the
     /// body or has not been placed.
     pub fn caret(&self, pos: &Pos) -> Option<Caret> {
+        self.caret_on(None, pos)
+    }
+
+    /// The same for a place of a header or footer as shown on `page`.
+    pub fn caret_on(&self, page: Option<usize>, pos: &Pos) -> Option<Caret> {
         let pos = &*self.resolve(pos);
-        let (index, line) = self.locate(pos)?;
+        let (index, line) = self.locate_on(page, pos)?;
         let frag = &self.frags[index];
         let paragraph = &frag.shaped.paragraph;
         let off = frag.shaped.to_shaped(pos.offset);
@@ -148,10 +247,17 @@ impl Layout {
 
     /// The place nearest to a point of a page. A click beside or below a
     /// line goes to the nearest line and its nearest end.
+    ///
+    /// Only the body answers: use [`Layout::hit_in`] for the other stories.
     pub fn hit(&self, page: usize, x: f32, y: f32) -> Option<Pos> {
+        self.hit_in(page, StoryId::Body, x, y)
+    }
+
+    /// The same among the paragraphs of one story as shown on `page`.
+    pub fn hit_in(&self, page: usize, story: StoryId, x: f32, y: f32) -> Option<Pos> {
         let mut best: Option<(f32, f32, usize)> = None;
         for (index, frag) in self.frags.iter().enumerate() {
-            if frag.page != page {
+            if frag.page != page || frag.path.story != story {
                 continue;
             }
             let b = &frag.bounds;
@@ -181,13 +287,25 @@ impl Layout {
 
     /// The rectangles a selection from `a` to `b` covers, per page.
     pub fn selection(&self, a: &Pos, b: &Pos) -> Vec<(usize, Rect)> {
+        self.selection_on(None, a, b)
+    }
+
+    /// The same for a selection in a header or footer as shown on `page`.
+    /// A selection lives in one story: none for two places in different
+    /// ones.
+    pub fn selection_on(&self, page: Option<usize>, a: &Pos, b: &Pos) -> Vec<(usize, Rect)> {
         let (from, to) = if a <= b { (a, b) } else { (b, a) };
         let mut out = Vec::new();
-        if from == to {
+        if from == to || from.path.story != to.path.story {
             return out;
         }
+        let single = matches!(from.path.story, StoryId::Marginal(_));
         for frag in &self.frags {
-            if frag.repeat || frag.path < from.path || frag.path > to.path {
+            if frag.repeat
+                || frag.path < from.path
+                || frag.path > to.path
+                || (single && page.is_some_and(|p| p != frag.page))
+            {
                 continue;
             }
             let shaped = &frag.shaped;
@@ -283,7 +401,11 @@ impl Layout {
 
     /// The first place on the line `pos` is on.
     pub fn line_start(&self, pos: &Pos) -> Option<Pos> {
-        let (index, line) = self.locate(pos)?;
+        self.line_start_on(None, pos)
+    }
+
+    pub fn line_start_on(&self, page: Option<usize>, pos: &Pos) -> Option<Pos> {
+        let (index, line) = self.locate_on(page, pos)?;
         let frag = &self.frags[index];
         let off = frag.shaped.paragraph.line_start_offset(line);
         Some(Pos::new(frag.path.clone(), frag.shaped.to_orig(off)))
@@ -292,7 +414,11 @@ impl Layout {
     /// The last place on the line `pos` is on (before the space a wrapped
     /// line gave up).
     pub fn line_end(&self, pos: &Pos) -> Option<Pos> {
-        let (index, line) = self.locate(pos)?;
+        self.line_end_on(None, pos)
+    }
+
+    pub fn line_end_on(&self, page: Option<usize>, pos: &Pos) -> Option<Pos> {
+        let (index, line) = self.locate_on(page, pos)?;
         let frag = &self.frags[index];
         let off = frag.shaped.paragraph.line_end_offset(line);
         Some(Pos::new(frag.path.clone(), frag.shaped.to_orig(off)))
@@ -300,16 +426,26 @@ impl Layout {
 
     /// The place on the line above, as near `goal_x` (a page x) as it gets.
     pub fn above(&self, pos: &Pos, goal_x: f32) -> Option<Pos> {
-        self.step(pos, goal_x, true)
+        self.step(None, pos, goal_x, true)
     }
 
     /// The place on the line below.
     pub fn below(&self, pos: &Pos, goal_x: f32) -> Option<Pos> {
-        self.step(pos, goal_x, false)
+        self.step(None, pos, goal_x, false)
     }
 
-    fn step(&self, pos: &Pos, goal_x: f32, up: bool) -> Option<Pos> {
-        let (index, line) = self.locate(pos)?;
+    /// The same for places of a header or footer as shown on `page`. They
+    /// stay in the story: the first line has nothing above it.
+    pub fn above_on(&self, page: Option<usize>, pos: &Pos, goal_x: f32) -> Option<Pos> {
+        self.step(page, pos, goal_x, true)
+    }
+
+    pub fn below_on(&self, page: Option<usize>, pos: &Pos, goal_x: f32) -> Option<Pos> {
+        self.step(page, pos, goal_x, false)
+    }
+
+    fn step(&self, page: Option<usize>, pos: &Pos, goal_x: f32, up: bool) -> Option<Pos> {
+        let (index, line) = self.locate_on(page, pos)?;
         let frag = &self.frags[index];
         let target = if up && line > frag.lines.start {
             Some((index, line - 1))
@@ -338,7 +474,7 @@ impl Layout {
         let frag = &self.frags[index];
         let l = &frag.shaped.paragraph.lines()[line];
         let (top, bottom) = (frag.y + l.top, frag.y + l.top + l.height);
-        let mut steps = frag.path.0.clone();
+        let mut steps = frag.path.steps.clone();
         while steps.len() >= 4 {
             steps.truncate(steps.len() - 3);
             let mut best: Option<(f32, usize, usize)> = None;
@@ -346,8 +482,9 @@ impl Layout {
                 if i == index
                     || g.repeat
                     || g.page != frag.page
-                    || !g.path.0.starts_with(&steps)
-                    || g.path.0.len() == steps.len()
+                    || g.path.story != frag.path.story
+                    || !g.path.steps.starts_with(&steps)
+                    || g.path.steps.len() == steps.len()
                     || goal_x < g.bounds.x0
                     || goal_x > g.bounds.x1
                 {
@@ -368,10 +505,10 @@ impl Layout {
         }
         // Reading order, leaving the tables the place is in.
         let inside = |g: &Frag| {
-            let mut steps = frag.path.0.clone();
+            let mut steps = frag.path.steps.clone();
             while steps.len() >= 4 {
                 steps.truncate(steps.len() - 3);
-                if g.path.0.starts_with(&steps) {
+                if g.path.steps.starts_with(&steps) {
                     return true;
                 }
             }
@@ -384,7 +521,13 @@ impl Layout {
         };
         for i in candidates {
             let g = &self.frags[i];
-            if g.repeat || inside(g) {
+            // A story is a world of its own; a header is a different one on
+            // each page.
+            if g.repeat
+                || g.path.story != frag.path.story
+                || (matches!(frag.path.story, StoryId::Marginal(_)) && g.page != frag.page)
+                || inside(g)
+            {
                 continue;
             }
             // Of a paragraph split over pages, the part that touches this one.

@@ -175,7 +175,7 @@ impl DocView {
             return vec![look];
         }
         let mut out = Vec::new();
-        for (path, paragraph) in self.document.paragraphs() {
+        for (path, paragraph) in self.document.paragraphs_in(from.path.story) {
             if path < from.path || path > to.path {
                 continue;
             }
@@ -207,7 +207,7 @@ impl DocView {
             return Vec::new();
         };
         self.document
-            .paragraphs()
+            .paragraphs_in(from.path.story)
             .into_iter()
             .filter(|(path, _)| *path >= from.path && *path <= to.path)
             .map(|(_, p)| &**p)

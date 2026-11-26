@@ -313,7 +313,7 @@ fn a_table_in_a_cell_is_nested() {
     // "r0c1" cut after one character, the table, the rest.
     assert_eq!(cell.blocks.len(), 3);
     assert!(cell.blocks[1].as_table().is_some());
-    assert_eq!(caret.path.0, vec![1, 0, 1, 1, 0, 0, 0]);
+    assert_eq!(caret.path.steps, vec![1, 0, 1, 1, 0, 0, 0]);
     assert!(doc.paragraph(&caret.path).is_some());
     assert_valid(&doc);
 }

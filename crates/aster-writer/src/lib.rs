@@ -178,47 +178,104 @@ impl Block {
 // Positions
 // ---------------------------------------------------------------------------
 
-/// Which paragraph (or table) of the body. `[b]` is body block `b`;
-/// `[b, r, c, k]` is block `k` of cell `c` of row `r` of the table that is
-/// body block `b`; three more steps for each further table inside. Compared
-/// element by element, paths are in reading order.
+/// Which flow of blocks a path or a position is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum StoryId {
+    /// The body of the document.
+    #[default]
+    Body,
+    /// A header or footer: an index into [`Document::marginals`].
+    Marginal(usize),
+    /// A footnote, by [`Note::id`].
+    Footnote(i32),
+    /// An endnote, by [`Note::id`].
+    Endnote(i32),
+}
+
+impl StoryId {
+    /// A note or a header or footer, not the body.
+    pub fn is_body(&self) -> bool {
+        matches!(self, StoryId::Body)
+    }
+}
+
+/// Which paragraph (or table) of a story. In the body (the default),
+/// `[b]` is body block `b`; `[b, r, c, k]` is block `k` of cell `c` of row
+/// `r` of the table that is body block `b`; three more steps for each
+/// further table inside. The same holds in any other story, whose blocks
+/// are numbered the same way. Compared story first, then step by step, so
+/// that paths of one story are in reading order.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Path(pub Vec<u32>);
+pub struct Path {
+    pub story: StoryId,
+    pub steps: Vec<u32>,
+}
+
+impl From<Vec<u32>> for Path {
+    /// The path of the body with these steps.
+    fn from(steps: Vec<u32>) -> Self {
+        Path {
+            story: StoryId::Body,
+            steps,
+        }
+    }
+}
 
 impl Path {
+    /// Block `block` of the body.
     pub fn body(block: usize) -> Self {
-        Path(vec![block as u32])
+        Path {
+            story: StoryId::Body,
+            steps: vec![block as u32],
+        }
+    }
+
+    /// Block `block` of `story`.
+    pub fn in_story(story: StoryId, block: usize) -> Self {
+        Path {
+            story,
+            steps: vec![block as u32],
+        }
+    }
+
+    /// The path made of `steps` in the same story as `self`.
+    pub fn with_steps(&self, steps: Vec<u32>) -> Self {
+        Path {
+            story: self.story,
+            steps,
+        }
     }
 
     /// Block `block` of cell `cell` of row `row` of the table at `self`.
     pub fn cell_block(&self, row: usize, cell: usize, block: usize) -> Self {
-        let mut steps = self.0.clone();
+        let mut steps = self.steps.clone();
         steps.extend([row as u32, cell as u32, block as u32]);
-        Path(steps)
+        self.with_steps(steps)
     }
 
     /// Inside a table: the path of the innermost table and the row, cell
     /// and block within it.
     pub fn in_cell(&self) -> Option<(Path, usize, usize, usize)> {
-        let n = self.0.len();
+        let n = self.steps.len();
         (n >= 4).then(|| {
             (
-                Path(self.0[..n - 3].to_vec()),
-                self.0[n - 3] as usize,
-                self.0[n - 2] as usize,
-                self.0[n - 1] as usize,
+                self.with_steps(self.steps[..n - 3].to_vec()),
+                self.steps[n - 3] as usize,
+                self.steps[n - 2] as usize,
+                self.steps[n - 1] as usize,
             )
         })
     }
 
-    /// The body block it is in or under.
+    /// The block of its story it is in or under.
     pub fn top(&self) -> usize {
-        self.0.first().map_or(0, |step| *step as usize)
+        self.steps.first().map_or(0, |step| *step as usize)
     }
 }
 
-/// A place in the body's text: a paragraph and a byte offset into its text.
-/// Ordered in reading order.
+/// A place in a story's text: a paragraph and a byte offset into its text.
+/// Ordered in reading order (paths of different stories are ordered by
+/// story, which means nothing but keeps the order total).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Pos {
     pub path: Path,
@@ -228,6 +285,10 @@ pub struct Pos {
 impl Pos {
     pub fn new(path: Path, offset: usize) -> Self {
         Self { path, offset }
+    }
+
+    pub fn story(&self) -> StoryId {
+        self.path.story
     }
 }
 
@@ -267,12 +328,12 @@ fn block_at_mut<'a>(blocks: &'a mut [Block], steps: &[u32]) -> Option<&'a mut Bl
 fn walk<'a>(
     blocks: &'a [Block],
     prefix: &mut Vec<u32>,
-    visit: &mut dyn FnMut(&Path, &'a Arc<Paragraph>),
+    visit: &mut dyn FnMut(&[u32], &'a Arc<Paragraph>),
 ) {
     for (index, block) in blocks.iter().enumerate() {
         prefix.push(index as u32);
         match block {
-            Block::Paragraph(paragraph) => visit(&Path(prefix.clone()), paragraph),
+            Block::Paragraph(paragraph) => visit(prefix, paragraph),
             Block::Table(table) => {
                 for (r, row) in table.rows.iter().enumerate() {
                     for (c, cell) in row.cells.iter().enumerate() {
@@ -292,18 +353,62 @@ fn walk<'a>(
 pub fn paragraphs_of(blocks: &[Block]) -> Vec<(Path, &Arc<Paragraph>)> {
     let mut out = Vec::new();
     walk(blocks, &mut Vec::new(), &mut |path, paragraph| {
-        out.push((path.clone(), paragraph));
+        out.push((Path::body(0).with_steps(path.to_vec()), paragraph));
     });
     out
 }
 
 impl Document {
-    /// The block at `path` in the body.
-    pub fn block(&self, path: &Path) -> Option<&Block> {
-        block_at(&self.body.blocks, &path.0)
+    /// The blocks of `story`, if there is such a story.
+    pub fn story_blocks(&self, story: StoryId) -> Option<&Vec<Block>> {
+        match story {
+            StoryId::Body => Some(&self.body.blocks),
+            StoryId::Marginal(index) => self.marginals.get(index).map(|s| &s.blocks),
+            StoryId::Footnote(id) => self
+                .footnotes
+                .notes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| &n.blocks),
+            StoryId::Endnote(id) => self
+                .endnotes
+                .notes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| &n.blocks),
+        }
     }
 
-    /// The paragraph at `path` in the body.
+    /// The same, to change. A header or footer shared with other documents
+    /// of the undo history is copied first.
+    pub fn story_blocks_mut(&mut self, story: StoryId) -> Option<&mut Vec<Block>> {
+        match story {
+            StoryId::Body => Some(&mut self.body.blocks),
+            StoryId::Marginal(index) => self
+                .marginals
+                .get_mut(index)
+                .map(|s| &mut Arc::make_mut(s).blocks),
+            StoryId::Footnote(id) => self
+                .footnotes
+                .notes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .map(|n| &mut n.blocks),
+            StoryId::Endnote(id) => self
+                .endnotes
+                .notes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .map(|n| &mut n.blocks),
+        }
+    }
+
+    /// The block at `path` in its story.
+    pub fn block(&self, path: &Path) -> Option<&Block> {
+        block_at(self.story_blocks(path.story)?, &path.steps)
+    }
+
+    /// The paragraph at `path` in its story.
     pub fn paragraph(&self, path: &Path) -> Option<&Paragraph> {
         self.block(path)?.as_paragraph()
     }
@@ -311,16 +416,27 @@ impl Document {
     /// The paragraph at `path`, to change: it and the tables it is in are
     /// copied if they are shared.
     pub fn paragraph_mut(&mut self, path: &Path) -> Option<&mut Paragraph> {
-        match block_at_mut(&mut self.body.blocks, &path.0)? {
+        // Check before copying: a path that leads nowhere must not unshare
+        // a header.
+        self.block(path)?;
+        match block_at_mut(self.story_blocks_mut(path.story)?, &path.steps)? {
             Block::Paragraph(paragraph) => Some(Arc::make_mut(paragraph)),
             Block::Table(_) => None,
         }
     }
 
-    /// The blocks `path`'s block is one of: the body's, or a table cell's.
+    /// The block at `path`, to change.
+    pub fn block_mut(&mut self, path: &Path) -> Option<&mut Block> {
+        self.block(path)?;
+        block_at_mut(self.story_blocks_mut(path.story)?, &path.steps)
+    }
+
+    /// The blocks `path`'s block is one of: its story's, or a table cell's.
     pub fn siblings(&self, path: &Path) -> Option<&[Block]> {
         match path.in_cell() {
-            None => (path.0.len() == 1).then_some(self.body.blocks.as_slice()),
+            None => (path.steps.len() == 1)
+                .then(|| self.story_blocks(path.story).map(|b| b.as_slice()))
+                .flatten(),
             Some((table, row, cell, _)) => {
                 let table = self.block(&table)?.as_table()?;
                 Some(table.rows.get(row)?.cells.get(cell)?.blocks.as_slice())
@@ -331,7 +447,13 @@ impl Document {
     /// The same, to change.
     pub fn siblings_mut(&mut self, path: &Path) -> Option<&mut Vec<Block>> {
         match path.in_cell() {
-            None => (path.0.len() == 1).then_some(&mut self.body.blocks),
+            None => {
+                if path.steps.len() != 1 {
+                    return None;
+                }
+                self.story_blocks(path.story)?;
+                self.story_blocks_mut(path.story)
+            }
             Some((table, row, cell, _)) => {
                 self.block(&table)?
                     .as_table()?
@@ -339,7 +461,7 @@ impl Document {
                     .get(row)?
                     .cells
                     .get(cell)?;
-                let Block::Table(table) = block_at_mut(&mut self.body.blocks, &table.0)? else {
+                let Block::Table(table) = self.block_mut(&table)? else {
                     return None;
                 };
                 Some(&mut Arc::make_mut(table).rows[row].cells[cell].blocks)
@@ -349,7 +471,38 @@ impl Document {
 
     /// Every paragraph of the body in reading order, those in tables too.
     pub fn paragraphs(&self) -> Vec<(Path, &Arc<Paragraph>)> {
-        paragraphs_of(&self.body.blocks)
+        self.paragraphs_in(StoryId::Body)
+    }
+
+    /// The same for any story; empty for one that does not exist.
+    pub fn paragraphs_in(&self, story: StoryId) -> Vec<(Path, &Arc<Paragraph>)> {
+        let Some(blocks) = self.story_blocks(story) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        walk(blocks, &mut Vec::new(), &mut |path, paragraph| {
+            out.push((
+                Path {
+                    story,
+                    steps: path.to_vec(),
+                },
+                paragraph,
+            ));
+        });
+        out
+    }
+
+    /// The first and the last place of a story.
+    pub fn story_start(&self, story: StoryId) -> Option<Pos> {
+        let paragraphs = self.paragraphs_in(story);
+        let (path, _) = paragraphs.first()?;
+        Some(Pos::new(path.clone(), 0))
+    }
+
+    pub fn story_end(&self, story: StoryId) -> Option<Pos> {
+        let paragraphs = self.paragraphs_in(story);
+        let (path, paragraph) = paragraphs.last()?;
+        Some(Pos::new(path.clone(), paragraph.len()))
     }
 
     /// The first and the last place of the body.
@@ -1359,6 +1512,43 @@ pub struct Marginals {
     pub even: Option<usize>,
 }
 
+/// Which of a section's headers (or footers) a page shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum MarginalSlot {
+    /// Odd pages, and every page where the others are not asked for.
+    #[default]
+    Default,
+    /// The first page of a section with a title page.
+    First,
+    /// Even pages of a document with different odd and even pages.
+    Even,
+}
+
+/// Header or footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarginalKind {
+    Header,
+    Footer,
+}
+
+impl Marginals {
+    pub fn get(&self, slot: MarginalSlot) -> Option<usize> {
+        match slot {
+            MarginalSlot::Default => self.default,
+            MarginalSlot::First => self.first,
+            MarginalSlot::Even => self.even,
+        }
+    }
+
+    pub fn slot_mut(&mut self, slot: MarginalSlot) -> &mut Option<usize> {
+        match slot {
+            MarginalSlot::Default => &mut self.default,
+            MarginalSlot::First => &mut self.first,
+            MarginalSlot::Even => &mut self.even,
+        }
+    }
+}
+
 /// The grid East Asian documents set lines and characters on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocGrid {
@@ -1603,7 +1793,7 @@ mod tests {
         let found: Vec<(Vec<u32>, String)> = document
             .paragraphs()
             .into_iter()
-            .map(|(path, paragraph)| (path.0, paragraph.text()))
+            .map(|(path, paragraph)| (path.steps, paragraph.text()))
             .collect();
         assert_eq!(
             found,
@@ -1636,7 +1826,7 @@ mod tests {
         assert!(after.body.blocks[2].is(&before.body.blocks[2]));
         // A path that leads nowhere changes nothing.
         let mut same = before.clone();
-        assert!(same.paragraph_mut(&Path(vec![1, 9, 9, 9])).is_none());
+        assert!(same.paragraph_mut(&Path::from(vec![1, 9, 9, 9])).is_none());
         assert!(same.body.blocks[1].is(&before.body.blocks[1]));
     }
 

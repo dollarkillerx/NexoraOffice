@@ -10087,7 +10087,9 @@ mod ui_tests {
             .next()
             .expect("the document pane");
         let origin = pane.absolute_position();
-        let at = LogicalPosition::new(origin.x + 200.0, origin.y + 120.0);
+        // Below the top strip of the page: a double click in the strip enters
+        // the header instead of picking a word.
+        let at = LogicalPosition::new(origin.x + 200.0, origin.y + 260.0);
         let window = ui.window();
         let before = window.is_maximized();
         window.dispatch_event(WindowEvent::PointerMoved { position: at });

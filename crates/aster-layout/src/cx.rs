@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aster_text::Shaper;
 use aster_writer::{
     Block, Border, BorderStyle, Document, Drawing, DrawingContent, Float, FloatAt, FloatFrom,
-    Paragraph, Path, Wrap,
+    Paragraph, Path, StoryId, Wrap,
 };
 
 use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
@@ -122,6 +122,9 @@ pub(crate) enum Paths {
     None,
     /// Cell `col` of row `row` of the table at this path.
     Cell(Path, usize, usize),
+    /// The blocks of a header, footer or note: block `k` is block `k` of
+    /// the story.
+    Story(StoryId),
 }
 
 struct Key {
@@ -382,6 +385,7 @@ impl Cx<'_> {
             let path = match paths {
                 Paths::None => None,
                 Paths::Cell(table, row, col) => Some(table.cell_block(*row, *col, k)),
+                Paths::Story(story) => Some(Path::in_story(*story, k)),
             };
             match block {
                 Block::Paragraph(para) => {
@@ -425,7 +429,7 @@ impl Cx<'_> {
                 Block::Table(table) => {
                     let table_path = match paths {
                         Paths::None => Path::default(),
-                        Paths::Cell(..) => path.clone().unwrap_or_default(),
+                        Paths::Cell(..) | Paths::Story(_) => path.clone().unwrap_or_default(),
                     };
                     let space = prev
                         .as_deref()
@@ -433,7 +437,7 @@ impl Cx<'_> {
                     y += space;
                     let layout = self.layout_table(
                         table,
-                        matches!(paths, Paths::Cell(..)).then_some(&table_path),
+                        matches!(paths, Paths::Cell(..) | Paths::Story(_)).then_some(&table_path),
                         width,
                         depth + 1,
                     );

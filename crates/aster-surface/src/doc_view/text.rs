@@ -83,15 +83,16 @@ pub(crate) fn floor_boundary(text: &str, offset: usize) -> usize {
     at
 }
 
-/// The text between two places of the body, in either order: one paragraph
-/// per line, pictures and note references left out, tabs kept.
+/// The text between two places of a story, in either order: one paragraph
+/// per line, pictures and note references left out, tabs kept. Nothing for
+/// places in different stories.
 pub fn text_between(document: &Document, a: &Pos, b: &Pos) -> String {
     let (from, to) = if a <= b { (a, b) } else { (b, a) };
-    if from == to {
+    if from == to || from.path.story != to.path.story {
         return String::new();
     }
     let mut lines = Vec::new();
-    for (path, paragraph) in document.paragraphs() {
+    for (path, paragraph) in document.paragraphs_in(from.path.story) {
         if path < from.path || path > to.path {
             continue;
         }
@@ -112,7 +113,7 @@ pub fn text_between(document: &Document, a: &Pos, b: &Pos) -> String {
 }
 
 /// `pos` moved onto the nearest `char` boundary of the paragraph it names;
-/// `None` for a path that is no paragraph of the body.
+/// `None` for a path that is no paragraph of its story.
 pub(crate) fn sanitized(document: &Document, pos: Pos) -> Option<Pos> {
     let paragraph = document.paragraph(&pos.path)?;
     let text = paragraph.text();

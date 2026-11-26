@@ -9,10 +9,15 @@
 //! each frame. A page too large to keep whole at a high zoom is drawn as a
 //! band around what is visible instead.
 //!
-//! The view does not change the document in this version. Positions are
-//! [`Pos`]es: a paragraph [`Path`] and a byte offset on a `char` boundary,
-//! always of a paragraph of the body (table cells included). Headers,
-//! footers, notes and text boxes are drawn but cannot be pointed at.
+//! Positions are [`Pos`]es: a paragraph [`Path`] (which names its story) and
+//! a byte offset on a `char` boundary. The caret and the selection are in the
+//! *active story*: the body, a footnote or endnote, or a header or footer.
+//! A click in a note puts the caret there, a click in the body goes back to
+//! the body; a double-click in the strip of a header or footer enters it,
+//! and while inside, a double-click in the body or [`DocView::leave_marginal`]
+//! leaves (see `stories`). A header or footer is shown on many pages, so the
+//! view remembers the page the caret is on. Find searches the body only.
+//! Text boxes are drawn but cannot be pointed at.
 //!
 //! Building a view lays the document out, which for a large document takes a
 //! few hundred milliseconds: do it on a worker thread, [`DocView`] is `Send`.
@@ -23,6 +28,9 @@ mod format;
 mod modify;
 mod objects;
 mod search;
+mod stories;
+#[cfg(test)]
+mod story_tests;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -194,6 +202,16 @@ pub struct DocView {
     last_edit: Option<std::time::Instant>,
     /// One print per page of the layout (see [`page_print`]).
     prints: Vec<u64>,
+    /// The page the caret is on, for a caret in a header or footer, which
+    /// is on every page of its section. `None` for the first page showing
+    /// it, and for the body and notes, which are on one page.
+    page: Option<usize>,
+    /// The header or footer entered on a page that shows none: it is made
+    /// by the first edit, so that entering changes nothing.
+    new_marginal: Option<stories::NewMarginal>,
+    /// The selection of the body when a header or footer was entered, to
+    /// go back to.
+    body_sel: Option<Sel>,
 }
 
 impl DocView {
@@ -244,6 +262,9 @@ impl DocView {
             compose: None,
             last_edit: None,
             prints: Vec::new(),
+            page: None,
+            new_marginal: None,
+            body_sel: None,
         };
         view.lay_out();
         view.saved = Some(view.document.clone());
@@ -281,6 +302,8 @@ impl DocView {
         self.find = None;
         self.hit_rects.clear();
         self.press = None;
+        self.new_marginal = None;
+        self.body_sel = None;
         self.revision += 1;
         self.saved_revision = self.revision;
         self.saved = Some(self.document.clone());
@@ -298,6 +321,9 @@ impl DocView {
         self.lay_out();
         self.sel_rects = None;
         self.hit_rects.clear();
+        // The page the caret was on may be gone.
+        let last = self.layout.pages.len().saturating_sub(1);
+        self.page = self.page.map(|page| page.min(last));
     }
 
     fn lay_out(&mut self) {
@@ -621,7 +647,7 @@ impl DocView {
         if let Some(rect) = self.caret_rect()
             && rect.1 >= 0.0
             && rect.1 + rect.3 <= f64::from(self.height)
-            && let Some(page) = self.caret_pos().and_then(|p| self.layout.page_of(&p))
+            && let Some(page) = self.caret_geometry().map(|c| c.page)
         {
             return page;
         }
@@ -662,7 +688,9 @@ impl DocView {
     /// the window.
     fn caret_shown(&self) -> bool {
         self.caret_on
-            && (self.compose.is_some() || self.sel.as_ref().is_some_and(|s| s.anchor == s.focus))
+            && (self.compose.is_some()
+                || self.new_marginal.is_some()
+                || self.sel.as_ref().is_some_and(|s| s.anchor == s.focus))
             && self
                 .caret_rect()
                 .is_some_and(|(_, y, _, h)| y + h > 0.0 && y < f64::from(self.height))
@@ -873,11 +901,9 @@ impl DocView {
             self.ctx.fill_rect(&on_page(r));
         }
         self.draw_object(index, rect, ppp);
+        self.draw_marginal_edges(index, rect, ppp, style);
         if self.caret_shown()
-            && let Some(caret) = self
-                .caret_pos()
-                .and_then(|p| self.layout.caret(&p))
-                .filter(|c| c.page == index)
+            && let Some(caret) = self.caret_geometry().filter(|c| c.page == index)
         {
             let width = (1.5 * self.s()).round().max(1.0);
             let x = (rect.x0 + f64::from(caret.x) * ppp - width / 2.0).round();
@@ -895,7 +921,7 @@ impl DocView {
     /// The caret's rectangle: x, y, width, height, physical pixels from the
     /// window's top-left corner; `None` without a caret.
     pub fn caret_rect(&self) -> Option<(f64, f64, f64, f64)> {
-        let caret = self.layout.caret(&self.caret_pos()?)?;
+        let caret = self.caret_geometry()?;
         let rect = self.page_rect(caret.page);
         let ppp = self.pixels_per_point();
         let width = (1.5 * self.s()).round().max(1.0);

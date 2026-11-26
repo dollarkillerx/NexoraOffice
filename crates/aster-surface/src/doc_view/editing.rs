@@ -41,6 +41,12 @@ pub enum Move {
     PageDown,
 }
 
+impl Press {
+    pub(super) fn new(start: Pos, end: Pos, unit: u8) -> Self {
+        Self { start, end, unit }
+    }
+}
+
 impl DocView {
     // --- The selection ---
 
@@ -77,6 +83,10 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        // A selection lives in one story.
+        if anchor.path.story != focus.path.story {
+            return false;
+        }
         let (Some(anchor), Some(focus)) = (
             sanitized(&self.document, anchor),
             sanitized(&self.document, focus),
@@ -89,6 +99,14 @@ impl DocView {
 
     pub(super) fn set_sel(&mut self, anchor: Pos, focus: Pos) -> bool {
         let new = Sel { anchor, focus };
+        // A header or footer that was only entered is left by going
+        // anywhere else; the page matters for headers and footers only.
+        if self.new_marginal.take().is_some() {
+            self.touch();
+        }
+        if !matches!(new.focus.path.story, aster_writer::StoryId::Marginal(_)) {
+            self.page = None;
+        }
         if self.sel.as_ref() == Some(&new) {
             return false;
         }
@@ -109,11 +127,19 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
-        let (Some(start), Some(end)) = (self.document.start(), self.document.end()) else {
+        if self.new_marginal.is_some() {
+            return false;
+        }
+        let story = self.active_story();
+        let (Some(start), Some(end)) = (
+            self.document.story_start(story),
+            self.document.story_end(story),
+        ) else {
             return false;
         };
         self.goal_x = None;
-        self.set_sel(start, end)
+        let page = self.page;
+        self.set_sel_on(start, end, page)
     }
 
     /// Drop the selection, leaving the caret where it was.
@@ -167,7 +193,7 @@ impl DocView {
     }
 
     /// The text a unit around `pos`: the character's word, its paragraph.
-    fn unit_range(&self, pos: &Pos, unit: u8) -> (Pos, Pos) {
+    pub(super) fn unit_range(&self, pos: &Pos, unit: u8) -> (Pos, Pos) {
         let Some(paragraph) = self.document.paragraph(&pos.path) else {
             return (pos.clone(), pos.clone());
         };
@@ -193,6 +219,11 @@ impl DocView {
     pub fn press(&mut self, x: f64, y: f64, clicks: u8, extend: bool) -> bool {
         if self.compose.is_some() {
             return false;
+        }
+        // A click in a note or in the strip of a header or footer, or in the
+        // body while inside a header or footer.
+        if let Some(done) = self.press_story(x, y, clicks, extend) {
+            return done;
         }
         // A click on a picture, or on a handle of the selected one.
         if !extend && let Some(changed) = self.press_object(x, y) {
@@ -233,7 +264,7 @@ impl DocView {
         let Some(press) = self.press.clone() else {
             return false;
         };
-        let Some(pos) = self.pos_at(x, y) else {
+        let Some(pos) = self.pos_in_story(x, y, press.start.path.story) else {
             return false;
         };
         let (anchor, focus) = if press.unit == 1 {
@@ -292,10 +323,16 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        // Nothing to move in a header or footer that is not made yet.
+        if self.new_marginal.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
         let focus = sel.focus.clone();
+        let story = focus.path.story;
+        let page = self.page_for(story);
         let collapsed = sel.anchor == sel.focus;
         let mut vertical = false;
         let target: Option<Pos> = match movement {
@@ -310,25 +347,36 @@ impl DocView {
                 let down = movement == Move::Down;
                 let goal = self
                     .goal_x
-                    .or_else(|| self.layout.caret(&focus).map(|c| c.x))
+                    .or_else(|| self.layout.caret_on(page, &focus).map(|c| c.x))
                     .unwrap_or(0.0);
                 self.goal_x = Some(goal);
                 let next = if down {
-                    self.layout.below(&focus, goal)
+                    self.layout.below_on(page, &focus, goal)
                 } else {
-                    self.layout.above(&focus, goal)
+                    self.layout.above_on(page, &focus, goal)
                 };
                 // Past the first or last line: to the start or the end.
                 match next {
-                    Some(next) => Some(self.table_cell_in_column(&focus, next, goal)),
-                    None if down => self.document.end(),
-                    None => self.document.start(),
+                    Some(next) if story.is_body() => {
+                        Some(self.table_cell_in_column(&focus, next, goal))
+                    }
+                    Some(next) => Some(next),
+                    None if down => self.document.story_end(story),
+                    None => self.document.story_start(story),
                 }
             }
-            Move::LineStart => self.layout.line_start(&focus),
-            Move::LineEnd => self.layout.line_end(&focus),
-            Move::DocStart => self.document.start(),
-            Move::DocEnd => self.document.end(),
+            Move::LineStart => self.layout.line_start_on(page, &focus),
+            Move::LineEnd => self.layout.line_end_on(page, &focus),
+            Move::DocStart => self.document.story_start(story),
+            Move::DocEnd => self.document.story_end(story),
+            Move::PageUp | Move::PageDown if !story.is_body() => {
+                // The window's height means nothing inside a header or note.
+                if movement == Move::PageDown {
+                    self.document.story_end(story)
+                } else {
+                    self.document.story_start(story)
+                }
+            }
             Move::PageUp | Move::PageDown => {
                 vertical = true;
                 self.page_target(&focus, movement == Move::PageDown)
@@ -351,7 +399,7 @@ impl DocView {
     /// the goal column of that row is where the caret goes.
     fn table_cell_in_column(&self, from: &Pos, next: Pos, goal: f32) -> Pos {
         let in_same_table =
-            from.path.in_cell().is_some() && from.path.0.first() == next.path.0.first();
+            from.path.in_cell().is_some() && from.path.steps.first() == next.path.steps.first();
         if next.path.in_cell().is_none() || in_same_table {
             return next;
         }
@@ -362,7 +410,7 @@ impl DocView {
             .layout
             .hit(caret.page, goal, caret.top + caret.height / 2.0)
         {
-            Some(found) if found.path.0.first() == next.path.0.first() => {
+            Some(found) if found.path.steps.first() == next.path.steps.first() => {
                 sanitized(&self.document, found).unwrap_or(next)
             }
             _ => next,
@@ -440,6 +488,21 @@ impl DocView {
 
     /// The paragraph after or before `path` in reading order.
     fn neighbour(&self, path: &aster_writer::Path, forward: bool) -> Option<aster_writer::Path> {
+        if !path.story.is_body() {
+            let paths: Vec<aster_writer::Path> = self
+                .document
+                .paragraphs_in(path.story)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let index = paths.iter().position(|p| p == path)?;
+            let next = if forward {
+                index.checked_add(1)?
+            } else {
+                index.checked_sub(1)?
+            };
+            return paths.get(next).cloned();
+        }
         let index = self.paths.binary_search(path).ok()?;
         let next = if forward {
             index.checked_add(1)?
@@ -674,7 +737,7 @@ impl DocView {
     pub(super) fn selection_rects(&mut self) -> &[(usize, PageRect)] {
         if self.sel_rects.is_none() {
             let rects = match self.selection() {
-                Some((a, b)) => self.layout.selection(a, b),
+                Some((a, b)) => self.layout.selection_on(self.page_for(a.path.story), a, b),
                 None => Vec::new(),
             };
             self.sel_rects = Some(rects);

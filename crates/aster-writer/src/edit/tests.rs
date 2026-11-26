@@ -250,7 +250,7 @@ fn newlines_tabs_and_control_characters() {
 fn bad_positions_do_nothing() {
     let mut doc = doc_of(vec![text_para("ab")]);
     let before = doc.clone();
-    let bad = Pos::new(Path(vec![5, 1, 1, 1]), 3);
+    let bad = Pos::new(Path::from(vec![5, 1, 1, 1]), 3);
     assert_eq!(insert_text(&mut doc, &bad, "x", None), bad);
     split_paragraph(&mut doc, &bad);
     delete(&mut doc, &bad, &pos(0, 1));
@@ -268,7 +268,7 @@ fn bad_positions_do_nothing() {
     // A path with a bad step in a table, and a block that is a table.
     doc.body.blocks.push(table(&[&[&["a"], &["b"]]]));
     for path in [vec![1], vec![1, 0, 5, 0], vec![1, 9, 0, 0], vec![]] {
-        let bad = Pos::new(Path(path), 0);
+        let bad = Pos::new(Path::from(path), 0);
         insert_text(&mut doc, &bad, "x", None);
         delete(&mut doc, &bad, &bad);
         split_paragraph(&mut doc, &bad);

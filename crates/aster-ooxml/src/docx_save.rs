@@ -8,7 +8,9 @@
 //! - every part but the main document (and `numbering.xml`, `.rels` and the
 //!   content types when a list, a link or a picture is added; picture parts
 //!   are added) is copied as it was, compressed bytes and all; a document with no change is returned as the
-//!   file it was read from, byte for byte;
+//!   file it was read from, byte for byte. Headers, footers, footnotes and
+//!   endnotes that changed are spliced the same way in their own parts, and
+//!   new ones get parts of their own: see the `stories` module;
 //! - the body is spliced. Between the original blocks the bytes stay as they
 //!   are (content-control wrappers, the final `sectPr`, anything unknown). A
 //!   block that is as read and in its place is copied; one that is gone has
@@ -79,10 +81,11 @@
 //!
 //! What cannot be written from the model, because it only exists as the
 //! bytes of a file, is kept by copying those bytes: drawings that were read,
-//! notes, markers and sections. A drawing that is not a picture, a ruby, a
-//! page number or a reference that has no source (one pasted from elsewhere)
-//! is left out; so are text boxes and the other drawings that were not read
-//! from this file.
+//! markers and sections (a section gains only the references to the headers
+//! and footers made since reading). A drawing that is not a picture and a
+//! ruby that has no source (one pasted from elsewhere) are left out; so are
+//! text boxes and the other drawings that were not read from this file. A
+//! page-number field that was made here is written as a simple field.
 //!
 //! Not updated, as with PPTX: `docProps/app.xml` statistics.
 
@@ -108,6 +111,7 @@ use crate::xml_edit::{
 mod blank;
 mod drawing;
 mod props;
+mod stories;
 mod table;
 mod xml;
 
@@ -160,9 +164,13 @@ pub fn save(source: Vec<u8>, document: &Document) -> Result<Vec<u8>> {
         .map(|name| name.to_ascii_lowercase())
         .collect();
     let docpr_floor = other_docpr_max(&mut package, &main, document);
-    let mut saver = Saver::new(&text, &original, document, rels_text);
+    let mut saver = Saver::new(&text, &original, &original.body.blocks, document, rels_text);
     saver.media = Media::new(&main, taken);
     saver.next_docpr = saver.next_docpr.max(docpr_floor);
+    // Headers, footers and the footnotes part made since reading: their
+    // parts and relationships come first, because the sections refer to
+    // them.
+    let plan = stories::plan(&main, &original, document, &mut saver);
     let new_text = saver.document_text()?;
 
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
@@ -202,20 +210,7 @@ pub fn save(source: Vec<u8>, document: &Document) -> Result<Vec<u8>> {
             }
         }
     }
-    if !saver.media.items.is_empty() {
-        let types = package.read(TYPES)?;
-        let types_text = String::from_utf8_lossy(&types).into_owned();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for item in &saver.media.items {
-            added.push((item.part.clone(), item.bytes.to_vec()));
-            if seen.insert(item.extension) && !has_default(&types_text, item.extension) {
-                types_edit.push(format!(
-                    "<Default Extension=\"{}\" ContentType=\"{}\"/>",
-                    item.extension, item.content_type
-                ));
-            }
-        }
-    }
+    collect_media(&mut package, &saver.media, &mut added, &mut types_edit)?;
     if saver.rels.changed {
         let bytes = saver.rels.text.clone().into_bytes();
         if package.has(&rels_part) {
@@ -224,6 +219,22 @@ pub fn save(source: Vec<u8>, document: &Document) -> Result<Vec<u8>> {
             added.push((rels_part.clone(), bytes));
         }
     }
+    // Headers, footers and notes: spliced like the body, in their own parts.
+    let carried = Carried {
+        taken: saver.media.taken.clone(),
+        docpr: saver.next_docpr,
+    };
+    stories::write(
+        &mut package,
+        &main,
+        &original,
+        document,
+        &plan,
+        carried,
+        &mut replaced,
+        &mut added,
+        &mut types_edit,
+    )?;
     if !types_edit.is_empty() {
         let types = package.read(TYPES)?;
         let items = types_edit.concat();
@@ -234,6 +245,39 @@ pub fn save(source: Vec<u8>, document: &Document) -> Result<Vec<u8>> {
         return Ok(source);
     }
     package.rewrite_adding(&replaced, &std::collections::HashSet::new(), &added)
+}
+
+/// What one part's saver hands the next: the names of the parts taken so
+/// far and the last `docPr` id given out, so that pictures made in several
+/// parts do not share names or ids.
+struct Carried {
+    taken: HashSet<String>,
+    docpr: u32,
+}
+
+/// The image parts a saver made, and the content types they need.
+fn collect_media(
+    package: &mut Package,
+    media: &Media,
+    added: &mut Vec<(String, Vec<u8>)>,
+    types_edit: &mut Vec<String>,
+) -> Result<()> {
+    if media.items.is_empty() {
+        return Ok(());
+    }
+    let types = package.read(TYPES)?;
+    let types_text = String::from_utf8_lossy(&types).into_owned();
+    for item in &media.items {
+        added.push((item.part.clone(), item.bytes.to_vec()));
+        let entry = format!(
+            "<Default Extension=\"{}\" ContentType=\"{}\"/>",
+            item.extension, item.content_type
+        );
+        if !has_default(&types_text, item.extension) && !types_edit.contains(&entry) {
+            types_edit.push(entry);
+        }
+    }
+    Ok(())
 }
 
 const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
@@ -261,11 +305,30 @@ fn has_default(types: &str, extension: &str) -> bool {
 /// notes) when the document has a picture to write that was not read, else 0:
 /// ids of new pictures start above it and above the main part's own.
 fn other_docpr_max(package: &mut Package, main: &str, document: &Document) -> u32 {
-    let has_new = document.paragraphs().iter().any(|(_, p)| {
+    let new_picture = |(_, p): &(aster_writer::Path, &Arc<Paragraph>)| {
         p.runs.iter().any(|r| {
             r.source.is_none() && matches!(&r.kind, Inline::Drawing(d) if matches!(d.content, DrawingContent::Picture(_)))
         })
-    });
+    };
+    let stories = std::iter::once(aster_writer::StoryId::Body)
+        .chain((0..document.marginals.len()).map(aster_writer::StoryId::Marginal))
+        .chain(
+            document
+                .footnotes
+                .notes
+                .iter()
+                .map(|n| aster_writer::StoryId::Footnote(n.id)),
+        )
+        .chain(
+            document
+                .endnotes
+                .notes
+                .iter()
+                .map(|n| aster_writer::StoryId::Endnote(n.id)),
+        );
+    let has_new = stories
+        .into_iter()
+        .any(|story| document.paragraphs_in(story).iter().any(new_picture));
     if !has_new {
         return 0;
     }
@@ -422,6 +485,13 @@ struct Saver<'a> {
     /// The opening tags of hyperlinks written here: two of them with
     /// nothing between become one.
     openers: HashSet<String>,
+    /// While writing a note: which one it is (`true` for an endnote, and
+    /// its id), so that its own mark is written as the mark.
+    in_note: Option<(bool, i32)>,
+    /// The `headerReference` and `footerReference` elements to put into the
+    /// sections whose `sectPr` was read from the range, for headers and
+    /// footers made since reading.
+    new_refs: HashMap<(usize, usize), String>,
 }
 
 /// What the original document has, by where it was read from.
@@ -514,11 +584,12 @@ impl<'a> Saver<'a> {
     fn new(
         text: &'a str,
         original: &'a Document,
+        original_blocks: &'a [Block],
         document: &'a Document,
         rels_text: String,
     ) -> Self {
         let mut index: Index<'a> = Default::default();
-        index_blocks(&original.body.blocks, &mut index);
+        index_blocks(original_blocks, &mut index);
         let Index {
             paras,
             tables,
@@ -578,6 +649,8 @@ impl<'a> Saver<'a> {
             next_docpr: max_docpr(text),
             written_drawings: HashSet::new(),
             openers: HashSet::new(),
+            in_note: None,
+            new_refs: HashMap::new(),
         }
     }
 
@@ -678,7 +751,28 @@ impl<'a> Saver<'a> {
         let mut out = String::with_capacity(text.len());
         out.push_str(&text[..region.start]);
         out.push_str(&blocks);
-        out.push_str(&text[region.end..]);
+        // The final section may have gained headers and footers.
+        let last = self.document.last_section.source.clone();
+        match last
+            .as_ref()
+            .and_then(|r| self.new_refs.get(&range_key(r)).map(|refs| (r, refs)))
+        {
+            Some((range, refs)) if range.start >= region.end && range.end <= text.len() => {
+                out.push_str(&text[region.end..range.start]);
+                out.push_str(&stories::with_references(&text[range.clone()], refs));
+                out.push_str(&text[range.end..]);
+            }
+            // No `sectPr` in the body: one is written, for the references.
+            _ if self.document.last_section.source.is_none()
+                && self.new_refs.contains_key(&stories::NO_SECTION) =>
+            {
+                let w = &self.w;
+                let refs = &self.new_refs[&stories::NO_SECTION];
+                out.push_str(&format!("<{w}sectPr>{refs}</{w}sectPr>"));
+                out.push_str(&text[region.end..]);
+            }
+            _ => out.push_str(&text[region.end..]),
+        }
         if self.needs_rel_namespace && self.rels.changed {
             out = add_namespace(&out, "r", REL_NS);
         }
@@ -806,7 +900,10 @@ impl<'a> Saver<'a> {
             && let Some(bytes) = self.slice(range)
             && is_element(bytes, "sectPr")
         {
-            return bytes.to_owned();
+            return match self.new_refs.get(&range_key(range)) {
+                Some(refs) => stories::with_references(bytes, refs),
+                None => bytes.to_owned(),
+            };
         }
         let w = &self.w;
         let mut out = format!("<{w}sectPr>");
@@ -1431,13 +1528,38 @@ impl<'a> Saver<'a> {
             Inline::Break(Break::Line) => format!("<{w}br/>"),
             Inline::Break(Break::Page) => format!("<{w}br {w}type=\"page\"/>"),
             Inline::Break(Break::Column) => format!("<{w}br {w}type=\"column\"/>"),
+            // A note's own mark, at the head of the note.
+            Inline::Footnote(id) if self.in_note == Some((false, *id)) => {
+                format!("<{w}footnoteRef/>")
+            }
+            Inline::Endnote(id) if self.in_note == Some((true, *id)) => {
+                format!("<{w}endnoteRef/>")
+            }
             Inline::Footnote(id) => format!("<{w}footnoteReference {w}id=\"{id}\"/>"),
             Inline::Endnote(id) => format!("<{w}endnoteReference {w}id=\"{id}\"/>"),
+            Inline::PageNumber(field) => {
+                let instruction = match field {
+                    aster_writer::PageField::Page => "PAGE",
+                    aster_writer::PageField::PageCount => "NUMPAGES",
+                    aster_writer::PageField::SectionPages => "SECTIONPAGES",
+                };
+                let shown = if run.text.trim().is_empty() {
+                    "1"
+                } else {
+                    run.text.as_str()
+                };
+                let src = self.styled(base, &run.style);
+                let rpr = rpr_patch(w, None, &src, &None, &run.look, &run.style, base);
+                return Some(format!(
+                    "<{w}fldSimple {w}instr=\" {instruction} \"><{w}r>{rpr}{}</{w}r></{w}fldSimple>",
+                    self.text_element(shown)
+                ));
+            }
             Inline::Drawing(drawing) => match &drawing.content {
                 DrawingContent::Picture(picture) => self.picture_xml(drawing, picture)?,
                 _ => return None,
             },
-            Inline::Marker | Inline::PageNumber(_) | Inline::Ruby(_) => {
+            Inline::Marker | Inline::Ruby(_) => {
                 return None;
             }
         };

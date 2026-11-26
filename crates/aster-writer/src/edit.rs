@@ -22,20 +22,30 @@
 //! the place the text was; where paragraphs are joined or removed, their
 //! markers move into the paragraph that remains.
 //!
-//! **Where it works.** In the body, table cells included. Headers, footers,
-//! notes and text boxes are not edited in this version.
+//! **Where it works.** In any story: the body, headers and footers, footnotes
+//! and endnotes, table cells in them included (a [`Pos`]'s path names its
+//! story, see [`crate::StoryId`]). A range lives in one story: given two
+//! places in different ones an operation does nothing. What makes no sense
+//! outside the body is refused there: page and column breaks, and footnote
+//! references (pasted ones are left out). Text boxes are not edited in this
+//! version. Footnotes, headers and footers are made by [`insert_footnote`]
+//! and [`ensure_marginal`].
 
 use std::sync::Arc;
 
 use crate::{
     Align, Block, Break, Document, Inline, LineSpacing, List, ListLevel, ListRef, NumberFormat,
-    Numbering, ParaProps, Paragraph, Path, Pos, Run, RunLook, RunPatch, Suffix, Twips,
+    Numbering, ParaProps, Paragraph, Path, Pos, Run, RunLook, RunPatch, StoryId, Suffix, Twips,
 };
 
 pub use link::{insert_link, link_range, set_link};
 pub use picture::{
     ImageFormat, PictureError, PictureLayout, drawing_at, image_format, insert_picture,
     move_drawing, move_floating_drawing, picture_layout, resize_drawing, set_picture_layout,
+};
+pub use story::{
+    drop_notes_without_references, ensure_marginal, existing_marginal, insert_footnote,
+    insert_page_number,
 };
 pub use table::{
     CellPos, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, available_width,
@@ -287,7 +297,7 @@ fn locate(doc: &Document, pos: &Pos) -> Option<Pos> {
 
 /// The paragraphs from `from` to `to` (both inclusive), by path.
 fn paths_between(doc: &Document, from: &Path, to: &Path) -> Vec<Path> {
-    doc.paragraphs()
+    doc.paragraphs_in(from.story)
         .into_iter()
         .map(|(path, _)| path)
         .filter(|path| path >= from && path <= to)
@@ -298,6 +308,10 @@ fn paths_between(doc: &Document, from: &Path, to: &Path) -> Vec<Path> {
 /// back out of a char or an object, the end forward; `None` if either path
 /// is bad.
 fn ends(doc: &Document, from: &Pos, to: &Pos) -> Option<(Pos, Pos)> {
+    // A range lives in one story.
+    if from.path.story != to.path.story {
+        return None;
+    }
     let (a, b) = if from <= to { (from, to) } else { (to, from) };
     let start = Pos::new(
         a.path.clone(),
@@ -428,6 +442,10 @@ fn insert_object(doc: &mut Document, at: &Pos, kind: Inline, look: Option<&RunLo
 
 /// A line, page or column break at `at`; where the caret goes.
 pub fn insert_break(doc: &mut Document, at: &Pos, kind: Break) -> Pos {
+    // A page or column break has no meaning in a header, a footer or a note.
+    if kind != Break::Line && !at.path.story.is_body() {
+        return at.clone();
+    }
     insert_object(doc, at, Inline::Break(kind), None)
 }
 
@@ -497,8 +515,8 @@ fn split_raw(doc: &mut Document, at: &Pos, next_style: bool) -> Pos {
         second.mark = second.base.clone();
         second.source = None;
     }
-    let index = at.path.0.last().copied().unwrap_or(0) as usize;
-    let mut path = at.path.0.clone();
+    let index = at.path.steps.last().copied().unwrap_or(0) as usize;
+    let mut path = at.path.steps.clone();
     if let Some(siblings) = doc.siblings_mut(&at.path)
         && index < siblings.len()
     {
@@ -506,7 +524,7 @@ fn split_raw(doc: &mut Document, at: &Pos, next_style: bool) -> Pos {
         *path.last_mut().expect("a path has steps") += 1;
     }
     doc.renumber();
-    Pos::new(Path(path), 0)
+    Pos::new(at.path.with_steps(path), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +549,15 @@ pub fn delete(doc: &mut Document, from: &Pos, to: &Pos) -> Pos {
     if f == t {
         return f;
     }
+    // A note goes with the last reference to it.
+    let refs = story::refs_between(doc, &f.path, &t.path);
+    let caret = delete_range(doc, &f, &t);
+    story::drop_lost_notes(doc, &refs);
+    caret
+}
+
+fn delete_range(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
+    let (f, t) = (f.clone(), t.clone());
     if f.path == t.path {
         let Some(p) = doc.paragraph_mut(&f.path) else {
             return f;
@@ -538,8 +565,8 @@ pub fn delete(doc: &mut Document, from: &Pos, to: &Pos) -> Pos {
         let at = remove_range(p, f.offset, t.offset);
         return Pos::new(f.path, at);
     }
-    let n = f.path.0.len();
-    let same_container = n == t.path.0.len() && f.path.0[..n - 1] == t.path.0[..n - 1];
+    let n = f.path.steps.len();
+    let same_container = n == t.path.steps.len() && f.path.steps[..n - 1] == t.path.steps[..n - 1];
     let caret = if same_container {
         delete_joining(doc, &f, &t)
     } else {
@@ -552,8 +579,8 @@ pub fn delete(doc: &mut Document, from: &Pos, to: &Pos) -> Pos {
 /// Both ends are paragraphs of the same container: what is between them
 /// goes, and they become one.
 fn delete_joining(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
-    let fi = f.path.0[f.path.0.len() - 1] as usize;
-    let ti = t.path.0[t.path.0.len() - 1] as usize;
+    let fi = f.path.steps[f.path.steps.len() - 1] as usize;
+    let ti = t.path.steps[t.path.steps.len() - 1] as usize;
     let mut moved: Vec<Run> = Vec::new();
     let Some(siblings) = doc.siblings_mut(&f.path) else {
         return f.clone();
@@ -599,19 +626,26 @@ fn delete_across(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
     // Whole blocks of the body between the two ends.
     let mut moved: Vec<Run> = Vec::new();
     let mut t = t.clone();
-    if bj > bi + 1 && bj <= doc.body.blocks.len() {
-        for block in &doc.body.blocks[bi + 1..bj] {
+    let story = f.path.story;
+    let blocks = doc.story_blocks(story).map_or(0, |b| b.len());
+    if bj > bi + 1 && bj <= blocks {
+        let Some(all) = doc.story_blocks_mut(story) else {
+            return f.clone();
+        };
+        for block in &all[bi + 1..bj] {
             collect_markers(block, &mut moved);
         }
-        doc.body.blocks.drain(bi + 1..bj);
-        t.path.0[0] = (bi + 1) as u32;
+        all.drain(bi + 1..bj);
+        t.path.steps[0] = (bi + 1) as u32;
     }
     // Tables that are cut through: empty the paragraphs between, remove the
     // tables that are inside.
     let bj = t.path.top();
-    clear_between(&mut doc.body.blocks, bi, &[], f, &t, &mut moved);
-    if bj != bi {
-        clear_between(&mut doc.body.blocks, bj, &[], f, &t, &mut moved);
+    if let Some(all) = doc.story_blocks_mut(story) {
+        clear_between(all, bi, &[], f, &t, &mut moved);
+        if bj != bi {
+            clear_between(all, bj, &[], f, &t, &mut moved);
+        }
     }
     if !moved.is_empty()
         && let Some(p) = doc.paragraph_mut(&f.path)
@@ -638,7 +672,7 @@ fn clear_between(
     let Some(block @ Block::Table(_)) = blocks.get(index) else {
         return;
     };
-    let (first, last) = table_span(block, &here);
+    let (first, last) = table_span(f.path.story, block, &here);
     if last < f.path || first > t.path {
         return;
     }
@@ -661,15 +695,15 @@ fn clear_cell(blocks: &mut Vec<Block>, prefix: &[u32], f: &Pos, t: &Pos, moved: 
         let mut here = prefix.to_vec();
         here.push(k as u32);
         if blocks[k].as_table().is_some() {
-            let (first, last) = table_span(&blocks[k], &here);
+            let (first, last) = table_span(f.path.story, &blocks[k], &here);
             if first > f.path && last < t.path {
                 collect_markers(&blocks[k], moved);
                 blocks.remove(k);
                 continue;
             }
             clear_between(blocks, k, prefix, f, t, moved);
-        } else if Path(here.clone()) > f.path
-            && Path(here) < t.path
+        } else if f.path.with_steps(here.clone()) > f.path
+            && f.path.with_steps(here) < t.path
             && let Block::Paragraph(p) = &mut blocks[k]
             && !p.is_empty()
         {
@@ -687,16 +721,17 @@ fn clear_cell(blocks: &mut Vec<Block>, prefix: &[u32], f: &Pos, t: &Pos, moved: 
 
 /// The paths of the first and last paragraph of the table `block` that is
 /// at `path`.
-fn table_span(block: &Block, path: &[u32]) -> (Path, Path) {
+fn table_span(story: StoryId, block: &Block, path: &[u32]) -> (Path, Path) {
     let inner = crate::paragraphs_of(std::slice::from_ref(block));
+    let make = |steps: Vec<u32>| Path { story, steps };
     let full = |p: &Path| {
         let mut steps = path.to_vec();
-        steps.extend_from_slice(&p.0[1..]);
-        Path(steps)
+        steps.extend_from_slice(&p.steps[1..]);
+        make(steps)
     };
     match (inner.first(), inner.last()) {
         (Some((a, _)), Some((b, _))) => (full(a), full(b)),
-        _ => (Path(path.to_vec()), Path(path.to_vec())),
+        _ => (make(path.to_vec()), make(path.to_vec())),
     }
 }
 
@@ -724,12 +759,12 @@ pub fn delete_backward(doc: &mut Document, at: &Pos) -> Pos {
         doc.renumber();
         return at;
     }
-    let index = at.path.0.last().copied().unwrap_or(0) as usize;
+    let index = at.path.steps.last().copied().unwrap_or(0) as usize;
     if index == 0 {
         return at;
     }
     let mut previous = at.path.clone();
-    *previous.0.last_mut().expect("a path has steps") -= 1;
+    *previous.steps.last_mut().expect("a path has steps") -= 1;
     match doc.paragraph(&previous) {
         Some(prev) => {
             let end = Pos::new(previous, prev.len());
@@ -759,7 +794,7 @@ pub fn delete_forward(doc: &mut Document, at: &Pos) -> Pos {
         return at;
     }
     let mut next = at.path.clone();
-    *next.0.last_mut().expect("a path has steps") += 1;
+    *next.steps.last_mut().expect("a path has steps") += 1;
     if doc.paragraph(&next).is_some() {
         delete(doc, &at, &Pos::new(next, 0));
     }
@@ -1145,13 +1180,13 @@ pub fn set_list(doc: &mut Document, from: &Pos, to: &Pos, kind: Option<ListKind>
     // The list: the one just before, an existing one, a new one.
     let previous = f
         .path
-        .0
+        .steps
         .last()
         .copied()
         .filter(|&i| i > 0)
         .and_then(|i| {
             let mut path = f.path.clone();
-            *path.0.last_mut()? = i - 1;
+            *path.steps.last_mut()? = i - 1;
             doc.paragraph(&path)?.props.list
         })
         .and_then(|r| doc.numbering.get(r.list))
@@ -1279,7 +1314,7 @@ pub fn plain_text(doc: &Document, from: &Pos, to: &Pos) -> String {
         return String::new();
     };
     let mut lines = Vec::new();
-    for (path, p) in doc.paragraphs() {
+    for (path, p) in doc.paragraphs_in(f.path.story) {
         if path < f.path || path > t.path {
             continue;
         }
@@ -1303,13 +1338,13 @@ pub fn fragment(doc: &Document, from: &Pos, to: &Pos) -> Vec<Block> {
     let Some((f, t)) = ends(doc, from, to) else {
         return Vec::new();
     };
-    let n = f.path.0.len();
+    let n = f.path.steps.len();
     let mut out = Vec::new();
-    for (path, p) in doc.paragraphs() {
+    for (path, p) in doc.paragraphs_in(f.path.story) {
         if path < f.path || path > t.path {
             continue;
         }
-        if path.0.len() != n || path.0[..n - 1] != f.path.0[..n - 1] {
+        if path.steps.len() != n || path.steps[..n - 1] != f.path.steps[..n - 1] {
             continue;
         }
         let mut copy = (**p).clone();
@@ -1362,13 +1397,13 @@ pub fn insert_fragment(doc: &mut Document, at: &Pos, blocks: &[Block]) -> Pos {
     };
     let second = split_raw(doc, &at, false);
     let mut first_path = second.path.clone();
-    if let Some(last) = first_path.0.last_mut() {
+    if let Some(last) = first_path.steps.last_mut() {
         *last = last.saturating_sub(1);
     }
     let end = doc.paragraph(&first_path).map_or(0, Paragraph::len);
     insert_runs(doc, &Pos::new(first_path.clone(), end), &first.runs);
     // The paragraphs between, after the first half.
-    let index = first_path.0.last().copied().unwrap_or(0) as usize;
+    let index = first_path.steps.last().copied().unwrap_or(0) as usize;
     let mut tail_path = second.path.clone();
     // Their base look is what their style gives them where they are now
     // (in a table cell the table style says something too).
@@ -1391,7 +1426,7 @@ pub fn insert_fragment(doc: &mut Document, at: &Pos, blocks: &[Block]) -> Pos {
             }
             siblings.insert(index + 1 + k, Block::paragraph(copy));
         }
-        *tail_path.0.last_mut().expect("a path has steps") += middle.len() as u32;
+        *tail_path.steps.last_mut().expect("a path has steps") += middle.len() as u32;
     }
     let size: usize = last.runs.iter().map(|r| r.text.len()).sum();
     insert_runs(doc, &Pos::new(tail_path.clone(), 0), &last.runs);
@@ -1401,7 +1436,6 @@ pub fn insert_fragment(doc: &mut Document, at: &Pos, blocks: &[Block]) -> Pos {
 
 /// Runs without a source into the text at `at`.
 fn insert_runs(doc: &mut Document, at: &Pos, runs: &[Run]) -> Pos {
-    let size: usize = runs.iter().map(|r| r.text.len()).sum();
     if runs.is_empty() {
         return at.clone();
     }
@@ -1410,8 +1444,22 @@ fn insert_runs(doc: &mut Document, at: &Pos, runs: &[Run]) -> Pos {
     };
     let offset = snap(p, at.offset, false);
     let index = split_run(p, offset);
+    let body = at.path.story.is_body();
+    let runs: Vec<&Run> = runs
+        .iter()
+        // Outside the body no note is referred to and nothing breaks a page.
+        .filter(|run| {
+            body || !matches!(
+                run.kind,
+                Inline::Footnote(_)
+                    | Inline::Endnote(_)
+                    | Inline::Break(Break::Page | Break::Column)
+            )
+        })
+        .collect();
+    let size: usize = runs.iter().map(|r| r.text.len()).sum();
     for (k, run) in runs.iter().enumerate() {
-        let mut run = run.clone();
+        let mut run = (*run).clone();
         if !only_in_file(&run) {
             run.source = None;
         }
@@ -1442,7 +1490,16 @@ pub fn same_content(a: &Document, b: &Document) -> bool {
         && a.marginals
             .iter()
             .zip(&b.marginals)
-            .all(|(x, y)| same_blocks(&x.blocks, &y.blocks))
+            .all(|(x, y)| Arc::ptr_eq(x, y) || same_blocks(&x.blocks, &y.blocks))
+        && same_notes(&a.footnotes.notes, &b.footnotes.notes)
+        && same_notes(&a.endnotes.notes, &b.endnotes.notes)
+}
+
+fn same_notes(a: &[crate::Note], b: &[crate::Note]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.id == y.id && same_blocks(&x.blocks, &y.blocks))
 }
 
 fn same_numbering(a: &Numbering, b: &Numbering) -> bool {
@@ -1722,8 +1779,11 @@ impl History {
 
 mod link;
 mod picture;
+mod story;
 mod table;
 
+#[cfg(test)]
+mod story_tests;
 #[cfg(test)]
 mod table_tests;
 #[cfg(test)]

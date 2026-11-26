@@ -176,9 +176,9 @@ fn marginals(m: &aster_writer::Marginals) -> String {
 
 fn blocks(list: &[Block], prefix: &Path, depth: usize) {
     for (i, block) in list.iter().enumerate() {
-        let mut steps = prefix.0.clone();
+        let mut steps = prefix.steps.clone();
         steps.push(i as u32);
-        let path = Path(steps);
+        let path = prefix.with_steps(steps);
         match block {
             Block::Paragraph(p) => paragraph(p, &path, depth),
             Block::Table(t) => table(t, &path, depth),
@@ -225,7 +225,7 @@ fn border(b: &Option<Border>) -> String {
 }
 
 fn paragraph(p: &Paragraph, path: &Path, depth: usize) {
-    let steps: Vec<String> = path.0.iter().map(u32::to_string).collect();
+    let steps: Vec<String> = path.steps.iter().map(u32::to_string).collect();
     let mut head = format!("{}[{}] P", indent(depth), steps.join(","));
     let props = para_props(&p.props);
     if !props.is_empty() {
@@ -510,7 +510,7 @@ fn look_diff(l: &RunLook, base: &RunLook) -> String {
 }
 
 fn table(t: &Table, path: &Path, depth: usize) {
-    let steps: Vec<String> = path.0.iter().map(u32::to_string).collect();
+    let steps: Vec<String> = path.steps.iter().map(u32::to_string).collect();
     let pad = indent(depth);
     println!(
         "{pad}[{}] TABLE grid {:?} style {} align {:?} indent {} margins {:?}{} source {:?}",
@@ -557,9 +557,9 @@ fn table(t: &Table, path: &Path, depth: usize) {
                 cell.align,
                 cell.source,
             );
-            let mut inner = path.0.clone();
+            let mut inner = path.steps.clone();
             inner.extend([r as u32, c as u32]);
-            blocks(&cell.blocks, &Path(inner), depth + 3);
+            blocks(&cell.blocks, &path.with_steps(inner), depth + 3);
         }
     }
 }

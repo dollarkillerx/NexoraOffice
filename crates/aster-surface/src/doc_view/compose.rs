@@ -111,7 +111,18 @@ impl DocView {
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
         let mut shown = self.document.clone();
-        let (from, to) = if sel.anchor <= sel.focus {
+        let (from, to) = if let Some(new) = self.new_marginal.clone() {
+            // In a header or footer that is not made yet: it is made in the
+            // copy that is shown, and in the document when text is committed.
+            let Some(story) = edit::ensure_marginal(&mut shown, new.section, new.kind, new.slot)
+            else {
+                return false;
+            };
+            let Some(start) = shown.story_start(story) else {
+                return false;
+            };
+            (start.clone(), start)
+        } else if sel.anchor <= sel.focus {
             (sel.anchor.clone(), sel.focus.clone())
         } else {
             (sel.focus.clone(), sel.anchor.clone())

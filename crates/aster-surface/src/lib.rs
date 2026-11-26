@@ -12,6 +12,7 @@ pub mod cell_editor;
 mod chart_draw;
 mod cond_icons;
 pub mod doc_paint;
+pub mod doc_view;
 mod glyphs;
 pub mod host;
 pub mod md_picture;
@@ -184,5 +185,35 @@ impl Surface for slide_view::SlideView {
     }
     fn text(&self) -> String {
         slide_view::SlideView::text(self)
+    }
+}
+
+impl Surface for doc_view::DocView {
+    fn resize(&mut self, width: u16, height: u16, scale: f32) {
+        doc_view::DocView::resize(self, width, height, scale)
+    }
+    fn size(&self) -> (u16, u16, f32) {
+        doc_view::DocView::size(self)
+    }
+    fn set_caret_on(&mut self, on: bool) {
+        doc_view::DocView::set_caret_on(self, on)
+    }
+    fn render(&mut self) -> &Pixmap {
+        doc_view::DocView::render(self)
+    }
+    fn scroll_by(&mut self, delta: f64) -> bool {
+        doc_view::DocView::scroll_by(self, delta)
+    }
+    fn scroll_range(&mut self) -> (f64, f64) {
+        doc_view::DocView::scroll_range(self)
+    }
+    fn is_composing(&self) -> bool {
+        doc_view::DocView::is_composing(self)
+    }
+    fn ime_cursor_area(&mut self) -> (f64, f64, f64, f64) {
+        doc_view::DocView::ime_cursor_area(self)
+    }
+    fn text(&self) -> String {
+        doc_view::DocView::text(self)
     }
 }

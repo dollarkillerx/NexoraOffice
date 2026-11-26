@@ -14,7 +14,8 @@ use aster_writer::{
 };
 
 use crate::cx::{
-    Cx, EmitCtx, Frag, Layers, Layouter, Out, ParaBox, ParaEntry, Paths, Stack, gap, pads,
+    Cx, EmitCtx, Entry, Frag, Layers, Layouter, Out, ParaBox, ParaEntry, Paths, Stack, gap, pads,
+    space_before,
 };
 use crate::display::{Item, Page, Rect, RuleStyle};
 use crate::query::{Layout, OutlineEntry};
@@ -49,11 +50,108 @@ struct PageState {
     footer_height: f32,
     header: Option<usize>,
     footer: Option<usize>,
-    notes: Vec<(i32, Stack)>,
+    notes: Vec<NoteSlice>,
     note_height: f32,
+    /// Floating drawings that text stops above and continues below.
     obstructions: Vec<Rect>,
+    /// Floating drawings that text flows beside (with their clearance).
+    wraps: Vec<Rect>,
     used: bool,
     page_in_section: usize,
+}
+
+/// A footnote, or the part of one that is on a page: the lines of `stack`
+/// whose tops are in `from..to`. A note too long for the room it was given
+/// continues on the next pages.
+#[derive(Clone)]
+struct NoteSlice {
+    id: i32,
+    stack: Arc<Stack>,
+    from: f32,
+    to: f32,
+}
+
+impl NoteSlice {
+    fn whole(id: i32, stack: Arc<Stack>) -> Self {
+        let to = stack.height;
+        Self {
+            id,
+            stack,
+            from: 0.0,
+            to,
+        }
+    }
+
+    fn height(&self) -> f32 {
+        self.to - self.from
+    }
+
+    fn is_whole(&self) -> bool {
+        self.from <= 0.0 && self.to >= self.stack.height - EPS
+    }
+}
+
+/// Where a note's stack may be cut after `from` so that what is before the
+/// cut is at most `room` high: the top of the furthest line or table that
+/// does. The end of the stack if all of it fits; `from` if not even the first
+/// line does.
+fn cut_note(stack: &Stack, from: f32, room: f32) -> f32 {
+    if stack.height - from <= room + EPS {
+        return stack.height;
+    }
+    let mut best = from;
+    for entry in &stack.entries {
+        let tops: Vec<f32> = match entry {
+            Entry::Para(p) => p.shaped.lines().iter().map(|l| p.top + l.top).collect(),
+            Entry::Table(_, _, top) => vec![*top],
+        };
+        for top in tops {
+            if top > best + EPS && top - from <= room + EPS {
+                best = top;
+            }
+        }
+    }
+    best
+}
+
+/// The top of the first line or table of a stack after `from`.
+fn next_cut(stack: &Stack, from: f32) -> f32 {
+    let mut best = stack.height;
+    for entry in &stack.entries {
+        let tops: Vec<f32> = match entry {
+            Entry::Para(p) => p.shaped.lines().iter().map(|l| p.top + l.top).collect(),
+            Entry::Table(_, _, top) => vec![*top],
+        };
+        for top in tops {
+            if top > from + EPS && top < best {
+                best = top;
+            }
+        }
+    }
+    best
+}
+
+/// A line placed on the page along with the notes it refers to: what of them
+/// goes on this page, and what goes on after.
+struct Pend {
+    line: usize,
+    slice: NoteSlice,
+    carry: Vec<NoteSlice>,
+}
+
+impl PageState {
+    /// Text keeps away from a floating drawing's `rect`: beside it, or above
+    /// and below it only.
+    fn keep_clear(&mut self, rect: Rect, wrap: Wrap) {
+        let list = match wrap {
+            Wrap::Square | Wrap::Tight => &mut self.wraps,
+            Wrap::TopAndBottom => &mut self.obstructions,
+            Wrap::None => return,
+        };
+        if !list.contains(&rect) {
+            list.push(rect);
+        }
+    }
 }
 
 /// The shape of a section's pages.
@@ -125,6 +223,12 @@ struct Flow<'a, 'b> {
     pending_start: Option<u32>,
     prev: Option<Arc<Paragraph>>,
     sections_pages: Vec<usize>,
+    /// Notes that did not fit where their reference is: the rest of them goes
+    /// at the bottom of the next page.
+    carry: Vec<NoteSlice>,
+    /// The height of a line of the text being placed, what a page of notes
+    /// leaves room for at least.
+    line_hint: f32,
 }
 
 fn collect_notes(doc: &Document) -> NoteNumbers {
@@ -200,6 +304,8 @@ impl Layouter {
             pending_start: None,
             prev: None,
             sections_pages: Vec::new(),
+            carry: Vec::new(),
+            line_hint: 12.0,
         };
         flow.run();
         let layout = flow.finish();
@@ -223,6 +329,10 @@ impl Flow<'_, '_> {
                 self.place_block(blocks, i);
             }
             start = end;
+        }
+        // What of the last notes did not fit goes on pages of its own.
+        while !self.carry.is_empty() && self.pages.len() < MAX_PAGES {
+            self.new_page();
         }
         self.place_endnotes();
     }
@@ -416,6 +526,7 @@ impl Flow<'_, '_> {
             notes: Vec::new(),
             note_height: 0.0,
             obstructions: Vec::new(),
+            wraps: Vec::new(),
             used: false,
             page_in_section,
         });
@@ -426,6 +537,53 @@ impl Flow<'_, '_> {
         if let Some(count) = self.sections_pages.get_mut(self.section) {
             *count += 1;
         }
+        self.place_carry();
+    }
+
+    /// The rest of notes that began on the page before goes at the bottom of
+    /// this one, as much of it as leaves room for a line of text; what is
+    /// left goes on to the next.
+    fn place_carry(&mut self) {
+        if self.carry.is_empty() {
+            return;
+        }
+        let page = self.pages.last().expect("page");
+        let capacity = page.body_bottom - page.body_top - NOTE_GAP - self.line_hint;
+        let mut used = 0.0f32;
+        let mut placed: Vec<NoteSlice> = Vec::new();
+        let mut rest: Vec<NoteSlice> = Vec::new();
+        let mut queue = std::mem::take(&mut self.carry).into_iter();
+        for slice in queue.by_ref() {
+            let room = capacity - used;
+            let cut = cut_note(&slice.stack, slice.from, room);
+            // Something always goes on a page, or nothing would ever end.
+            let cut = if cut <= slice.from + EPS && placed.is_empty() {
+                next_cut(&slice.stack, slice.from)
+            } else {
+                cut
+            };
+            if cut >= slice.to - EPS {
+                used += slice.height();
+                placed.push(slice);
+                continue;
+            }
+            if cut > slice.from + EPS {
+                let head = NoteSlice {
+                    to: cut,
+                    ..slice.clone()
+                };
+                placed.push(head);
+                rest.push(NoteSlice { from: cut, ..slice });
+            } else {
+                rest.push(slice);
+            }
+            break;
+        }
+        rest.extend(queue);
+        self.carry = rest;
+        let page = self.pages.last_mut().expect("page");
+        page.notes.extend(placed);
+        self.recompute_note_height();
     }
 
     /// Move to the next column, or the next page after the last. `explicit`
@@ -487,9 +645,7 @@ impl Flow<'_, '_> {
             };
             let shaped = self.cx.shaped(p, Cx::text_width(p, width));
             let lines = shaped.lines();
-            let space = prev
-                .as_deref()
-                .map_or(pt(p.props.space_before), |q| gap(q, p));
+            let space = prev.as_deref().map_or(space_before(p), |q| gap(q, p));
             let all = shaped.paragraph.height();
             let unit = if p.props.keep_lines || lines.len() <= 4 {
                 all
@@ -524,6 +680,71 @@ impl Flow<'_, '_> {
         self.place_paragraph(path, para, blocks.get(i + 1));
     }
 
+    /// The lines of a paragraph that a page or column break is asked for
+    /// at.
+    fn break_lines_of(shaped: &crate::shape::Shaped) -> Vec<usize> {
+        shaped
+            .breaks
+            .iter()
+            .map(|(offset, _)| shaped.paragraph.line_of(*offset))
+            .collect()
+    }
+
+    /// The places text beside floating drawings keeps out of, for a
+    /// paragraph whose text area starts at `x` and whose first line is at
+    /// `y`, down to `bottom`; from the paragraph's top-left corner.
+    fn wrap_obstacles(&self, x: f32, y: f32, bottom: f32) -> Vec<Rect> {
+        let Some(page) = self.pages.last() else {
+            return Vec::new();
+        };
+        let (col_x, col_w) = self.col_rect();
+        let mut out: Vec<Rect> = Vec::new();
+        for w in &page.wraps {
+            if w.x0 < col_x + col_w && w.x1 > col_x && w.y0 < bottom && w.y1 > y {
+                let o = Rect::new(w.x0 - x, w.y0.max(y) - y, w.x1 - x, w.y1.min(bottom) - y);
+                if !out.contains(&o) {
+                    out.push(o);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            (a.y0, a.x0, a.y1, a.x1)
+                .partial_cmp(&(b.y0, b.x0, b.y1, b.x1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    }
+
+    /// `plain` shaped to flow around the `obstacles` that matter to it: the
+    /// ones it reaches, counting that going around them makes it longer.
+    fn shaped_beside(
+        &mut self,
+        para: &Arc<Paragraph>,
+        plain: &Arc<crate::shape::Shaped>,
+        width: f32,
+        obstacles: &[Rect],
+    ) -> Arc<crate::shape::Shaped> {
+        let mut reach = plain.paragraph.height();
+        let mut result = plain.clone();
+        for _ in 0..8 {
+            let near: Vec<Rect> = obstacles
+                .iter()
+                .filter(|o| o.y0 < reach - EPS)
+                .copied()
+                .collect();
+            if near.is_empty() {
+                return result;
+            }
+            result = self.cx.shaped_around(para, width, &near);
+            let height = result.paragraph.height();
+            if height <= reach + EPS {
+                return result;
+            }
+            reach = height;
+        }
+        result
+    }
+
     fn obstruction(&self, top: f32, bottom: f32) -> Option<f32> {
         let page = self.pages.last()?;
         let (x, w) = self.col_rect();
@@ -547,10 +768,18 @@ impl Flow<'_, '_> {
         if props.page_break_before && self.pages.last().is_some_and(|p| p.used) {
             self.advance_page();
         }
-        let shaped = self
-            .cx
-            .shaped(para, Cx::text_width(para, self.geom.shape_width));
-        let nlines = shaped.lines().len();
+        let text_width = Cx::text_width(para, self.geom.shape_width);
+        // The paragraph as it is without anything beside it; where it goes
+        // decides what flows around.
+        let plain = self.cx.shaped(para, text_width);
+        let mut shaped = plain.clone();
+        let mut nlines = shaped.lines().len();
+        self.line_hint = plain
+            .lines()
+            .iter()
+            .map(|l| l.height)
+            .fold(f32::INFINITY, f32::min)
+            .clamp(1.0, 48.0);
         let (pad_top, pad_bottom) = pads(para);
         let next_para = next.and_then(Block::as_paragraph);
         let has_box = props.borders.iter().any(Option::is_some) || props.shading.is_some();
@@ -561,15 +790,11 @@ impl Flow<'_, '_> {
                 && a.props.indent_right == b.props.indent_right
         };
         let next_joined = has_box && next_para.is_some_and(|n| same(para, n));
-        let break_lines: Vec<usize> = shaped
-            .breaks
-            .iter()
-            .map(|(offset, _)| shaped.paragraph.line_of(*offset))
-            .collect();
+        let mut break_lines = Self::break_lines_of(&shaped);
         // Where floating drawings go, worked out once where the paragraph
         // starts; text keeps clear of them.
         let mut fixed: Vec<(usize, Rect)> = Vec::new();
-        let mut fixed_on: Option<(usize, usize)> = None;
+        let mut fixed_on: Option<(usize, usize, usize)> = None;
         let mut line = 0;
         let mut first_fragment = true;
         let mut guard = 0;
@@ -579,7 +804,7 @@ impl Flow<'_, '_> {
                 break;
             }
             // Something keeps pushing the text away: put what is left down.
-            let force = guard > nlines * 4 + 64;
+            let mut force = guard > nlines * 4 + 64;
             let (col_x, col_w) = self.col_rect();
             let joined = has_box
                 && self.prev.as_deref().is_some_and(|p| {
@@ -588,7 +813,7 @@ impl Flow<'_, '_> {
                 });
             let base_space = match &self.prev {
                 Some(prev) => gap(prev, para),
-                None => pt(props.space_before),
+                None => space_before(para),
             };
             let space = if line > 0 || (self.col_empty && self.overflowed && self.prev.is_none()) {
                 0.0
@@ -596,28 +821,32 @@ impl Flow<'_, '_> {
                 base_space
             };
             let top_pad = if line == 0 && !joined { pad_top } else { 0.0 };
-            let lines = shaped.lines();
             let bottom_edge = self.col_bottom();
             let y0 = self.y + space + top_pad;
-            if line == 0 && !shaped.floats.is_empty() {
+            if line == 0 && !plain.floats.is_empty() {
                 let page_index = self.pages.len() - 1;
-                if fixed_on.map(|(p, _)| p) != Some(page_index) {
-                    if let Some((p, len)) = fixed_on
+                if fixed_on.map(|(p, _, _)| p) != Some(page_index) {
+                    if let Some((p, len, wraps)) = fixed_on
                         && let Some(page) = self.pages.get_mut(p)
                     {
                         page.obstructions.truncate(len);
+                        page.wraps.truncate(wraps);
                     }
-                    fixed_on = Some((page_index, self.pages[page_index].obstructions.len()));
+                    fixed_on = Some((
+                        page_index,
+                        self.pages[page_index].obstructions.len(),
+                        self.pages[page_index].wraps.len(),
+                    ));
                     fixed.clear();
                     let ec = self.ec(false);
-                    let origin_y = y0 - shaped.lines()[0].top;
+                    let origin_y = y0 - plain.lines()[0].top;
                     let origin_x = col_x + pt(props.indent_left);
-                    for (n, (offset, drawing)) in shaped.floats.iter().enumerate() {
+                    for (n, (offset, drawing)) in plain.floats.iter().enumerate() {
                         let Some(float) = drawing.float else {
                             continue;
                         };
-                        let (li, caret_x) = shaped.paragraph.caret(*offset);
-                        let b = &shaped.lines()[li];
+                        let (li, caret_x) = plain.paragraph.caret(*offset);
+                        let b = &plain.lines()[li];
                         let rect = self.cx.float_rect(
                             drawing,
                             &float,
@@ -628,62 +857,141 @@ impl Flow<'_, '_> {
                                 origin_y + b.top + b.height,
                             ),
                             origin_y,
-                            origin_y + shaped.paragraph.height(),
+                            origin_y + plain.paragraph.height(),
                         );
                         fixed.push((n, rect));
                         if float.wrap != Wrap::None {
                             let [dl, dt, dr, db] = float.distance.map(emu_pt);
-                            self.pages[page_index].obstructions.push(Rect::new(
-                                rect.x0 - dl,
-                                rect.y0 - dt,
-                                rect.x1 + dr,
-                                rect.y1 + db,
-                            ));
+                            let around =
+                                Rect::new(rect.x0 - dl, rect.y0 - dt, rect.x1 + dr, rect.y1 + db);
+                            self.pages[page_index].keep_clear(around, float.wrap);
                         }
                     }
                 }
             }
-            let mut used = 0.0f32;
+            // Text beside floating drawings: shaped for where it is going
+            // to be, so only when it is at its start (what is on the page
+            // above it, and below it, is known then).
+            if line == 0 {
+                let crowded = self.pages.last().is_some_and(|p| !p.wraps.is_empty());
+                let obstacles = if crowded {
+                    let origin_x = col_x + pt(props.indent_left);
+                    // A line that starts lower than this does not fit above
+                    // the bottom of the page: it goes to the next one, where
+                    // what is on this page is not in its way.
+                    let shortest = plain
+                        .lines()
+                        .iter()
+                        .map(|l| l.height)
+                        .fold(f32::INFINITY, f32::min)
+                        .max(1.0);
+                    self.wrap_obstacles(origin_x, y0, bottom_edge - shortest)
+                } else {
+                    Vec::new()
+                };
+                if obstacles.is_empty() {
+                    if !Arc::ptr_eq(&shaped, &plain) {
+                        shaped = plain.clone();
+                    }
+                } else {
+                    shaped = self.shaped_beside(para, &plain, text_width, &obstacles);
+                }
+                nlines = shaped.lines().len();
+                break_lines = Self::break_lines_of(&shaped);
+                force = guard > nlines * 4 + 64;
+            }
+            let lines = shaped.lines();
+            let origin_y = if line == 0 { y0 } else { y0 - lines[line].top };
             let mut k = 0usize;
-            let mut pending: Vec<(usize, i32, Stack)> = Vec::new();
+            let mut pending: Vec<Pend> = Vec::new();
             let mut pending_height = 0.0f32;
             let mut bump: Option<f32> = None;
             let mut explicit = false;
             if force {
-                used = lines[line..].iter().map(|l| l.height).sum();
                 k = nlines - line;
             }
             for j in if force { nlines..nlines } else { line..nlines } {
                 let h = lines[j].height;
-                let j_top = y0 + used;
+                let j_top = origin_y + lines[j].top;
                 if let Some(b) = self.obstruction(j_top, j_top + h) {
                     // A bump past the bottom of an empty column would only
                     // move the problem to the next page.
-                    if !(b > bottom_edge && self.col_empty && used == 0.0) {
+                    if !(b > bottom_edge && self.col_empty && k == 0) {
                         bump = Some(b);
                         break;
                     }
                 }
-                let ids: Vec<i32> = pending.iter().map(|(_, id, _)| *id).collect();
+                let ids: Vec<i32> = pending.iter().map(|p| p.slice.id).collect();
                 let new_notes = self.notes_of_line(&shaped, j, &ids);
-                let mut extra: f32 = new_notes.iter().map(|(_, s)| s.height).sum();
-                if extra > 0.0
-                    && pending.is_empty()
-                    && self.pages.last().is_some_and(|p| p.notes.is_empty())
-                {
-                    extra += NOTE_GAP;
-                }
                 let pad = if j + 1 == nlines && !next_joined {
                     pad_bottom
                 } else {
                     0.0
                 };
-                if j_top + h + pad <= bottom_edge - pending_height - extra + EPS {
-                    used += h;
-                    k += 1;
-                    pending_height += extra;
+                // What is left for the notes of this line once it is on.
+                let room = bottom_edge - pending_height - (j_top + h + pad);
+                let mut fits = room >= -EPS;
+                let mut shown: Vec<NoteSlice> = Vec::new();
+                let mut later: Vec<NoteSlice> = Vec::new();
+                let mut used_room = 0.0f32;
+                if !new_notes.is_empty() {
+                    // A note that is going on to the next page keeps what
+                    // comes after it there.
+                    fits &= self.carry.is_empty() && pending.iter().all(|p| p.carry.is_empty());
+                    if self.pages.last().is_some_and(|p| p.notes.is_empty()) && pending.is_empty() {
+                        used_room += NOTE_GAP;
+                    }
+                }
+                if fits {
                     for (id, stack) in new_notes {
-                        pending.push((j, id, stack));
+                        if !later.is_empty() {
+                            later.push(NoteSlice::whole(id, stack));
+                            continue;
+                        }
+                        let cut = cut_note(&stack, 0.0, room - used_room);
+                        if cut >= stack.height - EPS {
+                            used_room += stack.height;
+                            shown.push(NoteSlice::whole(id, stack));
+                        } else if cut > EPS {
+                            // The first lines of a note that goes on over
+                            // the page.
+                            let to = stack.height;
+                            used_room += cut;
+                            shown.push(NoteSlice {
+                                id,
+                                stack: stack.clone(),
+                                from: 0.0,
+                                to: cut,
+                            });
+                            later.push(NoteSlice {
+                                id,
+                                stack,
+                                from: cut,
+                                to,
+                            });
+                        } else {
+                            // Not even its first line: the line is for the
+                            // next page, and its notes with it.
+                            fits = false;
+                            break;
+                        }
+                    }
+                }
+                if fits {
+                    k += 1;
+                    pending_height += used_room;
+                    let count = shown.len();
+                    for (n, slice) in shown.into_iter().enumerate() {
+                        let carry = if n + 1 == count {
+                            std::mem::take(&mut later)
+                        } else {
+                            Vec::new()
+                        };
+                        pending.push(Pend {
+                            line: j,
+                            slice,
+                            carry,
+                        });
                     }
                 } else {
                     break;
@@ -713,13 +1021,26 @@ impl Flow<'_, '_> {
             if k == 0 && bump.is_none() && fit == 0 && self.col_empty && self.prev.is_none() {
                 k = 1;
             }
+            // A line that had to be put down where it does not fit has its
+            // notes there all the same.
+            for j in line..line + k {
+                if pending.iter().any(|p| p.line == j) {
+                    continue;
+                }
+                let ids: Vec<i32> = pending.iter().map(|p| p.slice.id).collect();
+                for (id, stack) in self.notes_of_line(&shaped, j, &ids) {
+                    pending.push(Pend {
+                        line: j,
+                        slice: NoteSlice::whole(id, stack),
+                        carry: Vec::new(),
+                    });
+                }
+            }
             // The notes of the lines that stay go on the page.
-            {
-                let page = self.pages.last_mut().expect("page");
-                for (j, id, stack) in pending {
-                    if j < line + k {
-                        page.notes.push((id, stack));
-                    }
+            for p in pending {
+                if p.line < line + k {
+                    self.pages.last_mut().expect("page").notes.push(p.slice);
+                    self.carry.extend(p.carry);
                 }
             }
             self.recompute_note_height();
@@ -737,7 +1058,6 @@ impl Flow<'_, '_> {
                 continue;
             }
             // Put lines `line..line + k` on the page.
-            let origin_y = y0 - lines[line].top;
             let (x, _) = (col_x, col_w);
             let bx = has_box.then(|| ParaBox {
                 borders: props.borders,
@@ -760,7 +1080,7 @@ impl Flow<'_, '_> {
             let ec = self.ec(path.is_some());
             let end_line = line + k;
             let mut layers = std::mem::take(&mut self.pages.last_mut().expect("page").layers);
-            let clear = {
+            let clear: Vec<(Rect, Wrap)> = {
                 let mut out = Out {
                     layers: &mut layers,
                     frags: &mut self.frags,
@@ -786,7 +1106,9 @@ impl Flow<'_, '_> {
                 let page = self.pages.last_mut().expect("page");
                 page.layers = layers;
                 page.used = true;
-                page.obstructions.extend(clear);
+                for (rect, wrap) in clear {
+                    page.keep_clear(rect, wrap);
+                }
                 let region = page.regions.last_mut().expect("region");
                 region.used_bottom = region.used_bottom.max(end_y);
             }
@@ -830,7 +1152,7 @@ impl Flow<'_, '_> {
 
     fn recompute_note_height(&mut self) {
         let page = self.pages.last_mut().expect("page");
-        let sum: f32 = page.notes.iter().map(|(_, s)| s.height).sum();
+        let sum: f32 = page.notes.iter().map(NoteSlice::height).sum();
         page.note_height = if page.notes.is_empty() {
             0.0
         } else {
@@ -844,7 +1166,7 @@ impl Flow<'_, '_> {
         shaped: &crate::shape::Shaped,
         j: usize,
         pending: &[i32],
-    ) -> Vec<(i32, Stack)> {
+    ) -> Vec<(i32, Arc<Stack>)> {
         let mut out = Vec::new();
         if shaped.notes.is_empty() {
             return out;
@@ -856,7 +1178,7 @@ impl Flow<'_, '_> {
             let on_page = self
                 .pages
                 .last()
-                .is_some_and(|p| p.notes.iter().any(|(n, _)| n == id));
+                .is_some_and(|p| p.notes.iter().any(|n| n.id == *id));
             if on_page || pending.contains(id) || out.iter().any(|(n, _)| n == id) {
                 continue;
             }
@@ -865,7 +1187,7 @@ impl Flow<'_, '_> {
             };
             let width = self.pages.last().map_or(1.0, |p| p.margin.width());
             let stack = self.cx.layout_stack(&note.blocks, &Paths::None, width, 0);
-            out.push((*id, stack));
+            out.push((*id, Arc::new(stack)));
         }
         out
     }
@@ -1143,17 +1465,27 @@ impl Flow<'_, '_> {
                         color: [0, 0, 0, 255],
                         style: RuleStyle::Single,
                     });
-                    for (_, stack) in &state.notes {
+                    for note in &state.notes {
+                        let from = if note.from <= 0.0 {
+                            f32::NEG_INFINITY
+                        } else {
+                            note.from
+                        };
+                        let to = if note.is_whole() || note.to >= note.stack.height - EPS {
+                            f32::INFINITY
+                        } else {
+                            note.to
+                        };
                         self.cx.emit_stack(
-                            stack,
+                            &note.stack,
                             state.margin.x0,
                             y,
-                            f32::NEG_INFINITY,
-                            f32::INFINITY,
+                            from,
+                            to,
                             &ec,
                             &mut out,
                         );
-                        y += stack.height;
+                        y += note.height();
                     }
                 }
                 for region in &state.regions {

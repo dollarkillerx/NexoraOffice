@@ -14,7 +14,9 @@ use aster_writer::{
 
 use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
 use crate::fonts::Families;
-use crate::shape::{Env, NoteNumbers, PageValues, Shaped, context, emu_pt, pt, shape};
+use crate::shape::{
+    Env, NoteNumbers, PageValues, Shaped, context, emu_pt, fully_hidden, pt, shape,
+};
 use crate::table::TableLayout;
 
 /// The paint order of a page: shading under everything, then drawings
@@ -222,6 +224,9 @@ pub(crate) struct Cx<'a> {
 
 /// Space a paragraph's borders take above and below the text.
 pub(crate) fn pads(para: &Paragraph) -> (f32, f32) {
+    if fully_hidden(para) {
+        return (0.0, 0.0);
+    }
     let take = |border: &Option<Border>| border.map_or(0.0, |b| b.width + b.space);
     (take(&para.props.borders[1]), take(&para.props.borders[3]))
 }
@@ -238,29 +243,55 @@ fn same_box(a: &Paragraph, b: &Paragraph) -> bool {
         && a.props.first_line == b.props.first_line
 }
 
-/// What automatic paragraph spacing comes to, twips.
+/// What automatic paragraph spacing comes to, twips: the 14 points of an
+/// HTML paragraph.
 const AUTO_SPACE: i32 = 280;
 
-/// The space between two paragraphs, and whether it is dropped.
+/// The space above a paragraph that follows nothing.
+pub(crate) fn space_before(para: &Paragraph) -> f32 {
+    if fully_hidden(para) {
+        0.0
+    } else {
+        pt(para.props.space_before)
+    }
+}
+
+/// The space between two paragraphs.
+///
+/// Automatic spacing (`beforeAutospacing`, `afterAutospacing`) is what HTML
+/// has: 14 points, but two of them next to each other are one, and list
+/// items have none between them. Other spaces add up; contextual spacing
+/// drops the space between paragraphs of one style.
 pub(crate) fn gap(prev: &Paragraph, next: &Paragraph) -> f32 {
+    // A paragraph that is hidden altogether has no spaces of its own.
+    match (fully_hidden(prev), fully_hidden(next)) {
+        (true, true) => return 0.0,
+        (true, false) => return space_before(next),
+        (false, true) => return pt(prev.props.space_after.max(0)),
+        (false, false) => {}
+    }
     let same_style = prev.props.style == next.props.style;
+    let items = prev.props.list.is_some() && next.props.list.is_some();
+    let after_auto = prev.props.space_after_auto;
+    let before_auto = next.props.space_before_auto;
     let after = if prev.props.contextual_spacing && same_style {
         0
+    } else if after_auto {
+        if items { 0 } else { AUTO_SPACE }
     } else {
-        prev.props.space_after
+        prev.props.space_after.max(0)
     };
     let before = if next.props.contextual_spacing && same_style {
         0
+    } else if before_auto {
+        if items { 0 } else { AUTO_SPACE }
     } else {
-        next.props.space_before
+        next.props.space_before.max(0)
     };
-    // Space that the file asks for as "automatic" (HTML-style) is 14 points,
-    // and two of them next to each other do not add up: the model keeps no
-    // flag for it, so two 14-point spaces are taken as that.
-    if after == AUTO_SPACE && before == AUTO_SPACE {
-        return pt(AUTO_SPACE);
+    if after_auto && before_auto {
+        return pt(after.max(before));
     }
-    pt(after.max(0)) + pt(before.max(0))
+    pt(after) + pt(before)
 }
 
 pub(crate) fn rule_style(style: BorderStyle) -> RuleStyle {
@@ -279,7 +310,19 @@ pub(crate) fn border_color(border: &Border) -> Rgba {
 impl Cx<'_> {
     /// The paragraph shaped for a text area `width` wide.
     pub fn shaped(&mut self, para: &Arc<Paragraph>, width: f32) -> Arc<Shaped> {
+        self.shaped_around(para, width, &[])
+    }
+
+    /// The same for a paragraph whose text flows around `obstacles`
+    /// (rectangles from its top-left corner).
+    pub fn shaped_around(
+        &mut self,
+        para: &Arc<Paragraph>,
+        width: f32,
+        obstacles: &[Rect],
+    ) -> Arc<Shaped> {
         let env = Env {
+            obstacles,
             settings: &self.doc.settings,
             grid: self.grid,
             notes: &self.notes,
@@ -342,9 +385,7 @@ impl Cx<'_> {
                 Block::Paragraph(para) => {
                     let shaped = self.shaped(para, Self::text_width(para, width));
                     let (pad_top, pad_bottom) = pads(para);
-                    let space = prev
-                        .as_deref()
-                        .map_or(pt(para.props.space_before), |p| gap(p, para));
+                    let space = prev.as_deref().map_or(space_before(para), |p| gap(p, para));
                     let joined = prev.as_deref().is_some_and(|p| same_box(p, para));
                     let top_pad = if joined { 0.0 } else { pad_top };
                     let top = y + space + top_pad;
@@ -541,7 +582,7 @@ impl Cx<'_> {
         y: f32,
         ec: &EmitCtx,
         out: &mut Out<'_>,
-    ) -> Vec<Rect> {
+    ) -> Vec<(Rect, Wrap)> {
         let shaped = &entry.shaped;
         let paragraph = &shaped.paragraph;
         let all = paragraph.lines();
@@ -661,11 +702,9 @@ impl Cx<'_> {
             self.emit_drawing(&drawing, rect, layer, ec, out);
             if float.wrap != Wrap::None {
                 let [dl, dt, dr, db] = float.distance.map(emu_pt);
-                keep_clear.push(Rect::new(
-                    rect.x0 - dl,
-                    rect.y0 - dt,
-                    rect.x1 + dr,
-                    rect.y1 + db,
+                keep_clear.push((
+                    Rect::new(rect.x0 - dl, rect.y0 - dt, rect.x1 + dr, rect.y1 + db),
+                    float.wrap,
                 ));
             }
         }
@@ -789,7 +828,7 @@ impl Cx<'_> {
         s1: f32,
         ec: &EmitCtx,
         out: &mut Out<'_>,
-    ) -> Vec<Rect> {
+    ) -> Vec<(Rect, Wrap)> {
         let shift = if s0.is_finite() { s0 } else { 0.0 };
         let mut clear = Vec::new();
         for entry in &stack.entries {

@@ -13,14 +13,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aster_text::{
-    Above, Align as TextAlign, Decor, Extra, InlineObject, LineRule, Natural, Rules, Scaling,
-    Shaper, Spacing, Span, Spec, Stroke, Style, TabAlign, TabStop,
+    Above, Align as TextAlign, Band, Decor, Extra, Flow, InlineObject, LineRule, Natural, Rules,
+    Scaling, Shaper, Slot, Spacing, Span, Spec, Stroke, Style, TabAlign, TabStop,
 };
 use aster_writer::{
     Align, Break, Drawing, Inline, LineSpacing, PageField, Paragraph, RunLook, Settings, Suffix,
     TWIPS_PER_POINT, TabAlign as WTabAlign, TabLeader, UnderlineStyle, VertAlign,
 };
 
+use crate::display::Rect;
 use crate::fonts::Families;
 
 /// Points per EMU.
@@ -60,6 +61,9 @@ pub(crate) struct Env<'a> {
     pub max_object: f32,
     /// What text is on, where the paragraph itself has no shading (a cell's).
     pub background: Option<[u8; 4]>,
+    /// Places text flows around, from the paragraph's top-left corner
+    /// (floating drawings that text wraps beside).
+    pub obstacles: &'a [Rect],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,6 +186,11 @@ pub(crate) fn context(para: &Paragraph, env: &Env<'_>) -> u64 {
     env.grid.map(f32::to_bits).hash(&mut hasher);
     env.max_object.to_bits().hash(&mut hasher);
     env.background.hash(&mut hasher);
+    for o in env.obstacles {
+        for v in [o.x0, o.y0, o.x1, o.y1] {
+            ((v * 16.0).round() as i32).hash(&mut hasher);
+        }
+    }
     for run in &para.runs {
         if let Some(text) = replacement(run, env) {
             text.hash(&mut hasher);
@@ -603,6 +612,7 @@ pub(crate) fn shape(
 
     let grid = if props.snap_to_grid { env.grid } else { None };
     let line = match props.line {
+        _ if fully_hidden(para) => LineRule::Exactly(0.0),
         LineSpacing::Multiple(m) => LineRule::Multiple(m.max(0.0)),
         LineSpacing::AtLeast(v) => LineRule::AtLeast(pt(v)),
         LineSpacing::Exactly(v) => LineRule::Exactly(pt(v)),
@@ -643,6 +653,12 @@ pub(crate) fn shape(
         distribute: props.align == Align::Distribute,
         snap: false,
         trailing_line: true,
+        flow: None,
+    };
+    let around = |band: Band| free_stretch(env.obstacles, band);
+    let extra = Extra {
+        flow: (!env.obstacles.is_empty()).then_some(Flow(&around)),
+        ..extra
     };
     let paragraph = shaper.lay_out_with(&spec, &extra);
     Shaped {
@@ -658,6 +674,61 @@ pub(crate) fn shape(
         backs: builder.backs,
         has_tabs,
         rubies: builder.rubies,
+    }
+}
+
+/// A paragraph Word does not show at all: its mark is hidden and so is
+/// everything in it. It takes no room, spaces included.
+pub(crate) fn fully_hidden(para: &Paragraph) -> bool {
+    para.mark.hidden
+        && para.runs.iter().all(|run| {
+            run.look.hidden
+                || (matches!(run.kind, Inline::Text | Inline::Marker) && run.text.is_empty())
+        })
+}
+
+/// The widest stretch of a band that none of `obstacles` covers, and where
+/// to go to get below them (they are rectangles from the paragraph's
+/// top-left corner). With nothing in the way it is the band itself.
+pub(crate) fn free_stretch(obstacles: &[Rect], band: Band) -> Slot {
+    const EPS: f32 = 0.01;
+    let bottom = band.top + band.height;
+    let mut free = vec![(band.left, band.right)];
+    let mut below = band.top;
+    for o in obstacles {
+        if o.y0 >= bottom - EPS || o.y1 <= band.top + EPS {
+            continue;
+        }
+        below = below.max(o.y1);
+        let mut next = Vec::with_capacity(free.len() + 1);
+        for (a, b) in free {
+            if o.x1 <= a || o.x0 >= b {
+                next.push((a, b));
+                continue;
+            }
+            if o.x0 > a {
+                next.push((a, o.x0));
+            }
+            if o.x1 < b {
+                next.push((o.x1, b));
+            }
+        }
+        free = next;
+    }
+    // The wider side of what is left; the left one when they are equal.
+    let best = free
+        .into_iter()
+        .fold(None, |best: Option<(f32, f32)>, (a, b)| match best {
+            Some((x, y)) if y - x >= b - a => Some((x, y)),
+            _ => Some((a, b)),
+        });
+    match best {
+        Some((left, right)) => Slot { left, right, below },
+        None => Slot {
+            left: band.left,
+            right: band.left,
+            below,
+        },
     }
 }
 

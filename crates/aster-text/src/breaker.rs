@@ -501,70 +501,98 @@ pub fn break_lines_shaped(clusters: &[Cluster], options: Options, shape: &Shape<
     let count = clusters.len();
     let mut lines = Vec::new();
     let mut start = 0;
-    let tabbed = (!shape.stops.is_empty() || shape.default_tab > 0)
-        && clusters.iter().any(|cluster| cluster.tab);
-
+    let tabbed = has_tabs_to_resolve(clusters, shape);
     while start < count {
         let indent = if lines.is_empty() {
             shape.first_indent
         } else {
             0
         };
-        let breaker = Breaker {
+        let line = break_line(
             clusters,
-            options: Options {
-                max_width: options.max_width.saturating_sub(indent),
-                ..options
-            },
-            shape: *shape,
-            origin: shape.margin_offset + indent,
+            options,
+            shape,
             tabbed,
-        };
-        // The furthest allowed end that fits, and how it fits.
-        let mut best: Option<(usize, EndTreatment, BreakKind)> = None;
-        let mut end = start + 1;
-        loop {
-            let hard = clusters[end - 1].newline;
-            let finished = end == count;
-            if hard || finished || clusters[end].break_before {
-                match breaker.fit(start, end) {
-                    Some((treatment, _)) => {
-                        let kind = if hard {
-                            BreakKind::Hard
-                        } else if finished {
-                            BreakKind::End
-                        } else {
-                            BreakKind::Soft
-                        };
-                        best = Some((end, treatment, kind));
-                        if hard || finished {
-                            break;
-                        }
-                    }
-                    // Too long: fall back to the last opportunity that fitted,
-                    // or to an emergency break if there was none.
-                    None => break,
-                }
-            }
-            end += 1;
-        }
-
-        let (end, treatment, kind) = best.unwrap_or_else(|| {
-            // No opportunity fits: break wherever the line is full.
-            let mut cut = end.min(count) - 1;
-            while cut > start + 1 && breaker.fit(start, cut).is_none() {
-                cut -= 1;
-            }
-            let cut = cut.max(start + 1);
-            let treatment = breaker
-                .fit(start, cut)
-                .map_or(EndTreatment::None, |(t, _)| t);
-            (cut, treatment, BreakKind::Emergency)
-        });
-        lines.push(breaker.place(start, end, kind, treatment));
-        start = end;
+            start,
+            indent,
+            options.max_width,
+        );
+        start = line.clusters.end;
+        lines.push(line);
     }
     lines
+}
+
+/// Whether tabs in `clusters` have stops to be resolved against.
+pub fn has_tabs_to_resolve(clusters: &[Cluster], shape: &Shape<'_>) -> bool {
+    (!shape.stops.is_empty() || shape.default_tab > 0) && clusters.iter().any(|cluster| cluster.tab)
+}
+
+/// The one line that starts at cluster `start` and runs from `left` to
+/// `right` (counted from the paragraph's left edge). `tabbed` is
+/// [`has_tabs_to_resolve`]; `start` must be below `clusters.len()`.
+pub fn break_line(
+    clusters: &[Cluster],
+    options: Options,
+    shape: &Shape<'_>,
+    tabbed: bool,
+    start: usize,
+    left: Fx,
+    right: Fx,
+) -> Line {
+    let count = clusters.len();
+    let breaker = Breaker {
+        clusters,
+        options: Options {
+            max_width: right.saturating_sub(left),
+            ..options
+        },
+        shape: *shape,
+        origin: shape.margin_offset + left,
+        tabbed,
+    };
+    // The furthest allowed end that fits, and how it fits.
+    let mut best: Option<(usize, EndTreatment, BreakKind)> = None;
+    let mut end = start + 1;
+    loop {
+        let hard = clusters[end - 1].newline;
+        let finished = end == count;
+        if hard || finished || clusters[end].break_before {
+            match breaker.fit(start, end) {
+                Some((treatment, _)) => {
+                    let kind = if hard {
+                        BreakKind::Hard
+                    } else if finished {
+                        BreakKind::End
+                    } else {
+                        BreakKind::Soft
+                    };
+                    best = Some((end, treatment, kind));
+                    if hard || finished {
+                        break;
+                    }
+                }
+                // Too long: fall back to the last opportunity that fitted,
+                // or to an emergency break if there was none.
+                None => break,
+            }
+        }
+        end += 1;
+    }
+
+    let (end, treatment, kind) = best.unwrap_or_else(|| {
+        // No opportunity fits: break wherever the line is full.
+        let mut cut = end.min(count) - 1;
+        while cut > start + 1 && breaker.fit(start, cut).is_none() {
+            cut -= 1;
+        }
+        let cut = cut.max(start + 1);
+        let treatment = breaker
+            .fit(start, cut)
+            .map_or(EndTreatment::None, |(t, _)| t);
+        (cut, treatment, BreakKind::Emergency)
+    });
+    breaker.place(start, end, kind, treatment)
 }
 
 #[cfg(test)]

@@ -140,6 +140,14 @@ impl Families {
                 let found = shaper.has_family(name);
                 self.installed.insert(name.to_owned(), found);
             }
+            // Bold text should get a family's own bold face wherever it has
+            // one, the font named or what stands in for it.
+            if look.bold {
+                shaper.prefer_real_bold(name);
+                for substitute in substitutes(name) {
+                    shaper.prefer_real_bold(substitute);
+                }
+            }
         }
     }
 

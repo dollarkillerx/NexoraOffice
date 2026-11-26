@@ -17,6 +17,7 @@
 //!
 //! Nothing here depends on the GUI toolkit.
 
+mod bold;
 pub mod breaker;
 pub mod class;
 pub mod golden;

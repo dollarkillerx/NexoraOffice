@@ -498,6 +498,8 @@ pub struct Shaper {
     layout_cx: LayoutContext<NoBrush>,
     /// The weight class of fonts seen, by blob and index.
     weights: std::collections::HashMap<(u64, u32), Option<u16>>,
+    /// Families [`Shaper::prefer_real_bold`] has been through.
+    bold_checked: std::collections::HashSet<String>,
 }
 
 /// The `usWeightClass` of a font file (an OpenType font or a collection).
@@ -553,6 +555,46 @@ impl Shaper {
             font_cx,
             layout_cx: LayoutContext::default(),
             weights: std::collections::HashMap::new(),
+            bold_checked: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Make sure bold text in `family` gets the family's real bold face where
+    /// it has one the system does not describe as bold (Kaiti SC's "粗体" is
+    /// listed with the weight of the regular, so bold would otherwise be
+    /// the regular, thickened by hand). Does nothing for a family that is
+    /// not installed or already has a bold face, and is cheap to call again.
+    pub fn prefer_real_bold(&mut self, family: &str) {
+        if !self.bold_checked.insert(family.to_owned()) {
+            return;
+        }
+        let Some(info) = self.font_cx.collection.family_by_name(family) else {
+            return;
+        };
+        let name = info.name().to_owned();
+        let fonts: Vec<_> = info.fonts().to_vec();
+        if fonts.iter().any(|font| font.weight().value() >= 600.0) {
+            return;
+        }
+        for font in fonts {
+            let Some(blob) = font.load(None) else {
+                continue;
+            };
+            if !crate::bold::is_named_bold(blob.data(), font.index()) {
+                continue;
+            }
+            let Some(single) = crate::bold::single_face(blob.data(), font.index()) else {
+                continue;
+            };
+            self.font_cx.collection.register_fonts(
+                parley::fontique::Blob::new(std::sync::Arc::new(single)),
+                Some(parley::fontique::FontInfoOverride {
+                    family_name: Some(&name),
+                    weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                }),
+            );
+            break;
         }
     }
 
@@ -687,18 +729,19 @@ impl Shaper {
                 } else {
                     spec.spans[style_index - 1].style.bold
                 };
-                let east_asian_run = text[run.text_range()].chars().any(|c| c as u32 >= 0x2e80);
                 let font = run.font();
                 let coords_set = !run.normalized_coords().is_empty();
+                // A face that is bold is drawn as it is; only where the
+                // family has none that is (Heiti SC, Kaiti SC, whose bold
+                // faces the system does not report as bold) is it thickened.
                 let too_light = wants_bold && !coords_set && {
                     let key = (font.data.id(), font.index);
                     let weight = *self
                         .weights
                         .entry(key)
                         .or_insert_with(|| font_weight(font.data.data(), font.index));
-                    // The bold of East Asian serif fonts is faint at body sizes:
-                    // thicken it as for a font without one.
-                    weight.is_some_and(|w| w < 600 || (w < 800 && east_asian_run))
+                    let chosen = run.font_attrs().weight.value();
+                    weight.is_some_and(|w| w < 600) && chosen < 600.0
                 };
                 let face_index = faces.len();
                 faces.push(Face {
@@ -1948,6 +1991,61 @@ mod extra_tests {
         let b = shaper.lay_out_with(&spec(text, Some(120.0)), &Extra::default());
         assert_eq!(a.line_ranges(), b.line_ranges());
         assert_eq!(a.height(), b.height());
+    }
+
+    /// Whether the first drawn run of bold text in `family` is thickened by
+    /// hand, and which face of the file it is in. `None` without the font.
+    fn bold_of(shaper: &mut Shaper, family: &str) -> Option<(bool, u32)> {
+        if !shaper.has_family(family) {
+            return None;
+        }
+        let mut base = style(20.0);
+        base.family = Family::List(format!("\"{family}\"").into());
+        base.bold = true;
+        let paragraph = shaper.lay_out(&Spec {
+            text: "加粗的汉字",
+            base,
+            spans: &[],
+            language: "zh-Hans",
+            width: None,
+            scale: 1.0,
+            line_height: 1.2,
+            align: Align::Start,
+            rules: Rules::for_language("zh-Hans"),
+        });
+        let runs = paragraph.draw_runs(0.0, 1000.0);
+        let face = &runs.first()?.face;
+        Some((face.embolden, face.font.index))
+    }
+
+    #[test]
+    fn a_real_bold_face_is_not_thickened_again() {
+        let mut shaper = Shaper::new();
+        // Songti SC has a bold of its own (and a black, which is not it).
+        if let Some((thickened, _)) = bold_of(&mut shaper, "Songti SC") {
+            assert!(!thickened);
+        }
+        // Heiti SC has none: the regular is thickened by hand.
+        if let Some((thickened, _)) = bold_of(&mut shaper, "Heiti SC") {
+            assert!(thickened);
+        }
+    }
+
+    #[test]
+    fn a_bold_face_the_system_calls_regular_is_found_by_its_name() {
+        let mut shaper = Shaper::new();
+        let Some((before, regular)) = bold_of(&mut shaper, "Kaiti SC") else {
+            return;
+        };
+        shaper.prefer_real_bold("Kaiti SC");
+        // Asking again does no harm.
+        shaper.prefer_real_bold("Kaiti SC");
+        let (after, face) = bold_of(&mut shaper, "Kaiti SC").unwrap();
+        // The regular was thickened; now a face of its own is not.
+        assert!(before && !after, "{before} {after}");
+        let _ = (regular, face);
+        // A family that is not there is left alone.
+        shaper.prefer_real_bold("No Such Family");
     }
 
     #[test]

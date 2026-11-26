@@ -262,6 +262,7 @@ impl Default for Extra<'_> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectRect {
     pub offset: usize,
+    pub line: usize,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -1076,11 +1077,16 @@ impl Paragraph {
 
     /// Rectangles covering a byte range, one per line, as `[x0, y0, x1, y1]`.
     pub fn rects(&self, range: Range<usize>) -> Vec<[f32; 4]> {
+        self.rects_in(range, 0..self.lines.len())
+    }
+
+    /// The same, for the lines `lines` only.
+    pub fn rects_in(&self, range: Range<usize>, lines: Range<usize>) -> Vec<[f32; 4]> {
         let mut out = Vec::new();
         if range.is_empty() {
             return out;
         }
-        for line in &self.lines {
+        for line in self.lines_in(lines) {
             let mut x0 = f32::INFINITY;
             let mut x1 = f32::NEG_INFINITY;
             for placed in &line.placed {
@@ -1108,12 +1114,13 @@ impl Paragraph {
     /// Where the inline objects are.
     pub fn objects(&self) -> Vec<ObjectRect> {
         let mut out = Vec::new();
-        for line in &self.lines {
+        for (n, line) in self.lines.iter().enumerate() {
             for placed in &line.placed {
                 let Some([width, height]) = self.looks[placed.index].object else {
                     continue;
                 };
                 out.push(ObjectRect {
+                    line: n,
                     offset: self.clusters[placed.index].text.start,
                     x: line.left + from_fx(placed.x),
                     y: line.baseline - height,

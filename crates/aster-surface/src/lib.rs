@@ -11,6 +11,7 @@
 pub mod cell_editor;
 mod chart_draw;
 mod cond_icons;
+pub mod doc_paint;
 mod glyphs;
 pub mod host;
 pub mod md_picture;

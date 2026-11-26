@@ -5432,6 +5432,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         apply_static_models(&ui);
         apply_language(&ui, shell.language);
         refresh_chrome(&ui, &mut shell);
+        // A document asked for on the command line takes the keyboard, the
+        // way one made from the start page does.
+        if shell.active_surface().is_some() {
+            ui.invoke_focus_document();
+        }
     }
     if cfg!(target_os = "macos") {
         ui.set_leading_inset(WINDOW_BUTTONS_INSET);
@@ -8698,6 +8703,12 @@ mod ui_tests {
     /// The app with a new workbook in front, its data kept out of the
     /// user's folders.
     fn app() -> App {
+        app_opening(DocKind::Sheets)
+    }
+
+    /// The application started with one new document of `kind` asked for on
+    /// the command line.
+    fn app_opening(kind: DocKind) -> App {
         static DATA: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         DATA.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -8707,7 +8718,7 @@ mod ui_tests {
         });
         i_slint_backend_testing::init_no_event_loop();
         let app = setup(cli::Options {
-            open: vec![DocKind::Sheets],
+            open: vec![kind],
             ..cli::Options::default()
         })
         .expect("the window is made");
@@ -9754,6 +9765,18 @@ mod ui_tests {
         // The PDF card opens the file dialog (skipped in tests) and no tab.
         ui.invoke_new_document(DocKind::Pdf.index() as i32);
         assert_eq!(count(), before + 2);
+    }
+
+    /// A document asked for on the command line is ready for typing when the
+    /// window appears, like one made from the start page.
+    #[test]
+    fn a_word_document_opened_at_start_takes_the_keyboard() {
+        assert!(app_opening(DocKind::Writer).ui.get_surface_focused());
+    }
+
+    #[test]
+    fn a_markdown_document_opened_at_start_takes_the_keyboard() {
+        assert!(app_opening(DocKind::Markdown).ui.get_surface_focused());
     }
 
     /// The sample DOCX opened as a tab, the way a loaded file is.

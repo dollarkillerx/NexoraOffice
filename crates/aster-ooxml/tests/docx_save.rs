@@ -2092,3 +2092,147 @@ fn a_picture_where_the_package_has_other_media_names() {
     // image2 is taken (by .jpg): the new one is image3.
     assert!(parts(&saved).contains_key("word/media/image3.png"));
 }
+
+#[test]
+fn random_table_link_and_picture_edits_save_and_read_back() {
+    let bytes = grid_bytes();
+    for seed in 0..120u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut doc = read(&bytes);
+        let mut log: Vec<String> = Vec::new();
+        for _ in 0..(2 + rng.below(7)) {
+            let a = random_pos(&doc, &mut rng);
+            let b = if rng.below(2) == 0 {
+                a.clone()
+            } else {
+                random_pos(&doc, &mut rng)
+            };
+            match rng.below(12) {
+                0 | 1 => {
+                    let above = rng.below(2) == 0;
+                    log.push(format!("insert_rows {a:?} {b:?} {above}"));
+                    insert_rows(&mut doc, &a, &b, above);
+                }
+                2 | 3 => {
+                    let left = rng.below(2) == 0;
+                    log.push(format!("insert_columns {a:?} {b:?} {left}"));
+                    insert_columns(&mut doc, &a, &b, left);
+                }
+                4 => {
+                    log.push(format!("delete_rows {a:?} {b:?}"));
+                    delete_rows(&mut doc, &a, &b);
+                }
+                5 => {
+                    log.push(format!("delete_columns {a:?} {b:?}"));
+                    delete_columns(&mut doc, &a, &b);
+                }
+                6 => {
+                    log.push(format!("insert_table {a:?}"));
+                    insert_table(&mut doc, &a, 1 + rng.below(3), 1 + rng.below(3), 3_000);
+                }
+                7 => {
+                    if rng.below(3) == 0 {
+                        log.push(format!("delete_table {a:?}"));
+                        delete_table(&mut doc, &a);
+                    }
+                }
+                8 | 9 => {
+                    let link = (rng.below(3) > 0).then(|| Link {
+                        target: ["https://a.example/", "#mark", "https://b.example/?x=1&y=2"]
+                            [rng.below(3)]
+                        .to_owned(),
+                        tooltip: None,
+                    });
+                    log.push(format!("set_link {a:?} {b:?} {link:?}"));
+                    set_link(&mut doc, &a, &b, link);
+                }
+                10 => {
+                    log.push(format!("insert_picture {a:?}"));
+                    let image = if rng.below(2) == 0 {
+                        png_bytes(2, 2)
+                    } else {
+                        jpeg_like()
+                    };
+                    let _ = insert_picture(&mut doc, &a, image, (50_000, 40_000), None);
+                }
+                _ => {
+                    log.push(format!("insert_text {a:?}"));
+                    insert_text(&mut doc, &a, "x y", None);
+                }
+            }
+            assert_tables_valid_deep(&doc);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(&bytes, &doc, MEDIA_AND_RELS)
+        }));
+        if let Err(err) = result {
+            eprintln!("seed {seed} failed: {log:#?}");
+            std::panic::resume_unwind(err);
+        }
+    }
+}
+
+const MEDIA_AND_RELS: &[&str] = &[
+    "word/_rels/document.xml.rels",
+    "[Content_Types].xml",
+    "word/media/image1.png",
+    "word/media/image2.png",
+    "word/media/image1.jpeg",
+    "word/media/image2.jpeg",
+];
+
+fn assert_tables_valid_deep(doc: &Document) {
+    fn walk(blocks: &[Block]) {
+        for block in blocks {
+            if let Block::Table(t) = block {
+                check_table(t).unwrap();
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        walk(&cell.blocks);
+                    }
+                }
+            }
+        }
+    }
+    walk(&doc.body.blocks);
+}
+
+// ---------------------------------------------------------------------------
+// Styles in table cells
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_style_a_paragraph_in_a_cell_has_gives_it_back_what_the_reader_made() {
+    // The reader builds a cell paragraph's base from the document defaults,
+    // the table style (with its conditional formats) and the paragraph style;
+    // applying the paragraph's own style again must find the same.
+    let mut checked = 0;
+    for bytes in [sample(), grid_bytes()] {
+        let doc = read(&bytes);
+        let default_style = doc.styles.default_style.clone();
+        for (path, p) in doc.paragraphs() {
+            if path.in_cell().is_none() {
+                continue;
+            }
+            let Some(style) = p.props.style.clone().or_else(|| default_style.clone()) else {
+                continue;
+            };
+            let mut again = doc.clone();
+            let at = Pos::new(path.clone(), 0);
+            set_style(&mut again, &at, &at, &style);
+            let q = again.paragraph(&path).unwrap();
+            let mut expected = p.props.clone();
+            expected.style = Some(style);
+            // A list a paragraph is on comes from its own numbering, not
+            // from its style.
+            let mut got = q.props.clone();
+            got.list = expected.list;
+            got.indent_left = expected.indent_left;
+            got.first_line = expected.first_line;
+            assert_eq!(got, expected, "{:?}", p.text());
+            assert_eq!(q.base, p.base, "{:?}", p.text());
+            checked += 1;
+        }
+    }
+    assert!(checked > 10, "{checked}");
+}

@@ -6,16 +6,33 @@
 //! gives (the byte ranges of every block and run):
 //!
 //! - every part but the main document (and `numbering.xml`, `.rels` and the
-//!   content types when a list or a link is added) is copied as it was,
-//!   compressed bytes and all; a document with no change is returned as the
+//!   content types when a list, a link or a picture is added; picture parts
+//!   are added) is copied as it was, compressed bytes and all; a document with no change is returned as the
 //!   file it was read from, byte for byte;
 //! - the body is spliced. Between the original blocks the bytes stay as they
 //!   are (content-control wrappers, the final `sectPr`, anything unknown). A
 //!   block that is as read and in its place is copied; one that is gone has
 //!   its element removed; one with no source, or out of its order (moved, or
-//!   the second half of a split) is written where it now is. A table whose
-//!   structure is as read is spliced cell by cell; a table made here is
-//!   written from the model.
+//!   the second half of a split) is written where it now is.
+//! - a table that is where it was is kept as far as it is as read. Only the
+//!   content of cells changed: the table's bytes, with those cells' content
+//!   spliced. Rows added or removed: the table's start (`tblPr`, `tblGrid`)
+//!   and every row that is as read (cells with the same spans, merges,
+//!   borders, shading, margins and alignment) are copied; rows made here, and
+//!   rows whose cell structure changed (a merge that moved with the row
+//!   above it removed), are written from the model, the second kind keeping
+//!   their start tag and `trPr`. Columns added or removed: `tblPr` is kept
+//!   (its width follows the grid when it was the grid's sum), the grid and
+//!   every row are written from the model with their start tag and `trPr`,
+//!   and each cell's content is written as any block (paragraphs as read are
+//!   copied). A cell written from the model has a `tcPr` of `tcW`,
+//!   `gridSpan`, `vMerge`, `tcBorders`, `shd`, `tcMar` and `vAlign` from the
+//!   model: other cell properties the file had there (`cnfStyle`, `noWrap`,
+//!   `textDirection`) and the borders and shading the table style gives are
+//!   written as direct formatting of the final values. A table made here
+//!   writes `tblPr` (style, width, borders where every cell has the same,
+//!   alignment, indent, layout, cell margins, `tblLook`), `tblGrid` and its
+//!   rows the same way.
 //! - a changed paragraph keeps its start tag and its `pPr` with only the
 //!   changed properties set; the runs are spliced the same way: between the
 //!   original runs the bytes (hyperlink, insertion, smart tag and content
@@ -23,15 +40,33 @@
 //!   is copied, a removed run's element is removed, a changed run keeps its
 //!   `rPr` with only the changed properties set and its text is written
 //!   again. A run made here is written where it now is, outside the wrapper
-//!   it does not belong to.
+//!   it does not belong to. A run read inside a `w:hyperlink` that has
+//!   another link now (none, or another target) leaves the element, which
+//!   is dropped when nothing is left in it; neighbouring hyperlinks made
+//!   here with one opening tag are one. A link that was read from a field
+//!   (`HYPERLINK` instruction) stays in its field.
 //! - a paragraph made here has a `pPr` with the style, what differs from the
 //!   style, the list and the mark's `rPr`; its runs have an `rPr` with what
 //!   differs from the paragraph's base look.
 //!
+//! **Pictures.** A picture made here (or pasted from another place, with no
+//! usable source) is written as `<w:drawing><wp:inline>` with the image
+//! stored as `word/media/imageN.<ext>` (the extension from the image's first
+//! bytes), once for each distinct content, a relationship from the main
+//! part, a `Default` content type for the extension if the package has none,
+//! the `wp`, `a`, `pic` and `r` namespaces declared on the root element if it
+//! lacks them, a `wp:docPr` id above every id in the main part and the other
+//! story parts, and the crop as `a:srcRect`. A floating picture without a
+//! source is written in the line. A picture that was read and has another
+//! size keeps its element with only `wp:extent` and `a:ext` patched; its
+//! other changes (crop, description) are not written.
+//!
 //! What cannot be written from the model, because it only exists as the
-//! bytes of a file, is kept by copying those bytes: drawings, notes,
-//! markers and sections. A drawing or reference that has no source (one
-//! pasted from elsewhere) is left out.
+//! bytes of a file, is kept by copying those bytes: drawings that were read,
+//! notes, markers and sections. A drawing that is not a picture, a ruby, a
+//! page number or a reference that has no source (one pasted from elsewhere)
+//! is left out; so are text boxes and the other drawings that were not read
+//! from this file.
 //!
 //! Not updated, as with PPTX: `docProps/app.xml` statistics.
 

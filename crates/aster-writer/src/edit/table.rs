@@ -765,9 +765,11 @@ pub fn delete_columns(doc: &mut Document, from: &Pos, to: &Pos) -> Pos {
     table.columns.drain(c0..c1);
     for row in &mut table.rows {
         let before = row.grid_before as usize;
-        let after_start = grid - row.grid_after as usize;
-        row.grid_before -= overlap(0, before) as u32;
-        row.grid_after -= overlap(after_start, grid) as u32;
+        let after_start = grid.saturating_sub(row.grid_after as usize);
+        row.grid_before = row.grid_before.saturating_sub(overlap(0, before) as u32);
+        row.grid_after = row
+            .grid_after
+            .saturating_sub(overlap(after_start, grid) as u32);
         let mut column = before;
         let mut kept = Vec::with_capacity(row.cells.len());
         for mut cell in std::mem::take(&mut row.cells) {

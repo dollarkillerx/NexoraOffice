@@ -137,12 +137,16 @@ pub enum PictureProblem {
     TooLarge,
 }
 
-/// A picture file's bytes and size in pixels, if it is one a Word document
-/// takes: PNG, JPEG, GIF, BMP or TIFF, with at most
-/// [`aster_image::MAX_PIXELS`] pixels. PNG and JPEG are decoded (at a small
-/// size) to see that they can be; for the others the header is trusted.
+/// A picture file's size in pixels, if it is one the Writer tab inserts: a
+/// PNG or JPEG with at most [`aster_image::MAX_PIXELS`] pixels that decodes
+/// (tried at a small size). A Word file can hold GIF, BMP and TIFF pictures
+/// too, but nothing here draws them, so they are not offered: a picture
+/// that shows as a grey box is not what was asked for.
 pub fn read_picture(bytes: &[u8]) -> Result<(u32, u32), PictureProblem> {
-    if aster_writer::edit::image_format(bytes).is_none() {
+    if !matches!(
+        aster_image::sniff(bytes),
+        aster_image::Kind::Png | aster_image::Kind::Jpeg
+    ) {
         return Err(PictureProblem::NotAPicture);
     }
     let (w, h) = image_size(bytes).ok_or(PictureProblem::NotAPicture)?;
@@ -152,17 +156,11 @@ pub fn read_picture(bytes: &[u8]) -> Result<(u32, u32), PictureProblem> {
     if u64::from(w) * u64::from(h) > aster_image::MAX_PIXELS {
         return Err(PictureProblem::TooLarge);
     }
-    if matches!(
-        aster_image::sniff(bytes),
-        aster_image::Kind::Png | aster_image::Kind::Jpeg
-    ) {
-        match aster_image::decode(bytes, 64) {
-            Ok(_) => {}
-            Err(aster_image::Error::TooLarge { .. }) => return Err(PictureProblem::TooLarge),
-            Err(_) => return Err(PictureProblem::NotAPicture),
-        }
+    match aster_image::decode(bytes, 64) {
+        Ok(_) => Ok((w, h)),
+        Err(aster_image::Error::TooLarge { .. }) => Err(PictureProblem::TooLarge),
+        Err(_) => Err(PictureProblem::NotAPicture),
     }
-    Ok((w, h))
 }
 
 /// The width and height in pixels a PNG, JPEG, GIF, BMP or TIFF file's
@@ -1138,7 +1136,9 @@ mod tests {
         // GIF: little-endian width and height after the signature.
         let mut gif = b"GIF89a".to_vec();
         gif.extend([3, 0, 2, 0, 0, 0, 0]);
-        assert_eq!(read_picture(&gif), Ok((3, 2)));
+        assert_eq!(image_size(&gif), Some((3, 2)));
+        // Measured, but not inserted: nothing here draws a GIF.
+        assert_eq!(read_picture(&gif), Err(PictureProblem::NotAPicture));
         // BMP: a 40-byte header; a negative height is a top-down picture.
         let mut bmp = b"BM".to_vec();
         bmp.resize(14, 0);
@@ -1146,7 +1146,8 @@ mod tests {
         bmp.extend(5i32.to_le_bytes());
         bmp.extend((-4i32).to_le_bytes());
         bmp.resize(54, 0);
-        assert_eq!(read_picture(&bmp), Ok((5, 4)));
+        assert_eq!(image_size(&bmp), Some((5, 4)));
+        assert_eq!(read_picture(&bmp), Err(PictureProblem::NotAPicture));
         // TIFF, both byte orders: the first directory's width and height.
         for big in [false, true] {
             let u16b = |v: u16| {
@@ -1178,7 +1179,8 @@ mod tests {
                 tiff.extend([0, 0]);
             }
             tiff.extend(u32b(0));
-            assert_eq!(read_picture(&tiff), Ok((7, 9)), "big endian: {big}");
+            assert_eq!(image_size(&tiff), Some((7, 9)), "big endian: {big}");
+            assert_eq!(read_picture(&tiff), Err(PictureProblem::NotAPicture));
         }
         // JPEG: the start of frame after another segment.
         let jpeg = [

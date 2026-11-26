@@ -1395,7 +1395,7 @@ pub const ZH_HANS: Strings = Strings {
     table_rows: "行数",
     table_columns: "列数",
     picture_too_large_body: "这张图片的像素太多，无法插入。",
-    doc_picture_failed_body: "只能插入 PNG、JPEG、GIF、BMP 和 TIFF 图片。",
+    doc_picture_failed_body: "只能插入 PNG 和 JPEG 图片。",
     link_follow: "{key}+单击打开：{address}",
 };
 
@@ -1929,7 +1929,7 @@ pub const JA: Strings = Strings {
     table_rows: "行数",
     table_columns: "列数",
     picture_too_large_body: "この画像はピクセル数が多すぎて挿入できません。",
-    doc_picture_failed_body: "挿入できるのは PNG、JPEG、GIF、BMP、TIFF の画像だけです。",
+    doc_picture_failed_body: "挿入できるのは PNG と JPEG の画像だけです。",
     link_follow: "{key} を押しながらクリックで開く：{address}",
 };
 
@@ -2463,7 +2463,7 @@ pub const EN: Strings = Strings {
     table_rows: "Rows",
     table_columns: "Columns",
     picture_too_large_body: "This picture has too many pixels to be inserted.",
-    doc_picture_failed_body: "Only PNG, JPEG, GIF, BMP and TIFF pictures can be inserted.",
+    doc_picture_failed_body: "Only PNG and JPEG pictures can be inserted.",
     link_follow: "{key}+click to open: {address}",
 };
 
@@ -2990,7 +2990,7 @@ pub const ZH_HANT: Strings = Strings {
     table_rows: "列數",
     table_columns: "欄數",
     picture_too_large_body: "這張圖片的像素太多，無法插入。",
-    doc_picture_failed_body: "只能插入 PNG、JPEG、GIF、BMP 和 TIFF 圖片。",
+    doc_picture_failed_body: "只能插入 PNG 和 JPEG 圖片。",
     link_follow: "{key}+點按以開啟：{address}",
 };
 
@@ -3517,7 +3517,7 @@ pub const FR: Strings = Strings {
     table_rows: "Lignes",
     table_columns: "Colonnes",
     picture_too_large_body: "Cette image compte trop de pixels pour être insérée.",
-    doc_picture_failed_body: "Seules les images PNG, JPEG, GIF, BMP et TIFF peuvent être insérées.",
+    doc_picture_failed_body: "Seules les images PNG et JPEG peuvent être insérées.",
     link_follow: "{key}+clic pour ouvrir : {address}",
 };
 
@@ -4044,7 +4044,7 @@ pub const DE: Strings = Strings {
     table_rows: "Zeilen",
     table_columns: "Spalten",
     picture_too_large_body: "Dieses Bild hat zu viele Pixel, um eingefügt zu werden.",
-    doc_picture_failed_body: "Nur PNG-, JPEG-, GIF-, BMP- und TIFF-Bilder können eingefügt werden.",
+    doc_picture_failed_body: "Nur PNG- und JPEG-Bilder können eingefügt werden.",
     link_follow: "{key}+Klick zum Öffnen: {address}",
 };
 
@@ -4571,7 +4571,7 @@ pub const ES: Strings = Strings {
     table_rows: "Filas",
     table_columns: "Columnas",
     picture_too_large_body: "Esta imagen tiene demasiados píxeles para insertarla.",
-    doc_picture_failed_body: "Solo se pueden insertar imágenes PNG, JPEG, GIF, BMP y TIFF.",
+    doc_picture_failed_body: "Solo se pueden insertar imágenes PNG y JPEG.",
     link_follow: "{key}+clic para abrir: {address}",
 };
 
@@ -5098,7 +5098,7 @@ pub const KO: Strings = Strings {
     table_rows: "행",
     table_columns: "열",
     picture_too_large_body: "이 그림은 픽셀 수가 너무 많아 삽입할 수 없습니다.",
-    doc_picture_failed_body: "PNG, JPEG, GIF, BMP, TIFF 그림만 삽입할 수 있습니다.",
+    doc_picture_failed_body: "PNG와 JPEG 그림만 삽입할 수 있습니다.",
     link_follow: "{key}+클릭하여 열기: {address}",
 };
 

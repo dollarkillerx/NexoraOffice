@@ -807,7 +807,7 @@ pub(crate) fn insert_picture(ui: &AppWindow, shell: &mut Shell) {
     let _ = slint::spawn_local(async move {
         let types = [FileType {
             name: strings.file_type_picture,
-            extensions: &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"],
+            extensions: &["png", "jpg", "jpeg"],
         }];
         let Some(path) = dialogs::pick_file_to_open(strings.insert_picture_dialog, &types).await
         else {

@@ -53,6 +53,31 @@ pub fn run(editor: &mut MarkdownEditor, tool: &str, args: &Value) -> Result<Stri
     }
 }
 
+/// The tools that only read, on a Word document: its text is a line per
+/// paragraph, `selected` what is selected, `headings` its outline. The tools
+/// that change a document refuse: the assistant cannot edit Word documents
+/// yet.
+pub fn run_on_word(
+    text: &str,
+    selected: &str,
+    headings: Vec<Value>,
+    tool: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let rope = Rope::from_str(text);
+    match tool {
+        "read_document" => Ok(read(&rope, args)),
+        "search_document" => search(&rope, args),
+        "get_selection" => {
+            Ok(json!({ "text": selected.chars().take(20_000).collect::<String>() }).to_string())
+        }
+        "get_outline" => Ok(json!({ "headings": headings }).to_string()),
+        other => Err(format!(
+            "`{other}` does not work on a Word document: the assistant can read Word documents but not change them yet"
+        )),
+    }
+}
+
 fn string<'a>(args: &'a Value, name: &str) -> &'a str {
     args[name].as_str().unwrap_or_default()
 }

@@ -89,6 +89,12 @@ impl DocView {
         if self.sel.as_ref() == Some(&new) {
             return false;
         }
+        // A caret that goes somewhere else ends the step of typing and drops
+        // the look that was waiting for the next text.
+        if self.sel.as_ref().map(|s| &s.focus) != Some(&new.focus) {
+            self.pending = None;
+            self.history.seal();
+        }
         self.sel = Some(new);
         self.sel_rects = None;
         self.touch();

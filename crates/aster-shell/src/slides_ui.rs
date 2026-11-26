@@ -736,6 +736,7 @@ impl Shell {
             disk: tab.disk,
             workbook: false,
             presentation: true,
+            document: false,
         }
     }
 

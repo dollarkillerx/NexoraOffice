@@ -21,6 +21,7 @@ use aster_storage::{FileState, Fingerprint, FoundRecord, RecoveryRoot};
 const KIND: &str = "markdown";
 const KIND_WORKBOOK: &str = "workbook";
 const KIND_PRESENTATION: &str = "presentation";
+const KIND_DOCUMENT: &str = "document";
 const KEY_KIND: &str = "kind";
 const KEY_TITLE: &str = "title";
 const KEY_PATH: &str = "path";
@@ -40,6 +41,8 @@ pub struct RecordInfo {
     pub workbook: bool,
     /// A presentation rather than a Markdown document.
     pub presentation: bool,
+    /// A Word document rather than a Markdown document.
+    pub document: bool,
 }
 
 fn encode_format(format: &TextFormat) -> String {
@@ -115,6 +118,8 @@ impl RecordInfo {
                     KIND_WORKBOOK
                 } else if self.presentation {
                     KIND_PRESENTATION
+                } else if self.document {
+                    KIND_DOCUMENT
                 } else {
                     KIND
                 }
@@ -147,10 +152,11 @@ impl RecordInfo {
                 .map(|bytes| std::str::from_utf8(bytes).map_err(|_| format!("{key} is not UTF-8")))
                 .transpose()
         };
-        let (workbook, presentation) = match text(KEY_KIND)? {
-            Some(KIND) => (false, false),
-            Some(KIND_WORKBOOK) => (true, false),
-            Some(KIND_PRESENTATION) => (false, true),
+        let (workbook, presentation, document) = match text(KEY_KIND)? {
+            Some(KIND) => (false, false, false),
+            Some(KIND_WORKBOOK) => (true, false, false),
+            Some(KIND_PRESENTATION) => (false, true, false),
+            Some(KIND_DOCUMENT) => (false, false, true),
             Some(other) => return Err(format!("a record of an unknown kind ({other})")),
             None => return Err("the record does not say what it holds".to_owned()),
         };
@@ -170,6 +176,7 @@ impl RecordInfo {
             disk,
             workbook,
             presentation,
+            document,
         })
     }
 }
@@ -183,7 +190,7 @@ pub struct Candidate {
     /// The text the record replays to, or why it could not be read. Empty
     /// for a workbook.
     pub text: Result<Rope, String>,
-    /// A workbook's or presentation's record: the file as saving would
+    /// A workbook's, presentation's or document's record: the file as saving would
     /// write it.
     pub workbook: Option<Vec<u8>>,
     /// Whatever the shell computed from the text in advance, on the thread
@@ -210,7 +217,7 @@ pub fn load(record: FoundRecord) -> Candidate {
         journal.integrity().map_err(|err| err.to_string())?;
         let info = RecordInfo::from_meta(&journal.meta().map_err(|err| err.to_string())?)?;
         let replay = journal.replay().map_err(|err| err.to_string())?;
-        if info.workbook || info.presentation {
+        if info.workbook || info.presentation || info.document {
             if replay.checkpoint.is_empty() {
                 return Err("the record holds no file".to_owned());
             }
@@ -289,6 +296,7 @@ mod tests {
             disk: None,
             workbook: false,
             presentation: false,
+            document: false,
         }
     }
 
@@ -311,6 +319,7 @@ mod tests {
             disk: None,
             workbook: false,
             presentation: false,
+            document: false,
         };
         // A workbook's record says it is one.
         let workbook = RecordInfo {
@@ -320,6 +329,7 @@ mod tests {
             disk: None,
             workbook: true,
             presentation: false,
+            document: false,
         };
         for original in [with_file, untitled, workbook] {
             let meta = meta_map(original.to_meta());

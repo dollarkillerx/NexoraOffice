@@ -54,7 +54,7 @@ use aster_storage::{
 use aster_surface::cell_editor::EditMode;
 use aster_surface::host::{self, to_px};
 use aster_surface::preview::{PreviewBuilder, PreviewLayout, PreviewWorker};
-use aster_surface::{Action, ImeEvent, Surface};
+use aster_surface::{ImeEvent, Surface};
 use aster_workspace::{
     FileTree, Filter, RecentFiles, Row, RowKind, Store, WorkspaceState, read_folder,
 };
@@ -67,7 +67,7 @@ use slint::{
 
 use aster_shell::content::{
     self, DiskWarning, Format, JournalStep, MarkdownEditor, Opened, Prepared, ReplaceJob,
-    SearchJob, WriterView, rope_bytes,
+    SearchJob, rope_bytes,
 };
 
 slint::include_modules!();
@@ -104,9 +104,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// What a tab holds. Untitled Sheets, Slides and PDF tabs hold nothing yet.
 enum Content {
     // Boxed: each is several kilobytes, and tabs are moved around.
-    /// The plain-text Writer prototype.
-    Writer(Box<WriterView>),
-    /// A Word document from a file, read-only.
+    /// A Word document: from a file or a new one.
     Doc(Box<DocTab>),
     Markdown(Box<MarkdownEditor>),
     /// A workbook from a file or a new one.
@@ -120,7 +118,6 @@ enum Content {
 impl Content {
     fn surface(&mut self) -> &mut dyn Surface {
         match self {
-            Content::Writer(view) => &mut view.surface,
             Content::Doc(tab) => &mut tab.view,
             Content::Markdown(editor) => &mut editor.surface,
             Content::Sheet(tab) => &mut tab.view,
@@ -131,7 +128,6 @@ impl Content {
 
     fn stats(&self) -> TextStats {
         match self {
-            Content::Writer(view) => view.stats,
             Content::Markdown(editor) => editor.stats,
             Content::Doc(tab) => tab.stats,
             Content::Sheet(_) | Content::Slides(_) | Content::Pdf(_) => TextStats::default(),
@@ -145,8 +141,7 @@ impl Content {
             Content::Sheet(tab) => tab.path.as_deref(),
             Content::Slides(tab) => tab.path.as_deref(),
             Content::Pdf(tab) => Some(&tab.path),
-            Content::Doc(tab) => Some(&tab.path),
-            Content::Writer(_) => None,
+            Content::Doc(tab) => tab.path.as_deref(),
         }
     }
 }
@@ -269,6 +264,11 @@ struct Shell {
     shown_pdf: Option<(usize, u32)>,
     /// The same for a Word document.
     shown_doc: Option<(usize, u32)>,
+    /// Runs once typing has paused, to count a Word document's words.
+    doc_count_timer: Timer,
+    /// What the last copy from a Word document put on the clipboard: the
+    /// text, and the formatted paragraphs.
+    doc_clip: Option<(String, Vec<aster_writer::Block>)>,
     /// Where a selection in a Word document is being dragged past the
     /// window's edge, in physical pixels, while `drag_timer` scrolls it.
     doc_drag_at: Option<(f64, f64)>,
@@ -348,6 +348,8 @@ impl Shell {
             next_pdf_token: 1,
             shown_pdf: None,
             shown_doc: None,
+            doc_count_timer: Timer::default(),
+            doc_clip: None,
             doc_drag_at: None,
             fronted_pdf: None,
             preview_timer: Timer::default(),
@@ -378,13 +380,6 @@ impl Shell {
     /// The surface of the tab in front, if it has one.
     fn active_surface(&mut self) -> Option<&mut dyn Surface> {
         self.active_content().map(Content::surface)
-    }
-
-    fn active_writer(&mut self) -> Option<&mut WriterView> {
-        match self.active_content()? {
-            Content::Writer(view) => Some(&mut **view),
-            _ => None,
-        }
     }
 
     fn active_markdown(&mut self) -> Option<&mut MarkdownEditor> {
@@ -460,8 +455,8 @@ impl Shell {
 
     fn leave_active_document(&mut self) {
         match self.active_content() {
-            Some(Content::Writer(view)) if view.surface.is_composing() => {
-                view.surface.ime(ImeEvent::Disabled);
+            Some(Content::Doc(tab)) if tab.view.is_composing() => {
+                tab.view.cancel_composition();
             }
             Some(Content::Markdown(editor)) if editor.surface.is_composing() => {
                 editor.ime(ImeEvent::Disabled);
@@ -476,8 +471,10 @@ impl Shell {
         let id = self.tabs.open_untitled(kind, strings.untitled(kind));
         match kind {
             DocKind::Writer => {
-                let view = WriterView::new(strings.writer_sample, &self.tokens);
-                self.contents.insert(id, Content::Writer(Box::new(view)));
+                // Our own template: it always reads.
+                if let Some(tab) = DocTab::blank(&self.tokens) {
+                    self.contents.insert(id, Content::Doc(Box::new(tab)));
+                }
             }
             DocKind::Markdown => {
                 let editor =
@@ -610,7 +607,7 @@ impl Shell {
             }
             office::Loaded::Document(view, source) => {
                 let id = self.tabs.open(DocKind::Writer, title);
-                let tab = DocTab::new(*view, source, path, &self.tokens);
+                let tab = DocTab::new(*view, source, Some(path), &self.tokens);
                 self.contents.insert(id, Content::Doc(Box::new(tab)));
                 return id;
             }
@@ -657,6 +654,9 @@ impl Shell {
             .is_some_and(|info| info.presentation)
         {
             return self.restore_presentation(candidate);
+        }
+        if candidate.info.as_ref().is_some_and(|info| info.document) {
+            return self.restore_document(candidate);
         }
         if candidate.workbook.is_some() {
             return self.restore_workbook(candidate);
@@ -773,6 +773,7 @@ impl Shell {
             disk: editor.disk,
             workbook: false,
             presentation: false,
+            document: false,
         }
     }
 
@@ -789,6 +790,7 @@ impl Shell {
             disk: tab.disk,
             workbook: true,
             presentation: false,
+            document: false,
         }
     }
 
@@ -907,6 +909,7 @@ impl Shell {
             Some(Content::Markdown(editor)) => editor.is_modified(),
             Some(Content::Sheet(tab)) => tab.is_modified(),
             Some(Content::Slides(tab)) => tab.is_modified(),
+            Some(Content::Doc(tab)) => tab.is_modified(),
             _ => false,
         };
         if modified {
@@ -924,6 +927,7 @@ impl Shell {
             Some(Content::Markdown(editor)) => editor.record,
             Some(Content::Sheet(tab)) => tab.record,
             Some(Content::Slides(tab)) => tab.record,
+            Some(Content::Doc(tab)) => tab.record,
             _ => None,
         };
         if let (Some(writer), Some(key)) = (&self.writer, record) {
@@ -938,6 +942,7 @@ impl Shell {
                 Content::Markdown(editor) => editor.record.take(),
                 Content::Sheet(tab) => tab.record.take(),
                 Content::Slides(tab) => tab.record.take(),
+                Content::Doc(tab) => tab.record.take(),
                 _ => None,
             };
             if let (Some(key), Some(writer)) = (record, &self.writer) {
@@ -956,7 +961,6 @@ impl Shell {
         let strings = self.language.strings();
         for content in self.contents.values_mut() {
             match content {
-                Content::Writer(view) => view.restyle(&self.tokens),
                 Content::Doc(tab) => tab.restyle(&self.tokens),
                 Content::Markdown(editor) => editor.restyle(&self.tokens),
                 Content::Sheet(tab) => tab.restyle(&self.tokens, strings),
@@ -1066,18 +1070,7 @@ impl Shell {
             (Some(Content::Doc(tab)), Command::ZoomOut) => tab.zoom(Some(false)),
             (Some(Content::Doc(tab)), Command::ZoomReset) => tab.zoom(None),
             (Some(Content::Doc(tab)), Command::FitWidth) => tab.fit(),
-            (
-                Some(Content::Writer(view)),
-                Command::ZoomIn | Command::ZoomOut | Command::ZoomReset,
-            ) => {
-                view.zoom_percent = match command {
-                    Command::ZoomIn => zoom_step(view.zoom_percent, true),
-                    Command::ZoomOut => zoom_step(view.zoom_percent, false),
-                    _ => 100,
-                };
-                view.surface.set_zoom(view.zoom_percent as f32 / 100.0);
-                true
-            }
+            (Some(Content::Doc(tab)), command) => tab.run(command),
             _ => false,
         }
     }
@@ -1095,6 +1088,9 @@ impl Shell {
                     changed |= self.tabs.set_modified(*id, tab.is_modified());
                 }
                 Content::Slides(tab) => {
+                    changed |= self.tabs.set_modified(*id, tab.is_modified());
+                }
+                Content::Doc(tab) => {
                     changed |= self.tabs.set_modified(*id, tab.is_modified());
                 }
                 _ => {}
@@ -1119,6 +1115,21 @@ impl Shell {
             let suggested = tab.path.clone().unwrap_or_else(|| {
                 let mut name = files::suggested_file_name(&title);
                 name.set_extension("pptx");
+                name
+            });
+            return Some((tab.path.clone(), suggested));
+        }
+        if let Some(Content::Doc(tab)) = self.contents.get(&id) {
+            let extension = tab
+                .path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .filter(|e| e.eq_ignore_ascii_case("docm"))
+                .map_or("docx", |_| "docm");
+            let suggested = tab.path.clone().unwrap_or_else(|| {
+                let mut name = files::suggested_file_name(&title);
+                name.set_extension(extension);
                 name
             });
             return Some((tab.path.clone(), suggested));
@@ -1660,7 +1671,8 @@ fn refresh_chrome(ui: &AppWindow, shell: &mut Shell) {
     ui.set_can_save(
         shell.active_markdown().is_some()
             || shell.active_sheet().is_some()
-            || shell.active_slides().is_some(),
+            || shell.active_slides().is_some()
+            || shell.active_doc().is_some(),
     );
     agent::refresh(ui, shell);
     schedule_outline(ui, shell);
@@ -1681,10 +1693,9 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     let view = ViewState {
         zoom_percent: match shell.active_pdf().map(|tab| tab.view.zoom_percent()) {
             Some(percent) => percent as u32,
-            None => match shell.active_doc() {
-                Some(tab) => tab.view.zoom_percent() as u32,
-                None => shell.active_writer().map_or(100, |view| view.zoom_percent),
-            },
+            None => shell
+                .active_doc()
+                .map_or(100, |tab| tab.view.zoom_percent() as u32),
         },
         page: shell
             .active_pdf()
@@ -1707,6 +1718,18 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         ..ViewState::default()
     };
     let mut view = view;
+    let mut doc_look = toolbar::DocLook::default();
+    if let Some(tab) = shell.active_doc() {
+        let look = tab.look();
+        view.cell = CellLook {
+            bold: look.bold,
+            italic: look.italic,
+            underline: look.underline,
+            strike: look.strike,
+            ..CellLook::default()
+        };
+        doc_look = look;
+    }
     if let Some(tab) = shell.active_slides() {
         let (cell, text, list, has_slide) = slides_ui::toolbar_state(tab);
         view.cell = cell;
@@ -1738,10 +1761,31 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         });
         ui.set_mark_heading(i32::from(view.heading));
     }
-    let mut items = toolbar::toolbar(kind, view, shell.language.strings());
+    let mut items = toolbar::toolbar_for(kind, view, &doc_look, shell.language.strings());
     let strings = shell.language.strings();
     if let Some(tab) = shell.active_slides() {
         slides_ui::fill_lists(&mut items, tab, strings);
+    }
+    if let Some(tab) = shell.active_doc() {
+        let styles = tab.style_names();
+        for item in &mut items {
+            match item.command {
+                Some(Command::ParagraphStyle) => item.options = styles.clone(),
+                Some(Command::FontFamily) => {
+                    item.options = toolbar::FONT_FAMILIES
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect();
+                }
+                Some(Command::FontSize) => {
+                    item.options = toolbar::FONT_SIZES
+                        .iter()
+                        .map(|size| format!("{size}"))
+                        .collect();
+                }
+                _ => {}
+            }
+        }
     }
     ui.set_toolbar_items(model(items.iter().map(tool_item).collect()));
 }
@@ -1775,8 +1819,7 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
             Some(DocKind::Pdf) if shell.active_pdf().is_some() => strings.read_only_note,
             Some(DocKind::Sheets) if shell.active_sheet().is_some() => "",
             Some(DocKind::Slides) if shell.active_slides().is_some() => "",
-            Some(DocKind::Writer) if shell.active_doc().is_some() => strings.read_only_note,
-            Some(DocKind::Writer) => strings.plain_text_note,
+            Some(DocKind::Writer) if shell.active_doc().is_some() => "",
             Some(DocKind::Markdown) => strings.markdown_note,
             Some(_) => strings.placeholder_view,
             None => "",
@@ -1786,12 +1829,6 @@ fn refresh_status(ui: &AppWindow, shell: &mut Shell) {
 
     // Zoom exists on Writer and Markdown tabs; file details on Markdown tabs only.
     match shell.active_content() {
-        Some(Content::Writer(view)) => {
-            ui.set_status_zoom(format!("{}%", view.zoom_percent).into());
-            ui.set_zoom_enabled(true);
-            ui.set_status_format(SharedString::new());
-            ui.set_status_notice(SharedString::new());
-        }
         Some(Content::Doc(tab)) => writer_ui::status(ui, strings, tab),
         Some(Content::Markdown(editor)) => {
             ui.set_status_zoom(format!("{}%", editor.zoom_percent).into());
@@ -2256,11 +2293,12 @@ fn after_tab_change(ui: &AppWindow, shell: &mut Shell) {
 
 /// After the text or the view of the document in front changed.
 fn after_edit(ui: &AppWindow, shell: &mut Shell, text_changed: bool) {
+    if shell.active_doc().is_some() {
+        writer_ui::after_edit(ui, shell);
+        return;
+    }
     shell.wake_caret();
     if text_changed {
-        if let Some(view) = shell.active_writer() {
-            view.stats = TextStats::of(&view.surface.text());
-        }
         if shell.sync_modified() {
             refresh_tabs(ui, shell);
         }
@@ -2290,6 +2328,7 @@ fn undo_state(shell: &mut Shell) -> (bool, bool) {
         Some(Content::Markdown(editor)) => (editor.document.can_undo(), editor.document.can_redo()),
         Some(Content::Sheet(tab)) => (tab.history.can_undo(), tab.history.can_redo()),
         Some(Content::Slides(tab)) => (tab.view.can_undo(), tab.view.can_redo()),
+        Some(Content::Doc(tab)) => (tab.view.can_undo(), tab.view.can_redo()),
         _ => (false, false),
     }
 }
@@ -4080,6 +4119,13 @@ fn saving_under(shell: &Shell, path: &Path) -> bool {
                     .as_deref()
                     .is_some_and(|kept| kept.starts_with(path))
         }
+        Content::Doc(tab) => {
+            tab.saving
+                && tab
+                    .path
+                    .as_deref()
+                    .is_some_and(|kept| kept.starts_with(path))
+        }
         _ => false,
     })
 }
@@ -4112,14 +4158,14 @@ fn rename_entry(ui: &AppWindow, shell: &mut Shell, from: PathBuf) {
                 }
                 // And Word documents, which keep their path.
                 if let Some(Content::Doc(tab)) = shell.contents.get_mut(&id)
-                    && let Ok(rest) = tab.path.strip_prefix(&from)
+                    && let Some(rest) = tab.path.as_deref().and_then(|p| p.strip_prefix(&from).ok())
                 {
                     let moved = if rest.as_os_str().is_empty() {
                         to.clone()
                     } else {
                         to.join(rest)
                     };
-                    tab.path = moved.clone();
+                    tab.path = Some(moved.clone());
                     shell.tabs.rename(id, files::display_name(&moved));
                     continue;
                 }
@@ -5122,8 +5168,35 @@ fn save_document(
                     .and_then(|s| s.contents.get(&id).map(|c| matches!(c, Content::Slides(_)))),
                 Some(true)
             );
+            let doc_extension = shell
+                .try_borrow()
+                .ok()
+                .and_then(|s| match s.contents.get(&id) {
+                    Some(Content::Doc(tab)) => Some(
+                        if tab
+                            .path
+                            .as_deref()
+                            .and_then(|p| p.extension())
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("docm"))
+                        {
+                            "docm"
+                        } else {
+                            "docx"
+                        },
+                    ),
+                    _ => None,
+                });
             let (weak, shell) = (ui.as_weak(), shell.clone());
             let _ = slint::spawn_local(async move {
+                let docx_types = [FileType {
+                    name: strings.file_type_document,
+                    extensions: &["docx"],
+                }];
+                let docm_types = [FileType {
+                    name: strings.file_type_document,
+                    extensions: &["docm"],
+                }];
                 let sheet_types = [FileType {
                     name: strings.file_type_spreadsheet,
                     extensions: &["xlsx"],
@@ -5133,7 +5206,11 @@ fn save_document(
                     extensions: &["pptx"],
                 }];
                 let text_types = text_file_types(strings);
-                let types: &[FileType] = if is_sheet {
+                let types: &[FileType] = if doc_extension == Some("docm") {
+                    &docm_types
+                } else if doc_extension.is_some() {
+                    &docx_types
+                } else if is_sheet {
                     &sheet_types
                 } else if is_slides {
                     &slide_types
@@ -5169,6 +5246,10 @@ fn start_save(
     }
     if matches!(shell.contents.get(&id), Some(Content::Slides(_))) {
         slides_ui::start_save(ui, &mut shell, id, path, after);
+        return;
+    }
+    if matches!(shell.contents.get(&id), Some(Content::Doc(_))) {
+        writer_ui::start_save(ui, &mut shell, id, path, after);
         return;
     }
     if let Some(job) = shell.begin_save(id, path) {
@@ -5498,10 +5579,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
                 return EventResult::Propagate;
             }
             let text_changed = match shell.active_content() {
-                Some(Content::Writer(view)) => {
-                    let committed = matches!(event, ImeEvent::Commit(_));
-                    view.surface.ime(event);
-                    committed
+                Some(Content::Doc(tab)) => {
+                    if tab.view.ime(event) {
+                        writer_ui::after_edit(&ui, shell);
+                    }
+                    return EventResult::PreventDefault;
                 }
                 Some(Content::Markdown(editor)) => editor.ime(event),
                 Some(Content::Sheet(tab)) => {
@@ -5530,8 +5612,7 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     });
 
     ui.on_key_pressed(handler!(|ui, shell, text, shift, primary, alt| {
-        let zooms = shell.active_writer().is_some()
-            || shell.active_doc().is_some()
+        let zooms = shell.active_doc().is_some()
             || shell.active_markdown().is_some()
             || shell.active_pdf().is_some();
         if zooms && let Some(command) = shell_shortcut(text.as_str(), primary) {
@@ -5610,10 +5691,6 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             return false;
         }
         let text_changed = match shell.active_content() {
-            Some(Content::Writer(view)) => {
-                view.surface.apply(action);
-                true
-            }
             Some(Content::Markdown(editor)) => editor.key(action),
             _ => return false,
         };
@@ -5629,7 +5706,6 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         let scale = f64::from(ui.window().scale_factor());
         let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
         match shell.active_content() {
-            Some(Content::Writer(view)) => view.surface.pointer_down(x, y, shift),
             Some(Content::Markdown(editor)) => editor.pointer_press(x, y, shift, clicks),
             Some(Content::Sheet(tab)) => {
                 if tab.begin_resize(x, y) || tab.begin_fill(x, y) {
@@ -5685,7 +5761,6 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         let scale = f64::from(ui.window().scale_factor());
         let (x, y) = (f64::from(x) * scale, f64::from(y) * scale);
         match shell.active_content() {
-            Some(Content::Writer(view)) => view.surface.pointer_drag(x, y),
             Some(Content::Markdown(editor)) => editor.pointer_drag(x, y),
             Some(Content::Sheet(tab)) if tab.is_resizing() => {
                 if tab.drag_resize(x, y) {
@@ -6197,6 +6272,12 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_toolbar_option(handler!(|ui, shell, id, index| {
+        if shell.active_doc().is_some() {
+            if let (Some(command), Ok(index)) = (Command::from_id(id), usize::try_from(index)) {
+                writer_ui::option(&ui, shell, command, index);
+            }
+            return;
+        }
         if shell.active_slides().is_some() {
             if let (Some(command), Ok(index)) = (Command::from_id(id), usize::try_from(index)) {
                 slides_ui::option(&ui, shell, command, index);
@@ -6583,6 +6664,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         slides_ui::show_click(&ui, shell);
     }));
     ui.on_sheet_format(handler!(|ui, shell, code| {
+        if shell.active_doc().is_some() {
+            writer_ui::format_menu(&ui, shell, code);
+            return;
+        }
         if shell.active_slides().is_some() {
             slides_ui::format_menu(&ui, shell, code);
             return;
@@ -6829,6 +6914,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     // --- Clipboard and selection ---
 
     ui.on_edit_cut(handler!(|ui, shell| {
+        if shell.active_doc().is_some() {
+            writer_ui::cut(&ui, shell);
+            return;
+        }
         if slides_ui::edit(&ui, shell, slides_ui::Edit::Cut) {
             return;
         }
@@ -6891,6 +6980,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_edit_paste(handler!(|ui, shell| {
+        if shell.active_doc().is_some() {
+            writer_ui::paste(&ui, shell);
+            return;
+        }
         if slides_ui::edit(&ui, shell, slides_ui::Edit::Paste) {
             return;
         }
@@ -6948,7 +7041,6 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             return;
         }
         match shell.active_content() {
-            Some(Content::Writer(view)) => view.surface.apply(Action::SelectAll),
             Some(Content::Markdown(editor)) => editor.select_all(),
             _ => return,
         }
@@ -7115,6 +7207,7 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         handler!(|_ui, shell| {
             shell.sync_sheet_records();
             shell.sync_slide_records();
+            shell.sync_doc_records();
         }),
     );
     ui.on_sheet_sort(handler!(|ui, shell, descending| {
@@ -7359,6 +7452,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_menu_replace(handler!(|ui, shell| {
+        if writer_ui::find(&ui, shell, writer_ui::FindAction::OpenReplace) {
+            ui.invoke_focus_find_query();
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.open_find(true);
             let query = tab.find.query.clone();
@@ -7444,7 +7541,14 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         after_find(&ui, shell, job);
     }));
 
-    ui.on_find_replacement_edited(handler!(|_ui, shell, text| {
+    ui.on_find_replacement_edited(handler!(|ui, shell, text| {
+        if writer_ui::find(
+            &ui,
+            shell,
+            writer_ui::FindAction::Replacement(text.to_string()),
+        ) {
+            return;
+        }
         if let Some(tab) = shell.active_sheet() {
             tab.find.replacement = text.to_string();
             return;
@@ -7569,6 +7673,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_replace_one(handler!(|ui, shell| {
+        if writer_ui::find(&ui, shell, writer_ui::FindAction::ReplaceOne) {
+            return;
+        }
         let language = shell.language.tag();
         if let Some(tab) = shell.active_sheet() {
             let changes = tab.replace_one(language);
@@ -7583,6 +7690,9 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_replace_all(handler!(|ui, shell| {
+        if writer_ui::find(&ui, shell, writer_ui::FindAction::ReplaceAll) {
+            return;
+        }
         let language = shell.language.tag();
         if let Some(tab) = shell.active_sheet() {
             let changes = tab.replace_all(language);
@@ -7823,6 +7933,15 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             // no caret to blink.
             let editor_moved = mode.shows_source() && size != surface.size();
             let mut dirty = editor_moved || focused != was_focused || preview_moved;
+            // A composition is dropped when the document loses the keyboard.
+            if was_focused
+                && !focused
+                && shell
+                    .active_doc()
+                    .is_some_and(|tab| tab.view.cancel_composition())
+            {
+                dirty = true;
+            }
             was_focused = focused;
             if blink_due {
                 shell.last_blink = Instant::now();
@@ -8070,6 +8189,76 @@ mod tests {
         assert!(recovery::find(&root).unwrap().is_empty());
     }
 
+    #[test]
+    fn a_word_document_with_unsaved_changes_comes_back_from_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("報告.docx");
+        std::fs::write(&file, docx_sample::sample()).unwrap();
+        let root = RecoveryRoot::new(dir.path().join("records"));
+        let mut shell = shell();
+        shell.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let Ok(loaded) = office::load(&file) else {
+            panic!("the document loads");
+        };
+        let id = shell.open_office(file.clone(), loaded);
+        shell.sync_doc_records();
+        assert!(shell.writer.is_some());
+        {
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a Word tab");
+            };
+            assert!(tab.record.is_none(), "nothing changed, no record");
+            assert!(tab.view.type_text("未保存の変更 "));
+        }
+        shell.sync_doc_records();
+        if let Some(writer) = &shell.writer {
+            writer.flush();
+        }
+        let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+            panic!("a Word tab");
+        };
+        assert!(tab.record.is_some());
+
+        // As after a crash: a new run finds the record and restores it.
+        drop(shell);
+        let mut candidates = recovery::find(&root).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+        assert!(candidate.is_readable());
+        assert!(candidate.info.as_ref().is_some_and(|i| i.document));
+        assert_eq!(candidate.disk, Some(FileState::Unchanged));
+        let mut again = self::shell();
+        again.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let id = again.restore(candidate).expect("restored");
+        let Some(Content::Doc(tab)) = again.contents.get(&id) else {
+            panic!("a Word tab");
+        };
+        assert!(tab.is_modified());
+        assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+        assert!(
+            tab.view
+                .document()
+                .plain_text()
+                .starts_with("未保存の変更 ")
+        );
+        // Saving it starts from the bytes the record held.
+        let job = again
+            .contents
+            .get_mut(&id)
+            .and_then(|c| match c {
+                Content::Doc(tab) => tab.begin_save(),
+                _ => None,
+            })
+            .expect("a save job");
+        assert!(job.bytes().is_ok());
+        // Closing it is the user's choice: the record goes.
+        again.force_close(id);
+        if let Some(writer) = &again.writer {
+            writer.flush();
+        }
+        assert!(recovery::find(&root).unwrap().is_empty());
+    }
+
     fn decoded(text: &str) -> Opened {
         content::open(files::Loaded {
             decoded: aster_markdown::decode(text.as_bytes()).expect("valid UTF-8"),
@@ -8116,11 +8305,11 @@ mod tests {
         assert!(existing.is_none());
         assert_eq!(suggested.extension().and_then(|e| e.to_str()), Some("xlsx"));
         shell.open_untitled(DocKind::Writer);
-        assert!(shell.active_writer().is_some());
+        assert!(shell.active_doc().is_some());
         assert!(shell.active_markdown().is_none());
         shell.open_untitled(DocKind::Markdown);
         assert!(shell.active_markdown().is_some());
-        assert!(shell.active_writer().is_none());
+        assert!(shell.active_doc().is_none());
         shell.show_start_page();
         assert!(shell.active_surface().is_none());
         assert_eq!(shell.contents.len(), 4);
@@ -8331,15 +8520,16 @@ mod tests {
                 cursor: None,
             };
             let before = match shell.active_content().expect("a text tab") {
-                Content::Writer(view) => {
-                    view.surface.ime(preedit);
-                    view.surface.text()
+                Content::Doc(tab) => {
+                    tab.view.ime(preedit);
+                    assert!(tab.view.is_composing());
+                    tab.view.text()
                 }
                 Content::Markdown(editor) => {
                     editor.ime(preedit);
                     editor.document.text().to_string()
                 }
-                Content::Sheet(_) | Content::Slides(_) | Content::Pdf(_) | Content::Doc(_) => {
+                Content::Sheet(_) | Content::Slides(_) | Content::Pdf(_) => {
                     unreachable!("not a text tab")
                 }
             };
@@ -8366,28 +8556,38 @@ mod tests {
         assert!(shell.run(Command::ZoomReset));
         assert!(!shell.run(Command::ZoomReset));
         shell.open_untitled(DocKind::Writer);
-        assert!(shell.run(Command::ZoomIn));
-        assert!(shell.run(Command::ZoomIn));
-        let view = shell.active_writer().expect("writer tab");
-        assert_eq!(view.zoom_percent, 125);
-        assert_eq!(view.surface.zoom(), 1.25);
         assert!(shell.run(Command::ZoomReset));
-        assert_eq!(shell.active_writer().expect("writer tab").zoom_percent, 100);
-        // Commands that are not built yet change nothing, and a Writer tab has
-        // no history.
-        assert!(!shell.run(Command::Bold));
+        assert!(shell.run(Command::ZoomIn));
+        assert_eq!(
+            shell.active_doc().expect("writer tab").view.zoom_percent(),
+            125.0
+        );
+        assert!(shell.run(Command::ZoomOut));
+        assert_eq!(
+            shell.active_doc().expect("writer tab").view.zoom_percent(),
+            100.0
+        );
+        // A command with nothing to act on changes nothing.
         assert!(!shell.run(Command::Undo));
+        assert!(!shell.run(Command::Print));
     }
 
     #[test]
     fn zoom_is_kept_per_document() {
         let mut shell = shell();
         shell.open_untitled(DocKind::Writer);
+        shell.run(Command::ZoomReset);
         shell.run(Command::ZoomIn);
         shell.open_untitled(DocKind::Writer);
-        assert_eq!(shell.active_writer().expect("second").zoom_percent, 100);
+        assert_eq!(
+            shell.active_doc().expect("second").view.zoom(),
+            aster_surface::doc_view::Zoom::FitWidth
+        );
         shell.activate(0);
-        assert_eq!(shell.active_writer().expect("first").zoom_percent, 110);
+        assert_eq!(
+            shell.active_doc().expect("first").view.zoom_percent(),
+            125.0
+        );
     }
 
     #[test]
@@ -8440,9 +8640,9 @@ mod tests {
             titles,
             ["未命名文档 1", "Untitled document 2", "無題のシート 1"]
         );
-        // The text of a new Writer document follows the language too.
+        // A new Writer document is a real, empty one.
         let surface = shell.contents.get_mut(&english).expect("open").surface();
-        assert!(surface.text().starts_with("Aster Office shell"));
+        assert_eq!(surface.text(), "");
         // A new Markdown document is empty.
         shell.open_untitled(DocKind::Markdown);
         assert_eq!(shell.active_markdown().map(|e| e.document.len()), Some(0));
@@ -9596,7 +9796,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn a_word_document_opens_in_a_read_only_tab() {
+    fn a_word_document_opens_in_an_editable_tab() {
         let app = app();
         let ui = &app.ui;
         open_document(&app);
@@ -9605,23 +9805,37 @@ mod ui_tests {
             DocKind::Writer
         );
         assert_eq!(ui.get_viewer(), 4);
-        // Nothing to save, and no formatting: only the zoom buttons work.
-        assert!(!ui.get_can_save());
+        // It can be saved; the editing buttons work, printing does not.
+        assert!(ui.get_can_save());
         let items = ui.get_toolbar_items();
         let enabled: Vec<i32> = (0..items.row_count())
             .filter_map(|i| items.row_data(i))
             .filter(|item| item.enabled && item.command >= 0)
             .map(|item| item.command)
             .collect();
-        assert_eq!(
-            enabled,
-            [
-                Command::ZoomOut.id(),
-                Command::ZoomReset.id(),
-                Command::ZoomIn.id()
-            ]
+        for command in [
+            Command::Bold,
+            Command::Italic,
+            Command::Underline,
+            Command::ParagraphStyle,
+            Command::FontFamily,
+            Command::FontSize,
+            Command::TextColor,
+            Command::Highlight,
+            Command::AlignCenter,
+            Command::BulletList,
+            Command::IndentMore,
+            Command::ZoomIn,
+        ] {
+            assert!(enabled.contains(&command.id()), "{command:?}");
+        }
+        assert!(!enabled.contains(&Command::Print.id()));
+        assert!(
+            !enabled.contains(&Command::Undo.id()),
+            "nothing to undo yet"
         );
-        // The status bar says the page, the counts, the format and the zoom.
+        // The status bar says the page, the counts, the format and the zoom,
+        // and no longer says "read-only".
         assert!(
             ui.get_status_words().contains("1"),
             "{}",
@@ -9630,20 +9844,24 @@ mod ui_tests {
         assert_eq!(ui.get_status_format().as_str(), "DOCX");
         assert!(ui.get_status_zoom().ends_with('%'));
         assert!(ui.get_zoom_enabled());
+        assert!(
+            !ui.get_status_note()
+                .contains(app.shell.borrow().language.strings().read_only_note)
+        );
         // The outline lists the headings.
         let headings = with_doc(&app, |tab| tab.view.outline().len());
         assert!(headings > 0);
         assert_eq!(ui.get_outline().row_count(), headings);
         // Opening it again goes to the tab it has.
         let before = app.shell.borrow().tabs.len();
-        let path = with_doc(&app, |tab| tab.path.clone());
+        let path = with_doc(&app, |tab| tab.path.clone().expect("a file"));
         let loaded = office::load(&path).expect("it loads again");
         app.shell.borrow_mut().open_office(path, loaded);
         assert_eq!(app.shell.borrow().tabs.len(), before);
     }
 
     #[test]
-    fn keys_move_the_caret_in_a_word_document_and_typing_changes_nothing() {
+    fn typing_in_a_word_document_changes_it_and_marks_the_tab() {
         let app = app();
         let ui = &app.ui;
         open_document(&app);
@@ -9656,16 +9874,110 @@ mod ui_tests {
         key(ui, Key::DownArrow);
         let lower = with_doc(&app, |tab| tab.view.caret().cloned().unwrap());
         assert!(lower > caret);
-        type_text(ui, "typed");
-        key(ui, Key::Backspace);
-        key(ui, Key::Delete);
-        key(ui, Key::Return);
-        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), document);
         assert!(!app.shell.borrow().tabs.active().unwrap().modified);
+        type_text(ui, "typed");
+        assert!(app.shell.borrow().tabs.active().unwrap().modified);
+        assert!(with_doc(&app, |tab| tab
+            .view
+            .document()
+            .plain_text()
+            .contains("typed")));
+        // The undo buttons come alive; undo goes back to the opened text.
+        let items = ui.get_toolbar_items();
+        let undo = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .find(|item| item.command == Command::Undo.id())
+            .unwrap();
+        assert!(undo.enabled);
+        ui.invoke_edit_undo();
+        assert!(aster_writer::edit::same_content(
+            &with_doc(&app, |tab| tab.view.document().clone()),
+            &document
+        ));
+        ui.invoke_edit_redo();
+        key(ui, Key::Backspace);
+        key(ui, Key::Return);
+        assert!(with_doc(&app, |tab| !tab
+            .view
+            .document()
+            .plain_text()
+            .is_empty()));
+        // Select all, copy, and the Format menu's bold.
         command(ui, "a");
         assert!(with_doc(&app, |tab| tab.view.selected_text().len() > 200));
+        ui.invoke_sheet_format(0);
+        assert!(with_doc(&app, |tab| tab.look().bold));
         key(ui, Key::Escape);
         assert!(!with_doc(&app, |tab| tab.view.has_selection()));
+    }
+
+    #[test]
+    fn a_new_writer_document_saves_through_the_save_dialog_path() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_new_document(DocKind::Writer.index() as i32);
+        ui.invoke_focus_document();
+        type_text(ui, "hello");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let (existing, suggested) = app.shell.borrow_mut().save_target(id).unwrap();
+        assert!(existing.is_none());
+        assert_eq!(suggested.extension().and_then(|e| e.to_str()), Some("docx"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("新建.docx");
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::start_save(ui, &mut shell, id, path.clone(), AfterSave::Nothing);
+        }
+        // The write runs on a worker thread and comes back through the
+        // event loop, which the headless tests do not run: do what it does.
+        let job = {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.saving = false;
+            tab.begin_save().unwrap()
+        };
+        let written = job.write(&path).expect("it writes");
+        {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.finish_save(&job, &path, Some(written));
+            shell.sync_modified();
+        }
+        assert!(!app.shell.borrow().tabs.active().unwrap().modified);
+        let again = aster_ooxml::docx::read(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(again.plain_text(), "hello");
+    }
+
+    #[test]
+    fn a_double_click_on_the_document_does_not_zoom_the_window() {
+        let app = app();
+        let ui = &app.ui;
+        open_document(&app);
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let at = LogicalPosition::new(origin.x + 200.0, origin.y + 120.0);
+        let window = ui.window();
+        let before = window.is_maximized();
+        window.dispatch_event(WindowEvent::PointerMoved { position: at });
+        for _ in 0..2 {
+            window.dispatch_event(WindowEvent::PointerPressed {
+                position: at,
+                button: PointerEventButton::Left,
+            });
+            window.dispatch_event(WindowEvent::PointerReleased {
+                position: at,
+                button: PointerEventButton::Left,
+            });
+        }
+        assert_eq!(window.is_maximized(), before);
+        // The double click selected a word.
+        assert!(with_doc(&app, |tab| tab.view.has_selection()));
     }
 
     #[test]
@@ -9676,6 +9988,8 @@ mod ui_tests {
         ui.invoke_menu_find();
         assert!(ui.get_find_open());
         assert!(!ui.get_find_replace());
+        ui.invoke_menu_replace();
+        assert!(ui.get_find_replace());
         ui.invoke_find_query_edited("the".into());
         let position = ui.get_find_position().to_string();
         assert!(position.contains('9') || position.chars().any(|c| c.is_ascii_digit()));

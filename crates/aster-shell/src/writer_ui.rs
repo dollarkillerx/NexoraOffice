@@ -1,20 +1,25 @@
-//! The Word document tab in the window: keys, the pointer, scrolling, copy,
-//! the find bar, the outline in the sidebar and the status bar.
+//! The Word document tab in the window: keys, the pointer, scrolling, the
+//! clipboard, saving, recovery records, the find bar with replace, the
+//! outline in the sidebar and the status bar.
 //!
 //! The view itself is `aster_surface::doc_view`, and the tab around it is
 //! `aster_shell::writer_tab`; this module turns what the window reports into
-//! calls on them and keeps the window's chrome in step. Documents are read-only
-//! in this version: what would change the text does nothing.
+//! calls on them and keeps the window's chrome in step.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aster_shell::writer_tab::{DocTab, find_position};
-use aster_surface::doc_view::Move;
+use aster_shell::recovery::{Candidate, RecordInfo};
+use aster_shell::tabs::TabId;
+use aster_shell::writer_tab::{DocSave, DocTab, Written, find_position};
+use aster_storage::Contents;
+use aster_surface::doc_view::{Align, Break, DocCommand, Move};
 use slint::{ComponentHandle, SharedString, TimerMode};
 
 use super::{
-    AppWindow, OutlineItem, Shell, deliver, host, i18n, model, present, refresh_status,
-    refresh_toolbar,
+    AfterSave, AppWindow, Content, OutlineItem, Shell, deliver, files, host, i18n, model, present,
+    refresh_chrome, refresh_sidebar, refresh_status, refresh_tabs, refresh_toolbar, show_dialog,
 };
 
 /// How deep outline rows are indented at most, as levels.
@@ -26,6 +31,55 @@ pub(crate) fn after_move(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
     sync_outline(ui, shell);
     present(ui, shell);
+}
+
+/// How long typing has to pause before the words are counted again.
+const COUNT_DELAY: Duration = Duration::from_millis(500);
+
+/// After the document changed (or the caret moved by a key): the tab's
+/// modified mark, the recovery record, the toolbar, the outline, the counts
+/// and the picture.
+pub(crate) fn after_edit(ui: &AppWindow, shell: &mut Shell) {
+    shell.wake_caret();
+    if shell.sync_modified() {
+        refresh_tabs(ui, shell);
+    }
+    shell.sync_doc_records();
+    // Rebuild the toolbar only when what it shows has changed.
+    if let Some(tab) = shell.active_doc() {
+        let now = (tab.look(), tab.view.can_undo(), tab.view.can_redo());
+        if tab.shown_look.as_ref() != Some(&now) {
+            tab.shown_look = Some(now);
+            refresh_toolbar(ui, shell);
+        }
+    }
+    sync_outline(ui, shell);
+    schedule_count(ui, shell);
+    refresh_find_bar(ui, shell);
+    present(ui, shell);
+}
+
+/// Count the words again once typing has paused.
+fn schedule_count(ui: &AppWindow, shell: &mut Shell) {
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    tab.stats_due = true;
+    let weak = ui.as_weak();
+    shell
+        .doc_count_timer
+        .start(TimerMode::SingleShot, COUNT_DELAY, move || {
+            if let Some(ui) = weak.upgrade() {
+                deliver(
+                    ui,
+                    Box::new(|ui, shell| {
+                        if shell.active_doc().is_some_and(|tab| tab.recount()) {
+                            refresh_status(ui, shell);
+                        }
+                    }),
+                );
+            }
+        });
 }
 
 /// A key in a Word document. Returns whether it was used.
@@ -61,29 +115,55 @@ pub(crate) fn key(
         (Some(c), None) => Some(c),
         _ => None,
     };
+    let is = |key: Key| single == Some(char::from(key));
     // Control or Command with Home and End: the start and end of the document.
-    let ends = single.and_then(|c| {
-        if primary && c == char::from(Key::Home) {
-            Some(Move::DocStart)
-        } else if primary && c == char::from(Key::End) {
-            Some(Move::DocEnd)
+    let ends = if primary && is(Key::Home) {
+        Some(Move::DocStart)
+    } else if primary && is(Key::End) {
+        Some(Move::DocEnd)
+    } else {
+        None
+    };
+    // Command and Return: a page break. Command with L, E, R, J: alignment
+    // (Word's), when the menu did not take them.
+    let aligned = if primary && !shift {
+        match text {
+            "l" | "L" => Some(Align::Left),
+            "e" | "E" => Some(Align::Center),
+            "r" | "R" => Some(Align::Right),
+            "j" | "J" => Some(Align::Justify),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(tab) = shell.active_doc() else {
+        return false;
+    };
+    let used = if let Some(movement) = ends {
+        tab.view.move_caret(movement, shift);
+        true
+    } else if let Some(align) = aligned {
+        tab.view.command(DocCommand::Align(align));
+        true
+    } else if primary && is(Key::Return) {
+        tab.view.insert_break(Break::Page);
+        true
+    } else if is(Key::Backspace) || is(Key::Delete) {
+        let action = if is(Key::Backspace) {
+            aster_surface::Action::Backspace
         } else {
-            None
-        }
-    });
-    let used = match (shell.active_doc(), ends) {
-        (Some(tab), Some(movement)) => {
-            tab.view.move_caret(movement, shift);
-            true
-        }
-        (Some(tab), None) => match host::decode_key(text, shift, primary, alt) {
+            aster_surface::Action::Delete
+        };
+        tab.key_with(&action, alt, primary)
+    } else {
+        match host::decode_key(text, shift, primary, alt) {
             Some(action) => tab.key(&action),
             None => false,
-        },
-        (None, _) => false,
+        }
     };
     if used {
-        after_move(ui, shell);
+        after_edit(ui, shell);
     }
     used
 }
@@ -204,21 +284,64 @@ pub(crate) fn scrolled(ui: &AppWindow, shell: &mut Shell, dx: f64, dy: f64) {
     }
 }
 
-/// Copy: the selected text. Control and format characters that change how
-/// text reads without being seen stay off the clipboard; tabs and line
-/// breaks are kept.
+/// What may go on the clipboard: control and format characters that change
+/// how text reads without being seen stay off it; tabs and line breaks stay.
+fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !aster_pdf::clean::is_unwanted(*c))
+        .collect()
+}
+
+/// Copy: the selected text goes on the clipboard, and the formatted
+/// paragraphs are kept here for pasting into a Writer document.
 pub(crate) fn copy(ui: &AppWindow, shell: &mut Shell) {
     let Some(tab) = shell.active_doc() else {
         return;
     };
-    let text: String = tab
-        .view
-        .selected_text()
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !aster_pdf::clean::is_unwanted(*c))
-        .collect();
-    if !text.is_empty() {
-        ui.invoke_copy_to_clipboard(text.into());
+    let text = clean(&tab.view.selected_text());
+    let fragment = tab.view.selected_fragment();
+    if text.is_empty() {
+        return;
+    }
+    shell.doc_clip = fragment.map(|blocks| (text.clone(), blocks));
+    ui.invoke_copy_to_clipboard(text.into());
+}
+
+/// Cut: copy, then take the selection out.
+pub(crate) fn cut(ui: &AppWindow, shell: &mut Shell) {
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let Some((text, fragment)) = tab.view.cut() else {
+        return;
+    };
+    let text = clean(&text);
+    shell.doc_clip = fragment.map(|blocks| (text.clone(), blocks));
+    ui.invoke_copy_to_clipboard(text.into());
+    after_edit(ui, shell);
+}
+
+/// Paste: the formatted paragraphs if the clipboard still holds the text
+/// last copied from a Writer document, else the plain text.
+pub(crate) fn paste(ui: &AppWindow, shell: &mut Shell) {
+    let text = ui.invoke_clipboard_text().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let fragment = shell
+        .doc_clip
+        .as_ref()
+        .filter(|(copied, _)| *copied == text)
+        .map(|(_, blocks)| blocks.clone());
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let changed = match fragment {
+        Some(blocks) => tab.view.paste_fragment(&blocks),
+        None => tab.view.paste_text(&text),
+    };
+    if changed {
+        after_edit(ui, shell);
     }
 }
 
@@ -229,13 +352,44 @@ pub(crate) fn select_all(ui: &AppWindow, shell: &mut Shell) {
     }
 }
 
+/// An entry chosen from a toolbar list.
+pub(crate) fn option(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    command: aster_shell::toolbar::Command,
+    index: usize,
+) {
+    if shell
+        .active_doc()
+        .is_some_and(|tab| tab.option(command, index))
+    {
+        after_edit(ui, shell);
+    }
+    ui.invoke_focus_document();
+}
+
+/// The Format menu's bold, italic, underline and strikethrough.
+pub(crate) fn format_menu(ui: &AppWindow, shell: &mut Shell, code: i32) {
+    use aster_shell::toolbar::Command;
+    let command = match code {
+        0 => Command::Bold,
+        1 => Command::Italic,
+        2 => Command::Underline,
+        _ => Command::Strikethrough,
+    };
+    if shell.active_doc().is_some_and(|tab| tab.run(command)) {
+        after_edit(ui, shell);
+    }
+}
+
 /// The status bar's zoom, format and notice for a Word document.
 pub(crate) fn status(ui: &AppWindow, strings: &'static i18n::Strings, tab: &DocTab) {
     ui.set_status_zoom(format!("{}%", tab.view.zoom_percent() as u32).into());
     ui.set_zoom_enabled(true);
     let format = tab
         .path
-        .extension()
+        .as_deref()
+        .and_then(|p| p.extension())
         .and_then(|e| e.to_str())
         .map_or_else(|| "DOCX".to_owned(), str::to_ascii_uppercase);
     ui.set_status_format(format.into());
@@ -304,6 +458,7 @@ pub(crate) fn refresh_outline(ui: &AppWindow, shell: &mut Shell) -> bool {
     };
     let current = tab.outline_position();
     tab.outline_shown = current;
+    tab.outline_rows = outline_rows(tab);
     let items: Vec<OutlineItem> = tab
         .view
         .outline()
@@ -329,12 +484,22 @@ pub(crate) fn refresh_outline(ui: &AppWindow, shell: &mut Shell) -> bool {
     true
 }
 
-/// Mark another heading when the caret moved under one.
+/// The headings as the sidebar shows them.
+fn outline_rows(tab: &DocTab) -> Vec<(u8, String)> {
+    tab.view
+        .outline()
+        .iter()
+        .map(|entry| (entry.level, one_line(&entry.text)))
+        .collect()
+}
+
+/// Mark another heading when the caret moved under one, and list the
+/// headings again when they changed.
 fn sync_outline(ui: &AppWindow, shell: &mut Shell) {
     let Some(tab) = shell.active_doc() else {
         return;
     };
-    if tab.outline_position() != tab.outline_shown {
+    if tab.outline_position() != tab.outline_shown || outline_rows(tab) != tab.outline_rows {
         refresh_outline(ui, shell);
     }
 }
@@ -366,7 +531,7 @@ pub(crate) fn refresh_find_bar(ui: &AppWindow, shell: &mut Shell) -> bool {
     };
     let find = &tab.find;
     ui.set_find_open(find.open);
-    ui.set_find_replace(false);
+    ui.set_find_replace(find.replace_open);
     ui.set_find_case(find.query.case_sensitive);
     ui.set_find_whole(find.query.whole_word);
     ui.set_find_regex(false);
@@ -376,12 +541,20 @@ pub(crate) fn refresh_find_bar(ui: &AppWindow, shell: &mut Shell) -> bool {
     if ui.get_find_query().as_str() != find.query.pattern {
         ui.set_find_query(find.query.pattern.as_str().into());
     }
+    if ui.get_find_replacement().as_str() != find.replacement {
+        ui.set_find_replacement(find.replacement.as_str().into());
+    }
     true
 }
 
 /// Find bar actions on the Word document in front.
 pub(crate) enum FindAction {
     Open,
+    /// The bar with its replace row.
+    OpenReplace,
+    Replacement(String),
+    ReplaceOne,
+    ReplaceAll,
     /// The first line of the selection becomes the query.
     OpenWithSelection,
     Query(String),
@@ -399,6 +572,23 @@ pub(crate) fn find(ui: &AppWindow, shell: &mut Shell, action: FindAction) -> boo
     };
     match action {
         FindAction::Open => tab.open_find(),
+        FindAction::OpenReplace => {
+            tab.open_find();
+            tab.find.replace_open = true;
+        }
+        FindAction::Replacement(text) => tab.find.replacement = text,
+        FindAction::ReplaceOne => {
+            let with = tab.find.replacement.clone();
+            tab.view.replace_current(&with);
+            after_edit(ui, shell);
+            return true;
+        }
+        FindAction::ReplaceAll => {
+            let with = tab.find.replacement.clone();
+            tab.view.replace_all(&with);
+            after_edit(ui, shell);
+            return true;
+        }
         FindAction::OpenWithSelection => {
             let text = tab.view.selected_text();
             tab.open_find();
@@ -417,4 +607,192 @@ pub(crate) fn find(ui: &AppWindow, shell: &mut Shell, action: FindAction) -> boo
     sync_outline(ui, shell);
     super::after_find(ui, shell, None);
     true
+}
+
+// --- Saving ---
+
+pub(crate) fn start_save(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    path: PathBuf,
+    after: AfterSave,
+) {
+    let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+        return;
+    };
+    let Some(job) = tab.begin_save() else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = job.write(&path);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            deliver(
+                ui,
+                Box::new(move |ui, shell| finish_save(ui, shell, id, job, path, result, after)),
+            );
+        });
+    });
+}
+
+fn finish_save(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    job: DocSave,
+    path: PathBuf,
+    result: Result<Written, String>,
+    after: AfterSave,
+) {
+    let ok = result.is_ok();
+    let reason = result.as_ref().err().cloned();
+    if let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) {
+        tab.finish_save(&job, &path, result.ok());
+    }
+    if ok {
+        shell.tabs.rename(id, files::display_name(&path));
+        shell.sync_modified();
+        // Saved with nothing changed since: the record goes.
+        shell.sync_doc_records();
+        shell.remember_file(&path);
+        refresh_sidebar(ui, shell);
+        if after == AfterSave::CloseTab {
+            shell.force_close(id);
+            super::after_tab_change(ui, shell);
+        } else {
+            refresh_chrome(ui, shell);
+            present(ui, shell);
+        }
+    } else {
+        // Nothing was changed in the tab: the document is as it was, still
+        // modified, and can be saved again.
+        let strings = shell.language.strings();
+        let title = i18n::fill(strings.save_failed, "name", &files::display_name(&path));
+        show_dialog(ui, shell, 2, title, reason.unwrap_or_default());
+        refresh_chrome(ui, shell);
+    }
+}
+
+// --- Recovery records ---
+
+impl Shell {
+    /// What the recovery record of a document says about it.
+    fn doc_record_info(&self, id: TabId, tab: &DocTab) -> RecordInfo {
+        RecordInfo {
+            title: self
+                .tabs
+                .get(id)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default(),
+            path: tab.path.clone(),
+            format: aster_markdown::TextFormat::default(),
+            disk: tab.disk,
+            workbook: false,
+            presentation: false,
+            document: true,
+        }
+    }
+
+    /// Write each Word document with unsaved changes to its recovery record,
+    /// as saving would write it (made on the writer thread), at most every
+    /// few seconds; a record goes once its document has no unsaved changes.
+    pub(crate) fn sync_doc_records(&mut self) {
+        let ids: Vec<TabId> = self.contents.keys().copied().collect();
+        for id in ids {
+            let Some(Content::Doc(tab)) = self.contents.get(&id) else {
+                continue;
+            };
+            let info = self.doc_record_info(id, tab);
+            let Some(writer) = &self.writer else {
+                return;
+            };
+            let Some(Content::Doc(tab)) = self.contents.get_mut(&id) else {
+                continue;
+            };
+            if !tab.is_modified() {
+                if let Some(key) = tab.record.take() {
+                    writer.discard(key);
+                }
+                tab.recorded = None;
+                continue;
+            }
+            let revision = tab.view.revision();
+            let every = tab.record_every();
+            match tab.recorded {
+                Some((done, _)) if done == revision && tab.record.is_some() => continue,
+                Some((_, at)) if at.elapsed() < every => continue,
+                _ => {}
+            }
+            let contents = Contents::maybe(tab.snapshot());
+            match tab.record {
+                Some(key) => {
+                    let meta = info.to_meta();
+                    let remove = RecordInfo::optional_keys()
+                        .into_iter()
+                        .filter(|optional| !meta.iter().any(|(key, _)| key == optional))
+                        .collect();
+                    writer.set_meta(key, meta, remove);
+                    writer.checkpoint(key, contents);
+                }
+                None => {
+                    let key = self.next_key;
+                    self.next_key += 1;
+                    writer.open(key, info.to_meta(), contents);
+                    tab.record = Some(key);
+                }
+            }
+            tab.recorded = Some((revision, std::time::Instant::now()));
+        }
+    }
+
+    /// Bring back a Word document from its record: the file as it was last
+    /// written, in a tab of its own with unsaved changes, saving to the file
+    /// it belongs to. The record is kept writing.
+    pub(crate) fn restore_document(&mut self, candidate: Candidate) -> Option<TabId> {
+        let Candidate {
+            record,
+            info: Some(info),
+            workbook: Some(bytes),
+            ..
+        } = candidate
+        else {
+            return None;
+        };
+        let mut document = aster_ooxml::docx::read(bytes.clone()).ok()?;
+        document.renumber();
+        self.leave_active_document();
+        let title = if info.title.is_empty() {
+            info.path
+                .as_deref()
+                .map_or_else(String::new, files::display_name)
+        } else {
+            info.title.clone()
+        };
+        let id = self.tabs.open(aster_shell::tabs::DocKind::Writer, title);
+        let source = Arc::new(bytes);
+        let mut tab = DocTab::new(
+            aster_surface::doc_view::DocView::new(document),
+            source.clone(),
+            info.path.clone(),
+            &self.tokens,
+        );
+        tab.disk = info.disk;
+        tab.mark_recovered();
+        if let Some(writer) = &self.writer {
+            let key = self.next_key;
+            self.next_key += 1;
+            writer.adopt(
+                key,
+                record,
+                info.to_meta(),
+                Contents::Bytes((*source).clone()),
+            );
+            tab.record = Some(key);
+            tab.recorded = Some((tab.view.revision(), std::time::Instant::now()));
+        }
+        self.contents.insert(id, Content::Doc(Box::new(tab)));
+        self.sync_modified();
+        Some(id)
+    }
 }

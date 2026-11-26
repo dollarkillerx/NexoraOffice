@@ -22,7 +22,7 @@ use aster_storage::{Fingerprint, RecordKey};
 use aster_surface::preview::{PreviewJob, PreviewLayout, PreviewStyle, PreviewView};
 use aster_surface::text_view::line_lengths;
 use aster_surface::{
-    Action, Decoration, ImeEvent, PageLayout, Palette, Rgba8, TextStyle, TextSurface, TextView,
+    Action, Decoration, ImeEvent, PageLayout, Palette, Rgba8, TextStyle, TextView,
 };
 
 /// Body text size of the Markdown editor, in logical pixels.
@@ -430,32 +430,6 @@ struct PreviewRequest {
     width: u16,
     scale: f32,
     style: PreviewStyle,
-}
-
-/// A Writer tab: the plain-text surface on its own, with no document model, no
-/// undo and no file behind it.
-pub struct WriterView {
-    pub surface: TextSurface,
-    pub zoom_percent: u32,
-    pub stats: TextStats,
-}
-
-impl WriterView {
-    pub fn new(text: &str, tokens: &theme::Tokens) -> Self {
-        let mut surface = TextSurface::new(text);
-        surface.set_palette(palette(tokens));
-        surface.set_page_layout(page_layout(tokens));
-        Self {
-            stats: TextStats::of(text),
-            surface,
-            zoom_percent: 100,
-        }
-    }
-
-    pub fn restyle(&mut self, tokens: &theme::Tokens) {
-        self.surface.set_palette(palette(tokens));
-        self.surface.set_page_layout(page_layout(tokens));
-    }
 }
 
 /// A Markdown tab. The document owns the text, the selection and the undo

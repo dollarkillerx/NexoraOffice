@@ -1106,6 +1106,36 @@ fn sections_can_have_their_own_page_size_and_start_kinds() {
 }
 
 #[test]
+fn keep_with_next_does_not_reach_into_a_section_on_a_new_page() {
+    // A heading that ends its section has nothing on its page to keep with.
+    let build = |fillers: usize, split: bool| {
+        let mut blocks = numbered(fillers);
+        let mut heading = paragraph("heading");
+        heading.props.keep_next = true;
+        if split {
+            heading.section = Some(Arc::new(small()));
+        }
+        blocks.push(Block::paragraph(heading));
+        blocks.push(with("b1\nb2\nb3\nb4\nb5", |p| p.keep_lines = true));
+        doc(blocks)
+    };
+    // A count of fillers that leaves the heading at the bottom of a page when
+    // it is kept with the paragraph after it in the same section.
+    let n = (1..40)
+        .find(|n| {
+            let layout = lay(&build(*n, false));
+            page_of(&layout, *n) == 1 && page_of(&layout, n + 1) == 1 && {
+                let split = lay(&build(*n, true));
+                page_of(&split, *n) == 0
+            }
+        })
+        .expect("a heading that stays when its section ends");
+    let layout = lay(&build(n, true));
+    assert_eq!(page_of(&layout, n), 0);
+    assert_eq!(page_of(&layout, n + 1), 1);
+}
+
+#[test]
 fn a_document_grid_rounds_lines_to_whole_pitches() {
     let mut section = small();
     section.grid = Some(DocGrid {

@@ -229,6 +229,10 @@ struct Flow<'a, 'b> {
     /// The height of a line of the text being placed, what a page of notes
     /// leaves room for at least.
     line_hint: f32,
+    /// Where a keep-with-next chain stops: the end of the section when the
+    /// next one starts on a page of its own (nothing of it is on this page
+    /// to keep with), else the end of the document.
+    chain_end: usize,
 }
 
 fn collect_notes(doc: &Document) -> NoteNumbers {
@@ -306,6 +310,7 @@ impl Layouter {
             sections_pages: Vec::new(),
             carry: Vec::new(),
             line_hint: 12.0,
+            chain_end: usize::MAX,
         };
         flow.run();
         let layout = flow.finish();
@@ -322,6 +327,14 @@ impl Flow<'_, '_> {
         for (index, (last, sec)) in sections.iter().enumerate() {
             let end = (*last + 1).min(blocks.len()).max(start);
             self.begin_section(index, sec);
+            let continues = sections
+                .get(index + 1)
+                .is_some_and(|(_, next)| next.start == SectionStart::Continuous);
+            self.chain_end = if continues || index + 1 == sections.len() {
+                usize::MAX
+            } else {
+                end
+            };
             for i in start..end {
                 if self.pages.len() >= MAX_PAGES {
                     return;
@@ -639,7 +652,8 @@ impl Flow<'_, '_> {
         let mut need = 0.0;
         let width = self.geom.shape_width;
         let mut prev: Option<Arc<Paragraph>> = None;
-        for block in blocks.iter().skip(i).take(12) {
+        let limit = self.chain_end.saturating_sub(i).min(12);
+        for block in blocks.iter().skip(i).take(limit) {
             let Block::Paragraph(p) = block else {
                 break;
             };
@@ -669,7 +683,9 @@ impl Flow<'_, '_> {
         path: Option<Path>,
         para: &Arc<Paragraph>,
     ) {
-        if para.props.keep_next && !self.col_empty {
+        // The last paragraph before a break to a new page has nothing to
+        // stay with.
+        if para.props.keep_next && !self.col_empty && i + 1 < self.chain_end {
             let need = self.chain_need(blocks, i);
             if self.y + need > self.col_bottom() + EPS
                 && need <= self.col_bottom() - self.region().top

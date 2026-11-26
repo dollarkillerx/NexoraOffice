@@ -968,6 +968,7 @@ fn scaled_metrics(m: (f32, f32, f32), target: Option<f32>) -> (f32, f32, f32) {
 
 /// The height of a line and where its baseline is in it, from the largest
 /// ascent (with what is raised), descent and line gap on it.
+#[allow(clippy::too_many_arguments)]
 fn line_extent(
     rule: LineRule,
     grid: Option<f32>,

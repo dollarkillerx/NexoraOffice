@@ -73,6 +73,8 @@ pub enum Command {
     RotatePage,
     Annotate,
     FindInDocument,
+    IndentMore,
+    IndentLess,
     More,
 }
 
@@ -137,6 +139,8 @@ impl Command {
         Command::RotatePage,
         Command::Annotate,
         Command::FindInDocument,
+        Command::IndentMore,
+        Command::IndentLess,
         Command::More,
     ];
 
@@ -164,7 +168,31 @@ impl Command {
         match kind {
             DocKind::Writer => matches!(
                 self,
-                Command::ZoomOut | Command::ZoomReset | Command::ZoomIn
+                Command::Undo
+                    | Command::Redo
+                    | Command::ZoomOut
+                    | Command::ZoomReset
+                    | Command::ZoomIn
+                    | Command::ParagraphStyle
+                    | Command::FontFamily
+                    | Command::FontSizeDown
+                    | Command::FontSize
+                    | Command::FontSizeUp
+                    | Command::Bold
+                    | Command::Italic
+                    | Command::Underline
+                    | Command::Strikethrough
+                    | Command::TextColor
+                    | Command::Highlight
+                    | Command::AlignLeft
+                    | Command::AlignCenter
+                    | Command::AlignRight
+                    | Command::AlignJustify
+                    | Command::IndentMore
+                    | Command::IndentLess
+                    | Command::LineSpacing
+                    | Command::BulletList
+                    | Command::NumberedList
             ),
             DocKind::Markdown => {
                 matches!(
@@ -400,6 +428,46 @@ pub struct ViewState {
     pub thumbnails: bool,
 }
 
+/// How the text at the caret or over the selection looks, for the Writer
+/// toolbar. Anything that is only partly so shows as off.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DocLook {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// The typeface name, empty if mixed or the document's own.
+    pub font: String,
+    /// Points; 0 if mixed.
+    pub size: f32,
+    /// The name of the paragraph style, empty if mixed.
+    pub style: String,
+    /// 1 left, 2 centre, 3 right, 4 justified, 0 mixed.
+    pub align: u8,
+    pub bullets: bool,
+    pub numbering: bool,
+    pub color: Option<[u8; 4]>,
+    pub highlight: Option<[u8; 4]>,
+}
+
+impl DocLook {
+    fn has(&self, command: Command) -> bool {
+        match command {
+            Command::Bold => self.bold,
+            Command::Italic => self.italic,
+            Command::Underline => self.underline,
+            Command::Strikethrough => self.strike,
+            Command::AlignLeft => self.align == 1,
+            Command::AlignCenter => self.align == 2,
+            Command::AlignRight => self.align == 3,
+            Command::AlignJustify => self.align == 4,
+            Command::BulletList => self.bullets,
+            Command::NumberedList => self.numbering,
+            _ => false,
+        }
+    }
+}
+
 /// How the active cell of a workbook looks, for the toolbar.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellLook {
@@ -588,6 +656,43 @@ impl ViewState {
     }
 }
 
+/// The size shown in the size field: whole numbers plain, nothing if mixed.
+fn size_text(size: f32) -> String {
+    if size <= 0.0 {
+        String::new()
+    } else if size.fract() == 0.0 {
+        format!("{size:.0}")
+    } else {
+        format!("{size}")
+    }
+}
+
+/// The line spacings the line spacing button lists, as multiples.
+pub const LINE_SPACINGS: [f32; 6] = [1.0, 1.15, 1.5, 2.0, 2.5, 3.0];
+
+fn line_spacings() -> Vec<String> {
+    LINE_SPACINGS.iter().map(|v| format!("{v}")).collect()
+}
+
+/// The typefaces the font field of a Writer tab lists besides the one the
+/// text has.
+pub const FONT_FAMILIES: [&str; 14] = [
+    "Calibri",
+    "Arial",
+    "Times New Roman",
+    "Courier New",
+    "Georgia",
+    "Verdana",
+    "Helvetica",
+    "SimSun",
+    "SimHei",
+    "Microsoft YaHei",
+    "KaiTi",
+    "MS Mincho",
+    "MS Gothic",
+    "Noto Sans CJK",
+];
+
 /// The family name shown in the font field until real font handling exists.
 /// It is the bundled interface and body face the plan names.
 const DEFAULT_FONT: &str = "Noto Sans CJK";
@@ -595,6 +700,7 @@ const DEFAULT_FONT: &str = "Noto Sans CJK";
 struct Builder {
     kind: DocKind,
     view: ViewState,
+    doc: DocLook,
     items: Vec<Item>,
 }
 
@@ -615,7 +721,8 @@ impl Builder {
                     || (self.kind == DocKind::Markdown && self.view.has(command))
                     || (matches!(self.kind, DocKind::Sheets | DocKind::Slides)
                         && self.view.cell_has(command))
-                    || (command == Command::PageThumbnails && self.view.thumbnails)),
+                    || (command == Command::PageThumbnails && self.view.thumbnails)
+                    || (self.kind == DocKind::Writer && self.doc.has(command))),
             options: Vec::new(),
         });
         self
@@ -738,38 +845,69 @@ pub fn heading_names(strings: &Strings) -> Vec<String> {
 /// The toolbar for a document of this kind. `strings` supplies the values
 /// shown in its fields.
 pub fn toolbar(kind: DocKind, view: ViewState, strings: &Strings) -> Vec<Item> {
+    toolbar_for(kind, view, &DocLook::default(), strings)
+}
+
+/// The toolbar of a Writer tab, showing how the text at the caret looks.
+pub fn toolbar_for(kind: DocKind, view: ViewState, doc: &DocLook, strings: &Strings) -> Vec<Item> {
     let mut b = Builder {
         kind,
         view,
+        doc: doc.clone(),
         items: Vec::new(),
     };
     let plain = LetterStyle::default();
     match kind {
         DocKind::Writer => {
+            let doc = b.doc.clone();
             b.history()
                 .icon(Icon::Print, Command::Print)
                 .sep()
                 .zoom(view)
                 .sep()
-                .select(strings.style_body, 92.0, Command::ParagraphStyle)
-                .sep()
-                .font("12")
-                .sep()
-                .emphasis()
-                .letter(
-                    "A",
-                    LetterStyle {
-                        underline: true,
-                        ..plain
+                .select(
+                    if doc.style.is_empty() {
+                        strings.style_body
+                    } else {
+                        &doc.style
                     },
-                    Command::TextColor,
+                    120.0,
+                    Command::ParagraphStyle,
                 )
-                .icon(Icon::Highlight, Command::Highlight)
-                .sep()
+                .sep();
+            b.select(
+                if doc.font.is_empty() {
+                    DEFAULT_FONT
+                } else {
+                    &doc.font
+                },
+                132.0,
+                Command::FontFamily,
+            )
+            .sep()
+            .icon(Icon::Minus, Command::FontSizeDown)
+            .select(&size_text(doc.size), 44.0, Command::FontSize)
+            .icon(Icon::Plus, Command::FontSizeUp)
+            .sep()
+            .emphasis()
+            .swatch(None, "A", doc.color, Command::TextColor);
+            if let Some(item) = b.items.last_mut() {
+                item.options = vec![strings.font_auto.to_owned()];
+            }
+            b.swatch(Some(Icon::Highlight), "", doc.highlight, Command::Highlight);
+            if let Some(item) = b.items.last_mut() {
+                item.options = vec![strings.fill_none.to_owned()];
+            }
+            b.sep()
                 .alignment()
                 .icon(Icon::AlignJustify, Command::AlignJustify)
-                .icon(Icon::LineSpacing, Command::LineSpacing)
-                .sep()
+                .icon(Icon::IndentLess, Command::IndentLess)
+                .icon(Icon::IndentMore, Command::IndentMore)
+                .icon(Icon::LineSpacing, Command::LineSpacing);
+            if let Some(item) = b.items.last_mut() {
+                item.options = line_spacings();
+            }
+            b.sep()
                 .icon(Icon::BulletList, Command::BulletList)
                 .icon(Icon::NumberedList, Command::NumberedList)
                 .sep()
@@ -1093,7 +1231,33 @@ mod tests {
             match kind {
                 DocKind::Writer => assert_eq!(
                     enabled,
-                    [Command::ZoomOut, Command::ZoomReset, Command::ZoomIn]
+                    [
+                        Command::Undo,
+                        Command::Redo,
+                        Command::ZoomOut,
+                        Command::ZoomReset,
+                        Command::ZoomIn,
+                        Command::ParagraphStyle,
+                        Command::FontFamily,
+                        Command::FontSizeDown,
+                        Command::FontSize,
+                        Command::FontSizeUp,
+                        Command::Bold,
+                        Command::Italic,
+                        Command::Underline,
+                        Command::Strikethrough,
+                        Command::TextColor,
+                        Command::Highlight,
+                        Command::AlignLeft,
+                        Command::AlignCenter,
+                        Command::AlignRight,
+                        Command::AlignJustify,
+                        Command::IndentLess,
+                        Command::IndentMore,
+                        Command::LineSpacing,
+                        Command::BulletList,
+                        Command::NumberedList,
+                    ]
                 ),
                 DocKind::Markdown => assert_eq!(
                     enabled,
@@ -1289,12 +1453,16 @@ mod tests {
         };
         assert!(enabled(edited, Command::Undo));
         assert!(!enabled(edited, Command::Redo));
-        // A Writer tab has no history, whatever the view state says.
-        let writer_undo = toolbar(DocKind::Writer, edited, &ZH_HANS)
-            .into_iter()
-            .find(|item| item.command == Some(Command::Undo))
-            .expect("Writer shows an undo button");
-        assert!(!writer_undo.enabled);
+        // So does a Writer tab.
+        let writer_undo = |view: ViewState| {
+            toolbar(DocKind::Writer, view, &ZH_HANS)
+                .into_iter()
+                .find(|item| item.command == Some(Command::Undo))
+                .expect("Writer shows an undo button")
+                .enabled
+        };
+        assert!(writer_undo(edited));
+        assert!(!writer_undo(fresh));
     }
 
     #[test]

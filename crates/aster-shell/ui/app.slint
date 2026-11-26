@@ -180,7 +180,7 @@ export component AppWindow inherits Window {
     // The Format menu's character formats act on a workbook's cells.
     // Workbooks, and text on a slide: the Format menu's bold, italic,
     // underline and strikethrough act on them through `sheet-format`.
-    property <bool> sheet-formatting: (root.viewer == 1 || (root.viewer == 2 && root.slide-text)) && root.can-save;
+    property <bool> sheet-formatting: (root.viewer == 1 || (root.viewer == 2 && root.slide-text) || root.viewer == 4) && root.can-save;
     in property <bool> mark-italic;
     in property <bool> mark-strike;
     in property <bool> mark-code;
@@ -249,7 +249,7 @@ export component AppWindow inherits Window {
     out property <length> preview-width: preview-pane.width;
     out property <length> preview-height: preview-pane.height;
     // Views of files: 0 none, 1 a workbook, 2 a presentation, 3 a PDF file, 4 a
-    // Word document (read-only).
+    // Word document.
     in property <int> viewer;
     // The selected cell of a workbook, and the sheets one can switch to.
     in property <string> cell-address;
@@ -840,7 +840,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-replace;
                 shortcut: @keys(Control + Alt + F);
-                enabled: root.editing || root.viewer == 1;
+                enabled: root.editing || root.viewer == 1 || root.viewer == 4;
                 activated => {
                     root.menu-replace();
                 }

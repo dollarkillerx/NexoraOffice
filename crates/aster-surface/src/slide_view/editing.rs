@@ -184,8 +184,13 @@ pub(crate) enum Drag {
         frame: Frame,
         before: Box<Slide>,
     },
-    /// Selecting text.
-    Text { shape: usize },
+    /// Selecting text: `clicks` is 1 for characters, 2 for words and 3 for
+    /// paragraphs, and `origin` the range the press selected.
+    Text {
+        shape: usize,
+        clicks: u32,
+        origin: (TextPos, TextPos),
+    },
     /// A thumbnail, perhaps being dragged to another place.
     Slide { from: usize, y: f64, moving: bool },
 }
@@ -834,7 +839,11 @@ impl SlideView {
             anchor,
             caret,
         };
-        self.drag = Some(Drag::Text { shape });
+        self.drag = Some(Drag::Text {
+            shape,
+            clicks,
+            origin: (anchor, caret),
+        });
         self.touch();
     }
 
@@ -910,14 +919,48 @@ impl SlideView {
                 );
                 self.set_frame(shape, resized)
             }
-            Drag::Text { shape } => {
+            Drag::Text {
+                shape,
+                clicks,
+                origin,
+            } => {
                 let Some(at) = self.text_at(shape, point) else {
                     return false;
                 };
-                if let Selection::Text { caret, .. } = &mut self.selection
-                    && *caret != at
+                let body = self.presentation.slides[self.current].shapes[shape]
+                    .text
+                    .clone()
+                    .unwrap_or_default();
+                let (start, end) = origin;
+                // After a double or triple click the drag goes by whole
+                // words or paragraphs; inside the first one nothing moves.
+                let unit = |at: TextPos| match clicks {
+                    2 => body.word_at(at),
+                    n if n >= 3 => (
+                        TextPos::new(at.para, 0),
+                        TextPos::new(
+                            at.para,
+                            body.paragraphs.get(at.para).map_or(0, Paragraph::len),
+                        ),
+                    ),
+                    _ => (at, at),
+                };
+                let (new_anchor, new_caret) = if clicks < 2 {
+                    (None, at)
+                } else if at < start {
+                    (Some(end), unit(at).0)
+                } else if at > end {
+                    (Some(start), unit(at).1)
+                } else {
+                    (Some(start), end)
+                };
+                if let Selection::Text { anchor, caret, .. } = &mut self.selection
+                    && (*caret != new_caret || new_anchor.is_some_and(|a| *anchor != a))
                 {
-                    *caret = at;
+                    if let Some(a) = new_anchor {
+                        *anchor = a;
+                    }
+                    *caret = new_caret;
                     self.touch();
                     return true;
                 }
@@ -2684,5 +2727,86 @@ mod tests {
         assert_eq!(crushed.width, 12_700);
         assert_eq!(size_step(18.0, true), 20.0);
         assert_eq!(size_step(8.0, false), 7.0);
+    }
+
+    /// The title holds "alpha beta gamma"; returns the screen point at the
+    /// middle of the given word (byte range).
+    fn title_with_words(view: &mut SlideView) {
+        click(view, 6_000_000, 2_300_000);
+        view.type_text("alpha beta gamma");
+        view.render();
+    }
+
+    fn word_point(view: &mut SlideView, offset: usize) -> (f64, f64) {
+        let Selection::Text { shape, .. } = view.selection().clone() else {
+            panic!("no text selection");
+        };
+        let laid = view.text_layout(shape).unwrap();
+        let para = &laid.paras[0];
+        let (x, y, h) = SlideView::caret_box(para, offset);
+        let found = &view.presentation().slides[view.current()].shapes[shape];
+        let (rect, transform) = view.placed(found);
+        let local = Point::new(rect.x0 + x + 1.0, rect.y0 + y + h / 2.0);
+        let screen = transform * local;
+        (screen.x, screen.y)
+    }
+
+    fn text_selection(view: &SlideView) -> (usize, usize) {
+        match view.selection() {
+            Selection::Text { anchor, caret, .. } => (anchor.offset, caret.offset),
+            other => panic!("not a text selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_drag_after_a_double_click_keeps_and_extends_by_words() {
+        let mut view = view();
+        title_with_words(&mut view);
+        // Inside "beta" (offsets 6..10), a little after its start.
+        let (x, y) = word_point(&mut view, 8);
+        view.press(x, y, false, 2);
+        assert_eq!(text_selection(&view), (6, 10));
+        // A move event at the same spot changes nothing.
+        view.drag(x, y, false);
+        assert_eq!(text_selection(&view), (6, 10));
+        // To a later word: to its end.
+        let (gx, gy) = word_point(&mut view, 13);
+        view.drag(gx, gy, false);
+        assert_eq!(text_selection(&view), (6, 16));
+        // Back inside the first word: the word again.
+        view.drag(x, y, false);
+        assert_eq!(text_selection(&view), (6, 10));
+        // To an earlier word: to its start, anchored at the end of "beta".
+        let (ax, ay) = word_point(&mut view, 2);
+        view.drag(ax, ay, false);
+        assert_eq!(text_selection(&view), (10, 0));
+        view.release();
+    }
+
+    #[test]
+    fn a_drag_after_a_triple_click_keeps_the_paragraph() {
+        let mut view = view();
+        title_with_words(&mut view);
+        let (x, y) = word_point(&mut view, 8);
+        view.press(x, y, false, 3);
+        assert_eq!(text_selection(&view), (0, 16));
+        view.drag(x, y, false);
+        assert_eq!(text_selection(&view), (0, 16));
+        view.release();
+    }
+
+    #[test]
+    fn a_drag_after_a_single_click_goes_by_characters() {
+        let mut view = view();
+        title_with_words(&mut view);
+        let (x, y) = word_point(&mut view, 8);
+        view.press(x, y, false, 1);
+        let (_, caret) = text_selection(&view);
+        let (gx, gy) = word_point(&mut view, 13);
+        view.drag(gx, gy, false);
+        let (anchor, end) = text_selection(&view);
+        assert_eq!(anchor, caret);
+        assert!((12..=14).contains(&end), "{end}");
+        view.release();
     }
 }

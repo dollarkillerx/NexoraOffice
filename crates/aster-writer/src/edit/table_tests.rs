@@ -854,7 +854,8 @@ fn a_last_table_goes_and_the_caret_is_at_the_end_before_it() {
 fn undo_restores_the_exact_document() {
     let mut doc = with_table(labelled(3, 3));
     let mut history = History::default();
-    let steps: Vec<Box<dyn Fn(&mut Document)>> = vec![
+    type Step = Box<dyn Fn(&mut Document)>;
+    let steps: Vec<Step> = vec![
         Box::new(|d| {
             insert_rows(d, &cpos(1, 1, 1, 0), &cpos(1, 1, 1, 0), true);
         }),

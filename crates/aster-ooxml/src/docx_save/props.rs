@@ -375,7 +375,7 @@ fn align_name(align: Align) -> &'static str {
     }
 }
 
-fn border_element(w: &str, name: &str, border: Option<&Border>) -> String {
+pub fn border_element(w: &str, name: &str, border: Option<&Border>) -> String {
     let Some(b) = border else {
         return format!("<{w}{name} {w}val=\"nil\"/>");
     };

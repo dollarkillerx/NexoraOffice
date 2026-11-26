@@ -1174,10 +1174,11 @@ impl Paragraph {
         let line_index = self.line_of(offset);
         let line = &self.lines[line_index];
         let index = self.clusters.partition_point(|c| c.text.end <= offset);
-        if index < line.clusters.end && index >= line.clusters.start {
-            if let Some(placed) = line.placed.get(index - line.clusters.start) {
-                return (line_index, line.left + from_fx(placed.x));
-            }
+        if index < line.clusters.end
+            && index >= line.clusters.start
+            && let Some(placed) = line.placed.get(index - line.clusters.start)
+        {
+            return (line_index, line.left + from_fx(placed.x));
         }
         // The end of the text, or of an empty line.
         let end = line

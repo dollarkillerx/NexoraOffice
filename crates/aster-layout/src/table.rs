@@ -20,7 +20,6 @@ pub(crate) struct RowLayout {
     pub top: f32,
     pub height: f32,
     pub exact: bool,
-    pub cant_split: bool,
     pub header: bool,
 }
 
@@ -63,10 +62,6 @@ pub(crate) struct Slice {
 impl TableLayout {
     pub fn height(&self) -> f32 {
         self.rows.last().map_or(0.0, |row| row.top + row.height)
-    }
-
-    pub fn width(&self) -> f32 {
-        self.cols.last().copied().unwrap_or(0.0)
     }
 
     /// Rows at the top marked as headers.
@@ -298,7 +293,6 @@ impl Cx<'_> {
                 top,
                 height: heights[r],
                 exact: matches!(row.height, RowHeight::Exactly(_)),
-                cant_split: row.cant_split,
                 header: row.header,
             });
             top += heights[r];

@@ -290,7 +290,7 @@ impl Flow<'_, '_> {
             SectionStart::EvenPage | SectionStart::OddPage => {
                 let upcoming = self.pending_start.unwrap_or(self.next_number);
                 let want_even = sec.start == SectionStart::EvenPage;
-                if (upcoming % 2 == 0) != want_even {
+                if upcoming.is_multiple_of(2) != want_even {
                     let restart = self.pending_start.take();
                     self.new_page();
                     self.pending_start = restart;
@@ -337,7 +337,7 @@ impl Flow<'_, '_> {
     fn pick(&self, set: &Marginals, number: u32, first: bool) -> Option<usize> {
         if first && self.sec.title_page {
             set.first
-        } else if self.doc.settings.even_and_odd_headers && number % 2 == 0 {
+        } else if self.doc.settings.even_and_odd_headers && number.is_multiple_of(2) {
             set.even
         } else {
             set.default
@@ -492,9 +492,8 @@ impl Flow<'_, '_> {
             let unit = if p.props.keep_lines || lines.len() <= 4 {
                 all
             } else {
-                let tail = if p.props.keep_next { 2 } else { 2 };
-                let head: f32 = lines.iter().take(tail).map(|l| l.height).sum();
-                if p.props.keep_next { head } else { head }
+                // The part that has to stay with what follows or comes before.
+                lines.iter().take(2).map(|l| l.height).sum()
             };
             need += space + unit;
             if !p.props.keep_next {
@@ -587,7 +586,7 @@ impl Flow<'_, '_> {
                 None => pt(props.space_before),
             };
             let space = if line > 0 || (self.col_empty && self.overflowed && self.prev.is_none()) {
-                if line > 0 { 0.0 } else { 0.0 }
+                0.0
             } else {
                 base_space
             };
@@ -958,14 +957,14 @@ impl Flow<'_, '_> {
         if next_row < header_rows || header_rows == 0 {
             return;
         }
-        for h in 0..header_rows {
+        for (h, row) in layout.rows.iter().enumerate().take(header_rows) {
             batch.push(Slice {
                 row: h,
                 c0: 0.0,
-                c1: layout.rows[h].height,
+                c1: row.height,
                 repeat: true,
             });
-            self.y += layout.rows[h].height;
+            self.y += row.height;
         }
     }
 
@@ -1067,6 +1066,34 @@ impl Flow<'_, '_> {
             let header = self.marginal_stack(state.header, width, &values);
             let footer = self.marginal_stack(state.footer, width, &values);
             let mut layers = std::mem::take(&mut state.layers);
+            // Text that does not fill the page sits in the middle or at the
+            // bottom, if the section says so.
+            let used = state
+                .regions
+                .iter()
+                .map(|r| r.used_bottom)
+                .fold(state.body_top, f32::max);
+            let room = state.body_bottom - state.note_height - used;
+            let dy = match sec.vertical_align {
+                aster_writer::CellAlign::Top => 0.0,
+                aster_writer::CellAlign::Center => room / 2.0,
+                aster_writer::CellAlign::Bottom => room,
+            };
+            if dy > 0.5 {
+                for layer in [
+                    &mut layers.shade,
+                    &mut layers.behind,
+                    &mut layers.body,
+                    &mut layers.rules,
+                    &mut layers.front,
+                ] {
+                    layer.iter_mut().for_each(|item| item.shift(dy));
+                }
+                for frag in self.frags.iter_mut().filter(|f| f.page == index) {
+                    frag.y += dy;
+                    frag.bounds = frag.bounds.shifted(dy);
+                }
+            }
             let mut scratch = Vec::new();
             {
                 let mut out = Out {

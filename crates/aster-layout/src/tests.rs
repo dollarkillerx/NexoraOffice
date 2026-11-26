@@ -1706,3 +1706,88 @@ fn nothing_is_lost_in_a_long_mixed_document() {
         assert!(!parts.is_empty(), "{path:?} not placed");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Text, language and sections
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chinese_lines_never_start_with_a_closing_mark() {
+    let text = "排版引擎需要处理“禁则”：句号、逗号和后引号（」』）》等）不能出现在行首，前引号（「『（《等）不能出现在行尾。日本語の組版では、行頭に句読点や閉じ括弧（」）を置くことはできません。";
+    for width in [4_000, 4_300, 4_700, 5_100, 5_500] {
+        let mut section = small();
+        section.page.0 = width + 800;
+        let mut document = doc(vec![pb(text)]);
+        document.last_section = Arc::new(section);
+        document.settings.east_asian_language = Some("zh-CN".into());
+        let layout = lay(&document);
+        let shown = page_texts(&layout.pages[0]).join("\n");
+        for line in shown.lines().skip(1) {
+            let first = line.chars().next().unwrap();
+            assert!(
+                !"，。、」』）》：；！？”ゃゅょっー".contains(first),
+                "width {width}: {line}"
+            );
+        }
+        assert!(shown.lines().count() > 2);
+    }
+}
+
+#[test]
+fn letter_spacing_widens_a_run() {
+    let at = |spacing| {
+        let mut wide = look();
+        wide.spacing = spacing;
+        let mut p = paragraph("");
+        p.runs = vec![Run::text("abcd", wide)];
+        let layout = lay(&doc(vec![Block::paragraph(p)]));
+        layout.caret(&Pos::new(Path::body(0), 4)).unwrap().x
+    };
+    assert!((at(100) - at(0) - 20.0).abs() < 0.5);
+}
+
+#[test]
+fn superscripts_are_smaller_and_raised_and_small_caps_are_shorter() {
+    let mut sup = look();
+    sup.position = VertAlign::Superscript;
+    let mut p = paragraph("");
+    p.runs = vec![Run::text("x", look()), Run::text("2", sup)];
+    let layout = lay(&doc(vec![Block::paragraph(p)]));
+    let size_of_runs: Vec<f32> = layout.pages[0]
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Text(t) => Some(t.paragraph.draw_runs(0.0, 100.0)),
+            _ => None,
+        })
+        .flatten()
+        .map(|run| run.face.size)
+        .collect();
+    assert_eq!(size_of_runs.len(), 2);
+    assert!(size_of_runs[1] < size_of_runs[0]);
+}
+
+#[test]
+fn a_section_can_centre_its_text_vertically() {
+    let mut section = small();
+    section.vertical_align = CellAlign::Center;
+    let mut document = doc(vec![pb("middle")]);
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    let caret = layout.caret(&Pos::new(Path::body(0), 0)).unwrap();
+    assert!(caret.top > 70.0 && caret.top < 100.0, "{caret:?}");
+    // And a click finds it where it is drawn.
+    let hit = layout.hit(0, caret.x + 1.0, caret.top + 2.0).unwrap();
+    assert_eq!(hit.path, Path::body(0));
+}
+
+#[test]
+fn distribute_spreads_a_short_line_over_the_width() {
+    let mut p = paragraph("姓名");
+    p.props.align = Align::Distribute;
+    let layout = lay(&doc(vec![Block::paragraph(p)]));
+    let end = layout
+        .caret(&Pos::new(Path::body(0), "姓名".len()))
+        .unwrap();
+    assert!((end.x - 280.0).abs() < 1.5, "{end:?}");
+}

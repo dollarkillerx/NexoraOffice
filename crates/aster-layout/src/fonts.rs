@@ -91,10 +91,12 @@ pub fn family(look: &RunLook) -> Family {
     Family::List(format!("{}, system-ui", names.join(", ")).into())
 }
 
+type FontNames = (Option<Arc<str>>, Option<Arc<str>>);
+
 /// A look's family list, shared between looks that name the same fonts.
 #[derive(Default)]
 pub struct Families {
-    cache: std::collections::HashMap<(Option<Arc<str>>, Option<Arc<str>>), Family>,
+    cache: std::collections::HashMap<FontNames, Family>,
 }
 
 impl Families {

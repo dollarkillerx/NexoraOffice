@@ -28,24 +28,19 @@ fn color(rgba: [u8; 4]) -> Color {
 /// Draws pages. Keeps decoded pictures between pages.
 #[derive(Default)]
 pub struct DocPainter {
-    resources: Option<Resources>,
+    resources: Resources,
     images: ImageCache,
     buffer: Vec<Glyph>,
 }
 
 impl DocPainter {
     pub fn new() -> Self {
-        Self {
-            resources: Some(Resources::new()),
-            images: ImageCache::default(),
-            buffer: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Paint `page` with its top-left corner at `(x, y)` device pixels, one
     /// point being `scale` pixels. Draws the paper, then the items.
     pub fn paint_page(&mut self, ctx: &mut RenderContext, page: &Page, x: f64, y: f64, scale: f64) {
-        let mut resources = self.resources.take().unwrap_or_else(Resources::new);
         let s = scale;
         ctx.set_transform(Affine::IDENTITY);
         ctx.set_fill_rule(Fill::NonZero);
@@ -58,7 +53,7 @@ impl DocPainter {
         ));
         let mut pen = Pen {
             ctx,
-            resources: &mut resources,
+            resources: &mut self.resources,
             images: &mut self.images,
             buffer: &mut self.buffer,
             x,
@@ -74,7 +69,6 @@ impl DocPainter {
             pen.ctx.pop_layer();
             pen.clips -= 1;
         }
-        self.resources = Some(resources);
     }
 
     /// Render a page alone onto a new pixmap, one point being `scale` pixels.
@@ -85,9 +79,7 @@ impl DocPainter {
         self.paint_page(&mut ctx, page, 0.0, 0.0, scale);
         ctx.flush();
         let mut pixmap = Pixmap::new(width, height);
-        let mut resources = self.resources.take().unwrap_or_else(Resources::new);
-        ctx.render(&mut pixmap, &mut resources);
-        self.resources = Some(resources);
+        ctx.render(&mut pixmap, &mut self.resources);
         pixmap
     }
 
@@ -337,5 +329,76 @@ impl Pen<'_> {
                 f64::from(oy + (line.y + line.thickness) * s),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aster_layout::Layouter;
+    use aster_writer::{
+        Block, Document, Drawing, DrawingContent, Inline, Paragraph, Picture, Run, RunLook,
+        Section, Story,
+    };
+
+    use super::DocPainter;
+
+    fn document() -> Document {
+        let look = RunLook {
+            size: 18.0,
+            ..RunLook::default()
+        };
+        // A picture the decoders cannot read draws as a placeholder.
+        let picture = Run::object(
+            Inline::Drawing(Arc::new(Drawing {
+                size: (40 * 12_700, 30 * 12_700),
+                content: DrawingContent::Picture(Picture {
+                    image: Arc::from(vec![1u8, 2, 3]),
+                    crop: [0.0; 4],
+                }),
+                float: None,
+                alt: None,
+            })),
+            look.clone(),
+        );
+        let paragraph = Paragraph {
+            runs: vec![Run::text("Paper and ink", look.clone()), picture],
+            base: look.clone(),
+            mark: look,
+            ..Paragraph::default()
+        };
+        Document {
+            body: Story {
+                blocks: vec![Block::paragraph(paragraph)],
+                part: None,
+            },
+            last_section: Arc::new(Section::default()),
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn a_page_is_white_paper_with_dark_text() {
+        let layout = Layouter::new().layout(&document());
+        let mut painter = DocPainter::new();
+        let pixmap = painter.render(&layout.pages[0], 1.0);
+        let data = pixmap.data();
+        let (w, h) = (usize::from(pixmap.width()), usize::from(pixmap.height()));
+        assert_eq!((w, h), (596, 842));
+        let pixel = |x: usize, y: usize| data[y * w + x];
+        let corner = pixel(2, 2);
+        assert_eq!(
+            (corner.r, corner.g, corner.b, corner.a),
+            (255, 255, 255, 255)
+        );
+        // Some ink where the first line is, and the placeholder's grey box.
+        let dark = (60..110)
+            .flat_map(|y| (60..300).map(move |x| (x, y)))
+            .filter(|(x, y)| pixel(*x, *y).r < 100)
+            .count();
+        assert!(dark > 50, "{dark}");
+        let png = painter.encode_png(&layout.pages[0], 0.5).unwrap();
+        assert_eq!(&png[1..4], b"PNG");
     }
 }

@@ -18,8 +18,6 @@ use aster_surface::doc_paint::DocPainter;
 use aster_text::Shaper;
 use aster_writer::*;
 
-const BLACK: Rgba = [0, 0, 0, 255];
-
 fn look(size: f32) -> RunLook {
     RunLook {
         font: Some("Calibri".into()),
@@ -312,8 +310,7 @@ fn build() -> Document {
     let ja = "日本語の組版では、行頭に句読点や閉じ括弧（」）、小書きの仮名（ゃ・ゅ・ょ・っ）、長音記号「ー」などを置くことはできません。これを「行頭禁則」と呼びます。コンピューターでチェックしましょう。";
     let en = "Word processors lay text out in lines, lines in paragraphs and paragraphs on pages. This paragraph is set in the Latin font with a fallback for East Asian text, and it is long enough to wrap over several lines so that alignment, spacing and hyphen-less breaking can be checked at a glance.";
 
-    let mut body: Vec<Block> = Vec::new();
-    body.push(heading("Aster Office 排版演示 Layout Sample", 0));
+    let mut body: Vec<Block> = vec![heading("Aster Office 排版演示 Layout Sample", 0)];
     body.push(heading("1. 正文 Body text", 1));
     // Justified, first line indented two characters.
     body.push(para(
@@ -603,8 +600,7 @@ fn build() -> Document {
     body.push(end_of(section(columns)));
 
     // Landscape with a document grid.
-    let mut grid_para = Vec::new();
-    grid_para.push(heading("8. 文档网格 Landscape with a grid", 1));
+    let mut grid_para = vec![heading("8. 文档网格 Landscape with a grid", 1)];
     for _ in 0..2 {
         grid_para.push(para(
             vec![text(zh, &look(10.5))],
@@ -758,5 +754,4 @@ fn main() {
     for entry in layout.outline() {
         println!("{} {} (page {})", entry.level, entry.text, entry.page + 1);
     }
-    let _ = BLACK;
 }

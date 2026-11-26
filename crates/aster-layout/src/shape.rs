@@ -131,11 +131,6 @@ impl Shaped {
             piece.orig.1
         }
     }
-
-    /// Where the document's own text starts in the shaped text.
-    pub fn prefix(&self) -> usize {
-        self.prefix
-    }
 }
 
 /// What a run that is a field or a note reference shows, if it is one.

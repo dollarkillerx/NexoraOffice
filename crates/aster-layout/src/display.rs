@@ -40,8 +40,8 @@ impl Rect {
         self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
     }
 
-    pub(crate) fn offset(&self, dx: f32, dy: f32) -> Rect {
-        Rect::new(self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
+    pub(crate) fn shifted(&self, dy: f32) -> Rect {
+        Rect::new(self.x0, self.y0 + dy, self.x1, self.y1 + dy)
     }
 }
 
@@ -124,6 +124,26 @@ pub enum Item {
     /// Everything up to the matching `PopClip` is cut to the rectangle.
     PushClip(Rect),
     PopClip,
+}
+
+impl Item {
+    /// Move down by `dy`.
+    pub(crate) fn shift(&mut self, dy: f32) {
+        match self {
+            Item::Fill { rect, .. } | Item::Placeholder { rect, .. } | Item::PushClip(rect) => {
+                *rect = rect.shifted(dy)
+            }
+            Item::Rule { from, to, .. } => {
+                from.1 += dy;
+                to.1 += dy;
+            }
+            Item::Text(text) => text.y += dy,
+            Item::Leader(leader) => leader.baseline += dy,
+            Item::Picture(picture) => picture.rect = picture.rect.shifted(dy),
+            Item::Frame(frame) => frame.rect = frame.rect.shifted(dy),
+            Item::PopClip => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

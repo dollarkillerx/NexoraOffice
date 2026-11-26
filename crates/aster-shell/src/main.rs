@@ -296,9 +296,10 @@ struct Shell {
     /// it was at this version, for an image or not.
     link_edit: Option<(TabId, std::ops::Range<usize>, u64, bool)>,
     /// The link dialog is open for this Word document; and the insert table
-    /// dialog.
+    /// dialog, and the split cell dialog.
     doc_link_for: Option<TabId>,
     doc_table_for: Option<TabId>,
+    doc_split_for: Option<TabId>,
     /// Whether the remembered folder has been looked up; until then the
     /// sidebar state is not written back.
     workspace_loaded: bool,
@@ -368,6 +369,7 @@ impl Shell {
             link_edit: None,
             doc_link_for: None,
             doc_table_for: None,
+            doc_split_for: None,
             workspace_loaded: false,
             filter: None,
             sidebar_recent: Vec::new(),
@@ -1548,6 +1550,37 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_table_dialog_title(strings.table_dialog_title.into());
     s.set_table_rows(strings.table_rows.into());
     s.set_table_columns(strings.table_columns.into());
+    s.set_menu_edit_header(strings.menu_edit_header.into());
+    s.set_menu_edit_footer(strings.menu_edit_footer.into());
+    s.set_menu_back_to_body(strings.menu_back_to_body.into());
+    s.set_menu_page_number(strings.menu_page_number.into());
+    s.set_story_header(strings.story_header.into());
+    s.set_story_footer(strings.story_footer.into());
+    s.set_story_footnote(strings.story_footnote.into());
+    s.set_story_endnote(strings.story_endnote.into());
+    s.set_table_merge(strings.table_merge.into());
+    s.set_table_split(strings.table_split.into());
+    s.set_table_unmerge(strings.table_unmerge.into());
+    s.set_split_dialog_title(strings.split_dialog_title.into());
+    s.set_picture_wrap(strings.picture_wrap.into());
+    s.set_wrap_inline(strings.wrap_inline.into());
+    s.set_wrap_square(strings.wrap_square.into());
+    s.set_wrap_tight(strings.wrap_tight.into());
+    s.set_wrap_top_bottom(strings.wrap_top_bottom.into());
+    s.set_wrap_behind(strings.wrap_behind.into());
+    s.set_wrap_front(strings.wrap_front.into());
+    s.set_menu_review(strings.menu_review.into());
+    s.set_review_show_markup(strings.review_show_markup.into());
+    s.set_review_previous(strings.review_previous.into());
+    s.set_review_next(strings.review_next.into());
+    s.set_review_accept(strings.review_accept.into());
+    s.set_review_reject(strings.review_reject.into());
+    s.set_review_accept_all(strings.review_accept_all.into());
+    s.set_review_reject_all(strings.review_reject_all.into());
+    s.set_review_comments(strings.review_comments.into());
+    s.set_comments_title(strings.comments_title.into());
+    s.set_comments_empty(strings.comments_empty.into());
+    s.set_clipboard_picture(strings.clipboard_picture.into());
     ui.set_heading_names(model(
         toolbar::heading_names(strings)
             .into_iter()
@@ -1763,6 +1796,7 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     shell.shown_heading = view.heading;
     shell.shown_styles = view.styles;
     ui.set_in_table(view.styles.table || writer_ui::in_table(shell));
+    writer_ui::sync_flags(ui, shell);
     {
         use aster_markdown::format::Block;
         let styles = view.styles;
@@ -6382,6 +6416,20 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         shell.doc_table_for = None;
         ui.invoke_focus_document();
     }));
+    ui.on_split_accept(handler!(|ui, shell| {
+        writer_ui::accept_split(&ui, shell);
+    }));
+    ui.on_split_cancel(handler!(|ui, shell| {
+        ui.set_split_open(false);
+        shell.doc_split_for = None;
+        ui.invoke_focus_document();
+    }));
+    ui.on_review(handler!(|ui, shell, code| {
+        writer_ui::review(&ui, shell, code);
+    }));
+    ui.on_comment_clicked(handler!(|ui, shell, index| {
+        writer_ui::comment_clicked(&ui, shell, index);
+    }));
     ui.on_encoding_accept(handler!(|ui, shell| {
         accept_encoding(&ui, shell);
     }));
@@ -10604,6 +10652,658 @@ mod ui_tests {
         assert_eq!(read.plain_text(), "one\ntwo");
         assert!(!tab_modified(&app));
         assert!(with_doc(&app, |tab| tab.view.can_undo()));
+    }
+
+    /// The text the status bar shows after the kind of document.
+    fn status_note(ui: &AppWindow) -> String {
+        ui.get_status_note().to_string()
+    }
+
+    #[test]
+    fn headers_footers_and_notes_are_entered_from_the_menus_and_named_in_the_status_bar() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "body text");
+        let strings = app.shell.borrow().language.strings();
+        assert_eq!(ui.get_doc_story(), 0);
+        assert_eq!(status_note(ui), "");
+        // Edit header: the caret is in the header, which says so.
+        ui.invoke_format(40);
+        assert_eq!(ui.get_doc_story(), 1);
+        assert_eq!(status_note(ui), strings.story_header);
+        type_text(ui, "Top");
+        // A page number goes in there too, and a footnote does not.
+        ui.invoke_format(43);
+        let notes = with_doc(&app, |tab| tab.view.document().footnotes.notes.len());
+        ui.invoke_format(14);
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().footnotes.notes.len()),
+            notes,
+            "no footnotes in a header"
+        );
+        let header = with_doc(&app, |tab| {
+            tab.view
+                .document()
+                .marginals
+                .iter()
+                .map(|story| {
+                    aster_writer::paragraphs_of(&story.blocks)
+                        .iter()
+                        .map(|(_, p)| p.text())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            header.iter().any(|text| text.starts_with("Top")),
+            "{header:?}"
+        );
+        assert!(
+            with_doc(&app, |tab| tab.view.document().plain_text()) == "body text",
+            "the body is as it was"
+        );
+        // The menu's back to the body, and Esc, both leave.
+        ui.invoke_format(42);
+        assert_eq!(ui.get_doc_story(), 0);
+        assert_eq!(status_note(ui), "");
+        ui.invoke_format(41);
+        assert_eq!(ui.get_doc_story(), 1);
+        assert_eq!(status_note(ui), strings.story_footer);
+        key(ui, Key::Escape);
+        assert_eq!(ui.get_doc_story(), 0);
+        assert!(with_doc(&app, |tab| !tab.view.in_marginal()));
+        // Back in the body a footnote takes the caret into the note.
+        ui.invoke_format(14);
+        assert_eq!(ui.get_doc_story(), 2);
+        assert_eq!(status_note(ui), strings.story_footnote);
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().footnotes.notes.len()),
+            notes + 1
+        );
+        // Not another one from inside the note, and no page number either.
+        let in_note = with_doc(&app, |tab| tab.view.document().clone());
+        ui.invoke_format(14);
+        ui.invoke_format(43);
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), in_note);
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().footnotes.notes.len()),
+            notes + 1
+        );
+        // A click in the body is back in it.
+        with_doc(&app, |tab| {
+            let at = tab.view.document().start().unwrap();
+            tab.view.go_to(&at);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        assert_eq!(ui.get_doc_story(), 0);
+        assert_eq!(status_note(ui), "");
+        // Back to the body does nothing in the body.
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        ui.invoke_format(42);
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        assert!(tab_modified(&app));
+    }
+
+    #[test]
+    fn merging_splitting_and_unmerging_cells_from_the_table_menu() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        ui.invoke_format(10);
+        ui.set_table_rows("2".into());
+        ui.set_table_columns("2".into());
+        ui.invoke_table_accept();
+        let table_index = with_doc(&app, |tab| {
+            tab.view
+                .document()
+                .body
+                .blocks
+                .iter()
+                .position(|b| b.as_table().is_some())
+                .expect("a table")
+        });
+        let cell = |row: usize, column: usize| {
+            aster_writer::Pos::new(
+                aster_writer::Path::body(table_index).cell_block(row, column, 0),
+                0,
+            )
+        };
+        let select = |from: aster_writer::Pos, to: aster_writer::Pos| {
+            with_doc(&app, |tab| tab.view.set_selection(from, to));
+            writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        };
+        // In one cell: nothing to merge, a split is possible, nothing to
+        // unmerge.
+        select(cell(0, 0), cell(0, 0));
+        assert!(ui.get_in_table());
+        assert!(!ui.get_doc_can_merge());
+        assert!(ui.get_doc_can_split());
+        assert!(!ui.get_doc_can_unmerge());
+        ui.invoke_format(44);
+        ui.invoke_format(46);
+        // Two cells side by side: merged into one.
+        select(cell(0, 0), cell(0, 1));
+        assert!(ui.get_doc_can_merge());
+        ui.invoke_format(44);
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!(table.rows[0].cells.len(), 1);
+            assert_eq!(table.rows[0].cells[0].span, 2);
+        });
+        assert!(ui.get_doc_can_unmerge(), "the caret is in the merged cell");
+        assert!(!ui.get_doc_can_merge());
+        // Unmerging takes it apart again.
+        ui.invoke_format(46);
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!(table.rows[0].cells.len(), 2);
+        });
+        assert!(!ui.get_doc_can_unmerge());
+        // Split cell asks how: nothing happens for numbers that are not
+        // numbers; cancel leaves the table as it is.
+        select(cell(1, 0), cell(1, 0));
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        ui.invoke_format(45);
+        assert!(ui.get_split_open());
+        assert_eq!(ui.get_split_columns().as_str(), "2");
+        assert_eq!(ui.get_split_rows().as_str(), "1");
+        ui.set_split_columns("x".into());
+        ui.invoke_split_accept();
+        assert!(ui.get_split_open());
+        ui.set_split_columns("0".into());
+        ui.invoke_split_accept();
+        assert!(ui.get_split_open());
+        ui.invoke_split_cancel();
+        assert!(!ui.get_split_open());
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        // Three columns by two rows.
+        ui.invoke_format(45);
+        ui.set_split_columns("3".into());
+        ui.set_split_rows("2".into());
+        ui.invoke_split_accept();
+        assert!(!ui.get_split_open());
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert!(table.rows.len() > 2, "rows were added");
+        });
+        // One undo step for it.
+        ui.invoke_edit_undo();
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        // Outside a table the split dialog does not open, and nothing is
+        // merged.
+        with_doc(&app, |tab| {
+            tab.view
+                .move_caret(aster_surface::doc_view::Move::DocEnd, false);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        for code in [44, 45, 46] {
+            ui.invoke_format(code);
+        }
+        assert!(!ui.get_split_open() || !ui.get_in_table());
+        ui.invoke_split_cancel();
+    }
+
+    #[test]
+    fn the_wrap_menu_follows_the_selected_picture_and_changes_how_it_sits() {
+        use aster_surface::doc_view::PictureLayout;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "ab");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let size = aster_shell::writer_tab::read_picture(&DOT_PNG).unwrap();
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::place_picture(
+                ui,
+                &mut shell,
+                id,
+                std::path::Path::new("点.png"),
+                Ok((DOT_PNG.to_vec(), size)),
+            );
+        }
+        let object = |app: &App| {
+            with_doc(app, |tab| {
+                let start = tab.view.document().start().unwrap();
+                let mut a = start.clone();
+                let mut b = start;
+                a.offset = 2;
+                b.offset = 2 + aster_writer::OBJECT.len();
+                tab.view.set_selection(a, b);
+            });
+            writer_ui::after_move(&app.ui, &mut app.shell.borrow_mut());
+        };
+        // Nothing selected: no wrap is marked or can be asked for.
+        assert_eq!(ui.get_doc_wrap(), -1);
+        object(&app);
+        assert_eq!(ui.get_doc_wrap(), 0, "a new picture is in the line");
+        let layouts = [
+            PictureLayout::Inline,
+            PictureLayout::Square,
+            PictureLayout::Tight,
+            PictureLayout::TopAndBottom,
+            PictureLayout::BehindText,
+            PictureLayout::InFrontOfText,
+        ];
+        for (index, layout) in layouts.into_iter().enumerate().skip(1) {
+            ui.invoke_format(50 + index as i32);
+            assert_eq!(ui.get_doc_wrap(), index as i32);
+            assert_eq!(
+                with_doc(&app, |tab| tab.view.picture_layout()),
+                Some(layout)
+            );
+        }
+        ui.invoke_format(50);
+        assert_eq!(ui.get_doc_wrap(), 0);
+        // Undo goes step by step; the check mark follows.
+        ui.invoke_edit_undo();
+        assert_eq!(ui.get_doc_wrap(), 5);
+        // With the caret in the text, the menu is off again, and a wrap
+        // asked for anyway changes nothing.
+        with_doc(&app, |tab| {
+            let at = tab.view.document().start().unwrap();
+            tab.view.go_to(&at);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        assert_eq!(ui.get_doc_wrap(), -1);
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        ui.invoke_format(51);
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+    }
+
+    /// A document with, in its first paragraph, text inserted by Ann and
+    /// deleted by Bob, and in its second a comment of Cy on "cd".
+    fn make_reviewed(app: &App) {
+        use aster_writer::{
+            Annotation, Block, Change, Comment, Inline, Paragraph, Path, Pos, Run, RunLook,
+        };
+        use std::sync::Arc;
+        let look = RunLook {
+            size: 12.0,
+            ..RunLook::default()
+        };
+        let text = |s: &str| Run::text(s, look.clone());
+        let change = |id: i64, author: &str| Change {
+            id,
+            author: Arc::from(author),
+            date: None,
+            moved: false,
+        };
+        let marker = |annotation: Annotation| {
+            let mut run = Run::object(Inline::Marker, look.clone());
+            run.annotation = Some(annotation);
+            run
+        };
+        let mut inserted = text("two ");
+        inserted.annotation = Some(Annotation::Inserted(Arc::new(change(1, "Ann"))));
+        let paragraph = |runs: Vec<Run>| {
+            Block::paragraph(Paragraph {
+                runs,
+                base: look.clone(),
+                mark: look.clone(),
+                ..Paragraph::default()
+            })
+        };
+        with_doc(app, |tab| {
+            tab.view.edit_document(|doc, _| {
+                doc.body.blocks = vec![
+                    paragraph(vec![text("one "), inserted.clone(), text("three")]),
+                    paragraph(vec![
+                        text("ab "),
+                        marker(Annotation::CommentStart(7)),
+                        text("cd"),
+                        marker(Annotation::CommentEnd(7)),
+                        marker(Annotation::CommentReference(7)),
+                        text(" ef"),
+                    ]),
+                    paragraph(vec![text("plain")]),
+                ];
+                doc.comments.push(Arc::new(Comment {
+                    id: 7,
+                    author: "Cy".into(),
+                    initials: "C".into(),
+                    date: Some("2024-05-01T09:30:00Z".into()),
+                    paragraphs: vec!["Check this".into(), "twice".into()],
+                }));
+                doc.renumber();
+                Some(aster_writer::edit::Selection::caret(Pos::new(
+                    Path::body(0),
+                    0,
+                )))
+            });
+        });
+        writer_ui::after_edit(&app.ui, &mut app.shell.borrow_mut());
+    }
+
+    /// A point of the document pane (physical pixels, as the view has
+    /// them) where `test` holds.
+    fn find_point(
+        app: &App,
+        test: impl Fn(&aster_surface::doc_view::DocView, f64, f64) -> bool,
+    ) -> (f64, f64) {
+        with_doc(app, |tab| {
+            let (w, h, _) = tab.view.size();
+            for y in (0..h as i32).step_by(3) {
+                for x in (0..w as i32).step_by(3) {
+                    if test(&tab.view, f64::from(x), f64::from(y)) {
+                        return (f64::from(x), f64::from(y));
+                    }
+                }
+            }
+            panic!("no such point on the pages");
+        })
+    }
+
+    /// Click on the document at a point of the view (a left click, as the
+    /// window sends it).
+    fn click_document(app: &App, (x, y): (f64, f64)) {
+        let pane = ElementHandle::find_by_element_id(&app.ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = f64::from(app.ui.window().scale_factor());
+        let at = LogicalPosition::new(origin.x + (x / scale) as f32, origin.y + (y / scale) as f32);
+        let window = app.ui.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position: at });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: at,
+            button: PointerEventButton::Left,
+        });
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: at,
+            button: PointerEventButton::Left,
+        });
+    }
+
+    #[test]
+    fn the_review_menu_steps_through_and_settles_tracked_changes() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        // A document with nothing to review: the items stay off.
+        assert!(!ui.get_doc_has_changes());
+        assert!(!ui.get_doc_has_comments());
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        for code in 1..=6 {
+            ui.invoke_review(code);
+        }
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        make_reviewed(&app);
+        assert!(ui.get_doc_has_changes());
+        assert!(ui.get_doc_has_comments());
+        assert!(ui.get_doc_markup());
+        // Next change selects the insertion.
+        ui.invoke_review(2);
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.selected_text()),
+            "two ",
+            "the next change is selected"
+        );
+        // Reject this change takes the insertion out, as one step of undo.
+        ui.invoke_review(4);
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "one three\nab cd ef\nplain"
+        );
+        assert!(!ui.get_doc_has_changes());
+        ui.invoke_edit_undo();
+        assert!(ui.get_doc_has_changes());
+        // Accept this one keeps the text and ends the change.
+        ui.invoke_review(2);
+        ui.invoke_review(3);
+        assert!(!ui.get_doc_has_changes());
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "one two three\nab cd ef\nplain"
+        );
+        ui.invoke_edit_undo();
+        // All of them at once.
+        ui.invoke_review(5);
+        assert!(!ui.get_doc_has_changes());
+        ui.invoke_edit_undo();
+        ui.invoke_review(6);
+        assert!(!ui.get_doc_has_changes());
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "one three\nab cd ef\nplain"
+        );
+        ui.invoke_edit_undo();
+        // Previous change wraps round to the last one.
+        ui.invoke_review(1);
+        assert_eq!(with_doc(&app, |tab| tab.view.selected_text()), "two ");
+        // The markup switch: the check mark follows, the pages change, and
+        // the PDF export follows the switch.
+        let shown = with_doc(&app, |tab| tab.pdf_job("t"));
+        assert!(shown.show_markup);
+        ui.invoke_review(0);
+        assert!(!ui.get_doc_markup());
+        assert!(!with_doc(&app, |tab| tab.view.show_markup()));
+        let hidden = with_doc(&app, |tab| tab.pdf_job("t"));
+        assert!(!hidden.show_markup);
+        assert!(shown.bytes().is_ok() && hidden.bytes().is_ok());
+        ui.invoke_review(0);
+        assert!(ui.get_doc_markup());
+        // The markup is a view setting: it does not make the tab modified.
+    }
+
+    #[test]
+    fn the_comments_panel_lists_comments_and_clicks_go_both_ways() {
+        use slint::Model;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        make_reviewed(&app);
+        assert!(!ui.get_comments_open());
+        assert_eq!(ui.get_comments().row_count(), 0);
+        ui.invoke_review(7);
+        assert!(ui.get_comments_open());
+        assert_eq!(ui.get_comments().row_count(), 1);
+        let row = ui.get_comments().row_data(0).unwrap();
+        assert_eq!(row.author.as_str(), "Cy");
+        assert_eq!(row.date.as_str(), "2024-05-01 09:30");
+        assert_eq!(row.text.as_str(), "Check this\ntwice");
+        assert!(!row.current);
+        let colour = row.color;
+        assert_ne!(colour.alpha(), 0, "the author's colour");
+        // A click on the entry goes to the text and marks it.
+        ui.invoke_comment_clicked(0);
+        assert_eq!(with_doc(&app, |tab| tab.view.selected_text()), "cd");
+        assert!(ui.get_comments().row_data(0).unwrap().current);
+        // A click elsewhere in the text clears the mark; a click on the
+        // commented text marks it again.
+        let plain = find_point(&app, |view, x, y| {
+            view.is_over_page(x, y)
+                && view.comment_at(x, y).is_none()
+                && view.link_at(x, y).is_none()
+        });
+        click_document(&app, plain);
+        assert!(!ui.get_comments().row_data(0).unwrap().current);
+        let commented = find_point(&app, |view, x, y| view.comment_at(x, y) == Some(7));
+        click_document(&app, commented);
+        assert!(ui.get_comments().row_data(0).unwrap().current);
+        // The panel closes from the menu.
+        ui.invoke_review(7);
+        assert!(!ui.get_comments_open());
+        // With the panel closed, a click marks nothing.
+        click_document(&app, commented);
+        ui.invoke_review(7);
+        assert!(!ui.get_comments().row_data(0).unwrap().current);
+        // Another tab (a new document) has none of these comments.
+        new_writer(&app);
+        assert_eq!(ui.get_comments().row_count(), 0);
+        assert!(!ui.get_doc_has_comments());
+    }
+
+    #[test]
+    fn a_picture_alone_is_copied_cut_and_pasted() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "ab");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let size = aster_shell::writer_tab::read_picture(&DOT_PNG).unwrap();
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::place_picture(
+                ui,
+                &mut shell,
+                id,
+                std::path::Path::new("点.png"),
+                Ok((DOT_PNG.to_vec(), size)),
+            );
+        }
+        let pictures = |app: &App| {
+            with_doc(app, |tab| {
+                tab.view
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .flat_map(|(_, p)| p.runs.iter())
+                    .filter(|r| matches!(r.kind, aster_writer::Inline::Drawing(_)))
+                    .count()
+            })
+        };
+        let select_picture = |app: &App| {
+            with_doc(app, |tab| {
+                let start = tab.view.document().start().unwrap();
+                let mut a = start.clone();
+                let mut b = start;
+                a.offset = 2;
+                b.offset = 2 + aster_writer::OBJECT.len();
+                tab.view.set_selection(a, b);
+            });
+        };
+        assert_eq!(pictures(&app), 1);
+        select_picture(&app);
+        let strings = app.shell.borrow().language.strings();
+        // Copy: the system clipboard gets the stand-in, the picture stays.
+        ui.invoke_edit_copy();
+        assert_eq!(
+            ui.invoke_clipboard_text().as_str(),
+            strings.clipboard_picture
+        );
+        assert_eq!(pictures(&app), 1);
+        // Paste at the end of the text: a second picture.
+        with_doc(&app, |tab| {
+            tab.view
+                .move_caret(aster_surface::doc_view::Move::DocEnd, false);
+        });
+        ui.invoke_edit_paste();
+        assert_eq!(pictures(&app), 2);
+        // Cut takes the picture out and it can be pasted again; undo
+        // brings it back.
+        select_picture(&app);
+        ui.invoke_edit_cut();
+        assert_eq!(pictures(&app), 1);
+        assert_eq!(
+            ui.invoke_clipboard_text().as_str(),
+            strings.clipboard_picture
+        );
+        ui.invoke_edit_paste();
+        assert_eq!(pictures(&app), 2);
+        // The same words typed by hand are only words once something else
+        // replaced the clipboard.
+        ui.invoke_copy_to_clipboard("plain words".into());
+        ui.invoke_edit_paste();
+        assert_eq!(pictures(&app), 2);
+        assert!(with_doc(&app, |tab| tab.view.document().plain_text()).contains("plain words"));
+        // The picture is saved in the file with the others.
+        let dir = tempfile::tempdir().unwrap();
+        let read = save_and_read(&app, dir.path(), "图.docx");
+        let drawings = read
+            .paragraphs()
+            .iter()
+            .flat_map(|(_, p)| p.runs.iter())
+            .filter(|r| matches!(r.kind, aster_writer::Inline::Drawing(_)))
+            .count();
+        assert_eq!(drawings, 2);
+    }
+
+    #[test]
+    fn hovering_over_a_link_says_how_to_follow_it_in_the_status_bar() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "see the site now");
+        with_doc(&app, |tab| {
+            let a = tab.view.document().start().unwrap();
+            let mut b = a.clone();
+            let mut c = a.clone();
+            b.offset = 4;
+            c.offset = 12;
+            tab.view.set_selection(b, c);
+        });
+        ui.invoke_format(8);
+        ui.set_link_address("https://example.com/".into());
+        ui.invoke_link_accept();
+        // Click away from the text so that nothing is selected.
+        with_doc(&app, |tab| {
+            let at = tab.view.document().start().unwrap();
+            tab.view.go_to(&at);
+        });
+        let over = find_point(&app, |view, x, y| {
+            view.link_at(x, y).as_deref() == Some("https://example.com/")
+        });
+        let off = find_point(&app, |view, x, y| {
+            view.is_over_page(x, y) && view.link_at(x, y).is_none()
+        });
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let scale = f64::from(ui.window().scale_factor());
+        let at = |(x, y): (f64, f64)| {
+            LogicalPosition::new(origin.x + (x / scale) as f32, origin.y + (y / scale) as f32)
+        };
+        // The pointer, as a real window sends it.
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: at(over) });
+        let strings = app.shell.borrow().language.strings();
+        let key_name = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        let expected = i18n::fill(
+            &i18n::fill(strings.link_follow, "key", key_name),
+            "address",
+            "https://example.com/",
+        );
+        assert_eq!(ui.get_status_notice().as_str(), expected);
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: at(off) });
+        assert_eq!(ui.get_status_notice().as_str(), "");
+    }
+
+    #[test]
+    fn read_word_also_lists_headers_footers_notes_comments_and_tracked_changes() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        make_reviewed(&app);
+        ui.invoke_format(40);
+        type_text(ui, "Running head");
+        ui.invoke_format(42);
+        ui.invoke_format(14);
+        type_text(ui, "A note");
+        let read = with_doc(&app, |tab| {
+            aster_shell::doc_tools::run(tab, "read_word", &serde_json::json!({}))
+                .unwrap()
+                .0
+        });
+        let value: serde_json::Value = serde_json::from_str(&read).unwrap();
+        assert_eq!(value["headers"][0], "Running head");
+        assert!(value["footnotes"][0].as_str().unwrap().contains("A note"));
+        assert!(value["tracked_changes"].is_string());
+        assert_eq!(value["comments"][0]["author"], "Cy");
+        assert_eq!(value["comments"][0]["text"], "Check this\ntwice");
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap()
+                .contains("only the body can be edited")
+        );
     }
 
     #[test]

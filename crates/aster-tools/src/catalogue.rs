@@ -350,7 +350,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "read_word",
         title: "Read Word document",
-        description: "The body of a Word document as JSON, block by block. Every block has its number from 1 (`block`): a paragraph with its style name, text, list kind, alignment and links, or a table with its rows of cell texts (rows and cells are numbered from 1 in the order listed). The editing tools take these numbers. Long documents come in parts: pass start_block and max_blocks (default 60) to read on; a long table is read with start_row and max_rows. Also gives the paragraph styles the document has. Pictures, headers, footers and footnotes are not shown and cannot be edited yet.",
+        description: "The body of a Word document as JSON, block by block. Every block has its number from 1 (`block`): a paragraph with its style name, text, list kind, alignment and links, or a table with its rows of cell texts (rows and cells are numbered from 1 in the order listed). The editing tools take these numbers. Long documents come in parts: pass start_block and max_blocks (default 60) to read on; a long table is read with start_row and max_rows. Also gives the paragraph styles the document has, and, for reading only, the text of headers, footers, footnotes, endnotes and comments and whether there are tracked changes. The editing tools work on the body only. Pictures are not shown.",
         capability: Capability::Read,
         annotations: READ,
         on_document: true,

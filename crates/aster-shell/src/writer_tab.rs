@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aster_surface::Action;
-use aster_surface::doc_pdf::{DocPdfInfo, export_document};
+use aster_surface::doc_pdf::{DocPdfInfo, export_document_with};
 use aster_surface::doc_view::{
     Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, LinkInfo, Move, Tri,
     Unit, Zoom,
 };
 use aster_writer::edit::Selection;
-use aster_writer::{Break, Document, OBJECT};
+use aster_writer::{Break, Document, MarginalKind, OBJECT, StoryId};
 
 use crate::i18n::{self, Strings};
 use crate::stats::{TextStats, group_digits};
@@ -63,6 +63,24 @@ pub struct DocTab {
     pub stats_due: bool,
     /// The address of the link under the pointer, for the status bar.
     pub hover_link: Option<String>,
+    /// Where the caret was when the status bar was last told.
+    pub shown_place: Place,
+    /// The comments panel as last shown, to leave the list alone (and
+    /// where it is scrolled to) when nothing in it changed.
+    pub comments_shown: Vec<ShownComment>,
+    /// The comment the last click was in, which the panel marks.
+    pub comment_current: Option<i64>,
+}
+
+/// One row of the comments panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShownComment {
+    pub id: i64,
+    pub author: String,
+    pub date: String,
+    pub text: String,
+    pub color: [u8; 4],
+    pub current: bool,
 }
 
 /// What a save of a document writes.
@@ -109,6 +127,18 @@ pub enum TableEdit {
     DeleteRow,
     DeleteColumn,
     DeleteTable,
+    MergeCells,
+    UnmergeCell,
+}
+
+/// Where the caret is, for the menus and the status bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Body,
+    Header,
+    Footer,
+    Footnote,
+    Endnote,
 }
 
 /// The most rows and columns the insert table dialog makes.
@@ -120,12 +150,15 @@ pub const TABLE_MAX_COLUMNS: usize = 63;
 pub struct DocPdf {
     document: Document,
     info: DocPdfInfo,
+    /// Tracked changes and comments are drawn as on the screen: the export
+    /// follows the Review menu's switch.
+    pub show_markup: bool,
 }
 
 impl DocPdf {
     /// The PDF file's bytes.
     pub fn bytes(&self) -> Result<Vec<u8>, String> {
-        export_document(&self.document, &self.info)
+        export_document_with(&self.document, &self.info, self.show_markup)
     }
 }
 
@@ -305,6 +338,9 @@ impl DocTab {
             shown_look: None,
             stats_due: false,
             hover_link: None,
+            shown_place: Place::Body,
+            comments_shown: Vec::new(),
+            comment_current: None,
         }
     }
 
@@ -361,7 +397,22 @@ impl DocTab {
             TableEdit::DeleteRow => DocCommand::DeleteRows,
             TableEdit::DeleteColumn => DocCommand::DeleteColumns,
             TableEdit::DeleteTable => DocCommand::DeleteTable,
+            TableEdit::MergeCells => DocCommand::MergeCells,
+            TableEdit::UnmergeCell => DocCommand::UnmergeCell,
         })
+    }
+
+    /// Where the caret is.
+    pub fn place(&self) -> Place {
+        match self.view.active_story() {
+            StoryId::Body => Place::Body,
+            StoryId::Marginal(_) => match self.view.marginal_kind() {
+                Some(MarginalKind::Footer) => Place::Footer,
+                _ => Place::Header,
+            },
+            StoryId::Footnote(_) => Place::Footnote,
+            StoryId::Endnote(_) => Place::Endnote,
+        }
     }
 
     /// What the link dialog starts from.
@@ -396,6 +447,7 @@ impl DocTab {
                 title: Some(title.to_owned()).filter(|t| !t.is_empty()),
                 language: self.view.document().settings.language.clone(),
             },
+            show_markup: self.view.show_markup(),
         }
     }
 

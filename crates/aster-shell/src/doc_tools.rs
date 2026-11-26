@@ -27,7 +27,7 @@
 use aster_writer::edit::{self, ListKind, Selection};
 use aster_writer::{
     Align, Block, Document, Inline, Link, NumberFormat, OBJECT, Paragraph, Path, Pos, Rgba, Run,
-    RunLook, RunPatch, Table, Underline, UnderlineStyle,
+    RunLook, RunPatch, StoryId, Table, Underline, UnderlineStyle,
 };
 use serde_json::{Map, Value, json};
 
@@ -462,13 +462,107 @@ fn read(doc: &Document, args: &Value) -> Result<String, String> {
                 .collect::<Vec<_>>()
         ),
     );
+    other_stories(doc, &mut out);
     out.insert(
         "note".into(),
         json!(
-            "Only the body is shown. Pictures (objects), headers, footers and footnotes cannot be read or edited yet."
+            "The blocks are the body, and only the body can be edited. Headers, footers, footnotes, endnotes and comments are listed for reading; pictures (objects) are not shown."
         ),
     );
     Ok(Value::Object(out).to_string())
+}
+
+/// Most notes and comments `read_word` lists; the rest are counted.
+const MAX_LISTED: usize = 50;
+
+/// The text of a story's paragraphs on lines of their own, objects left
+/// out and cut short.
+fn story_text(doc: &Document, story: StoryId) -> String {
+    let text = doc
+        .paragraphs_in(story)
+        .iter()
+        .map(|(_, p)| shown(p))
+        .collect::<Vec<_>>()
+        .join("\n");
+    cut(text.trim(), CELL_READ).0
+}
+
+/// What `read_word` says besides the body, in a compact form: the headers
+/// and footers the sections use, the notes, the comments, and whether the
+/// document has tracked changes. Empty things are left out. All read only.
+fn other_stories(doc: &Document, out: &mut Map<String, Value>) {
+    let sections = doc.sections();
+    for (key, footer) in [("headers", false), ("footers", true)] {
+        let mut used: Vec<usize> = Vec::new();
+        for (_, section) in &sections {
+            let set = if footer {
+                &section.footers
+            } else {
+                &section.headers
+            };
+            for index in [set.default, set.first, set.even].into_iter().flatten() {
+                if !used.contains(&index) {
+                    used.push(index);
+                }
+            }
+        }
+        let texts: Vec<String> = used
+            .into_iter()
+            .map(|index| story_text(doc, StoryId::Marginal(index)))
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !texts.is_empty() {
+            out.insert(key.into(), json!(texts));
+        }
+    }
+    for (key, notes, endnote) in [
+        ("footnotes", &doc.footnotes.notes, false),
+        ("endnotes", &doc.endnotes.notes, true),
+    ] {
+        let listed: Vec<Value> = notes
+            .iter()
+            .map(|note| {
+                let story = if endnote {
+                    StoryId::Endnote(note.id)
+                } else {
+                    StoryId::Footnote(note.id)
+                };
+                (note.id, story_text(doc, story))
+            })
+            .filter(|(_, text)| !text.is_empty())
+            .take(MAX_LISTED)
+            .map(|(id, text)| json!(format!("{id}: {text}")))
+            .collect();
+        if !listed.is_empty() {
+            out.insert(key.into(), Value::Array(listed));
+        }
+    }
+    if !doc.comments.is_empty() {
+        let listed: Vec<Value> = doc
+            .comments
+            .iter()
+            .take(MAX_LISTED)
+            .map(|c| {
+                json!({
+                    "author": c.author,
+                    "text": cut(&c.text(), CELL_READ).0,
+                })
+            })
+            .collect();
+        out.insert("comments".into(), Value::Array(listed));
+        if doc.comments.len() > MAX_LISTED {
+            out.insert(
+                "more_comments".into(),
+                json!(doc.comments.len() - MAX_LISTED),
+            );
+        }
+    }
+    if doc.has_changes() {
+        out.insert(
+            "tracked_changes".into(),
+            json!("the document has tracked insertions or deletions; the text shown includes deleted text"),
+        );
+    }
 }
 
 // --- Writing ------------------------------------------------------------------

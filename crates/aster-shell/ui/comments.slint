@@ -1,0 +1,134 @@
+import { ListView } from "std-widgets.slint";
+import { Tokens, Icons, Strings, CommentItem } from "tokens.slint";
+import { IconButton, VHairline } from "widgets.slint";
+
+// One comment: a bar and the author's name in the author's colour, the date,
+// and the text as long as it is.
+component CommentRow inherits Rectangle {
+    in property <CommentItem> item;
+    in property <length> available;
+    callback clicked;
+    height: column.preferred-height + 2 * Tokens.space-sm;
+
+    Rectangle {
+        x: Tokens.space-xs;
+        width: parent.width - 2 * Tokens.space-xs;
+        border-radius: Tokens.radius-md;
+        background: root.item.current ? Tokens.accent-soft : touch.pressed ? Tokens.pressed : touch.has-hover ? Tokens.hover : transparent;
+    }
+
+    Rectangle {
+        x: Tokens.space-md;
+        y: Tokens.space-sm;
+        width: 3px;
+        height: parent.height - 2 * Tokens.space-sm;
+        border-radius: 1.5px;
+        background: root.item.color;
+    }
+
+    column := VerticalLayout {
+        x: Tokens.space-md + 3px + Tokens.space-sm;
+        y: Tokens.space-sm;
+        width: root.available - self.x - Tokens.space-md;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: Tokens.space-sm;
+            Text {
+                text: root.item.author;
+                font-size: Tokens.font-md;
+                font-weight: 600;
+                color: root.item.color;
+                overflow: elide;
+                horizontal-stretch: 1;
+                min-width: 0px;
+            }
+
+            Text {
+                text: root.item.date;
+                font-size: Tokens.font-xs;
+                color: Tokens.text-tertiary;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: root.item.text;
+            font-size: Tokens.font-md;
+            color: Tokens.text;
+            wrap: word-wrap;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The comments of the Word document in front, in the order of their text.
+// A click goes to the comment's text in the document.
+export component CommentsPanel inherits Rectangle {
+    // Width when open; the caller animates the actual width.
+    in property <length> panel-width: 300px;
+    in property <[CommentItem]> items;
+    callback clicked(int);
+    callback close();
+    background: Tokens.panel;
+    clip: true;
+
+    VHairline {
+        x: 0;
+    }
+
+    // Laid out at the full width even while the panel is sliding shut.
+    VerticalLayout {
+        x: 1px;
+        width: root.panel-width - 1px;
+        HorizontalLayout {
+            padding: Tokens.space-md;
+            padding-left: Tokens.space-lg;
+            spacing: Tokens.space-sm;
+            Text {
+                text: Strings.comments-title;
+                font-size: Tokens.font-lg;
+                font-weight: 600;
+                color: Tokens.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+
+            IconButton {
+                icon: Icons.close;
+                accessible-role: button;
+                accessible-label: Strings.find-close;
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+
+        if root.items.length == 0: HorizontalLayout {
+            padding-left: Tokens.space-lg;
+            padding-right: Tokens.space-lg;
+            Text {
+                text: Strings.comments-empty;
+                font-size: Tokens.font-sm;
+                color: Tokens.text-tertiary;
+                wrap: word-wrap;
+            }
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for item[index] in root.items: CommentRow {
+                item: item;
+                available: root.panel-width - 1px;
+                clicked => {
+                    root.clicked(index);
+                }
+            }
+        }
+    }
+}

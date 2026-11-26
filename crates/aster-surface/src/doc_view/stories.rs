@@ -61,6 +61,32 @@ impl DocView {
         matches!(self.active_story(), StoryId::Marginal(_))
     }
 
+    /// Whether the header or footer the caret is in is a header or a footer
+    /// (for the status bar). `None` outside both.
+    pub fn marginal_kind(&self) -> Option<MarginalKind> {
+        if let Some(new) = &self.new_marginal
+            && self.compose.is_none()
+        {
+            return Some(new.kind);
+        }
+        let StoryId::Marginal(index) = self.active_story() else {
+            return None;
+        };
+        let used = |kind: fn(&aster_writer::Section) -> &aster_writer::Marginals| {
+            self.document.sections().iter().any(|(_, section)| {
+                let set = kind(section);
+                [set.default, set.first, set.even].contains(&Some(index))
+            })
+        };
+        if used(|s| &s.headers) {
+            Some(MarginalKind::Header)
+        } else if used(|s| &s.footers) {
+            Some(MarginalKind::Footer)
+        } else {
+            None
+        }
+    }
+
     /// The page the caret is on when it is in a header or footer.
     pub fn marginal_page(&self) -> Option<usize> {
         self.in_marginal()

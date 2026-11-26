@@ -573,6 +573,9 @@ impl Flow<'_, '_> {
         let mut guard = 0;
         loop {
             guard += 1;
+            if self.pages.len() >= MAX_PAGES {
+                break;
+            }
             // Something keeps pushing the text away: put what is left down.
             let force = guard > nlines * 4 + 64;
             let (col_x, col_w) = self.col_rect();
@@ -769,10 +772,6 @@ impl Flow<'_, '_> {
                     &mut out,
                 )
             };
-            let used_height = used
-                .min(lines[end_line - 1].top + lines[end_line - 1].height - lines[line].top)
-                .max(0.0);
-            let _ = used_height;
             let bottom = origin_y + lines[end_line - 1].top + lines[end_line - 1].height;
             let last = end_line == nlines;
             let end_y = bottom
@@ -883,7 +882,7 @@ impl Flow<'_, '_> {
         let mut guard = 0usize;
         while r < nrows {
             guard += 1;
-            if guard > nrows * 8 + 10_000_000 {
+            if guard > (nrows + 1) * 100_000 || self.pages.len() >= MAX_PAGES {
                 break;
             }
             let row = &layout.rows[r];

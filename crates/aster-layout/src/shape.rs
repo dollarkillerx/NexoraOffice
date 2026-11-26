@@ -141,10 +141,12 @@ pub(crate) struct Shaped {
     orig_len: usize,
     /// Width of the text area the lines were broken for.
     pub width: f32,
-    /// Inline drawings: where in the shaped text, and what.
-    pub objects: Vec<(usize, Arc<Drawing>)>,
-    /// Floating drawings: the place they are anchored at.
-    pub floats: Vec<(usize, Arc<Drawing>)>,
+    /// Inline drawings: where in the shaped text, what, and the byte offset
+    /// of their object character in the paragraph's own text.
+    pub objects: Vec<(usize, Arc<Drawing>, usize)>,
+    /// Floating drawings: the place they are anchored at, what, and the
+    /// byte offset of their object character in the paragraph's own text.
+    pub floats: Vec<(usize, Arc<Drawing>, usize)>,
     /// Note references: the place and the note's id.
     pub notes: Vec<(usize, i32, bool)>,
     /// Page and column breaks: the place of the line break that stands for it.
@@ -384,8 +386,8 @@ struct Builder<'a, 'e> {
     background: Option<[u8; 4]>,
     spacing: Vec<Spacing>,
     objects: Vec<InlineObject>,
-    drawings: Vec<(usize, Arc<Drawing>)>,
-    floats: Vec<(usize, Arc<Drawing>)>,
+    drawings: Vec<(usize, Arc<Drawing>, usize)>,
+    floats: Vec<(usize, Arc<Drawing>, usize)>,
     notes: Vec<(usize, i32, bool)>,
     breaks: Vec<(usize, Break)>,
     backs: Vec<(Range<usize>, [u8; 4])>,
@@ -562,10 +564,14 @@ impl Builder<'_, '_> {
                             width: w,
                             height: h,
                         });
-                        self.drawings.push((self.text.len(), drawing.clone()));
+                        self.drawings
+                            .push((self.text.len(), drawing.clone(), orig.start));
                         self.text.push('\u{fffc}');
                     }
-                    Some(_) => self.floats.push((self.text.len(), drawing.clone())),
+                    Some(_) => {
+                        self.floats
+                            .push((self.text.len(), drawing.clone(), orig.start));
+                    }
                 },
                 Inline::Footnote(id) | Inline::Endnote(id) => {
                     let end = matches!(run.kind, Inline::Endnote(_));

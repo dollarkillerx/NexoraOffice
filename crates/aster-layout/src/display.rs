@@ -86,6 +86,17 @@ pub struct PictureItem {
     pub image: Arc<[u8]>,
     pub rect: Rect,
     pub crop: [f64; 4],
+    /// Which drawing of the document this draws, when it has a place of its
+    /// own in it; `None` for a picture inside a text box.
+    pub source: Option<Arc<PictureSource>>,
+}
+
+/// Where a picture is in the document: the paragraph and the byte offset of
+/// the drawing's object character in that paragraph's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PictureSource {
+    pub path: aster_writer::Path,
+    pub offset: usize,
 }
 
 /// A text box's background and outline. Its content follows as ordinary

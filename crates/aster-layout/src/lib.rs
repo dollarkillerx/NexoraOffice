@@ -29,7 +29,7 @@ mod table;
 
 pub use cx::Layouter;
 pub use display::{
-    FrameItem, Item, LeaderItem, Page, PictureItem, Rect, Rgba, RuleStyle, TextItem,
+    FrameItem, Item, LeaderItem, Page, PictureItem, PictureSource, Rect, Rgba, RuleStyle, TextItem,
 };
 pub use query::{Caret, GridRow, Layout, LinkRect, OutlineEntry, PageInfo, TableBorder, TableGrid};
 

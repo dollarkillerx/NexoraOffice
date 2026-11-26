@@ -39,6 +39,7 @@ fn read(mut p: Paragraph) -> Paragraph {
             look: run.look.clone(),
             style: run.style.clone(),
             link: run.link.clone(),
+            annotation: run.annotation.clone(),
         });
         at += 10;
         run.source = Some(source.clone());
@@ -50,6 +51,7 @@ fn read(mut p: Paragraph) -> Paragraph {
         props: p.props.clone(),
         mark: p.mark.clone(),
         section: p.section.clone(),
+        changes: p.changes.clone(),
     }));
     p
 }

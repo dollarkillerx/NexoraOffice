@@ -95,9 +95,9 @@ use std::sync::Arc;
 
 use aster_writer::edit::{image_format, rebase_look};
 use aster_writer::{
-    Align, Block, Break, CellAlign, Document, Drawing, DrawingContent, Inline, Link, List,
-    ListLevel, NumberFormat, ParaSource, Paragraph, Picture, Row, RowHeight, RunLook, RunSource,
-    Section, SectionStart, Suffix, Table, VMerge,
+    Align, Annotation, Block, Break, CellAlign, Change, Document, Drawing, DrawingContent, Inline,
+    Link, List, ListLevel, NumberFormat, ParaSource, Paragraph, Picture, Row, RowHeight, RunLook,
+    RunSource, Section, SectionStart, Suffix, Table, VMerge,
 };
 
 use crate::docx;
@@ -113,6 +113,7 @@ mod drawing;
 mod props;
 mod stories;
 mod table;
+mod track;
 mod xml;
 
 pub use blank::blank;
@@ -136,6 +137,14 @@ fn run_key(source: &RunSource) -> RunKey {
         source.range.end,
         source.parent.as_ref().map(|p| (p.start, p.end)),
     )
+}
+
+/// The insertion a run is inside of, if it is.
+fn inserted_of(run: &aster_writer::Run) -> Option<&Change> {
+    match &run.annotation {
+        Some(Annotation::Inserted(change)) => Some(change),
+        _ => None,
+    }
 }
 
 fn range_key(range: &Range<usize>) -> (usize, usize) {
@@ -671,6 +680,7 @@ impl<'a> Saver<'a> {
         run.text == origin.text
             && run.style == origin.style
             && run.link == origin.link
+            && run.annotation == origin.annotation
             && run.look == self.effective(origin, base)
             && self.drawing_change(run, origin).is_none()
     }
@@ -1032,6 +1042,9 @@ impl<'a> Saver<'a> {
         } else {
             ppr_old.unwrap_or_default().to_owned()
         };
+        // Records of tracked changes the paragraph has lost (accepted) or
+        // gained (a split paragraph's mark).
+        let ppr = track::edit_marks(&self.w, &ppr, &osrc.changes, &model.changes);
 
         let mut gaps: Vec<Range<usize>> = Vec::with_capacity(units.len() + 1);
         let mut from = range.start + content_start;
@@ -1040,7 +1053,10 @@ impl<'a> Saver<'a> {
             from = unit.range.end;
         }
         gaps.push(from..limit);
-        let content = self.rewrite_runs(model, osrc, &units, gaps)?;
+        let mut content = self.rewrite_runs(model, osrc, &units, gaps)?;
+        if osrc.changes.formatting && !model.changes.formatting {
+            content = track::without_elements(&content, "rPrChange");
+        }
         let end_tag = format!("</{qname}>");
         Some(format!("{start_tag}{ppr}{content}{end_tag}"))
     }
@@ -1161,7 +1177,13 @@ impl<'a> Saver<'a> {
                     }
                     let original = &osrc.runs[i];
                     let relinked = run.link != original.link;
-                    if !relinked {
+                    // Accepted: out of the insertion's wrapper.
+                    let reinserted = inserted_of(run).map(|c| c.id)
+                        != original.annotation.as_ref().and_then(|a| match a {
+                            Annotation::Inserted(c) => Some(c.id),
+                            _ => None,
+                        });
+                    if !relinked && !reinserted {
                         em.reopen();
                     }
                     let bytes = if whole[j] {
@@ -1173,8 +1195,9 @@ impl<'a> Saver<'a> {
                     } else {
                         self.run_from_origin(run, original, &model.base)?
                     };
-                    if relinked {
+                    if relinked || reinserted {
                         let w = self.w.clone();
+                        let bytes = em.in_insertion(inserted_of(run), bytes, &w);
                         let mut opener = |link: &Link| self.hyperlink_open(link);
                         em.place(&run.link, &bytes, &w, &mut opener);
                     } else {
@@ -1187,8 +1210,10 @@ impl<'a> Saver<'a> {
                         continue;
                     };
                     let w = self.w.clone();
+                    em.leave_after(&run.link, &after, k);
+                    let bytes = em.in_insertion(inserted_of(run), bytes, &w);
                     let mut opener = |link: &Link| self.hyperlink_open(link);
-                    em.elsewhere(&run.link, &after, k, &bytes, &w, &mut opener);
+                    em.place(&run.link, &bytes, &w, &mut opener);
                     after = None;
                 }
             }
@@ -1196,7 +1221,8 @@ impl<'a> Saver<'a> {
         for g in k..=m {
             em.gap(g);
         }
-        Some(self.join_links(em.out))
+        let out = track::without_empty_wrappers(&self.w, &em.out);
+        Some(self.join_links(out))
     }
 
     /// Hyperlinks written here that follow each other with nothing between
@@ -1248,17 +1274,33 @@ impl<'a> Saver<'a> {
         )
         .unwrap_or_default();
         let w = self.w.clone();
+        let ppr = track::edit_marks(&w, &ppr, &aster_writer::ParaChanges::default(), &p.changes);
         let mut out = format!("<{w}p>{ppr}");
         let mut i = 0;
         while i < p.runs.len() {
             let link = p.runs[i].link.clone();
             let mut j = i;
             let mut group = String::new();
+            // The insertion whose wrapper is open in `group`.
+            let mut open: Option<Change> = None;
             while j < p.runs.len() && p.runs[j].link == link {
                 if let Some(bytes) = self.run_xml(&p.runs[j], &p.base) {
+                    let now = inserted_of(&p.runs[j]);
+                    if open.as_ref().map(|c| c.id) != now.map(|c| c.id) {
+                        if let Some(change) = open.take() {
+                            group.push_str(&track::wrapper_close(&w, &change));
+                        }
+                        if let Some(change) = now {
+                            group.push_str(&track::wrapper_open(&w, change));
+                            open = Some(change.clone());
+                        }
+                    }
                     group.push_str(&bytes);
                 }
                 j += 1;
+            }
+            if let Some(change) = open.take() {
+                group.push_str(&track::wrapper_close(&w, &change));
             }
             match link {
                 Some(link) if !group.is_empty() => {
@@ -1761,6 +1803,7 @@ fn para_unchanged(model: &Paragraph, op: &Paragraph) -> bool {
         && model.base == op.base
         && model.mark == osrc.mark
         && model.section == osrc.section
+        && model.changes == osrc.changes
         && model.runs.len() == osrc.runs.len()
         && model.runs.iter().zip(&op.runs).all(|(run, orig)| {
             run.kind == orig.kind
@@ -1771,7 +1814,11 @@ fn para_unchanged(model: &Paragraph, op: &Paragraph) -> bool {
 }
 
 fn run_same_run(a: &aster_writer::Run, b: &aster_writer::Run) -> bool {
-    a.text == b.text && a.look == b.look && a.style == b.style && a.link == b.link
+    a.text == b.text
+        && a.look == b.look
+        && a.style == b.style
+        && a.link == b.link
+        && a.annotation == b.annotation
 }
 
 /// The table has the rows and cells it was read with, as they were: the
@@ -1943,19 +1990,43 @@ impl Em<'_> {
         self.consumed[g] = range.end - range.start;
     }
 
-    /// A run that has no place among the original runs, written after the
-    /// last thing written. Wrappers it does not belong to are left first.
-    fn elsewhere(
-        &mut self,
-        link: &Option<Arc<Link>>,
-        after: &Option<Option<Arc<Link>>>,
-        next: usize,
-        bytes: &str,
-        w: &str,
-        opener: &mut dyn FnMut(&Link) -> String,
-    ) {
-        self.leave_after(link, after, next);
-        self.place(link, bytes, w, opener);
+    /// A run that is inside a tracked insertion (or is not) is about to be
+    /// written: step out of an insertion wrapper that is not its own, and
+    /// give back `bytes` in a wrapper of their own when it has none open.
+    fn in_insertion(&mut self, inserted: Option<&Change>, bytes: String, w: &str) -> String {
+        let open = self
+            .open
+            .iter()
+            .rposition(|x| matches!(local(&x.name), "ins" | "moveTo"));
+        if let Some(i) = open {
+            if inserted.is_some_and(|c| track::wrapper_is_for(w, &self.open[i].bytes, c.id)) {
+                return bytes;
+            }
+            self.step_out(i);
+        }
+        match inserted {
+            Some(change) => format!(
+                "{}{bytes}{}",
+                track::wrapper_open(w, change),
+                track::wrapper_close(w, change)
+            ),
+            None => bytes,
+        }
+    }
+
+    /// Close the open wrappers from `i` on (the one that is not written to
+    /// gets nothing: it is dropped if nothing came into it), to be opened
+    /// again if a later run belongs inside.
+    fn step_out(&mut self, i: usize) {
+        let popped: Vec<Wrapper> = self.open.drain(i..).collect();
+        for wrapper in popped.iter().rev() {
+            if self.out.len() == wrapper.body_at {
+                self.out.truncate(wrapper.out_at);
+            } else {
+                self.out.push_str(&format!("</{}>", wrapper.name));
+            }
+        }
+        self.suspended.splice(0..0, popped);
     }
 
     /// Leave the wrappers an original run ends inside, before a run that
@@ -2016,15 +2087,7 @@ impl Em<'_> {
                 if &self.open[i].link == link {
                     wrap = false;
                 } else {
-                    let popped: Vec<Wrapper> = self.open.drain(i..).collect();
-                    for wrapper in popped.iter().rev() {
-                        if self.out.len() == wrapper.body_at {
-                            self.out.truncate(wrapper.out_at);
-                        } else {
-                            self.out.push_str(&format!("</{}>", wrapper.name));
-                        }
-                    }
-                    self.suspended.splice(0..0, popped);
+                    self.step_out(i);
                 }
             }
             (None, None) => {}

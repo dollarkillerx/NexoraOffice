@@ -12,9 +12,13 @@
 //! note references, ruby, page-number fields and hyperlinks; styles and
 //! lists; sections with their headers and footers; footnotes and endnotes;
 //! the settings that matter for layout. Kept in place but not shown:
-//! bookmarks, comment ranges, field codes, deleted text of tracked changes
-//! and every element this version does not know. Not read: macros, math,
-//! comments, embedded objects, `altChunk`.
+//! bookmarks, field codes and every element this version does not know.
+//! Tracked changes and comments are read ([`aster_writer::track`]): the
+//! text of an insertion carries its author and date, the text of a deletion
+//! is kept in a marker where it was, the ends of a comment's range are
+//! markers, and `word/comments.xml` gives the comments. Changes to
+//! formatting are only known as a fact about the paragraph. Not read:
+//! macros, math, embedded objects, `altChunk`, changes to tables.
 
 mod body;
 mod dom;
@@ -77,6 +81,9 @@ struct PartState {
     pub cell: Option<Arc<CondFormat>>,
     /// Section breaks count (the main part only).
     pub sections: bool,
+    /// A run of the paragraph being read has a formatting change
+    /// (`w:rPrChange`).
+    pub formatting_changed: bool,
 }
 
 impl PartState {
@@ -92,6 +99,7 @@ impl PartState {
             depth: 0,
             cell: None,
             sections: false,
+            formatting_changed: false,
         }
     }
 }
@@ -303,6 +311,11 @@ pub fn read_package(package: &mut Package) -> Result<Document> {
         None => Notes::default(),
     };
 
+    let comments = match related(&part.rels, "comments").map(str::to_owned) {
+        Some(name) => reader.comments(&name),
+        None => Vec::new(),
+    };
+
     if let Some(error) = reader.error.take() {
         return Err(error);
     }
@@ -318,6 +331,7 @@ pub fn read_package(package: &mut Package) -> Result<Document> {
         styles: Arc::new(sheet),
         numbering: Arc::new(reader.lists.numbering),
         settings,
+        comments,
     };
     document.renumber();
     Ok(document)
@@ -384,6 +398,37 @@ impl Reader<'_> {
             blocks,
             part: Some(part_name),
         })
+    }
+
+    /// `word/comments.xml`: who said what and when. A part that is missing
+    /// or cannot be read gives no comments; the markers in the text stay.
+    fn comments(&mut self, name: &str) -> Vec<Arc<aster_writer::Comment>> {
+        let Some(bytes) = optional(self.package, Some(name)) else {
+            return Vec::new();
+        };
+        let Ok(root) = dom::parse(&bytes, name) else {
+            return Vec::new();
+        };
+        root.each("comment")
+            .filter_map(|node| {
+                let id = node.int("id")?;
+                let paragraphs = node
+                    .each("p")
+                    .map(|p| {
+                        let mut text = String::new();
+                        p.collect_text(&mut text);
+                        text
+                    })
+                    .collect();
+                Some(Arc::new(aster_writer::Comment {
+                    id,
+                    author: node.attr("author").unwrap_or_default(),
+                    initials: node.attr("initials").unwrap_or_default(),
+                    date: node.attr("date").filter(|d| !d.is_empty()),
+                    paragraphs,
+                }))
+            })
+            .collect()
     }
 
     fn notes(&mut self, name: &str, endnotes: bool) -> Notes {

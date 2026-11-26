@@ -40,6 +40,9 @@
 
 pub mod edit;
 pub mod numbering;
+pub mod track;
+
+pub use track::{Annotation, Change, Comment, Deleted, ParaChanges};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -79,6 +82,11 @@ pub struct Document {
     pub styles: Arc<StyleSheet>,
     pub numbering: Arc<Numbering>,
     pub settings: Settings,
+    /// The comments of `word/comments.xml`; the text each is about is marked
+    /// in the paragraphs by [`Annotation::CommentStart`] and
+    /// [`Annotation::CommentEnd`] runs. Read only: editing never changes
+    /// them, and saving leaves the part as it was.
+    pub comments: Vec<Arc<Comment>>,
 }
 
 /// A flow of blocks: the body, a header or footer, the inside of a text
@@ -574,6 +582,10 @@ pub struct Paragraph {
     pub section: Option<Arc<Section>>,
     /// Where it was read from; `None` for a paragraph made here.
     pub source: Option<Arc<ParaSource>>,
+    /// Tracked changes of the paragraph itself: its mark inserted or
+    /// deleted, or its formatting changed (its text's changes are on the
+    /// runs).
+    pub changes: ParaChanges,
 }
 
 impl Paragraph {
@@ -636,6 +648,7 @@ impl Paragraph {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
                 _ => false,
             }
+            && self.changes == source.changes
             && self.runs.len() == source.runs.len()
             && self.runs.iter().zip(&source.runs).all(|(run, read)| {
                 run.source
@@ -651,9 +664,12 @@ impl Paragraph {
         let mut copy = self.clone();
         copy.source = None;
         copy.section = None;
+        copy.changes = ParaChanges::default();
         copy.runs.retain(|run| !matches!(run.kind, Inline::Marker));
         for run in &mut copy.runs {
             run.source = None;
+            // Pasted text is not tracked as inserted.
+            run.annotation = None;
         }
         copy
     }
@@ -669,6 +685,7 @@ pub struct ParaSource {
     pub props: ParaProps,
     pub mark: RunLook,
     pub section: Option<Arc<Section>>,
+    pub changes: ParaChanges,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -871,6 +888,10 @@ pub struct Run {
     pub link: Option<Arc<Link>>,
     /// Where it was read from; `None` for a run made here.
     pub source: Option<Arc<RunSource>>,
+    /// What the run is besides text: inside a tracked insertion, the place
+    /// of a tracked deletion, an end of a comment's range. `None` for
+    /// ordinary text.
+    pub annotation: Option<Annotation>,
 }
 
 impl Run {
@@ -882,6 +903,7 @@ impl Run {
             style: None,
             link: None,
             source: None,
+            annotation: None,
         }
     }
 
@@ -905,6 +927,7 @@ impl Run {
             style: None,
             link: None,
             source: None,
+            annotation: None,
         }
     }
 
@@ -926,12 +949,17 @@ impl Run {
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
                     _ => false,
                 }
+                && self.annotation == source.annotation
         })
     }
 
-    /// The same look, style and link, so that the two could be one run.
+    /// The same look, style, link and annotation, so that the two could be
+    /// one run.
     pub fn same_look(&self, other: &Run) -> bool {
-        self.look == other.look && self.style == other.style && self.link == other.link
+        self.look == other.look
+            && self.style == other.style
+            && self.link == other.link
+            && self.annotation == other.annotation
     }
 }
 
@@ -1012,6 +1040,7 @@ pub struct RunSource {
     pub look: RunLook,
     pub style: Option<Arc<str>>,
     pub link: Option<Arc<Link>>,
+    pub annotation: Option<Annotation>,
 }
 
 /// How text looks, final.
@@ -1869,6 +1898,7 @@ mod tests {
             look: look.clone(),
             style: None,
             link: None,
+            annotation: None,
         });
         let mut run = Run::text("hello", look.clone());
         run.source = Some(run_source.clone());
@@ -1882,6 +1912,7 @@ mod tests {
             props: paragraph.props.clone(),
             mark: paragraph.mark.clone(),
             section: None,
+            changes: ParaChanges::default(),
         }));
         assert!(paragraph.is_as_read());
 

@@ -319,11 +319,14 @@ fn things_kept_but_not_shown_are_zero_width_markers() {
     for run in paragraph.runs.iter().filter(|r| r.kind == Inline::Marker) {
         assert!(run.text.is_empty());
     }
-    // Neighbouring markers are one marker, and a marker never takes room.
+    // Neighbouring plain markers are one marker, and a marker never takes
+    // room; the ends of a comment, a deletion and a move are markers of their
+    // own (they carry what they are).
     assert_eq!(
         kinds(paragraph),
         [
-            "marker", "text", "marker", "text", "marker", "text", "text", "marker", "text"
+            "marker", "text", "marker", "text", "marker", "marker", "marker", "marker", "marker",
+            "marker", "text", "text", "marker", "text"
         ]
     );
     let part = common_part(&bytes, "word/document.xml");
@@ -332,11 +335,11 @@ fn things_kept_but_not_shown_are_zero_width_markers() {
         raw(&part, &first.range),
         r#"<w:bookmarkStart w:id="0" w:name="b"/><w:bookmarkEnd w:id="0"/>"#
     );
-    let deleted = paragraph.runs[4].source.clone().unwrap();
-    assert!(raw(&part, &deleted.range).starts_with("<w:commentRangeEnd"));
-    assert!(raw(&part, &deleted.range).contains("<w:del "));
-    assert!(raw(&part, &deleted.range).contains("<w:moveFrom"));
-    assert!(raw(&part, &deleted.range).ends_with(r#"<w:moveToRangeEnd w:id="6"/>"#));
+    let source = |i: usize| raw(&part, &paragraph.runs[i].source.clone().unwrap().range).to_owned();
+    assert!(source(4).starts_with("<w:commentRangeEnd"));
+    assert!(source(7).starts_with("<w:del "));
+    assert!(source(8).starts_with("<w:moveFrom "));
+    assert!(source(9).ends_with(r#"<w:moveToRangeEnd w:id="6"/>"#));
 }
 
 #[test]

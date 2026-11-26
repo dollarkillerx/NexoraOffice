@@ -54,6 +54,7 @@ pub use table::{
     move_column_border, set_column_width, set_row_height, space_for_block, split_cell,
     unmerge_cell,
 };
+pub use track::{accept_all, accept_in, reject_all, reject_in};
 
 /// How far one step of indenting moves a paragraph, in twips (half an inch).
 pub const INDENT_STEP: Twips = 720;
@@ -414,9 +415,21 @@ fn insert_plain(doc: &mut Document, at: &Pos, text: &str, look: Option<&RunLook>
         run.style = p.runs[i].style.clone();
         run.link = p.runs[i].link.clone();
     }
+    // Typed into or at the end of an inserted range, it is part of it.
+    if let Some((i, _)) = before {
+        run.annotation = inserted(&p.runs[i]);
+    }
     let index = insert_index(p, offset);
     p.runs.insert(index, run);
     result
+}
+
+/// The annotation of a run that is inside a tracked insertion, for text typed
+/// next to it.
+fn inserted(run: &Run) -> Option<crate::Annotation> {
+    matches!(run.annotation, Some(crate::Annotation::Inserted(_)))
+        .then(|| run.annotation.clone())
+        .flatten()
 }
 
 /// A tab, line break or other single thing at `at`.
@@ -433,6 +446,11 @@ fn insert_object(doc: &mut Document, at: &Pos, kind: Inline, look: Option<&RunLo
     {
         run.style = p.runs[i].style.clone();
         run.link = p.runs[i].link.clone();
+    }
+    if let Some(i) = neighbour
+        && offset > 0
+    {
+        run.annotation = inserted(&p.runs[i]);
     }
     let size = run.text.len();
     let index = insert_index(p, offset);
@@ -496,6 +514,8 @@ fn split_raw(doc: &mut Document, at: &Pos, next_style: bool) -> Pos {
         label: None,
         section: p.section.take(),
         source: p.source.clone(),
+        // The mark at the end of the text is the second half's.
+        changes: std::mem::take(&mut p.changes),
     };
     if at_end
         && next_style
@@ -607,6 +627,8 @@ fn delete_joining(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
         first.runs.push(run);
     }
     first.section = last.section;
+    // The mark that ends the joined paragraph is the second one's.
+    first.changes = last.changes;
     merge_runs(first);
     Pos::new(f.path.clone(), at)
 }
@@ -1561,13 +1583,20 @@ struct Seen<'a> {
     look: Option<&'a RunLook>,
     style: &'a Option<Arc<str>>,
     link: &'a Option<Arc<crate::Link>>,
+    annotation: &'a Option<crate::Annotation>,
 }
 
 fn seen(p: &Paragraph) -> Vec<Seen<'_>> {
     let mut out: Vec<Seen<'_>> = Vec::new();
     for run in &p.runs {
         if matches!(run.kind, Inline::Marker) {
-            if out.last().is_some_and(|s| matches!(s.kind, Inline::Marker)) {
+            // Plain markers run together; an annotated one (a deletion, an
+            // end of a comment) is a thing of its own.
+            if run.annotation.is_none()
+                && out
+                    .last()
+                    .is_some_and(|s| matches!(s.kind, Inline::Marker) && s.annotation.is_none())
+            {
                 continue;
             }
             out.push(Seen {
@@ -1576,6 +1605,7 @@ fn seen(p: &Paragraph) -> Vec<Seen<'_>> {
                 look: None,
                 style: &None,
                 link: &None,
+                annotation: &run.annotation,
             });
             continue;
         }
@@ -1588,6 +1618,7 @@ fn seen(p: &Paragraph) -> Vec<Seen<'_>> {
             && last.look == Some(&run.look)
             && last.style == &run.style
             && last.link == &run.link
+            && same_annotation(last.annotation, &run.annotation)
         {
             last.text.push_str(&run.text);
             continue;
@@ -1598,6 +1629,7 @@ fn seen(p: &Paragraph) -> Vec<Seen<'_>> {
             look: Some(&run.look),
             style: &run.style,
             link: &run.link,
+            annotation: &run.annotation,
         });
     }
     out
@@ -1625,11 +1657,23 @@ fn same_kind(a: &Inline, b: &Inline) -> bool {
     }
 }
 
+/// The same annotation; the looks of the text a deletion holds are not
+/// compared (they follow the paragraph's base look).
+fn same_annotation(a: &Option<crate::Annotation>, b: &Option<crate::Annotation>) -> bool {
+    match (a, b) {
+        (Some(crate::Annotation::Deleted(x)), Some(crate::Annotation::Deleted(y))) => {
+            Arc::ptr_eq(x, y) || x.same_text(y)
+        }
+        _ => a == b,
+    }
+}
+
 fn same_paragraph(a: &Paragraph, b: &Paragraph) -> bool {
     if a.props != b.props
         || a.base != b.base
         || a.mark != b.mark
         || a.label != b.label
+        || a.changes != b.changes
         || a.section.is_some() != b.section.is_some()
     {
         return false;
@@ -1647,6 +1691,7 @@ fn same_paragraph(a: &Paragraph, b: &Paragraph) -> bool {
                 && m.look == n.look
                 && m.style == n.style
                 && m.link == n.link
+                && same_annotation(m.annotation, n.annotation)
         })
 }
 
@@ -1781,6 +1826,7 @@ mod link;
 mod picture;
 mod story;
 mod table;
+mod track;
 
 #[cfg(test)]
 mod story_tests;
@@ -1788,3 +1834,5 @@ mod story_tests;
 mod table_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod track_tests;

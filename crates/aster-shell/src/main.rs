@@ -10912,6 +10912,72 @@ mod ui_tests {
         assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
     }
 
+    /// The text the toolbar's font size box shows.
+    fn shown_font_size(app: &App) -> String {
+        use slint::Model;
+        let items = app.ui.get_toolbar_items();
+        (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .find(|item| item.command == Command::FontSize.id())
+            .expect("a font size box")
+            .text
+            .to_string()
+    }
+
+    #[test]
+    fn the_toolbar_follows_a_click_into_a_paragraph_with_another_look() {
+        use aster_writer::{Block, Paragraph, Path, Pos, Run, RunLook};
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        let paragraph = |size: f32| {
+            let look = RunLook {
+                size,
+                ..RunLook::default()
+            };
+            Block::paragraph(Paragraph {
+                runs: vec![Run::text("some text", look.clone())],
+                base: look.clone(),
+                mark: look,
+                ..Paragraph::default()
+            })
+        };
+        with_doc(&app, |tab| {
+            tab.view.edit_document(|doc, _| {
+                doc.body.blocks = vec![paragraph(12.0), paragraph(30.0)];
+                doc.renumber();
+                Some(aster_writer::edit::Selection::caret(Pos::new(
+                    Path::body(0),
+                    0,
+                )))
+            });
+        });
+        writer_ui::after_edit(ui, &mut app.shell.borrow_mut());
+        assert_eq!(shown_font_size(&app), "12");
+        // Where each paragraph's caret is (moved without scrolling), with
+        // the caret back in the first one and the window not told.
+        let place = |app: &App, n: usize| {
+            with_doc(app, |tab| {
+                let at = Pos::new(Path::body(n), 2);
+                tab.view.set_selection(at.clone(), at);
+                let (x, y, _, h) = tab.view.caret_rect().expect("a caret");
+                (x, y + h / 2.0)
+            })
+        };
+        let (first, second) = (place(&app, 0), place(&app, 1));
+        assert!(second.1 > first.1 + 5.0, "{first:?} {second:?}");
+        with_doc(&app, |tab| {
+            let at = Pos::new(Path::body(0), 0);
+            tab.view.set_selection(at.clone(), at);
+        });
+        // A press in the second, and no key at all.
+        click_document(&app, second);
+        assert_eq!(shown_font_size(&app), "30");
+        // And back.
+        click_document(&app, first);
+        assert_eq!(shown_font_size(&app), "12");
+    }
+
     /// A document with, in its first paragraph, text inserted by Ann and
     /// deleted by Bob, and in its second a comment of Cy on "cd".
     fn make_reviewed(app: &App) {

@@ -35,8 +35,21 @@ const OUTLINE_INDENT: u8 = 8;
 pub(crate) fn after_move(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
     sync_flags(ui, shell);
+    sync_toolbar(ui, shell);
     sync_outline(ui, shell);
     present(ui, shell);
+}
+
+/// Rebuild the toolbar only when what it shows has changed: the look of the
+/// text at the caret, and whether undo and redo are possible.
+fn sync_toolbar(ui: &AppWindow, shell: &mut Shell) {
+    if let Some(tab) = shell.active_doc() {
+        let now = (tab.look(), tab.view.can_undo(), tab.view.can_redo());
+        if tab.shown_look.as_ref() != Some(&now) {
+            tab.shown_look = Some(now);
+            refresh_toolbar(ui, shell);
+        }
+    }
 }
 
 /// The pictures' wrap menu, in the order of the window's menu.
@@ -167,14 +180,7 @@ pub(crate) fn after_edit(ui: &AppWindow, shell: &mut Shell) {
         refresh_tabs(ui, shell);
     }
     shell.sync_doc_records();
-    // Rebuild the toolbar only when what it shows has changed.
-    if let Some(tab) = shell.active_doc() {
-        let now = (tab.look(), tab.view.can_undo(), tab.view.can_redo());
-        if tab.shown_look.as_ref() != Some(&now) {
-            tab.shown_look = Some(now);
-            refresh_toolbar(ui, shell);
-        }
-    }
+    sync_toolbar(ui, shell);
     sync_outline(ui, shell);
     schedule_count(ui, shell);
     refresh_find_bar(ui, shell);

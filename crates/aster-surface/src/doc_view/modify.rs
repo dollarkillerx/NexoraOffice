@@ -415,10 +415,10 @@ impl DocView {
         let (inner, _) = aster_writer::paragraphs_of(&target.blocks)
             .into_iter()
             .next()?;
-        let mut steps = table_path.0.clone();
+        let mut steps = table_path.steps.clone();
         steps.extend([r as u32, c as u32]);
-        steps.extend(inner.0);
-        Some(Pos::new(Path(steps), 0))
+        steps.extend(inner.steps);
+        Some(Pos::new(table_path.with_steps(steps), 0))
     }
 
     // --- Clipboard ---

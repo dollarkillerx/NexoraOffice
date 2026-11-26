@@ -211,10 +211,10 @@ impl DocView {
         let (inner, _) = paragraphs_of(&t.rows[row].cells[cell].blocks)
             .into_iter()
             .next()?;
-        let mut steps = table.0.clone();
+        let mut steps = table.steps.clone();
         steps.extend([row as u32, cell as u32]);
-        steps.extend(inner.0);
-        Some(Pos::new(Path(steps), 0))
+        steps.extend(inner.steps);
+        Some(Pos::new(table.with_steps(steps), 0))
     }
 
     // --- Links ---

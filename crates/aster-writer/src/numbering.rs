@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Document, Label, List, ListLevel, NumberFormat, Path};
+use crate::{Document, Label, List, ListLevel, NumberFormat, Path, StoryId};
 
 /// Levels a list has.
 const LEVELS: usize = 9;
@@ -21,39 +21,59 @@ pub fn renumber(document: &mut Document) {
         .map(|list| (list.id, list))
         .collect();
     let fallback = ListLevel::default();
-    // Where each definition's levels have got to.
-    let mut counters: HashMap<u32, [Option<u32>; LEVELS]> = HashMap::new();
-    let mut restarted: HashSet<(u32, usize)> = HashSet::new();
     let mut changes: Vec<(Path, Option<Label>)> = Vec::new();
 
-    for (path, paragraph) in document.paragraphs() {
-        let label = paragraph
-            .props
-            .list
-            .and_then(|r| lists.get(&r.list).map(|list| (r, *list)))
-            .map(|(r, list)| {
-                let level = usize::from(r.level).min(LEVELS - 1);
-                let state = counters.entry(list.definition).or_insert([None; LEVELS]);
-                let own = list.levels.get(level).unwrap_or(&fallback);
-                let number = match own.restart {
-                    Some(restart) if restarted.insert((list.id, level)) => restart,
-                    _ => state[level].map_or(own.start, |n| n.saturating_add(1)),
-                };
-                state[level] = Some(number);
-                for deeper in &mut state[level + 1..] {
-                    *deeper = None;
-                }
-                let mut look = paragraph.mark.clone();
-                own.look.apply(&mut look);
-                Label {
-                    text: label_text(list, own, level, number, state),
-                    look,
-                    suffix: own.suffix,
-                    align: own.align,
-                }
-            });
-        if paragraph.label != label {
-            changes.push((path, label));
+    // Each story counts on its own: a numbered list in a header does not
+    // continue the body's.
+    let mut stories = vec![StoryId::Body];
+    stories.extend((0..document.marginals.len()).map(StoryId::Marginal));
+    stories.extend(
+        document
+            .footnotes
+            .notes
+            .iter()
+            .map(|n| StoryId::Footnote(n.id)),
+    );
+    stories.extend(
+        document
+            .endnotes
+            .notes
+            .iter()
+            .map(|n| StoryId::Endnote(n.id)),
+    );
+    for story in stories {
+        // Where each definition's levels have got to.
+        let mut counters: HashMap<u32, [Option<u32>; LEVELS]> = HashMap::new();
+        let mut restarted: HashSet<(u32, usize)> = HashSet::new();
+        for (path, paragraph) in document.paragraphs_in(story) {
+            let label = paragraph
+                .props
+                .list
+                .and_then(|r| lists.get(&r.list).map(|list| (r, *list)))
+                .map(|(r, list)| {
+                    let level = usize::from(r.level).min(LEVELS - 1);
+                    let state = counters.entry(list.definition).or_insert([None; LEVELS]);
+                    let own = list.levels.get(level).unwrap_or(&fallback);
+                    let number = match own.restart {
+                        Some(restart) if restarted.insert((list.id, level)) => restart,
+                        _ => state[level].map_or(own.start, |n| n.saturating_add(1)),
+                    };
+                    state[level] = Some(number);
+                    for deeper in &mut state[level + 1..] {
+                        *deeper = None;
+                    }
+                    let mut look = paragraph.mark.clone();
+                    own.look.apply(&mut look);
+                    Label {
+                        text: label_text(list, own, level, number, state),
+                        look,
+                        suffix: own.suffix,
+                        align: own.align,
+                    }
+                });
+            if paragraph.label != label {
+                changes.push((path, label));
+            }
         }
     }
     for (path, label) in changes {

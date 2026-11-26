@@ -1359,7 +1359,7 @@ fn insert_table(doc: &mut Document, args: &Value) -> Result<Applied, String> {
     };
     let mut caret = edit::insert_table(doc, &at, cells.len(), columns, width);
     let mut table = Path::body(caret.path.top());
-    if caret.path.0.len() < 4 || doc.block(&table).and_then(Block::as_table).is_none() {
+    if caret.path.steps.len() < 4 || doc.block(&table).and_then(Block::as_table).is_none() {
         return Err("the table could not be made at that place".to_owned());
     }
     // Two tables with nothing between them are one table to Word: a

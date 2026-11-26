@@ -457,7 +457,7 @@ fn edits() -> Vec<(&'static str, Edit)> {
             let end = end_of(d, "After the break");
             let next = {
                 let mut path = end.path.clone();
-                *path.0.last_mut().unwrap() += 1;
+                *path.steps.last_mut().unwrap() += 1;
                 Pos::new(path, 0)
             };
             let _ = from;
@@ -1082,14 +1082,14 @@ fn automatic_spacing_is_written_for_a_split_paragraph_and_cleared_by_a_set_space
     .bytes();
     let mut doc = read(&bytes);
     assert!(docx_doc::p(&doc, 0).props.space_before_auto);
-    split_paragraph(&mut doc, &Pos::new(Path(vec![0]), 5));
+    split_paragraph(&mut doc, &Pos::new(Path::from(vec![0]), 5));
     let saved = save(bytes.clone(), &doc).expect("saves");
     let again = read(&saved);
     for index in 0..2 {
         let props = &docx_doc::p(&again, index).props;
         assert!(props.space_before_auto && props.space_after_auto, "{index}");
     }
-    let start = Pos::new(Path(vec![0]), 0);
+    let start = Pos::new(Path::from(vec![0]), 0);
     set_space_before(&mut doc, &start, &start, 240);
     let saved = save(bytes, &doc).expect("saves");
     let again = read(&saved);
@@ -1122,12 +1122,12 @@ fn a_section_break_goes_with_its_paragraph_and_stays_when_it_is_split() {
     let end = end_of(&doc, "After the break");
     let next = {
         let mut path = end.path.clone();
-        *path.0.last_mut().unwrap() += 1;
+        *path.steps.last_mut().unwrap() += 1;
         Pos::new(path, 0)
     };
     let after_it = {
         let mut path = next.path.clone();
-        *path.0.last_mut().unwrap() += 1;
+        *path.steps.last_mut().unwrap() += 1;
         Pos::new(path, 0)
     };
     delete(&mut doc, &next, &after_it);
@@ -1146,7 +1146,7 @@ fn a_section_break_goes_with_its_paragraph_and_stays_when_it_is_split() {
     let at = Pos::new(
         {
             let mut path = end_of(&doc, "After the break").path;
-            *path.0.last_mut().unwrap() += 1;
+            *path.steps.last_mut().unwrap() += 1;
             path
         },
         0,
@@ -1252,7 +1252,7 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
             // after a new style is only approximately what the file says;
             // styles are set on body paragraphs here.
             let id = ["Normal", "Heading1", "Title", "Heading3"][rng.below(4)];
-            if a.path.0.len() == 1 {
+            if a.path.steps.len() == 1 {
                 set_style(doc, &a, &a, id);
             }
         }
@@ -1279,7 +1279,7 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
                 .iter()
                 .filter_map(Block::as_paragraph)
                 .any(|p| p.runs.iter().any(|r| matches!(r.kind, Inline::Drawing(_))));
-            if !(drawing && c.path.0.len() > 1) {
+            if !(drawing && c.path.steps.len() > 1) {
                 insert_fragment(doc, &c, &part);
             }
         }
@@ -1298,7 +1298,7 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
         _ => {
             let b = random_pos(doc, rng);
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
-            let (start, end) = if start.path.0.len() == 1 && end.path.0.len() == 1 {
+            let (start, end) = if start.path.steps.len() == 1 && end.path.steps.len() == 1 {
                 (start, end)
             } else {
                 (start.clone(), start)

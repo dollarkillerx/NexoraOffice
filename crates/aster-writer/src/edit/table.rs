@@ -64,11 +64,11 @@ impl CellPos {
 
 /// The table cells a position is in, outermost first.
 fn cells_around(doc: &Document, pos: &Pos) -> Vec<CellPos> {
-    let steps = &pos.path.0;
+    let steps = &pos.path.steps;
     let mut out = Vec::new();
     let mut at = 1;
     while at + 3 <= steps.len() {
-        let table = Path(steps[..at].to_vec());
+        let table = pos.path.with_steps(steps[..at].to_vec());
         let (row, cell) = (steps[at] as usize, steps[at + 1] as usize);
         let Some(t) = doc.block(&table).and_then(|b| b.as_table()) else {
             break;
@@ -143,7 +143,7 @@ fn table_of<'a>(doc: &'a Document, path: &Path) -> Option<&'a Table> {
 }
 
 fn table_mut<'a>(doc: &'a mut Document, path: &Path) -> Option<&'a mut Table> {
-    match crate::block_at_mut(&mut doc.body.blocks, &path.0)? {
+    match doc.block_mut(path)? {
         Block::Table(table) => Some(Arc::make_mut(table)),
         Block::Paragraph(_) => None,
     }
@@ -154,10 +154,10 @@ fn table_mut<'a>(doc: &'a mut Document, path: &Path) -> Option<&'a mut Table> {
 fn cell_start(table_path: &Path, table: &Table, row: usize, cell: usize) -> Option<Pos> {
     let cell_ref = table.rows.get(row)?.cells.get(cell)?;
     let (inner, _) = paragraphs_of(&cell_ref.blocks).into_iter().next()?;
-    let mut steps = table_path.0.clone();
+    let mut steps = table_path.steps.clone();
     steps.extend([row as u32, cell as u32]);
-    steps.extend(inner.0);
-    Some(Pos::new(Path(steps), 0))
+    steps.extend(inner.steps);
+    Some(Pos::new(table_path.with_steps(steps), 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -169,10 +169,10 @@ fn cell_start(table_path: &Path, table: &Table, row: usize, cell: usize) -> Opti
 /// cell's left and right margins), or else the text width of its section (a
 /// column's, in a section with columns: the first). At least 1.
 pub fn space_for_block(doc: &Document, path: &Path) -> Twips {
-    let steps = &path.0;
+    let steps = &path.steps;
     if steps.len() >= 4 {
         let n = steps.len();
-        let table_path = Path(steps[..n - 3].to_vec());
+        let table_path = path.with_steps(steps[..n - 3].to_vec());
         let (row, cell) = (steps[n - 3] as usize, steps[n - 2] as usize);
         if let Some(table) = table_of(doc, &table_path)
             && let Some(r) = table.rows.get(row)
@@ -550,8 +550,8 @@ pub fn insert_table(
         source: None,
     };
 
-    let index = at.path.0.last().copied().unwrap_or(0) as usize;
-    let mut steps = at.path.0.clone();
+    let index = at.path.steps.last().copied().unwrap_or(0) as usize;
+    let mut steps = at.path.steps.clone();
     let place = if at.offset > 0 {
         split_raw(doc, &at, false);
         index + 1
@@ -567,7 +567,7 @@ pub fn insert_table(
     }
     siblings.insert(place, Block::table(table));
     doc.renumber();
-    Pos::new(Path(steps).cell_block(0, 0, 0), 0)
+    Pos::new(at.path.with_steps(steps).cell_block(0, 0, 0), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +919,7 @@ pub fn delete_table(doc: &mut Document, at: &Pos) -> Pos {
 }
 
 fn remove_table(doc: &mut Document, table: &Path) -> Pos {
-    let Some(index) = table.0.last().map(|&step| step as usize) else {
+    let Some(index) = table.steps.last().map(|&step| step as usize) else {
         return Pos::default();
     };
     let mut moved: Vec<Run> = Vec::new();
@@ -937,7 +937,7 @@ fn remove_table(doc: &mut Document, table: &Path) -> Pos {
     }
     // The first paragraph at or after where the table was, else the last
     // one before it.
-    let paragraphs = doc.paragraphs();
+    let paragraphs = doc.paragraphs_in(table.story);
     let caret = paragraphs
         .iter()
         .find(|(path, _)| path >= table)

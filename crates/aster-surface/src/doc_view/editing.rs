@@ -351,7 +351,7 @@ impl DocView {
     /// the goal column of that row is where the caret goes.
     fn table_cell_in_column(&self, from: &Pos, next: Pos, goal: f32) -> Pos {
         let in_same_table =
-            from.path.in_cell().is_some() && from.path.0.first() == next.path.0.first();
+            from.path.in_cell().is_some() && from.path.steps.first() == next.path.steps.first();
         if next.path.in_cell().is_none() || in_same_table {
             return next;
         }
@@ -362,7 +362,7 @@ impl DocView {
             .layout
             .hit(caret.page, goal, caret.top + caret.height / 2.0)
         {
-            Some(found) if found.path.0.first() == next.path.0.first() => {
+            Some(found) if found.path.steps.first() == next.path.steps.first() => {
                 sanitized(&self.document, found).unwrap_or(next)
             }
             _ => next,

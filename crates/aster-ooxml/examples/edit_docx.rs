@@ -88,10 +88,10 @@ fn in_table(
     let t = document.body.blocks.get(table)?.as_table()?;
     let blocks = &t.rows.get(row)?.cells.get(cell)?.blocks;
     let (inner, _) = paragraphs_of(blocks).into_iter().next()?;
-    let mut steps = Path::body(table).0;
+    let mut steps = Path::body(table).steps;
     steps.extend([row as u32, cell as u32]);
-    steps.extend(inner.0);
-    Some(Pos::new(Path(steps), 0))
+    steps.extend(inner.steps);
+    Some(Pos::new(Path::from(steps), 0))
 }
 
 fn main() {
@@ -146,7 +146,7 @@ fn main() {
     let start = Pos::new(
         {
             let mut path = at.path.clone();
-            if let Some(last) = path.0.last_mut() {
+            if let Some(last) = path.steps.last_mut() {
                 *last = last.saturating_sub(2);
             }
             path

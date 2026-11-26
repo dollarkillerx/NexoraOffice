@@ -22,7 +22,7 @@ use crate::table::TableLayout;
 /// The paint order of a page: shading under everything, then drawings
 /// behind the text, text and pictures, borders and rules, and drawings in
 /// front of the text.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Layers {
     pub shade: Vec<Item>,
     pub behind: Vec<Item>,
@@ -310,7 +310,7 @@ pub(crate) fn border_color(border: &Border) -> Rgba {
 impl Cx<'_> {
     /// The paragraph shaped for a text area `width` wide.
     pub fn shaped(&mut self, para: &Arc<Paragraph>, width: f32) -> Arc<Shaped> {
-        self.shaped_around(para, width, &[])
+        self.shaped_around(para, width, &[], f32::INFINITY)
     }
 
     /// The same for a paragraph whose text flows around `obstacles`
@@ -320,9 +320,11 @@ impl Cx<'_> {
         para: &Arc<Paragraph>,
         width: f32,
         obstacles: &[Rect],
+        limit: f32,
     ) -> Arc<Shaped> {
         let env = Env {
             obstacles,
+            limit,
             settings: &self.doc.settings,
             grid: self.grid,
             notes: &self.notes,

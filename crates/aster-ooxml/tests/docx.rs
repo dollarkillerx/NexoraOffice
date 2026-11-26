@@ -277,6 +277,19 @@ fn nested_fields_and_fields_across_paragraphs_do_not_lose_their_place() {
 }
 
 #[test]
+fn simple_hyperlink_fields_link_their_content() {
+    let document = read(
+        r#"<w:p><w:fldSimple w:instr=" HYPERLINK &quot;https://example.org/s&quot; "><w:r><w:t>simple</w:t></w:r></w:fldSimple><w:fldSimple w:instr=" HYPERLINK \l &quot;mark&quot; "><w:r><w:t>local</w:t></w:r></w:fldSimple></w:p>"#,
+    );
+    let runs = &p(&document, 0).runs;
+    assert_eq!(
+        runs[0].link.as_ref().unwrap().target,
+        "https://example.org/s"
+    );
+    assert_eq!(runs[1].link.as_ref().unwrap().target, "#mark");
+}
+
+#[test]
 fn hyperlink_fields_link_their_result() {
     let document = read(&format!(
         "<w:p>{}</w:p>",

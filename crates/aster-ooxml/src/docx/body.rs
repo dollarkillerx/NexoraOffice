@@ -318,10 +318,21 @@ impl Reader<'_> {
                     self.content(&node.children, part, &inner, out, depth + 1);
                 }
                 b"fldSimple" if depth < MAX_NESTING => {
-                    let field = node.attr("instr").as_deref().and_then(page_field);
+                    let instruction = node.attr("instr").unwrap_or_default();
+                    let link = hyperlink_target(&instruction).map(|target| {
+                        Arc::new(Link {
+                            target,
+                            tooltip: None,
+                        })
+                    });
+                    let inner = Cx {
+                        base: cx.base,
+                        link: link.or_else(|| cx.link.clone()),
+                    };
                     let outer = part.simple.take();
-                    part.simple = field.map(|field| SimpleField { field, done: false });
-                    self.content(&node.children, part, cx, out, depth + 1);
+                    part.simple =
+                        page_field(&instruction).map(|field| SimpleField { field, done: false });
+                    self.content(&node.children, part, &inner, out, depth + 1);
                     part.simple = outer;
                 }
                 b"ins" | b"moveTo" | b"smartTag" | b"customXml" | b"dir" | b"bdo"

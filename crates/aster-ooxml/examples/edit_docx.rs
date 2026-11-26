@@ -11,13 +11,21 @@
 //! first paragraph that has them; a small picture at the end of the first
 //! paragraph; and a table of two rows and three columns after the first
 //! paragraph. `blank` as the input starts from a new document.
+//!
+//! With `shape` as a third argument the document also gets: in the first
+//! table, the first two cells of the first row merged, a column border
+//! moved, the first row made taller and the last cell of the last row split
+//! in two; and the first drawing it has made to float with the text
+//! wrapping around it, moved a little, and made a little larger.
 
 use aster_ooxml::docx_save::{blank, save};
 use aster_writer::edit::{
-    ListKind, apply_run_patch, delete_rows, insert_columns, insert_picture, insert_rows,
-    insert_table, insert_text, set_link, set_list, split_paragraph,
+    ListKind, PictureLayout, apply_run_patch, delete_rows, insert_columns, insert_picture,
+    insert_rows, insert_table, insert_text, merge_cells, move_column_border, move_floating_drawing,
+    resize_drawing, set_link, set_list, set_picture_layout, set_row_height, split_cell,
+    split_paragraph,
 };
-use aster_writer::{Block, Link, Path, Pos, RunPatch, paragraphs_of};
+use aster_writer::{Block, Inline, Link, Path, Pos, RowHeight, RunPatch, paragraphs_of};
 
 /// A small RGB PNG (a gradient), written with stored deflate blocks.
 fn png(width: u32, height: u32) -> Vec<u8> {
@@ -179,6 +187,10 @@ fn main() {
         }
     }
 
+    if std::env::args().nth(3).as_deref() == Some("shape") {
+        shape(&mut document, first_table);
+    }
+
     // A link on the first two words of the first paragraph with two words.
     let words = document.paragraphs().into_iter().find_map(|(path, p)| {
         let text = p.text();
@@ -221,4 +233,60 @@ fn main() {
     let saved = save(source, &document).expect("the document saves");
     std::fs::write(&output, saved).expect("the output file is written");
     println!("wrote {output}");
+}
+
+/// The extra edits of `shape`: see the top of the file.
+fn shape(document: &mut aster_writer::Document, first_table: Option<usize>) {
+    if let Some(table) = first_table {
+        let cells = |document: &aster_writer::Document, row: usize| {
+            document
+                .body
+                .blocks
+                .get(table)
+                .and_then(Block::as_table)
+                .and_then(|t| t.rows.get(row))
+                .map_or(0, |r| r.cells.len())
+        };
+        if let (Some(a), Some(b)) = (
+            in_table(document, table, 0, 0),
+            in_table(document, table, 0, 1),
+        ) {
+            merge_cells(document, &a, &b);
+            set_row_height(document, &a, &a, RowHeight::AtLeast(500));
+        }
+        move_column_border(document, &Path::body(table), 1, 200);
+        let rows = document
+            .body
+            .blocks
+            .get(table)
+            .and_then(Block::as_table)
+            .map_or(0, |t| t.rows.len());
+        if rows > 0 {
+            let last = cells(document, rows - 1);
+            if last > 0
+                && let Some(at) = in_table(document, table, rows - 1, last - 1)
+            {
+                split_cell(document, &at, 2, 1);
+            }
+        }
+    }
+    // The first drawing: where it is, as a position before its object.
+    let found = document.paragraphs().into_iter().find_map(|(path, p)| {
+        let mut start = 0;
+        for run in &p.runs {
+            if matches!(run.kind, Inline::Drawing(_)) {
+                return Some(Pos::new(path, start));
+            }
+            start += run.text.len();
+        }
+        None
+    });
+    if let Some(at) = found {
+        set_picture_layout(document, &at, PictureLayout::Square);
+        move_floating_drawing(document, &at, (91_440, 45_720), (0, 0));
+        if let Some(d) = aster_writer::edit::drawing_at(document, &at) {
+            let size = (d.size.0 + d.size.0 / 10, d.size.1 + d.size.1 / 10);
+            resize_drawing(document, &at, size);
+        }
+    }
 }

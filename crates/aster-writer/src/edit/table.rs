@@ -1,4 +1,5 @@
-//! Tables: making one, and adding and removing rows and columns.
+//! Tables: making one, adding and removing rows and columns, merging and
+//! splitting cells, and sizes (see `shape` for the last three).
 //!
 //! **Which table.** Row and column operations take two positions, the ends
 //! of a selection. The table is the innermost one that holds the first
@@ -30,6 +31,13 @@ use super::{collect_markers, locate, snap, split_raw, style_base};
 use crate::{
     Block, Border, BorderStyle, Cell, CellLayer, Document, Paragraph, Path, Pos, Row, Run,
     StyleKind, Table, TableProps, Twips, VMerge, paragraphs_of,
+};
+
+mod shape;
+pub use shape::{
+    MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, can_merge_cells, can_split_cell,
+    can_unmerge_cell, merge_cells, move_column_border, set_column_width, set_row_height,
+    split_cell, unmerge_cell,
 };
 
 /// Most columns a table made here has (Word's own limit).

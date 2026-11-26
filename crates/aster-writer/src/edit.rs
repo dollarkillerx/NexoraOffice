@@ -1290,7 +1290,9 @@ pub fn insert_fragment(doc: &mut Document, at: &Pos, blocks: &[Block]) -> Pos {
     };
     let second = split_raw(doc, &at, false);
     let mut first_path = second.path.clone();
-    *first_path.0.last_mut().expect("a path has steps") -= 1;
+    if let Some(last) = first_path.0.last_mut() {
+        *last = last.saturating_sub(1);
+    }
     let end = doc.paragraph(&first_path).map_or(0, Paragraph::len);
     insert_runs(doc, &Pos::new(first_path.clone(), end), &first.runs);
     // The paragraphs between, after the first half.

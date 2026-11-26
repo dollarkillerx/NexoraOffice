@@ -55,6 +55,8 @@ pub fn synthetic_clusters(text: &str, language: &str) -> Vec<Cluster> {
             em: SYNTHETIC_EM,
             break_before: offset > 0 && breaks.binary_search(&offset).is_ok(),
             newline: c == '\n',
+            tab: false,
+            point: false,
         })
         .collect()
 }

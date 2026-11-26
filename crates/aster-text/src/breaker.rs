@@ -45,6 +45,10 @@ pub struct Cluster {
     pub break_before: bool,
     /// This cluster is a hard line break; the line ends after it.
     pub newline: bool,
+    /// This cluster is a tab: its advance comes from the tab stops.
+    pub tab: bool,
+    /// This cluster is the decimal point a decimal tab stop lines up on.
+    pub point: bool,
 }
 
 impl Cluster {
@@ -75,6 +79,63 @@ pub struct Options {
     pub hang: bool,
     pub autospace: bool,
     pub justify: bool,
+    /// Justify the last line of the paragraph and lines ended by a line
+    /// break too.
+    pub distribute: bool,
+}
+
+/// How a tab stop lines text up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TabAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    /// The decimal point is at the stop.
+    Decimal,
+}
+
+/// What fills the gap a tab makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Leader {
+    #[default]
+    None,
+    Dots,
+    Hyphens,
+    Underscore,
+    MiddleDots,
+}
+
+/// A tab stop, from the margin the tab positions are counted from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stop {
+    pub position: Fx,
+    pub align: TabAlign,
+    pub leader: Leader,
+}
+
+/// What differs between the lines of a paragraph: where the first starts, and
+/// where tabs go.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Shape<'a> {
+    /// The first line starts this far from the others (negative: hanging).
+    pub first_indent: Fx,
+    /// Distance from the margin the stops are counted from to the left edge
+    /// of the lines after the first.
+    pub margin_offset: Fx,
+    /// Sorted by position.
+    pub stops: &'a [Stop],
+    /// Interval of the stops after the explicit ones; 0 for none, and a tab
+    /// then keeps the width of its glyph.
+    pub default_tab: Fx,
+}
+
+/// A tab's gap on a line, for drawing leaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabGap {
+    /// The tab's cluster.
+    pub index: usize,
+    pub leader: Leader,
 }
 
 impl Options {
@@ -88,6 +149,7 @@ impl Options {
             hang: true,
             autospace: true,
             justify: true,
+            distribute: false,
         }
     }
 
@@ -100,6 +162,7 @@ impl Options {
             hang: false,
             autospace: false,
             justify: false,
+            distribute: false,
         }
     }
 }
@@ -146,11 +209,17 @@ pub struct Line {
     pub kind: BreakKind,
     pub end: EndTreatment,
     pub justified: bool,
+    pub tabs: Vec<TabGap>,
 }
 
 struct Breaker<'a> {
     clusters: &'a [Cluster],
     options: Options,
+    shape: Shape<'a>,
+    /// Where the line starts, counted from the margin the stops use.
+    origin: Fx,
+    /// There are tabs to resolve against stops.
+    tabbed: bool,
 }
 
 impl Breaker<'_> {
@@ -210,6 +279,23 @@ impl Breaker<'_> {
     /// Width of clusters `start..last` with adjacency rules applied and nothing
     /// done to the end of the line.
     fn natural_width(&self, start: usize, last: usize) -> Fx {
+        if self.has_tab(start, last) {
+            let mut boxes: Vec<(Fx, Fx, Fx)> = (start..last)
+                .map(|i| {
+                    let lead = self.leading_trim(i, start);
+                    (
+                        self.space_before(i, start),
+                        self.clusters[i].advance - lead - self.trailing_trim(i, last),
+                        lead,
+                    )
+                })
+                .collect();
+            self.resolve_tabs(start, &mut boxes, None);
+            return boxes
+                .iter()
+                .map(|(space, advance, _)| space + advance)
+                .sum();
+        }
         (start..last)
             .map(|i| {
                 self.space_before(i, start) + self.clusters[i].advance
@@ -217,6 +303,65 @@ impl Breaker<'_> {
                     - self.trailing_trim(i, last)
             })
             .sum()
+    }
+
+    fn has_tab(&self, start: usize, last: usize) -> bool {
+        self.tabbed && self.clusters[start..last].iter().any(|c| c.tab)
+    }
+
+    /// The first stop after `at`, counted from the margin.
+    fn next_stop(&self, at: Fx) -> Option<(Fx, TabAlign, Leader)> {
+        if let Some(stop) = self.shape.stops.iter().find(|stop| stop.position > at) {
+            return Some((stop.position, stop.align, stop.leader));
+        }
+        let interval = self.shape.default_tab;
+        (interval > 0).then(|| {
+            (
+                (at.div_euclid(interval) + 1) * interval,
+                TabAlign::Left,
+                Leader::None,
+            )
+        })
+    }
+
+    /// Give every tab in `boxes` (the boxes of the clusters from `start`) the
+    /// width that takes the text after it to its stop.
+    fn resolve_tabs(
+        &self,
+        start: usize,
+        boxes: &mut [(Fx, Fx, Fx)],
+        mut gaps: Option<&mut Vec<TabGap>>,
+    ) {
+        let mut x: Fx = 0;
+        for k in 0..boxes.len() {
+            let i = start + k;
+            if self.clusters[i].tab {
+                let at = x + boxes[k].0 + self.origin;
+                if let Some((position, align, leader)) = self.next_stop(at) {
+                    let (mut segment, mut before_point) = (0, None);
+                    for (j, b) in boxes.iter().enumerate().skip(k + 1) {
+                        if self.clusters[start + j].tab {
+                            break;
+                        }
+                        if before_point.is_none() && self.clusters[start + j].point {
+                            before_point = Some(segment + b.0);
+                        }
+                        segment += b.0 + b.1;
+                    }
+                    let need = match align {
+                        TabAlign::Left => 0,
+                        TabAlign::Center => segment / 2,
+                        TabAlign::Right => segment,
+                        TabAlign::Decimal => before_point.unwrap_or(segment),
+                    };
+                    boxes[k].1 = (position - need - at).max(0);
+                    if let Some(gaps) = gaps.as_deref_mut() {
+                        gaps.push(TabGap { index: i, leader });
+                    }
+                }
+            }
+            x += boxes[k].0 + boxes[k].1;
+        }
     }
 
     /// The least invasive end-of-line treatment that makes `start..end` fit, and
@@ -249,6 +394,9 @@ impl Breaker<'_> {
     /// Whether the gap after cluster `i` may be stretched when justifying.
     fn stretches_after(&self, i: usize) -> bool {
         let (a, b) = (self.clusters[i].class, self.clusters[i + 1].class);
+        if self.clusters[i].tab || self.clusters[i + 1].tab {
+            return false;
+        }
         if a == Class::Space {
             return true;
         }
@@ -286,6 +434,10 @@ impl Breaker<'_> {
                 (self.space_before(i, start), advance, lead)
             })
             .collect();
+        let mut tabs = Vec::new();
+        if self.has_tab(start, last) {
+            self.resolve_tabs(start, &mut boxes[..last - start], Some(&mut tabs));
+        }
         let content: Fx = boxes[..inside - start]
             .iter()
             .map(|(space, advance, _)| space + advance)
@@ -295,8 +447,10 @@ impl Breaker<'_> {
             .filter(|&i| self.stretches_after(i))
             .collect();
         let slack = self.options.max_width - content;
-        let justified =
-            self.options.justify && kind == BreakKind::Soft && slack > 0 && !gaps.is_empty();
+        let justified = self.options.justify
+            && (kind == BreakKind::Soft || self.options.distribute)
+            && slack > 0
+            && !gaps.is_empty();
         if justified {
             let (each, extra) = (slack / gaps.len() as Fx, slack % gaps.len() as Fx);
             for (n, &i) in gaps.iter().enumerate() {
@@ -331,18 +485,41 @@ impl Breaker<'_> {
             kind,
             end: end_treatment,
             justified,
+            tabs,
         }
     }
 }
 
 /// Break a paragraph into lines and position every cluster.
 pub fn break_lines(clusters: &[Cluster], options: Options) -> Vec<Line> {
-    let breaker = Breaker { clusters, options };
+    break_lines_shaped(clusters, options, &Shape::default())
+}
+
+/// The same for a paragraph whose first line starts elsewhere and which has
+/// tab stops. `options.max_width` is the width of the lines after the first.
+pub fn break_lines_shaped(clusters: &[Cluster], options: Options, shape: &Shape<'_>) -> Vec<Line> {
     let count = clusters.len();
     let mut lines = Vec::new();
     let mut start = 0;
+    let tabbed = (!shape.stops.is_empty() || shape.default_tab > 0)
+        && clusters.iter().any(|cluster| cluster.tab);
 
     while start < count {
+        let indent = if lines.is_empty() {
+            shape.first_indent
+        } else {
+            0
+        };
+        let breaker = Breaker {
+            clusters,
+            options: Options {
+                max_width: options.max_width.saturating_sub(indent),
+                ..options
+            },
+            shape: *shape,
+            origin: shape.margin_offset + indent,
+            tabbed,
+        };
         // The furthest allowed end that fits, and how it fits.
         let mut best: Option<(usize, EndTreatment, BreakKind)> = None;
         let mut end = start + 1;
@@ -419,6 +596,8 @@ mod tests {
                 em: EM,
                 break_before: offset > 0 && !glued_to_previous && !previous_opens,
                 newline: c == '\n',
+                tab: false,
+                point: false,
             });
         }
         out

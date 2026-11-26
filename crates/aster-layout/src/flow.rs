@@ -28,13 +28,39 @@ const NOTE_GAP: f32 = 6.0;
 /// Most pages a document is laid out into; the rest is dropped.
 const MAX_PAGES: usize = 20_000;
 
+#[derive(Clone)]
 struct Region {
     top: f32,
     cols: Vec<(f32, f32)>,
     separator: bool,
     used_bottom: f32,
+    /// How far down each column is filled: what balancing the columns is
+    /// worked out from.
+    fills: Vec<f32>,
 }
 
+impl Region {
+    fn new(top: f32, cols: Vec<(f32, f32)>, separator: bool) -> Self {
+        let fills = vec![top; cols.len()];
+        Self {
+            top,
+            cols,
+            separator,
+            used_bottom: top,
+            fills,
+        }
+    }
+
+    /// Note that column `col` is filled down to `y`.
+    fn fill(&mut self, col: usize, y: f32) {
+        self.used_bottom = self.used_bottom.max(y);
+        if let Some(f) = self.fills.get_mut(col) {
+            *f = f.max(y);
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PageState {
     width: f32,
     height: f32,
@@ -155,6 +181,7 @@ impl PageState {
 }
 
 /// The shape of a section's pages.
+#[derive(Clone)]
 struct Geom {
     width: f32,
     height: f32,
@@ -233,6 +260,39 @@ struct Flow<'a, 'b> {
     /// next one starts on a page of its own (nothing of it is on this page
     /// to keep with), else the end of the document.
     chain_end: usize,
+    /// While the columns of a section are being balanced: how far down the
+    /// page they may go.
+    cap: Option<Cap>,
+}
+
+/// The depth the columns of a section may be filled to on one page, when
+/// they are balanced.
+#[derive(Clone, Copy)]
+struct Cap {
+    page: usize,
+    height: f32,
+}
+
+/// What `Flow` has to be put back to, to place a section again.
+struct Snapshot {
+    pages: usize,
+    last: Option<PageState>,
+    frags: usize,
+    outline: usize,
+    redirects: usize,
+    section: usize,
+    sec: Arc<Section>,
+    geom: Geom,
+    col: usize,
+    y: f32,
+    col_empty: bool,
+    overflowed: bool,
+    next_number: u32,
+    pending_start: Option<u32>,
+    prev: Option<Arc<Paragraph>>,
+    sections_pages: Vec<usize>,
+    carry: Vec<NoteSlice>,
+    line_hint: f32,
 }
 
 fn collect_notes(doc: &Document) -> NoteNumbers {
@@ -311,6 +371,7 @@ impl Layouter {
             carry: Vec::new(),
             line_hint: 12.0,
             chain_end: usize::MAX,
+            cap: None,
         };
         flow.run();
         let layout = flow.finish();
@@ -326,20 +387,27 @@ impl Flow<'_, '_> {
         let mut start = 0usize;
         for (index, (last, sec)) in sections.iter().enumerate() {
             let end = (*last + 1).min(blocks.len()).max(start);
-            self.begin_section(index, sec);
-            let continues = sections
-                .get(index + 1)
-                .is_some_and(|(_, next)| next.start == SectionStart::Continuous);
-            self.chain_end = if continues || index + 1 == sections.len() {
+            let next = sections.get(index + 1).map(|(_, s)| s);
+            let continues = next.is_some_and(|n| n.start == SectionStart::Continuous);
+            self.chain_end = if continues || next.is_none() {
                 usize::MAX
             } else {
                 end
             };
-            for i in start..end {
-                if self.pages.len() >= MAX_PAGES {
-                    return;
-                }
-                self.place_block(blocks, i);
+            // Word evens out the columns of a section that a continuous
+            // break ends, and only of such a section.
+            let balanced = next.is_some_and(|n| {
+                n.start == SectionStart::Continuous
+                    && n.page == sec.page
+                    && geometry(sec).cols.len() > 1
+            });
+            let snapshot = balanced.then(|| self.snapshot());
+            self.begin_section(index, sec);
+            if !self.place_range(blocks, start, end) {
+                return;
+            }
+            if let Some(snapshot) = snapshot {
+                self.balance(snapshot, index, sec, start..end);
             }
             start = end;
         }
@@ -350,15 +418,150 @@ impl Flow<'_, '_> {
         self.place_endnotes();
     }
 
+    /// Place blocks `start..end`; false when the page limit was reached.
+    fn place_range(&mut self, blocks: &[Block], start: usize, end: usize) -> bool {
+        for i in start..end {
+            if self.pages.len() >= MAX_PAGES {
+                return false;
+            }
+            self.place_block(blocks, i);
+        }
+        true
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            pages: self.pages.len(),
+            last: self.pages.last().cloned(),
+            frags: self.frags.len(),
+            outline: self.outline.len(),
+            redirects: self.cx.redirects.len(),
+            section: self.section,
+            sec: self.sec.clone(),
+            geom: self.geom.clone(),
+            col: self.col,
+            y: self.y,
+            col_empty: self.col_empty,
+            overflowed: self.overflowed,
+            next_number: self.next_number,
+            pending_start: self.pending_start,
+            prev: self.prev.clone(),
+            sections_pages: self.sections_pages.clone(),
+            carry: self.carry.clone(),
+            line_hint: self.line_hint,
+        }
+    }
+
+    fn restore(&mut self, s: &Snapshot) {
+        self.pages.truncate(s.pages);
+        if let (Some(last), Some(page)) = (self.pages.last_mut(), &s.last) {
+            *last = page.clone();
+        }
+        self.frags.truncate(s.frags);
+        self.outline.truncate(s.outline);
+        self.cx.redirects.truncate(s.redirects);
+        self.section = s.section;
+        self.sec = s.sec.clone();
+        self.geom = s.geom.clone();
+        self.col = s.col;
+        self.y = s.y;
+        self.col_empty = s.col_empty;
+        self.overflowed = s.overflowed;
+        self.next_number = s.next_number;
+        self.pending_start = s.pending_start;
+        self.prev = s.prev.clone();
+        self.sections_pages = s.sections_pages.clone();
+        self.carry = s.carry.clone();
+        self.line_hint = s.line_hint;
+    }
+
+    /// Place a section again, from `snapshot`, with its columns on the last
+    /// page no deeper than `height`; whether it still ends on that page.
+    fn replace_section(
+        &mut self,
+        snapshot: &Snapshot,
+        index: usize,
+        sec: &Arc<Section>,
+        range: &std::ops::Range<usize>,
+        cap: Option<Cap>,
+    ) -> bool {
+        self.restore(snapshot);
+        self.cap = cap;
+        self.begin_section(index, sec);
+        let blocks = &self.doc.body.blocks;
+        let placed = self.place_range(blocks, range.start, range.end);
+        self.cap = None;
+        placed && cap.is_none_or(|c| self.pages.len() == c.page + 1)
+    }
+
+    /// The section just placed ends with a continuous break: lay its columns
+    /// out again so that those on the last page are as even as lines allow.
+    /// Starts from the depth the text would have if it were divided evenly
+    /// and goes deeper until it fits; if nothing does, the section stays as
+    /// it was.
+    fn balance(
+        &mut self,
+        snapshot: Snapshot,
+        index: usize,
+        sec: &Arc<Section>,
+        range: std::ops::Range<usize>,
+    ) {
+        let Some(page) = self.pages.last() else {
+            return;
+        };
+        let Some(region) = page.regions.last() else {
+            return;
+        };
+        let columns = region.cols.len();
+        let top = region.top;
+        let full = page.body_bottom - page.note_height - top;
+        let total: f32 = region.fills.iter().map(|f| f - top).sum();
+        if columns < 2 || total <= EPS || range.is_empty() {
+            return;
+        }
+        let at = self.pages.len() - 1;
+        let step = (self.line_hint * 0.5).max(1.0);
+        let mut height = (total / columns as f32).max(step);
+        let mut tries = 0;
+        while height < full - EPS && tries < 12 {
+            let cap = Cap { page: at, height };
+            if self.replace_section(&snapshot, index, sec, &range, Some(cap)) {
+                return;
+            }
+            tries += 1;
+            height += step;
+        }
+        // Not even: the way it was.
+        self.replace_section(&snapshot, index, sec, &range, None);
+    }
+
     fn page(&mut self) -> &mut PageState {
         self.pages
             .last_mut()
             .expect("a page exists once flow begins")
     }
 
-    fn col_bottom(&self) -> f32 {
+    /// The bottom of the page's text, above the notes.
+    fn real_bottom(&self) -> f32 {
         let page = self.pages.last().expect("page");
         page.body_bottom - page.note_height
+    }
+
+    /// Whether balancing holds the current column shallower than the page.
+    fn capped(&self) -> bool {
+        self.cap
+            .is_some_and(|c| self.pages.len() == c.page + 1 && self.col_bottom() < self.real_bottom())
+    }
+
+    /// How far down the current column may be filled.
+    fn col_bottom(&self) -> f32 {
+        let real = self.real_bottom();
+        match self.cap {
+            Some(cap) if self.pages.len() == cap.page + 1 => {
+                real.min(self.region().top + cap.height)
+            }
+            _ => real,
+        }
     }
 
     fn region(&self) -> &Region {
@@ -398,12 +601,7 @@ impl Flow<'_, '_> {
                 let margin = self.geom.margin;
                 let page = self.page();
                 page.margin = margin;
-                page.regions.push(Region {
-                    top,
-                    cols,
-                    separator,
-                    used_bottom: top,
-                });
+                page.regions.push(Region::new(top, cols, separator));
                 self.col = 0;
                 self.y = top;
                 self.col_empty = true;
@@ -441,12 +639,7 @@ impl Flow<'_, '_> {
         let margin = self.geom.margin;
         let page = self.page();
         page.margin = margin;
-        page.regions.push(Region {
-            top,
-            cols,
-            separator,
-            used_bottom: top,
-        });
+        page.regions.push(Region::new(top, cols, separator));
         self.col = 0;
         self.y = top;
         self.col_empty = true;
@@ -530,12 +723,7 @@ impl Flow<'_, '_> {
             section: self.section,
             sec,
             layers: Layers::default(),
-            regions: vec![Region {
-                top: body_top,
-                cols,
-                separator,
-                used_bottom: body_top,
-            }],
+            regions: vec![Region::new(body_top, cols, separator)],
             margin,
             body_top,
             body_bottom,
@@ -746,6 +934,7 @@ impl Flow<'_, '_> {
         plain: &Arc<crate::shape::Shaped>,
         width: f32,
         obstacles: &[Rect],
+        limit: f32,
     ) -> Arc<crate::shape::Shaped> {
         let mut reach = plain.paragraph.height();
         let mut result = plain.clone();
@@ -928,7 +1117,6 @@ impl Flow<'_, '_> {
                 k = nlines - line;
             }
             for j in if force { nlines..nlines } else { line..nlines } {
-        limit: f32,
                 let h = lines[j].height;
                 let j_top = origin_y + lines[j].top;
                 if let Some(b) = self.obstruction(j_top, j_top + h) {
@@ -947,8 +1135,10 @@ impl Flow<'_, '_> {
                     0.0
                 };
                 // What is left for the notes of this line once it is on.
-                let room = bottom_edge - pending_height - (j_top + h + pad);
-                let mut fits = room >= -EPS;
+                // Notes go at the bottom of the page, whatever depth the
+                // column is held to.
+                let room = self.real_bottom() - pending_height - (j_top + h + pad);
+                let mut fits = room >= -EPS && j_top + h + pad <= bottom_edge + EPS;
                 let mut shown: Vec<NoteSlice> = Vec::new();
                 let mut later: Vec<NoteSlice> = Vec::new();
                 let mut used_room = 0.0f32;
@@ -1032,11 +1222,17 @@ impl Flow<'_, '_> {
                         k = 0;
                     }
                 }
-                if k == 0 && self.col_empty && self.prev.is_none() {
+                if k == 0 && self.col_empty && self.prev.is_none() && !self.capped() {
                     k = fit.max(1).min(remaining);
                 }
             }
-            if k == 0 && bump.is_none() && fit == 0 && self.col_empty && self.prev.is_none() {
+            if k == 0
+                && bump.is_none()
+                && fit == 0
+                && self.col_empty
+                && self.prev.is_none()
+                && !self.capped()
+            {
                 k = 1;
             }
             // A line that had to be put down where it does not fit has its
@@ -1127,8 +1323,9 @@ impl Flow<'_, '_> {
                 for (rect, wrap) in clear {
                     page.keep_clear(rect, wrap);
                 }
+                let col = self.col;
                 let region = page.regions.last_mut().expect("region");
-                region.used_bottom = region.used_bottom.max(end_y);
+                region.fill(col, end_y);
             }
             if first_fragment
                 && let Some(level) = props.outline_level
@@ -1329,11 +1526,12 @@ impl Flow<'_, '_> {
             };
             self.cx.emit_row_slices(layout, batch, ox, y, &ec, &mut out)
         };
+        let col = self.col;
         let page = self.pages.last_mut().expect("page");
         page.layers = layers;
         page.used = true;
         let region = page.regions.last_mut().expect("region");
-        region.used_bottom = region.used_bottom.max(y + height);
+        region.fill(col, y + height);
         batch.clear();
     }
 

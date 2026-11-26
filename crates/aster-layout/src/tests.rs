@@ -1135,6 +1135,151 @@ fn keep_with_next_does_not_reach_into_a_section_on_a_new_page() {
     assert_eq!(page_of(&layout, n + 1), 1);
 }
 
+/// `count` one-line paragraphs in two columns, a section that is followed by
+/// `next` (a section start) holding one more paragraph.
+fn two_columns_then(count: usize, next: SectionStart) -> Document {
+    let mut first = small();
+    first.columns = Columns {
+        count: 2,
+        space: 400,
+        widths: Vec::new(),
+        separator: false,
+    };
+    let mut blocks = numbered(count);
+    let Some(Block::Paragraph(last)) = blocks.last_mut() else {
+        unreachable!()
+    };
+    Arc::make_mut(last).section = Some(Arc::new(first));
+    blocks.push(pb("below"));
+    let mut document = doc(blocks);
+    let mut second = small();
+    second.start = next;
+    document.last_section = Arc::new(second);
+    document
+}
+
+fn caret_x(layout: &Layout, block: usize) -> f32 {
+    layout
+        .caret(&Pos::new(Path::body(block), 0))
+        .expect("a caret")
+        .x
+}
+
+#[test]
+fn a_continuous_break_evens_out_the_columns_above_it() {
+    let document = two_columns_then(8, SectionStart::Continuous);
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 1);
+    // Four lines in each column, side by side.
+    for i in 0..4 {
+        assert!((caret_x(&layout, i) - 20.0).abs() < 0.01, "{i}");
+        assert!((caret_x(&layout, i + 4) - 160.0).abs() < 0.01, "{}", i + 4);
+        assert!((caret_top(&layout, i, 0) - caret_top(&layout, i + 4, 0)).abs() < 0.01);
+    }
+    // What follows starts below the taller column.
+    let line = caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0);
+    assert!((caret_top(&layout, 8, 0) - (caret_top(&layout, 0, 0) + 4.0 * line)).abs() < 1.0);
+    // An odd count: the left column has the extra line.
+    let layout = lay(&two_columns_then(7, SectionStart::Continuous));
+    assert!((caret_x(&layout, 3) - 20.0).abs() < 0.01);
+    assert!((caret_x(&layout, 4) - 160.0).abs() < 0.01);
+}
+
+#[test]
+fn columns_are_not_evened_out_unless_a_continuous_break_follows() {
+    // The next section starts on a new page.
+    let layout = lay(&two_columns_then(8, SectionStart::NextPage));
+    for i in 0..8 {
+        assert!((caret_x(&layout, i) - 20.0).abs() < 0.01, "{i}");
+    }
+    // The last section of a document is not balanced either.
+    let mut section = small();
+    section.columns.count = 2;
+    section.columns.space = 400;
+    let mut document = doc(numbered(8));
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    for i in 0..8 {
+        assert!((caret_x(&layout, i) - 20.0).abs() < 0.01, "{i}");
+    }
+}
+
+#[test]
+fn balanced_columns_keep_lines_together_and_notes_at_the_bottom() {
+    // Keep-lines holds a three-line paragraph in one column.
+    let mut blocks: Vec<Block> = (0..3).map(|i| pb(&format!("short {i}"))).collect();
+    blocks.push(with("a\nb\nc", |p| p.keep_lines = true));
+    blocks.push(pb("short 4"));
+    let mut first = small();
+    first.columns.count = 2;
+    first.columns.space = 400;
+    let Some(Block::Paragraph(last)) = blocks.last_mut() else {
+        unreachable!()
+    };
+    Arc::make_mut(last).section = Some(Arc::new(first));
+    blocks.push(pb("below"));
+    let mut document = doc(blocks);
+    let mut second = small();
+    second.start = SectionStart::Continuous;
+    document.last_section = Arc::new(second);
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 1);
+    let start = caret_top(&layout, 3, 0);
+    let end = caret_top(&layout, 3, "a\nb\n".len());
+    assert!(end > start, "the three lines stay together");
+    // A section too long for one page: only the last page is evened out and
+    // nothing is lost.
+    let layout = lay(&two_columns_then(60, SectionStart::Continuous));
+    assert!(layout.pages.len() >= 2);
+    for i in 0..61 {
+        assert!(layout.caret(&Pos::new(Path::body(i), 0)).is_some(), "{i}");
+    }
+    let last = page_of(&layout, 59);
+    assert_eq!(page_of(&layout, 60), last);
+    assert!(caret_x(&layout, 59) > 100.0, "the right column has text");
+}
+
+#[test]
+fn balanced_columns_leave_the_notes_at_the_foot_of_the_page() {
+    let mut document = two_columns_then(8, SectionStart::Continuous);
+    let mut with_note = paragraph("");
+    with_note.runs = vec![
+        Run::text("noted", look()),
+        Run::object(Inline::Footnote(1), look()),
+    ];
+    let Some(Block::Paragraph(second)) = document.body.blocks.get_mut(1) else {
+        unreachable!()
+    };
+    *Arc::make_mut(second) = with_note;
+    let mut note = paragraph("");
+    note.runs = vec![
+        Run::object(Inline::Footnote(1), look()),
+        Run::text(" the note", look()),
+    ];
+    document.footnotes = Notes {
+        notes: vec![Note {
+            id: 1,
+            blocks: vec![Block::paragraph(note)],
+        }],
+        part: None,
+    };
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 1);
+    // Still four lines a column, and the note is not among them.
+    assert!((caret_x(&layout, 4) - 160.0).abs() < 0.01);
+    assert!((caret_x(&layout, 3) - 20.0).abs() < 0.01);
+    let note_y = layout.pages[0]
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Text(t) if t.paragraph.text().contains("the note") => Some(t.y),
+            _ => None,
+        })
+        .expect("the note is drawn");
+    assert!(note_y > caret_top(&layout, 8, 0), "{note_y}");
+    assert!(note_y > 150.0, "{note_y}");
+}
+
 #[test]
 fn a_next_column_section_needs_a_column_left_in_the_section_before() {
     let build = |before_columns: u32| {
@@ -2400,6 +2545,33 @@ fn text_takes_the_wider_side_of_a_picture_in_the_middle() {
 }
 
 #[test]
+fn a_line_moved_to_the_next_page_does_not_keep_the_indent_of_the_picture() {
+    // The picture hangs over the foot of the page, at heights that put the
+    // last line beside it at every offset in a line's height.
+    for offset in 118..140 {
+        let layout = lay(&floated_n(
+            12,
+            beside(FloatAt::Start, offset, Wrap::Square, 0),
+            50.0,
+            90.0,
+            vec![],
+        ));
+        assert!(layout.pages.len() >= 2, "{offset}");
+        for frag in layout.frags.iter().filter(|f| f.page == 1) {
+            let lines = frag.shaped.paragraph.lines();
+            for line in &lines[frag.lines.clone()] {
+                assert!(
+                    (frag.x + line.left - 20.0).abs() < 0.01,
+                    "offset {offset}: indent {} at {}",
+                    line.left,
+                    frag.y + line.top
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn lines_with_no_room_for_a_word_skip_below_the_picture() {
     // 250 of 260 points are taken: nothing fits beside it.
     let layout = lay(&floated(
@@ -2544,33 +2716,6 @@ fn flowing_around_a_picture_does_not_reshape_other_paragraphs() {
     }];
     blocks.extend(numbered(60));
     let before = doc(blocks);
-#[test]
-fn a_line_moved_to_the_next_page_does_not_keep_the_indent_of_the_picture() {
-    // The picture hangs over the foot of the page, at heights that put the
-    // last line beside it at every offset in a line's height.
-    for offset in 118..140 {
-        let layout = lay(&floated_n(
-            12,
-            beside(FloatAt::Start, offset, Wrap::Square, 0),
-            50.0,
-            90.0,
-            vec![],
-        ));
-        assert!(layout.pages.len() >= 2, "{offset}");
-        for frag in layout.frags.iter().filter(|f| f.page == 1) {
-            let lines = frag.shaped.paragraph.lines();
-            for line in &lines[frag.lines.clone()] {
-                assert!(
-                    (frag.x + line.left - 20.0).abs() < 0.01,
-                    "offset {offset}: indent {} at {}",
-                    line.left,
-                    frag.y + line.top
-                );
-            }
-        }
-    }
-}
-
     let mut layouter = Layouter::new();
     layouter.layout(&before);
     let count = layouter.shaped_count();

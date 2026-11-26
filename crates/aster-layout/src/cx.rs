@@ -22,7 +22,7 @@ use crate::table::TableLayout;
 /// The paint order of a page: shading under everything, then drawings
 /// behind the text, text and pictures, borders and rules, and drawings in
 /// front of the text.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Layers {
     pub shade: Vec<Item>,
     pub behind: Vec<Item>,

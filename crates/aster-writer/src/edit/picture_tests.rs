@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::edit::table_tests::{doc_of, pos};
+use crate::edit::{fragment, insert_fragment, plain_text};
 use crate::{OBJECT, Path};
 
 fn png() -> Arc<[u8]> {
@@ -215,4 +216,36 @@ fn a_picture_dropped_inside_text_splits_the_run_and_the_text_joins_again() {
     // "second" is one run again.
     assert_eq!(p.runs.len(), 1);
     assert_eq!(p.text(), "second");
+}
+
+#[test]
+fn a_copied_selection_keeps_its_pictures_and_pastes_them() {
+    let mut doc = with_picture();
+    let width = OBJECT.len();
+    // The selection is the picture alone: it has no text to copy, only the
+    // object, so a clipboard that goes by the text finds nothing.
+    let (from, to) = (pos(0, 2), pos(0, 2 + width));
+    assert_eq!(plain_text(&doc, &from, &to), "");
+    let blocks = fragment(&doc, &from, &to);
+    assert_eq!(blocks.len(), 1);
+    let kept = blocks[0].as_paragraph().unwrap();
+    assert!(matches!(kept.runs[0].kind, Inline::Drawing(_)));
+    // Pasted into another paragraph, it is a second picture, equal to the
+    // first.
+    insert_fragment(&mut doc, &pos(1, 3), &blocks);
+    let first = drawing(&doc, 0, 2);
+    let second = drawing(&doc, 1, 3);
+    assert_eq!(first, second);
+    assert_eq!(
+        doc.paragraph(&Path::body(1)).unwrap().text(),
+        format!("sec{OBJECT}ond")
+    );
+    // Floating pictures keep their place when copied.
+    set_picture_layout(&mut doc, &pos(1, 3), PictureLayout::BehindText);
+    let blocks = fragment(&doc, &pos(1, 3), &pos(1, 3 + width));
+    insert_fragment(&mut doc, &pos(0, 0), &blocks);
+    assert_eq!(
+        picture_layout(&drawing(&doc, 0, 0)),
+        PictureLayout::BehindText
+    );
 }

@@ -90,6 +90,7 @@ use crate::xml_edit::{
 };
 
 mod blank;
+mod drawing;
 mod props;
 mod table;
 mod xml;
@@ -399,6 +400,9 @@ struct Saver<'a> {
     wrote_picture: bool,
     /// The last `docPr` id given out (or found in the file).
     next_docpr: u32,
+    /// The drawings of the file that have been written as they were: a
+    /// second copy of one (a pasted duplicate) gets an id of its own.
+    written_drawings: HashSet<RunKey>,
     /// The opening tags of hyperlinks written here: two of them with
     /// nothing between become one.
     openers: HashSet<String>,
@@ -556,6 +560,7 @@ impl<'a> Saver<'a> {
             undeclared,
             wrote_picture: false,
             next_docpr: max_docpr(text),
+            written_drawings: HashSet::new(),
             openers: HashSet::new(),
         }
     }
@@ -578,29 +583,59 @@ impl<'a> Saver<'a> {
             && run.style == origin.style
             && run.link == origin.link
             && run.look == self.effective(origin, base)
-            && self.resized(run, origin).is_none()
+            && self.drawing_change(run, origin).is_none()
     }
 
-    /// For a drawing whose size is not what the file had: the size it had
-    /// and the size it has.
-    fn resized(
-        &self,
-        run: &aster_writer::Run,
+    /// For a drawing whose size or place is not what the file had: the
+    /// drawing it was and the drawing it is.
+    fn drawing_change<'d>(
+        &'d self,
+        run: &'d aster_writer::Run,
         origin: &RunSource,
-    ) -> Option<((i64, i64), (i64, i64))> {
+    ) -> Option<(&'d Drawing, &'d Drawing)> {
         let (Inline::Drawing(now), Some(then)) = (&run.kind, self.drawings.get(&run_key(origin)))
         else {
             return None;
         };
-        (now.size != then.size).then_some((then.size, now.size))
+        drawing::changed(then, now)
     }
 
     fn slice(&self, range: &Range<usize>) -> Option<&'a str> {
         self.text.get(range.clone())
     }
 
+    /// Note the drawings in paragraphs that are written as they were: a
+    /// copy of one elsewhere is a second drawing, whichever is met first.
+    fn note_whole_paragraphs(&mut self, blocks: &'a [Block]) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(p) => {
+                    let whole = p
+                        .source
+                        .as_ref()
+                        .and_then(|s| self.paras.get(&range_key(&s.range)).copied())
+                        .is_some_and(|op| para_unchanged(p, op));
+                    if whole {
+                        for run in &p.runs {
+                            if let (Inline::Drawing(_), Some(source)) = (&run.kind, &run.source) {
+                                self.written_drawings.insert(run_key(source));
+                            }
+                        }
+                    }
+                }
+                Block::Table(t) => {
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        self.note_whole_paragraphs(&cell.blocks);
+                    }
+                }
+            }
+        }
+    }
+
     /// The main part's text with the body written again where it changed.
     fn document_text(&mut self) -> Result<String> {
+        let document = self.document;
+        self.note_whole_paragraphs(&document.body.blocks);
         let text = self.text;
         let body = find_all(text, "body")
             .into_iter()
@@ -1162,7 +1197,7 @@ impl<'a> Saver<'a> {
     /// A run read from the file: its element with the look patched and the
     /// text written again, or its bytes as they were.
     fn run_from_origin(
-        &self,
+        &mut self,
         run: &aster_writer::Run,
         origin: &RunSource,
         base: &RunLook,
@@ -1172,6 +1207,11 @@ impl<'a> Saver<'a> {
             return (!element.is_empty() && is_balanced(element)).then(|| element.to_owned());
         }
         let same = self.unchanged(run, origin, base);
+        // The same drawing a second time (a copy pasted in the same file):
+        // its bytes are written again, with an id of its own. It points at
+        // the same image part, which is stored once.
+        let duplicate = matches!(run.kind, Inline::Drawing(_))
+            && !self.written_drawings.insert(run_key(origin));
         let mut src_look = self.effective(origin, base);
         if run.style != origin.style {
             // A character style given or taken: the look the run had is
@@ -1197,7 +1237,11 @@ impl<'a> Saver<'a> {
                     .map(|c| &element[c.start..c.end])
                     .collect();
                 if same {
-                    return Some(element.to_owned());
+                    return Some(if duplicate {
+                        self.renumbered(element)
+                    } else {
+                        element.to_owned()
+                    });
                 }
                 let _ = close;
                 (
@@ -1240,8 +1284,13 @@ impl<'a> Saver<'a> {
         };
         let content = if run.is_text() {
             self.text_element(&run.text)
-        } else if let Some((then, now)) = self.resized(run, origin) {
-            patch_extent(&content, then, now)
+        } else if let Some((then, now)) = self.drawing_change(run, origin) {
+            drawing::patch_drawing(&content, then, now)
+        } else {
+            content
+        };
+        let content = if duplicate {
+            self.renumbered(&content)
         } else {
             content
         };
@@ -1379,10 +1428,52 @@ impl<'a> Saver<'a> {
 // ---------------------------------------------------------------------------
 
 impl Saver<'_> {
+    /// `content` with the `wp:docPr` ids it has replaced by a new one (ids
+    /// must be different in a document).
+    fn renumbered(&mut self, content: &str) -> String {
+        let mut out = content.to_owned();
+        for span in find_all(content, "docPr").into_iter().rev() {
+            self.next_docpr += 1;
+            let tag = set_attribute(
+                &out[span.start..span.end],
+                "id",
+                &self.next_docpr.to_string(),
+            );
+            out.replace_range(span.start..span.end, &tag);
+        }
+        out
+    }
+
+    /// The relationship and file name of a picture the file already has
+    /// with exactly these bytes, so that a copy of a picture does not store
+    /// the image a second time.
+    fn existing_image(&self, image: &Arc<[u8]>) -> Option<(String, String)> {
+        let key = self
+            .drawings
+            .iter()
+            .filter(|(_, d)| {
+                matches!(&d.content, DrawingContent::Picture(p)
+                    if Arc::ptr_eq(&p.image, image) || p.image == *image)
+            })
+            .map(|(key, _)| *key)
+            .min()?;
+        let element = self.text.get(key.0..key.1)?;
+        let id = drawing::first_attribute(element, "blip", &format!("{}embed", self.r))?;
+        let target = find_all(&self.rels.text, "Relationship")
+            .into_iter()
+            .map(|span| &self.rels.text[span.start..span.end])
+            .find(|xml| attribute(xml, "Id").as_deref() == Some(id.as_str()))
+            .and_then(|xml| attribute(xml, "Target"))?;
+        Some((id, target))
+    }
+
     /// The relationship and part name for `image`, made on first use.
     /// `None` for bytes that are not in a format Word opens.
     fn image_rel(&mut self, image: &Arc<[u8]>) -> Option<(String, String)> {
         let format = image_format(image)?;
+        if let Some(found) = self.existing_image(image) {
+            return Some(found);
+        }
         if let Some(&at) = self.media.by_bytes.get(image) {
             let item = &self.media.items[at];
             return Some((item.rel_id.clone(), item.part.clone()));
@@ -1417,9 +1508,9 @@ impl Saver<'_> {
         Some((rel_id, part))
     }
 
-    /// `<w:drawing>` for a picture made here, in the line. The image is
-    /// stored once however often it is used; a floating picture is written
-    /// in the line (where it floats is not kept).
+    /// `<w:drawing>` for a picture made here, in the line or floating. The
+    /// image is stored once however often it is used (and not at all again
+    /// where the file already holds a picture with the same bytes).
     fn picture_xml(&mut self, drawing: &Drawing, picture: &Picture) -> Option<String> {
         let (rel_id, part) = self.image_rel(&picture.image)?;
         self.next_docpr += 1;
@@ -1449,18 +1540,26 @@ impl Saver<'_> {
             crop.push_str("/>");
         }
         let file = escape_attribute(file);
-        Some(format!(
-            "<{w}drawing><{wp}inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
-<{wp}extent cx=\"{cx}\" cy=\"{cy}\"/><{wp}effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
-<{wp}docPr id=\"{id}\" name=\"Picture {id}\"{descr}/>\
+        let extent = format!(
+            "<{wp}extent cx=\"{cx}\" cy=\"{cy}\"/><{wp}effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+        );
+        let tail = format!(
+            "<{wp}docPr id=\"{id}\" name=\"Picture {id}\"{descr}/>\
 <{wp}cNvGraphicFramePr><{a}graphicFrameLocks noChangeAspect=\"1\"/></{wp}cNvGraphicFramePr>\
 <{a}graphic><{a}graphicData uri=\"{PIC_NS}\"><{pic}pic><{pic}nvPicPr>\
 <{pic}cNvPr id=\"0\" name=\"{file}\"/><{pic}cNvPicPr/></{pic}nvPicPr>\
 <{pic}blipFill><{a}blip {r}embed=\"{rel_id}\"/>{crop}<{a}stretch><{a}fillRect/></{a}stretch></{pic}blipFill>\
 <{pic}spPr><{a}xfrm><{a}off x=\"0\" y=\"0\"/><{a}ext cx=\"{cx}\" cy=\"{cy}\"/></{a}xfrm>\
 <{a}prstGeom prst=\"rect\"><{a}avLst/></{a}prstGeom></{pic}spPr></{pic}pic>\
-</{a}graphicData></{a}graphic></{wp}inline></{w}drawing>"
-        ))
+</{a}graphicData></{a}graphic>"
+        );
+        let holder = match &drawing.float {
+            Some(float) => drawing::anchor_xml(&wp, float, &extent, &tail),
+            None => format!(
+                "<{wp}inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">{extent}{tail}</{wp}inline>"
+            ),
+        };
+        Some(format!("<{w}drawing>{holder}</{w}drawing>"))
     }
 }
 

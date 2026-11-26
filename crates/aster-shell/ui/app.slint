@@ -3,7 +3,7 @@
 // one image that the Rust side draws itself, and Slint only forwards input to it.
 // A Markdown tab has up to two: the source and the preview.
 
-import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, EncodingChoice, FilterChoice, HintItem } from "tokens.slint";
+import { Tokens, Icons, Strings, TabItem, ToolItem, KindItem, RecentItem, TreeItem, RecoveryItem, ChatItem, ApprovalItem, OutlineItem, CommentItem, EncodingChoice, FilterChoice, HintItem } from "tokens.slint";
 import { FilterList } from "filter_list.slint";
 import { ChoiceList } from "choice_list.slint";
 import { TabStrip } from "tabstrip.slint";
@@ -16,6 +16,8 @@ import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { LinkDialog } from "link_dialog.slint";
 import { TableDialog } from "table_dialog.slint";
+import { SplitDialog } from "split_dialog.slint";
+import { CommentsPanel } from "comments.slint";
 import { PromptDialog } from "prompt_dialog.slint";
 import { CopyDialog } from "copy_dialog.slint";
 import { EncodingDialog } from "encoding_dialog.slint";
@@ -104,6 +106,34 @@ export component AppWindow inherits Window {
     in-out property <string> table-columns;
     callback table-accept();
     callback table-cancel();
+    // The split cell dialog of a Word document: how many columns and rows
+    // the cell is cut into.
+    in property <bool> split-open;
+    in-out property <string> split-rows;
+    in-out property <string> split-columns;
+    callback split-accept();
+    callback split-cancel();
+    // What the Word document in front allows, for its menus: where the
+    // caret is (0 body, 1 header or footer, 2 note), whether the selected
+    // cells can be merged, the cell split or unmerged, how the selected
+    // picture sits (-1 when none is selected, else the order of the wrap
+    // menu), and what there is to review.
+    in property <int> doc-story;
+    in property <bool> doc-can-merge;
+    in property <bool> doc-can-split;
+    in property <bool> doc-can-unmerge;
+    in property <int> doc-wrap: -1;
+    in property <bool> doc-markup: true;
+    in property <bool> doc-has-changes;
+    in property <bool> doc-has-comments;
+    // The Review menu: 0 show markup, 1 previous change, 2 next, 3 accept
+    // this one, 4 reject it, 5 accept all, 6 reject all, 7 the comments panel.
+    callback review(int);
+    // The comments panel: open, the comments, the one the caret is in, and
+    // a click on an entry.
+    in-out property <bool> comments-open;
+    in property <[CommentItem]> comments;
+    callback comment-clicked(int);
     // A question asking for one line of text: go to line, rename.
     in property <bool> prompt-open;
     in property <string> prompt-title;
@@ -172,7 +202,7 @@ export component AppWindow inherits Window {
     // A dialog with a text field is open. The Edit menu's text commands
     // step aside, so their shortcuts (Cmd+A, Cmd+C ...) reach the field
     // rather than the document behind it.
-    property <bool> dialog-text: root.prompt-open || root.link-open || root.table-open;
+    property <bool> dialog-text: root.prompt-open || root.link-open || root.table-open || root.split-open;
     // Its source is on screen, so the Format menu can write into it.
     property <bool> formatting: root.editing && root.view-mode != 2;
     // The caret is in a table: the table's row and column commands apply.
@@ -983,6 +1013,113 @@ export component AppWindow inherits Window {
                     root.sheet-freeze(3);
                 }
             }
+
+            MenuSeparator { }
+
+            // A Word document's header and footer of the page in view; Esc
+            // leaves them too.
+            MenuItem {
+                title: Strings.menu-edit-header;
+                enabled: root.doc-editing;
+                activated => {
+                    root.format(40);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-edit-footer;
+                enabled: root.doc-editing;
+                activated => {
+                    root.format(41);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-back-to-body;
+                enabled: root.doc-editing && root.doc-story == 1;
+                activated => {
+                    root.format(42);
+                }
+            }
+        }
+
+        // Tracked changes and comments of a Word document.
+        Menu {
+            title: Strings.menu-review;
+
+            MenuItem {
+                title: Strings.review-show-markup;
+                checkable: true;
+                checked: root.doc-markup;
+                enabled: root.doc-editing && (root.doc-has-changes || root.doc-has-comments);
+                activated => {
+                    root.review(0);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.review-previous;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(1);
+                }
+            }
+
+            MenuItem {
+                title: Strings.review-next;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(2);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.review-accept;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(3);
+                }
+            }
+
+            MenuItem {
+                title: Strings.review-reject;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(4);
+                }
+            }
+
+            MenuItem {
+                title: Strings.review-accept-all;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(5);
+                }
+            }
+
+            MenuItem {
+                title: Strings.review-reject-all;
+                enabled: root.doc-editing && root.doc-has-changes;
+                activated => {
+                    root.review(6);
+                }
+            }
+
+            MenuSeparator { }
+
+            MenuItem {
+                title: Strings.review-comments;
+                checkable: true;
+                checked: root.comments-open;
+                enabled: root.doc-editing;
+                activated => {
+                    root.review(7);
+                }
+            }
         }
 
         // Markdown syntax written for the user; only with the source on
@@ -1149,9 +1286,17 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-footnote;
-                enabled: root.formatting;
+                enabled: root.formatting || (root.doc-editing && root.doc-story == 0);
                 activated => {
                     root.format(14);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-page-number;
+                enabled: root.doc-editing && root.doc-story != 2;
+                activated => {
+                    root.format(43);
                 }
             }
 
@@ -1223,6 +1368,32 @@ export component AppWindow inherits Window {
                 MenuSeparator { }
 
                 MenuItem {
+                    title: Strings.table-merge;
+                    enabled: root.doc-editing && root.doc-can-merge;
+                    activated => {
+                        root.format(44);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-split;
+                    enabled: root.doc-editing && root.doc-can-split;
+                    activated => {
+                        root.format(45);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-unmerge;
+                    enabled: root.doc-editing && root.doc-can-unmerge;
+                    activated => {
+                        root.format(46);
+                    }
+                }
+
+                MenuSeparator { }
+
+                MenuItem {
                     title: Strings.table-align-left;
                     enabled: root.formatting && root.in-table;
                     activated => {
@@ -1243,6 +1414,73 @@ export component AppWindow inherits Window {
                     enabled: root.formatting && root.in-table;
                     activated => {
                         root.format(38);
+                    }
+                }
+            }
+
+            // How the selected picture of a Word document sits in the text.
+            Menu {
+                title: Strings.picture-wrap;
+
+                MenuItem {
+                    title: Strings.wrap-inline;
+                    checkable: true;
+                    checked: root.doc-wrap == 0;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(50);
+                    }
+                }
+
+                MenuSeparator { }
+
+                MenuItem {
+                    title: Strings.wrap-square;
+                    checkable: true;
+                    checked: root.doc-wrap == 1;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(51);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.wrap-tight;
+                    checkable: true;
+                    checked: root.doc-wrap == 2;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(52);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.wrap-top-bottom;
+                    checkable: true;
+                    checked: root.doc-wrap == 3;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(53);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.wrap-behind;
+                    checkable: true;
+                    checked: root.doc-wrap == 4;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(54);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.wrap-front;
+                    checkable: true;
+                    checked: root.doc-wrap == 5;
+                    enabled: root.doc-editing && root.doc-wrap >= 0;
+                    activated => {
+                        root.format(55);
                     }
                 }
             }
@@ -1686,7 +1924,7 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.resize-cursor == 5 ? MouseCursor.pointer : root.resize-cursor == 6 ? MouseCursor.nwse-resize : root.resize-cursor == 7 ? MouseCursor.nesw-resize : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
+                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.resize-cursor == 5 ? MouseCursor.pointer : root.resize-cursor == 6 ? MouseCursor.nwse-resize : root.resize-cursor == 7 ? MouseCursor.nesw-resize : root.resize-cursor == 8 ? MouseCursor.move : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();
@@ -2069,6 +2307,22 @@ export component AppWindow inherits Window {
                 }
             }
 
+            CommentsPanel {
+                width: root.viewer == 4 && root.comments-open ? self.panel-width : 0px;
+                items: root.comments;
+                clicked(index) => {
+                    root.comment-clicked(index);
+                }
+                close => {
+                    root.comments-open = false;
+                    root.focus-document();
+                }
+                animate width {
+                    duration: 140ms;
+                    easing: ease-out;
+                }
+            }
+
             AssistantPanel {
                 width: root.assistant-open ? self.panel-width : 0px;
                 items: root.ai-items;
@@ -2275,6 +2529,17 @@ export component AppWindow inherits Window {
         }
         dismissed => {
             root.link-cancel();
+        }
+    }
+
+    if root.split-open: SplitDialog {
+        rows <=> root.split-rows;
+        columns <=> root.split-columns;
+        confirmed => {
+            root.split-accept();
+        }
+        dismissed => {
+            root.split-cancel();
         }
     }
 

@@ -14,15 +14,17 @@ use aster_platform::dialogs::{self, FileType};
 use aster_shell::recovery::{Candidate, RecordInfo};
 use aster_shell::tabs::TabId;
 use aster_shell::writer_tab::{
-    DocPdf, DocSave, DocTab, PictureProblem, TableEdit, Written, find_position, read_picture,
+    DocPdf, DocSave, DocTab, PictureProblem, Place, ShownComment, TableEdit, Written,
+    find_position, read_picture,
 };
 use aster_storage::Contents;
-use aster_surface::doc_view::{Align, Break, Corner, DocCommand, Handle, Move};
+use aster_surface::doc_view::{Align, Break, Corner, DocCommand, Handle, Move, PictureLayout};
 use slint::{ComponentHandle, SharedString, TimerMode};
 
 use super::{
-    AfterSave, AppWindow, Content, OutlineItem, Shell, deliver, files, host, i18n, model, present,
-    refresh_chrome, refresh_sidebar, refresh_status, refresh_tabs, refresh_toolbar, show_dialog,
+    AfterSave, AppWindow, CommentItem, Content, OutlineItem, Shell, deliver, files, host, i18n,
+    model, present, refresh_chrome, refresh_sidebar, refresh_status, refresh_tabs, refresh_toolbar,
+    show_dialog,
 };
 
 /// How deep outline rows are indented at most, as levels.
@@ -32,17 +34,123 @@ const OUTLINE_INDENT: u8 = 8;
 /// sidebar's outline marking the heading the caret is under.
 pub(crate) fn after_move(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
-    sync_table_flag(ui, shell);
+    sync_flags(ui, shell);
     sync_outline(ui, shell);
     present(ui, shell);
 }
 
-/// Tell the window whether the caret is in a table, for the menu's table
-/// items.
-fn sync_table_flag(ui: &AppWindow, shell: &mut Shell) {
-    let now = in_table(shell);
-    if ui.get_in_table() != now {
-        ui.set_in_table(now);
+/// The pictures' wrap menu, in the order of the window's menu.
+const WRAPS: [PictureLayout; 6] = [
+    PictureLayout::Inline,
+    PictureLayout::Square,
+    PictureLayout::Tight,
+    PictureLayout::TopAndBottom,
+    PictureLayout::BehindText,
+    PictureLayout::InFrontOfText,
+];
+
+/// Tell the window what the Word document in front allows, for its menus:
+/// whether the caret is in a table (and which cell commands apply), where it
+/// is, what is selected, and what there is to review. The status bar and
+/// the comments panel follow.
+pub(crate) fn sync_flags(ui: &AppWindow, shell: &mut Shell) {
+    let Some(tab) = shell.active_doc() else {
+        ui.set_in_table(false);
+        ui.set_doc_story(0);
+        ui.set_doc_can_merge(false);
+        ui.set_doc_can_split(false);
+        ui.set_doc_can_unmerge(false);
+        ui.set_doc_wrap(-1);
+        ui.set_doc_markup(true);
+        ui.set_doc_has_changes(false);
+        ui.set_doc_has_comments(false);
+        return;
+    };
+    let composing = tab.view.is_composing();
+    let place = tab.place();
+    let view = &tab.view;
+    ui.set_in_table(!composing && view.in_table());
+    ui.set_doc_story(match place {
+        Place::Body => 0,
+        Place::Header | Place::Footer => 1,
+        Place::Footnote | Place::Endnote => 2,
+    });
+    ui.set_doc_can_merge(view.can_merge_cells());
+    ui.set_doc_can_split(view.can_split_cell(2, 1) || view.can_split_cell(1, 2));
+    ui.set_doc_can_unmerge(view.can_unmerge_cell());
+    let wrap = if composing {
+        None
+    } else {
+        view.picture_layout()
+    };
+    ui.set_doc_wrap(wrap.map_or(-1, |layout| {
+        WRAPS
+            .iter()
+            .position(|l| *l == layout)
+            .map_or(-1, |i| i as i32)
+    }));
+    ui.set_doc_markup(view.show_markup());
+    ui.set_doc_has_changes(view.has_tracked_changes());
+    ui.set_doc_has_comments(!view.comments().is_empty());
+    let moved = tab.shown_place != place;
+    tab.shown_place = place;
+    if moved {
+        refresh_status(ui, shell);
+    }
+    refresh_comments(ui, shell);
+}
+
+/// The comments panel's list, when the panel is open: left alone when it
+/// has not changed, so that the list keeps its scroll.
+fn refresh_comments(ui: &AppWindow, shell: &mut Shell) {
+    if !ui.get_comments_open() {
+        return;
+    }
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let rows: Vec<ShownComment> = tab
+        .view
+        .comments()
+        .into_iter()
+        .map(|c| ShownComment {
+            current: tab.comment_current == Some(c.id),
+            id: c.id,
+            author: c.author,
+            date: c.date.as_deref().map(short_date).unwrap_or_default(),
+            text: c.text,
+            color: c.color,
+        })
+        .collect();
+    use slint::Model;
+    if rows == tab.comments_shown && ui.get_comments().row_count() == rows.len() {
+        return;
+    }
+    let items: Vec<CommentItem> = rows
+        .iter()
+        .map(|row| CommentItem {
+            author: row.author.as_str().into(),
+            date: row.date.as_str().into(),
+            text: row.text.as_str().into(),
+            color: slint::Color::from_argb_u8(
+                row.color[3],
+                row.color[0],
+                row.color[1],
+                row.color[2],
+            ),
+            current: row.current,
+        })
+        .collect();
+    tab.comments_shown = rows;
+    ui.set_comments(slint::ModelRc::new(slint::VecModel::from(items)));
+}
+
+/// A comment's date as the panel shows it: the day and the time, from the
+/// file's `2024-05-01T09:30:00Z`; anything else the file has is kept as is.
+fn short_date(date: &str) -> String {
+    match date.split_once('T') {
+        Some((day, time)) => format!("{day} {}", time.get(..5).unwrap_or(time)),
+        None => date.to_owned(),
     }
 }
 
@@ -54,7 +162,7 @@ const COUNT_DELAY: Duration = Duration::from_millis(500);
 /// and the picture.
 pub(crate) fn after_edit(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
-    sync_table_flag(ui, shell);
+    sync_flags(ui, shell);
     if shell.sync_modified() {
         refresh_tabs(ui, shell);
     }
@@ -115,6 +223,12 @@ pub(crate) fn key(
         if tab.find.open {
             tab.close_find();
             super::after_find(ui, shell, None);
+            return true;
+        }
+        // Out of a header or footer, back to the body; a selection there is
+        // left behind with it.
+        if tab.view.in_marginal() && tab.view.leave_marginal() {
+            after_move(ui, shell);
             return true;
         }
         if tab.view.has_selection() {
@@ -194,8 +308,16 @@ pub(crate) fn pointer_down(
     shell.doc_drag_at = None;
     shell.drag_timer.stop();
     let primary = ui.get_pointer_primary();
+    let marking = ui.get_comments_open();
     if let Some(tab) = shell.active_doc() {
         tab.pointer_down_with(x, y, clicks.clamp(1, 3), shift, primary);
+        // The panel marks the comment that was clicked, if the click was in
+        // the text of one.
+        tab.comment_current = if marking {
+            tab.view.comment_at(x, y)
+        } else {
+            None
+        };
     }
     refresh_status(ui, shell);
     after_move(ui, shell);
@@ -299,8 +421,7 @@ pub(crate) fn hover(ui: &AppWindow, shell: &mut Shell, x: f64, y: f64) {
         Some(Handle::Corner(Corner::TopRight | Corner::BottomLeft)) => 7,
         Some(Handle::ColumnBorder) => 1,
         Some(Handle::RowBorder) => 2,
-        // No cursor for moving yet: the pointer stays what the page makes it.
-        Some(Handle::Move) => 0,
+        Some(Handle::Move) => 8,
         None if link.is_some() && primary => 5,
         None if tab.view.is_over_page(x, y) => 4,
         None => 0,
@@ -353,11 +474,30 @@ pub(crate) fn copy(ui: &AppWindow, shell: &mut Shell) {
     }
     let text = clean(&tab.view.selected_text());
     let fragment = tab.view.selected_fragment();
-    if text.is_empty() {
+    let Some(text) = clipboard_text(shell.language.strings(), text, fragment.is_some()) else {
         return;
-    }
+    };
     shell.doc_clip = fragment.map(|blocks| (text.clone(), blocks));
     ui.invoke_copy_to_clipboard(text.into());
+}
+
+/// What goes on the system clipboard for a selection: its text, or when
+/// the selection has none but still something to copy (a picture) a short
+/// stand-in, so that other programs get something harmless and the
+/// stored paragraphs are still recognised when pasting. `None` when there
+/// is nothing to copy.
+fn clipboard_text(
+    strings: &'static i18n::Strings,
+    text: String,
+    has_fragment: bool,
+) -> Option<String> {
+    if !text.is_empty() {
+        Some(text)
+    } else if has_fragment {
+        Some(strings.clipboard_picture.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Cut: copy, then take the selection out.
@@ -371,9 +511,11 @@ pub(crate) fn cut(ui: &AppWindow, shell: &mut Shell) {
     let Some((text, fragment)) = tab.view.cut() else {
         return;
     };
-    let text = clean(&text);
-    shell.doc_clip = fragment.map(|blocks| (text.clone(), blocks));
-    ui.invoke_copy_to_clipboard(text.into());
+    let text = clipboard_text(shell.language.strings(), clean(&text), fragment.is_some());
+    if let Some(text) = text {
+        shell.doc_clip = fragment.map(|blocks| (text.clone(), blocks));
+        ui.invoke_copy_to_clipboard(text.into());
+    }
     after_edit(ui, shell);
 }
 
@@ -456,6 +598,17 @@ pub(crate) fn status(ui: &AppWindow, strings: &'static i18n::Strings, tab: &DocT
         .and_then(|e| e.to_str())
         .map_or_else(|| "DOCX".to_owned(), str::to_ascii_uppercase);
     ui.set_status_format(format.into());
+    // Where the caret is, when it is not in the body.
+    ui.set_status_note(
+        match tab.place() {
+            Place::Body => "",
+            Place::Header => strings.story_header,
+            Place::Footer => strings.story_footer,
+            Place::Footnote => strings.story_footnote,
+            Place::Endnote => strings.story_endnote,
+        }
+        .into(),
+    );
     ui.set_status_notice(if tab.link_refused {
         strings.notice_link_refused.into()
     } else if let Some(address) = &tab.hover_link {
@@ -693,13 +846,20 @@ pub(crate) fn find(ui: &AppWindow, shell: &mut Shell, action: FindAction) -> boo
 // --- Tables, links, pictures and the Format menu ---
 
 /// The Format menu's codes (see `format` in `ui/app.slint`) for a Word
-/// document: 8 link, 9 picture, 10 table, 30 to 35 and 39 the table's rows,
-/// columns and the table itself.
+/// document: 8 link, 9 picture, 10 table, 14 footnote, 30 to 35 and 39 the
+/// table's rows, columns and the table itself, 40 and 41 the header and
+/// footer, 42 back to the body, 43 a page number, 44 to 46 merging, splitting
+/// and unmerging cells, 50 to 55 the picture's wrap (in the order of
+/// [`WRAPS`]).
 pub(crate) fn format(ui: &AppWindow, shell: &mut Shell, code: i32) {
     let edit = match code {
         8 => return open_link_dialog(ui, shell),
         9 => return insert_picture(ui, shell),
         10 => return open_table_dialog(ui, shell),
+        14 | 40..=43 | 50..=55 => return story_or_picture(ui, shell, code),
+        45 => return open_split_dialog(ui, shell),
+        44 => TableEdit::MergeCells,
+        46 => TableEdit::UnmergeCell,
         30 => TableEdit::RowAbove,
         31 => TableEdit::RowBelow,
         32 => TableEdit::ColumnLeft,
@@ -712,6 +872,146 @@ pub(crate) fn format(ui: &AppWindow, shell: &mut Shell, code: i32) {
     if shell.active_doc().is_some_and(|tab| tab.edit_table(edit)) {
         after_edit(ui, shell);
     }
+}
+
+/// The menu's commands for headers, footers, notes and pictures. The view
+/// refuses what does not apply where the caret is (and while an input
+/// method composes), and nothing then changes.
+fn story_or_picture(ui: &AppWindow, shell: &mut Shell, code: i32) {
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let place = tab.place();
+    let view = &mut tab.view;
+    let (done, edits) = match code {
+        14 => (view.insert_footnote(), true),
+        40 => (view.enter_header(), false),
+        41 => (view.enter_footer(), false),
+        42 => (view.leave_marginal(), false),
+        // A page number makes no sense in a note.
+        43 if matches!(place, Place::Footnote | Place::Endnote) => (false, false),
+        43 => (view.insert_page_number(), true),
+        _ => {
+            let layout = WRAPS[(code - 50) as usize];
+            (view.set_picture_layout(layout), true)
+        }
+    };
+    if done {
+        if edits {
+            after_edit(ui, shell);
+        } else {
+            after_move(ui, shell);
+        }
+    }
+    ui.invoke_focus_document();
+}
+
+/// Open the split cell dialog, two columns by one row to start with. Not
+/// where the cell cannot be split at all.
+fn open_split_dialog(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+        return;
+    };
+    if !(tab.view.can_split_cell(2, 1) || tab.view.can_split_cell(1, 2)) {
+        return;
+    }
+    shell.doc_split_for = Some(id);
+    ui.set_split_columns("2".into());
+    ui.set_split_rows("1".into());
+    ui.set_split_open(true);
+}
+
+/// OK in the split cell dialog. Numbers that are not whole numbers, or are
+/// 0, and splits the table cannot take (it would get too large) keep the
+/// dialog open.
+pub(crate) fn accept_split(ui: &AppWindow, shell: &mut Shell) {
+    let number = |text: SharedString| text.trim().parse::<usize>().ok().filter(|n| *n > 0);
+    let (Some(rows), Some(columns)) = (number(ui.get_split_rows()), number(ui.get_split_columns()))
+    else {
+        return;
+    };
+    let Some(id) = shell.doc_split_for else {
+        return;
+    };
+    let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+        return;
+    };
+    if !tab.view.can_split_cell(columns, rows) {
+        return;
+    }
+    let done = tab.view.split_cell(columns, rows);
+    shell.doc_split_for = None;
+    ui.set_split_open(false);
+    if done {
+        after_edit(ui, shell);
+    }
+    ui.invoke_focus_document();
+}
+
+// --- Review ---
+
+/// The Review menu (see `review` in `ui/app.slint`): 0 shows or hides the
+/// markup, 1 and 2 step through the changes, 3 and 4 accept or reject the
+/// changes at the selection, 5 and 6 all of them, 7 opens or closes the
+/// comments panel.
+pub(crate) fn review(ui: &AppWindow, shell: &mut Shell, code: i32) {
+    if code == 7 {
+        ui.set_comments_open(!ui.get_comments_open());
+        // The list is made when the panel opens.
+        if let Some(tab) = shell.active_doc() {
+            tab.comments_shown.clear();
+        }
+        sync_flags(ui, shell);
+        ui.invoke_focus_document();
+        return;
+    }
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let view = &mut tab.view;
+    let (done, edits) = match code {
+        0 => {
+            let on = !view.show_markup();
+            (view.set_show_markup(on), true)
+        }
+        1 => (view.previous_change(), false),
+        2 => (view.next_change(), false),
+        3 => (view.accept_changes(), true),
+        4 => (view.reject_changes(), true),
+        5 => (view.accept_all_changes(), true),
+        6 => (view.reject_all_changes(), true),
+        _ => return,
+    };
+    if done {
+        if edits {
+            after_edit(ui, shell);
+        } else {
+            after_move(ui, shell);
+        }
+    }
+    ui.invoke_focus_document();
+}
+
+/// A click on an entry of the comments panel: the comment's text is
+/// selected and shown, and the entry stays marked.
+pub(crate) fn comment_clicked(ui: &AppWindow, shell: &mut Shell, index: i32) {
+    let Some(tab) = shell.active_doc() else {
+        return;
+    };
+    let Some(id) = usize::try_from(index)
+        .ok()
+        .and_then(|i| tab.comments_shown.get(i))
+        .map(|row| row.id)
+    else {
+        return;
+    };
+    tab.comment_current = Some(id);
+    tab.view.go_to_comment(id);
+    after_move(ui, shell);
+    ui.invoke_focus_document();
 }
 
 /// Whether the caret of the Word document in front is in a table.

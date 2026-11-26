@@ -284,6 +284,37 @@ export global Strings {
     in property <string> table-align-center;
     in property <string> table-align-right;
     in property <string> table-delete-table;
+    in property <string> menu-edit-header;
+    in property <string> menu-edit-footer;
+    in property <string> menu-back-to-body;
+    in property <string> menu-page-number;
+    in property <string> story-header;
+    in property <string> story-footer;
+    in property <string> story-footnote;
+    in property <string> story-endnote;
+    in property <string> table-merge;
+    in property <string> table-split;
+    in property <string> table-unmerge;
+    in property <string> split-dialog-title;
+    in property <string> picture-wrap;
+    in property <string> wrap-inline;
+    in property <string> wrap-square;
+    in property <string> wrap-tight;
+    in property <string> wrap-top-bottom;
+    in property <string> wrap-behind;
+    in property <string> wrap-front;
+    in property <string> menu-review;
+    in property <string> review-show-markup;
+    in property <string> review-previous;
+    in property <string> review-next;
+    in property <string> review-accept;
+    in property <string> review-reject;
+    in property <string> review-accept-all;
+    in property <string> review-reject-all;
+    in property <string> review-comments;
+    in property <string> comments-title;
+    in property <string> comments-empty;
+    in property <string> clipboard-picture;
     in property <string> table-dialog-title;
     in property <string> table-rows;
     in property <string> table-columns;
@@ -437,6 +468,18 @@ export struct OutlineItem {
     // Markdown headings have neither.
     expandable: bool,
     expanded: bool,
+}
+
+// One comment of a Word document in the comments panel.
+export struct CommentItem {
+    author: string,
+    // As shown: the day and the time, or empty.
+    date: string,
+    text: string,
+    // The comment's author's colour on the pages.
+    color: color,
+    // The comment the caret or the last click is in.
+    current: bool,
 }
 
 // A value in an autofilter's list, with whether it shows.

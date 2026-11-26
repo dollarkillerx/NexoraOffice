@@ -175,6 +175,18 @@ fn make_bold() -> RunPatch {
 /// exactly its original bytes, and saving the re-read document again changes
 /// nothing. Returns the saved file.
 fn check(source: &[u8], edited: &Document, may_change: &[&str]) -> Vec<u8> {
+    check_except(source, edited, may_change, &[])
+}
+
+/// [`check`], but the paragraphs whose text starts with one of `rewritten`
+/// are not expected to keep their bytes (an edit the model cannot tell from
+/// "as read", such as the size of a picture).
+fn check_except(
+    source: &[u8],
+    edited: &Document,
+    may_change: &[&str],
+    rewritten: &[&str],
+) -> Vec<u8> {
     let saved = save(source.to_vec(), edited).expect("the document saves");
     assert_well_formed(&saved);
     let back = read(&saved);
@@ -240,7 +252,9 @@ fn check(source: &[u8], edited: &Document, may_change: &[&str]) -> Vec<u8> {
     let original = part(source, "word/document.xml");
     let saved_main = part(&saved, "word/document.xml");
     let original_doc = read(source);
-    let untouched = |p: &aster_writer::Paragraph| p.is_as_read();
+    let untouched = |p: &aster_writer::Paragraph| {
+        p.is_as_read() && !rewritten.iter().any(|text| p.text().starts_with(text))
+    };
     for (_, p) in edited.paragraphs() {
         if untouched(p) {
             let range = &p.source.as_ref().unwrap().range;
@@ -1301,4 +1315,924 @@ fn random_edits_save_and_read_back() {
         }
     }
     assert!(skipped < 250, "{skipped} sequences were left out");
+}
+
+// ---------------------------------------------------------------------------
+// Tables, links and pictures made by the editing operations
+// ---------------------------------------------------------------------------
+
+const GRID_STYLES: &str = r#"<w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:tblPr><w:tblCellMar><w:left w:w="108" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>"#;
+
+fn tc(width: u32, props: &str, text: &str) -> String {
+    format!(
+        r#"<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/>{props}</w:tcPr><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#
+    )
+}
+
+/// A paragraph, a table of four rows over three columns (a cell spanning
+/// two columns in row 1, a merge down in the last column of rows 2 and 3),
+/// and a paragraph.
+fn grid_body() -> String {
+    let mut t = String::from(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="6000" w:type="dxa"/><w:tblLayout w:type="fixed"/><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>"#,
+    );
+    t += r#"<w:tr w:rsidR="00A10001">"#;
+    t += &(tc(2000, "", "r0c0") + &tc(2000, "", "r0c1") + &tc(2000, "", "r0c2"));
+    t += "</w:tr>";
+    t += r#"<w:tr w:rsidR="00A10002"><w:trPr><w:cantSplit/></w:trPr>"#;
+    t += &(tc(4000, r#"<w:gridSpan w:val="2"/>"#, "r1 wide") + &tc(2000, "", "r1c2"));
+    t += "</w:tr>";
+    t += r#"<w:tr w:rsidR="00A10003">"#;
+    t += &(tc(2000, "", "r2c0")
+        + &tc(2000, "", "r2c1")
+        + &tc(2000, r#"<w:vMerge w:val="restart"/>"#, "r2c2"));
+    t += "</w:tr>";
+    t += r#"<w:tr w:rsidR="00A10004">"#;
+    t += &(tc(2000, "", "r3c0") + &tc(2000, "", "r3c1") + &tc(2000, r#"<w:vMerge/>"#, ""));
+    t += "</w:tr></w:tbl>";
+    format!(
+        "<w:p><w:r><w:t>before the table</w:t></w:r></w:p>{t}<w:p><w:r><w:t>after the table</w:t></w:r></w:p>"
+    )
+}
+
+fn grid_bytes() -> Vec<u8> {
+    docx_doc::doc(&grid_body()).styles(GRID_STYLES).bytes()
+}
+
+/// The table's block index in the body.
+fn table_index(doc: &Document) -> usize {
+    doc.body
+        .blocks
+        .iter()
+        .position(|b| b.as_table().is_some())
+        .expect("a table")
+}
+
+/// A position in a cell of the first table.
+fn cell_pos(doc: &Document, row: usize, cell: usize) -> Pos {
+    let t = table_index(doc);
+    Pos::new(Path::body(t).cell_block(row, cell, 0), 0)
+}
+
+fn assert_tables_valid(doc: &Document) {
+    for block in &doc.body.blocks {
+        if let Block::Table(t) = block {
+            check_table(t).unwrap();
+        }
+    }
+}
+
+/// The original bytes of row `row` of the table in `bytes`.
+fn row_bytes(bytes: &[u8], row: usize) -> String {
+    let doc = read(bytes);
+    let t = doc.body.blocks[table_index(&doc)].as_table().unwrap();
+    let xml = part(bytes, "word/document.xml");
+    xml[t.rows[row].source.clone().unwrap()].to_owned()
+}
+
+fn table_xml(saved: &[u8]) -> String {
+    let xml = part(saved, "word/document.xml");
+    let start = xml.find("<w:tbl>").unwrap();
+    let end = xml.rfind("</w:tbl>").unwrap() + 8;
+    xml[start..end].to_owned()
+}
+
+fn grid_edit(edit: impl FnOnce(&mut Document)) -> (Vec<u8>, Document, Vec<u8>) {
+    let bytes = grid_bytes();
+    let mut doc = read(&bytes);
+    edit(&mut doc);
+    assert_tables_valid(&doc);
+    let saved = check(&bytes, &doc, &[]);
+    (bytes, doc, saved)
+}
+
+#[test]
+fn rows_added_keep_the_rows_and_the_table_start_as_they_were() {
+    let (bytes, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 1, 0);
+        insert_rows(d, &at, &at, false);
+        let at = cell_pos(d, 0, 0);
+        insert_rows(d, &at, &at, true);
+    });
+    let (before, after_) = (table_xml(&bytes), table_xml(&saved));
+    // The start of the table, up to the first row, is byte for byte.
+    let head = before.find("<w:tr ").unwrap();
+    assert!(after_.starts_with(&before[..head]));
+    for row in 0..4 {
+        assert!(after_.contains(&row_bytes(&bytes, row)), "row {row}");
+    }
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    assert_eq!(t.rows.len(), 6);
+    assert_eq!(t.columns, vec![2000, 2000, 2000]);
+    check_table(t).unwrap();
+}
+
+#[test]
+fn rows_removed_keep_the_other_rows_byte_for_byte() {
+    let (bytes, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 0, 0);
+        delete_rows(d, &at, &at);
+    });
+    let after_ = table_xml(&saved);
+    assert!(!after_.contains("r0c0"));
+    for row in 1..4 {
+        assert!(after_.contains(&row_bytes(&bytes, row)), "row {row}");
+    }
+    let before = table_xml(&bytes);
+    let head = before.find("<w:tr ").unwrap();
+    assert!(after_.starts_with(&before[..head]));
+}
+
+#[test]
+fn removing_the_start_of_a_merge_rewrites_only_the_row_that_becomes_it() {
+    let (bytes, doc, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 2, 0);
+        delete_rows(d, &at, &at);
+    });
+    let t = doc.body.blocks[table_index(&doc)].as_table().unwrap();
+    // The merge had two cells; one is left, an ordinary cell.
+    assert_eq!(t.rows[2].cells[2].merge, aster_writer::VMerge::None);
+    let after_ = table_xml(&saved);
+    assert!(after_.contains(&row_bytes(&bytes, 0)));
+    assert!(after_.contains(&row_bytes(&bytes, 1)));
+    assert!(!after_.contains("w:vMerge"));
+}
+
+#[test]
+fn rows_added_inside_a_merge_stay_in_it() {
+    let (_, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 2, 2);
+        insert_rows(d, &at, &at, false);
+    });
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    assert_eq!(t.rows.len(), 5);
+    let merges: Vec<_> = t
+        .rows
+        .iter()
+        .map(|r| r.cells.last().unwrap().merge)
+        .collect();
+    use aster_writer::VMerge::{Continue, None as No, Start};
+    assert_eq!(merges, [No, No, Start, Continue, Continue]);
+    check_table(t).unwrap();
+}
+
+#[test]
+fn columns_added_keep_the_table_properties_and_the_text_of_the_cells() {
+    let (bytes, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 0, 1);
+        insert_columns(d, &at, &at, false);
+    });
+    let after_ = table_xml(&saved);
+    let before = table_xml(&bytes);
+    // `tblPr` as it was, but for the width that follows the grid.
+    let pr = &before[before.find("<w:tblPr>").unwrap()..before.find("</w:tblPr>").unwrap()];
+    assert!(after_.contains(&pr.replace("w:w=\"6000\"", "w:w=\"8000\"")));
+    assert_eq!(after_.matches("<w:gridCol").count(), 4);
+    // The rows keep their own start tags and properties.
+    assert!(after_.contains(r#"<w:tr w:rsidR="00A10002"><w:trPr><w:cantSplit/></w:trPr>"#));
+    // The paragraphs in the cells are the original bytes.
+    for text in ["r0c0", "r1c2", "r3c1"] {
+        let original = format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>");
+        assert!(after_.contains(&original), "{text}");
+    }
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    assert_eq!(t.columns, vec![2000, 2000, 2000, 2000]);
+    check_table(t).unwrap();
+    // The new column is right of column 1: the wide cell is left of it.
+    assert_eq!(t.rows[1].cells[0].span, 2);
+    assert_eq!(t.rows[1].cells.len(), 3);
+}
+
+#[test]
+fn a_column_through_a_spanning_cell_widens_it_in_the_file() {
+    let (_, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 0, 1);
+        insert_columns(d, &at, &at, true);
+    });
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    assert_eq!(t.rows[1].cells[0].span, 3);
+    check_table(t).unwrap();
+}
+
+#[test]
+fn columns_removed_narrow_spans_and_drop_cells() {
+    let (_, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 0, 1);
+        delete_columns(d, &at, &at);
+    });
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    assert_eq!(t.columns, vec![2000, 2000]);
+    assert_eq!(t.rows[1].cells[0].span, 1);
+    assert_eq!(t.rows[0].cells.len(), 2);
+    check_table(t).unwrap();
+    assert!(table_xml(&saved).contains("<w:tblW w:w=\"4000\" w:type=\"dxa\"/>"));
+}
+
+#[test]
+fn a_deleted_table_leaves_the_rest_untouched() {
+    let (bytes, doc, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 1, 0);
+        delete_table(d, &at);
+    });
+    assert!(doc.body.blocks.iter().all(|b| b.as_table().is_none()));
+    let (before, after_) = (
+        part(&bytes, "word/document.xml"),
+        part(&saved, "word/document.xml"),
+    );
+    assert!(!after_.contains("<w:tbl>"));
+    let cut = before.find("<w:tbl>").unwrap();
+    assert!(after_.starts_with(&before[..cut]));
+    assert!(after_.contains("after the table"));
+}
+
+#[test]
+fn a_new_table_is_written_with_grid_borders_and_cells() {
+    let (bytes, _, saved) = grid_edit(|d| {
+        let at = after(d, "before");
+        insert_table(d, &at, 2, 3, 9_000);
+    });
+    let back = read(&saved);
+    let first = back.body.blocks.iter().find_map(Block::as_table).unwrap();
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.columns, vec![3000, 3000, 3000]);
+    assert_eq!(first.props.style.as_deref(), Some("TableGrid"));
+    assert!(first.rows[0].cells[0].borders.iter().all(Option::is_some));
+    let xml = part(&saved, "word/document.xml");
+    for needle in [
+        "<w:tblStyle w:val=\"TableGrid\"/>",
+        "<w:tblW w:w=\"9000\" w:type=\"dxa\"/>",
+        "<w:tblBorders>",
+        "<w:tcBorders>",
+        "<w:tblGrid><w:gridCol w:w=\"3000\"/>",
+    ] {
+        assert!(xml.contains(needle), "{needle}");
+    }
+    // The old table is as it was.
+    assert!(xml.contains(&table_xml(&bytes)));
+}
+
+#[test]
+fn a_table_in_a_cell_is_nested_and_a_table_in_a_nested_table_too() {
+    let (_, _, saved) = grid_edit(|d| {
+        let at = cell_pos(d, 0, 0);
+        let caret = insert_table(d, &at, 1, 2, 1_800);
+        insert_table(d, &caret, 1, 1, 800);
+    });
+    let back = read(&saved);
+    let outer = back.body.blocks[table_index(&back)].as_table().unwrap();
+    let cell = &outer.rows[0].cells[0];
+    let nested = cell.blocks.iter().find_map(Block::as_table).unwrap();
+    assert_eq!(nested.columns, vec![900, 900]);
+    assert!(
+        nested.rows[0].cells[0]
+            .blocks
+            .iter()
+            .any(|b| b.as_table().is_some())
+    );
+}
+
+#[test]
+fn a_table_edit_that_is_undone_saves_the_file_it_was() {
+    let bytes = grid_bytes();
+    let mut doc = read(&bytes);
+    let before = doc.clone();
+    let at = cell_pos(&doc, 1, 0);
+    insert_rows(&mut doc, &at, &at, false);
+    let mut history = History::default();
+    let sel = Selection::caret(at.clone());
+    history.record(&before, &sel, &sel, None);
+    let (restored, _) = history.undo(&doc).unwrap();
+    assert_eq!(save(bytes.clone(), &restored).unwrap(), bytes);
+}
+
+#[test]
+fn tables_with_merges_and_nesting_survive_row_and_column_edits() {
+    let bytes = sample();
+    let mut doc = read(&bytes);
+    let at = after(&doc, "Merged across");
+    insert_rows(&mut doc, &at, &at, false);
+    let at = after(&doc, "Score");
+    let _ = insert_columns(&mut doc, &at, &at, true);
+    assert_tables_valid(&doc);
+    let saved = save(bytes.clone(), &doc).unwrap();
+    assert_well_formed(&saved);
+    let back = read(&saved);
+    assert_tables_valid(&back);
+    let (a, b) = (
+        doc.body.blocks.iter().find_map(Block::as_table).unwrap(),
+        back.body.blocks.iter().find_map(Block::as_table).unwrap(),
+    );
+    assert_eq!(
+        (a.columns.len(), a.rows.len()),
+        (b.columns.len(), b.rows.len())
+    );
+    for (r, s) in a.rows.iter().zip(&b.rows) {
+        assert_eq!(
+            r.cells
+                .iter()
+                .map(|c| (c.span, c.merge))
+                .collect::<Vec<_>>(),
+            s.cells
+                .iter()
+                .map(|c| (c.span, c.merge))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The nested table was in a cell that was written again: its bytes stay.
+    assert!(part(&saved, "word/document.xml").contains("<w:t>n1</w:t>"));
+}
+
+// -- links -------------------------------------------------------------------
+
+fn plain_link_doc() -> Vec<u8> {
+    docx_doc::doc(
+        r#"<w:p><w:r><w:t xml:space="preserve">see </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>this thing</w:t></w:r><w:r><w:t xml:space="preserve"> now</w:t></w:r></w:p>"#,
+    )
+    .styles(GRID_STYLES)
+    .bytes()
+}
+
+fn target() -> Link {
+    Link {
+        target: "https://example.org/page".to_owned(),
+        tooltip: None,
+    }
+}
+
+#[test]
+fn a_link_added_to_text_that_was_read() {
+    let bytes = plain_link_doc();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "this"), after(&doc, "this thing"));
+    set_link(&mut doc, &from, &to, Some(target()));
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    let xml = paragraph_xml(&saved);
+    assert_eq!(xml.matches("<w:hyperlink").count(), 1);
+    assert!(xml.contains("<w:rStyle w:val=\"Hyperlink\"/>"));
+    // The run keeps its bold and its text.
+    assert!(xml.contains("<w:b/>") && xml.contains("this thing"));
+    let rels = part(&saved, "word/_rels/document.xml.rels");
+    assert!(rels.contains("https://example.org/page") && rels.contains("External"));
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    let linked: Vec<_> = p.runs.iter().filter(|r| r.link.is_some()).collect();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].text, "this thing");
+    assert!(linked[0].look.bold);
+    assert_eq!(linked[0].link.as_deref(), Some(&target()));
+    // The first run is the bytes it was.
+    assert!(xml.contains(r#"<w:p><w:r><w:t xml:space="preserve">see </w:t></w:r><w:hyperlink"#));
+}
+
+#[test]
+fn a_link_added_to_part_of_a_run_splits_it_inside_the_hyperlink() {
+    let bytes = plain_link_doc();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "thing"), after(&doc, "thing"));
+    set_link(&mut doc, &from, &to, Some(target()));
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    let marked: Vec<_> = p
+        .runs
+        .iter()
+        .map(|r| (r.text.as_str(), r.link.is_some()))
+        .collect();
+    assert_eq!(
+        marked,
+        [
+            ("see ", false),
+            ("this ", false),
+            ("thing", true),
+            (" now", false)
+        ]
+    );
+}
+
+fn linked_bytes() -> Vec<u8> {
+    docx_doc::doc(
+        r#"<w:p><w:r><w:t xml:space="preserve">go </w:t></w:r><w:hyperlink r:id="rId9" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/><w:b/></w:rPr><w:t>to the site</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> please</w:t></w:r></w:p>"#,
+    )
+    .styles(GRID_STYLES)
+    .rel("rId9", "hyperlink", "https://example.org/")
+    .bytes()
+}
+
+#[test]
+fn a_link_removed_from_text_that_was_read_leaves_the_text_and_its_formatting() {
+    let bytes = linked_bytes();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "to the"), after(&doc, "site"));
+    set_link(&mut doc, &from, &to, None);
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    let xml = paragraph_xml(&saved);
+    assert!(!xml.contains("hyperlink"), "{xml}");
+    assert!(xml.contains("to the site"));
+    assert!(xml.contains("<w:b/>"));
+    assert!(!xml.contains("Hyperlink"));
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    assert!(p.runs.iter().all(|r| r.link.is_none() && r.style.is_none()));
+    assert!(
+        p.runs
+            .iter()
+            .any(|r| r.look.bold && r.text == "to the site")
+    );
+    assert_eq!(p.text(), "go to the site please");
+}
+
+#[test]
+fn removing_a_link_from_part_of_it_leaves_the_rest_linked() {
+    let bytes = linked_bytes();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "to the"), after(&doc, "to the"));
+    set_link(&mut doc, &from, &to, None);
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    let marked: Vec<_> = p
+        .runs
+        .iter()
+        .map(|r| (r.text.as_str(), r.link.is_some()))
+        .collect();
+    assert_eq!(
+        marked,
+        [
+            ("go ", false),
+            ("to the", false),
+            (" site", true),
+            (" please", false)
+        ]
+    );
+    assert_eq!(paragraph_xml(&saved).matches("<w:hyperlink").count(), 1);
+}
+
+#[test]
+fn a_link_with_another_target_replaces_the_old_one() {
+    let bytes = linked_bytes();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "to the"), after(&doc, "site"));
+    set_link(
+        &mut doc,
+        &from,
+        &to,
+        Some(Link {
+            target: "https://example.net/new".to_owned(),
+            tooltip: Some("new".to_owned()),
+        }),
+    );
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    let link = p.runs.iter().find_map(|r| r.link.clone()).unwrap();
+    assert_eq!(link.target, "https://example.net/new");
+    assert_eq!(link.tooltip.as_deref(), Some("new"));
+    assert_eq!(paragraph_xml(&saved).matches("<w:hyperlink").count(), 1);
+    assert!(paragraph_xml(&saved).contains("w:tooltip=\"new\""));
+}
+
+#[test]
+fn a_link_to_a_bookmark_is_an_anchor_with_no_relationship() {
+    let bytes = plain_link_doc();
+    let mut doc = read(&bytes);
+    let (from, to) = (before(&doc, "this"), after(&doc, "this"));
+    set_link(
+        &mut doc,
+        &from,
+        &to,
+        Some(Link {
+            target: "#chapter_1".to_owned(),
+            tooltip: None,
+        }),
+    );
+    let saved = check(&bytes, &doc, &[]);
+    let xml = paragraph_xml(&saved);
+    assert!(xml.contains("<w:hyperlink w:anchor=\"chapter_1\""));
+    assert!(!xml.contains("r:id"));
+    assert_eq!(
+        part(&saved, "word/_rels/document.xml.rels"),
+        part(&bytes, "word/_rels/document.xml.rels")
+    );
+    let back = read(&saved);
+    let p = back.paragraph(&Path::body(0)).unwrap();
+    assert!(
+        p.runs
+            .iter()
+            .any(|r| r.link.as_ref().is_some_and(|l| l.target == "#chapter_1"))
+    );
+}
+
+#[test]
+fn a_linked_text_inserted_is_one_hyperlink() {
+    let bytes = plain_link_doc();
+    let mut doc = read(&bytes);
+    let at = after(&doc, "see ");
+    insert_link(&mut doc, &at, "HERE", target());
+    let saved = check(&bytes, &doc, &["word/_rels/document.xml.rels"]);
+    assert_eq!(paragraph_xml(&saved).matches("<w:hyperlink").count(), 1);
+    assert!(paragraph_xml(&saved).contains("HERE"));
+}
+
+// -- pictures ----------------------------------------------------------------
+
+fn png_bytes(width: u32, height: u32) -> Arc<[u8]> {
+    Arc::from(docx_sample::png(width, height))
+}
+
+fn jpeg_like() -> Arc<[u8]> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    bytes.extend(b"not really a picture");
+    Arc::from(bytes)
+}
+
+const MEDIA_CHANGES: &[&str] = &[
+    "word/_rels/document.xml.rels",
+    "[Content_Types].xml",
+    "word/media/image1.png",
+    "word/media/image2.png",
+    "word/media/image1.jpeg",
+    "word/media/image3.png",
+    "word/media/image2.jpeg",
+];
+
+fn drawing_sizes(doc: &Document) -> Vec<(i64, i64)> {
+    doc.paragraphs()
+        .iter()
+        .flat_map(|(_, p)| p.runs.iter())
+        .filter_map(|r| match &r.kind {
+            Inline::Drawing(d) => Some(d.size),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_picture_is_stored_once_per_image_and_related() {
+    let bytes = grid_bytes();
+    let mut doc = read(&bytes);
+    let png = png_bytes(4, 3);
+    let at = after(&doc, "before");
+    let end = insert_picture(
+        &mut doc,
+        &at,
+        png.clone(),
+        (914_400, 685_800),
+        Some("a & b".into()),
+    )
+    .unwrap();
+    insert_picture(&mut doc, &end, png.clone(), (100_000, 100_000), None).unwrap();
+    let at = after(&doc, "after the");
+    insert_picture(&mut doc, &at, jpeg_like(), (200_000, 300_000), None).unwrap();
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    let all = parts(&saved);
+    let media: Vec<&String> = all
+        .keys()
+        .filter(|n| n.starts_with("word/media/"))
+        .collect();
+    assert_eq!(media.len(), 2, "{media:?}");
+    assert_eq!(all["word/media/image1.png"], png.to_vec());
+    assert_eq!(all["word/media/image2.jpeg"], jpeg_like().to_vec());
+    let rels = part(&saved, "word/_rels/document.xml.rels");
+    assert_eq!(rels.matches("relationships/image").count(), 2);
+    assert!(rels.contains("Target=\"media/image1.png\""));
+    let types = part(&saved, "[Content_Types].xml");
+    assert!(types.contains("Extension=\"png\"") && types.contains("image/png"));
+    assert!(types.contains("Extension=\"jpeg\"") && types.contains("image/jpeg"));
+    // Read back: the same pictures at the same sizes.
+    let back = read(&saved);
+    assert_eq!(
+        drawing_sizes(&back),
+        [(914_400, 685_800), (100_000, 100_000), (200_000, 300_000)]
+    );
+    let alt: Vec<Option<String>> = back
+        .paragraphs()
+        .iter()
+        .flat_map(|(_, p)| p.runs.iter())
+        .filter_map(|r| match &r.kind {
+            Inline::Drawing(d) => Some(d.alt.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alt[0].as_deref(), Some("a & b"));
+}
+
+#[test]
+fn drawing_namespaces_are_declared_where_the_file_has_none() {
+    // Remove the drawing namespaces from the root: they are added.
+    let bytes = grid_bytes();
+    let mut all = parts(&bytes);
+    let xml = String::from_utf8(all["word/document.xml"].clone()).unwrap();
+    let mut stripped = xml.clone();
+    for ns in [
+        " xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"",
+        " xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"",
+        " xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+    ] {
+        stripped = stripped.replace(ns, "");
+    }
+    assert_ne!(stripped, xml);
+    all.insert("word/document.xml".to_owned(), stripped.into_bytes());
+    let list: Vec<(String, Vec<u8>)> = all.into_iter().collect();
+    let bytes = docx_sample::zip(&list);
+    let mut doc = read(&bytes);
+    let at = after(&doc, "before");
+    insert_picture(&mut doc, &at, png_bytes(2, 2), (10_000, 10_000), None).unwrap();
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    let xml = part(&saved, "word/document.xml");
+    let root = &xml[..xml.find("<w:body>").unwrap()];
+    for ns in ["xmlns:wp=", "xmlns:a=", "xmlns:pic=", "xmlns:r="] {
+        assert!(root.contains(ns), "{ns}");
+    }
+    assert_eq!(drawing_sizes(&read(&saved)), [(10_000, 10_000)]);
+}
+
+#[test]
+fn a_new_drawing_id_does_not_repeat_one_in_the_file() {
+    let bytes = sample();
+    let mut doc = read(&bytes);
+    let at = after(&doc, "Introduction");
+    insert_picture(&mut doc, &at, png_bytes(3, 3), (10_000, 20_000), None).unwrap();
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    let xml = part(&saved, "word/document.xml");
+    let mut ids: Vec<String> = xml
+        .match_indices("<wp:docPr id=\"")
+        .map(|(i, _)| xml[i + 14..].split('"').next().unwrap().to_owned())
+        .collect();
+    let total = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "{ids:?}");
+    // The file's own picture part is not renamed.
+    assert!(parts(&saved).contains_key("word/media/image1.png"));
+    assert!(parts(&saved).contains_key("word/media/image2.png"));
+    let rels = part(&saved, "word/_rels/document.xml.rels");
+    assert!(rels.contains("media/image1.png") && rels.contains("media/image2.png"));
+    // The content type for png was there already: not repeated.
+    let types = part(&saved, "[Content_Types].xml");
+    assert_eq!(types.matches("Extension=\"png\"").count(), 1);
+}
+
+#[test]
+fn a_picture_in_a_table_cell_and_a_cropped_one() {
+    let bytes = grid_bytes();
+    let mut doc = read(&bytes);
+    let at = cell_pos(&doc, 0, 1);
+    let end = insert_picture(&mut doc, &at, png_bytes(5, 5), (50_000, 50_000), None).unwrap();
+    // A crop is set on the model by hand: the operation makes uncropped ones.
+    {
+        let p = doc.paragraph_mut(&end.path).unwrap();
+        if let Inline::Drawing(d) = &mut p.runs[0].kind
+            && let aster_writer::DrawingContent::Picture(pic) = &mut Arc::make_mut(d).content
+        {
+            pic.crop = [0.1, 0.0, 0.25, 0.5];
+        }
+    }
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    let xml = part(&saved, "word/document.xml");
+    assert!(xml.contains("<a:srcRect l=\"10000\" r=\"25000\" b=\"50000\"/>"));
+    let back = read(&saved);
+    let t = back.body.blocks[table_index(&back)].as_table().unwrap();
+    let p = t.rows[0].cells[1].blocks[0].as_paragraph().unwrap();
+    let Inline::Drawing(d) = &p.runs[0].kind else {
+        panic!("a drawing");
+    };
+    let aster_writer::DrawingContent::Picture(pic) = &d.content else {
+        panic!("a picture");
+    };
+    assert_eq!(pic.crop, [0.1, 0.0, 0.25, 0.5]);
+}
+
+#[test]
+fn a_picture_copied_inside_the_document_is_written_again() {
+    let bytes = grid_bytes();
+    let mut doc = read(&bytes);
+    let at = after(&doc, "before");
+    let end = insert_picture(&mut doc, &at, png_bytes(4, 4), (30_000, 30_000), None).unwrap();
+    let blocks = fragment(&doc, &at, &end);
+    let target = after(&doc, "after the");
+    insert_fragment(&mut doc, &target, &blocks);
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    assert_eq!(drawing_sizes(&read(&saved)).len(), 2);
+    assert_eq!(
+        parts(&saved)
+            .keys()
+            .filter(|n| n.starts_with("word/media/"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_picture_read_from_the_file_that_is_resized_keeps_its_bytes() {
+    let bytes = sample();
+    let mut doc = read(&bytes);
+    let (path, offset) = doc
+        .paragraphs()
+        .iter()
+        .find_map(|(path, p)| {
+            let mut at = 0;
+            for run in &p.runs {
+                if let Inline::Drawing(d) = &run.kind
+                    && d.float.is_none()
+                    && matches!(d.content, aster_writer::DrawingContent::Picture(_))
+                {
+                    return Some((path.clone(), at));
+                }
+                at += run.text.len();
+            }
+            None
+        })
+        .expect("an inline picture");
+    resize_drawing(&mut doc, &Pos::new(path, offset), (2_286_000, 1_524_000));
+    let saved = check_except(&bytes, &doc, &[], &["Inline picture"]);
+    let (before_xml, after_xml) = (
+        part(&bytes, "word/document.xml"),
+        part(&saved, "word/document.xml"),
+    );
+    assert_eq!(
+        before_xml.matches("cx=\"1143000\" cy=\"762000\"").count(),
+        2
+    );
+    assert_eq!(
+        after_xml.matches("cx=\"2286000\" cy=\"1524000\"").count(),
+        2
+    );
+    // Nothing else changed: with the sizes put back it is the original.
+    assert_eq!(
+        after_xml.replace(
+            "cx=\"2286000\" cy=\"1524000\"",
+            "cx=\"1143000\" cy=\"762000\""
+        ),
+        before_xml
+    );
+    assert_eq!(
+        parts(&saved)["word/media/image1.png"],
+        parts(&bytes)["word/media/image1.png"]
+    );
+}
+
+#[test]
+fn a_picture_where_the_package_has_other_media_names() {
+    let bytes = sample();
+    let mut all = parts(&bytes);
+    let image = all["word/media/image1.png"].clone();
+    all.insert("word/media/image2.jpg".to_owned(), image);
+    let list: Vec<(String, Vec<u8>)> = all.into_iter().collect();
+    let bytes = docx_sample::zip(&list);
+    let mut doc = read(&bytes);
+    let at = after(&doc, "Introduction");
+    insert_picture(&mut doc, &at, png_bytes(3, 3), (10_000, 20_000), None).unwrap();
+    let saved = check(&bytes, &doc, MEDIA_CHANGES);
+    // image2 is taken (by .jpg): the new one is image3.
+    assert!(parts(&saved).contains_key("word/media/image3.png"));
+}
+
+#[test]
+fn random_table_link_and_picture_edits_save_and_read_back() {
+    let bytes = grid_bytes();
+    for seed in 0..120u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut doc = read(&bytes);
+        let mut log: Vec<String> = Vec::new();
+        for _ in 0..(2 + rng.below(7)) {
+            let a = random_pos(&doc, &mut rng);
+            let b = if rng.below(2) == 0 {
+                a.clone()
+            } else {
+                random_pos(&doc, &mut rng)
+            };
+            match rng.below(12) {
+                0 | 1 => {
+                    let above = rng.below(2) == 0;
+                    log.push(format!("insert_rows {a:?} {b:?} {above}"));
+                    insert_rows(&mut doc, &a, &b, above);
+                }
+                2 | 3 => {
+                    let left = rng.below(2) == 0;
+                    log.push(format!("insert_columns {a:?} {b:?} {left}"));
+                    insert_columns(&mut doc, &a, &b, left);
+                }
+                4 => {
+                    log.push(format!("delete_rows {a:?} {b:?}"));
+                    delete_rows(&mut doc, &a, &b);
+                }
+                5 => {
+                    log.push(format!("delete_columns {a:?} {b:?}"));
+                    delete_columns(&mut doc, &a, &b);
+                }
+                6 => {
+                    log.push(format!("insert_table {a:?}"));
+                    insert_table(&mut doc, &a, 1 + rng.below(3), 1 + rng.below(3), 3_000);
+                }
+                7 => {
+                    if rng.below(3) == 0 {
+                        log.push(format!("delete_table {a:?}"));
+                        delete_table(&mut doc, &a);
+                    }
+                }
+                8 | 9 => {
+                    let link = (rng.below(3) > 0).then(|| Link {
+                        target: ["https://a.example/", "#mark", "https://b.example/?x=1&y=2"]
+                            [rng.below(3)]
+                        .to_owned(),
+                        tooltip: None,
+                    });
+                    log.push(format!("set_link {a:?} {b:?} {link:?}"));
+                    set_link(&mut doc, &a, &b, link);
+                }
+                10 => {
+                    log.push(format!("insert_picture {a:?}"));
+                    let image = if rng.below(2) == 0 {
+                        png_bytes(2, 2)
+                    } else {
+                        jpeg_like()
+                    };
+                    let _ = insert_picture(&mut doc, &a, image, (50_000, 40_000), None);
+                }
+                _ => {
+                    log.push(format!("insert_text {a:?}"));
+                    insert_text(&mut doc, &a, "x y", None);
+                }
+            }
+            assert_tables_valid_deep(&doc);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(&bytes, &doc, MEDIA_AND_RELS)
+        }));
+        if let Err(err) = result {
+            eprintln!("seed {seed} failed: {log:#?}");
+            std::panic::resume_unwind(err);
+        }
+    }
+}
+
+const MEDIA_AND_RELS: &[&str] = &[
+    "word/_rels/document.xml.rels",
+    "[Content_Types].xml",
+    "word/media/image1.png",
+    "word/media/image2.png",
+    "word/media/image1.jpeg",
+    "word/media/image2.jpeg",
+];
+
+fn assert_tables_valid_deep(doc: &Document) {
+    fn walk(blocks: &[Block]) {
+        for block in blocks {
+            if let Block::Table(t) = block {
+                check_table(t).unwrap();
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        walk(&cell.blocks);
+                    }
+                }
+            }
+        }
+    }
+    walk(&doc.body.blocks);
+}
+
+// ---------------------------------------------------------------------------
+// Styles in table cells
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_style_a_paragraph_in_a_cell_has_gives_it_back_what_the_reader_made() {
+    // The reader builds a cell paragraph's base from the document defaults,
+    // the table style (with its conditional formats) and the paragraph style;
+    // applying the paragraph's own style again must find the same.
+    let mut checked = 0;
+    for bytes in [sample(), grid_bytes()] {
+        let doc = read(&bytes);
+        let default_style = doc.styles.default_style.clone();
+        for (path, p) in doc.paragraphs() {
+            if path.in_cell().is_none() {
+                continue;
+            }
+            let Some(style) = p.props.style.clone().or_else(|| default_style.clone()) else {
+                continue;
+            };
+            let mut again = doc.clone();
+            let at = Pos::new(path.clone(), 0);
+            set_style(&mut again, &at, &at, &style);
+            let q = again.paragraph(&path).unwrap();
+            let mut expected = p.props.clone();
+            expected.style = Some(style);
+            // A list a paragraph is on comes from its own numbering, not
+            // from its style.
+            let mut got = q.props.clone();
+            got.list = expected.list;
+            got.indent_left = expected.indent_left;
+            got.first_line = expected.first_line;
+            assert_eq!(got, expected, "{:?}", p.text());
+            assert_eq!(q.base, p.base, "{:?}", p.text());
+            checked += 1;
+        }
+    }
+    assert!(checked > 10, "{checked}");
 }

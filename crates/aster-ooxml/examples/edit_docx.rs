@@ -5,12 +5,94 @@
 //!
 //! The edits: a sentence typed at the end of the first paragraph, the first
 //! words of the second made bold, the third paragraph split in two, and a
-//! bullet list of three items added at the end. `blank` as the input starts
-//! from a new document.
+//! bullet list of three items added at the end; then, in the first table of
+//! the document if it has one, a row and a column added and the last row
+//! removed (its text is gone with it); a link on the first two words of the
+//! first paragraph that has them; a small picture at the end of the first
+//! paragraph; and a table of two rows and three columns after the first
+//! paragraph. `blank` as the input starts from a new document.
 
 use aster_ooxml::docx_save::{blank, save};
-use aster_writer::edit::{ListKind, apply_run_patch, insert_text, set_list, split_paragraph};
-use aster_writer::{Pos, RunPatch};
+use aster_writer::edit::{
+    ListKind, apply_run_patch, delete_rows, insert_columns, insert_picture, insert_rows,
+    insert_table, insert_text, set_link, set_list, split_paragraph,
+};
+use aster_writer::{Block, Link, Path, Pos, RunPatch, paragraphs_of};
+
+/// A small RGB PNG (a gradient), written with stored deflate blocks.
+fn png(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        let mut checked = kind.to_vec();
+        checked.extend(data);
+        out.extend(&checked);
+        out.extend(crc32(&checked).to_be_bytes());
+    }
+    let mut raw = Vec::new();
+    for y in 0..height {
+        raw.push(0);
+        for x in 0..width {
+            raw.extend([
+                (x * 255 / width.max(1)) as u8,
+                (y * 255 / height.max(1)) as u8,
+                160,
+            ]);
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        z.extend((block.len() as u16).to_le_bytes());
+        z.extend((!(block.len() as u16)).to_le_bytes());
+        z.extend(*block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in &raw {
+        a = (a + u32::from(*byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend(((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend(width.to_be_bytes());
+    header.extend(height.to_be_bytes());
+    header.extend([8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &header);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// The start of the first paragraph of the table that is body block `table`.
+fn in_table(
+    document: &aster_writer::Document,
+    table: usize,
+    row: usize,
+    cell: usize,
+) -> Option<Pos> {
+    let t = document.body.blocks.get(table)?.as_table()?;
+    let blocks = &t.rows.get(row)?.cells.get(cell)?.blocks;
+    let (inner, _) = paragraphs_of(blocks).into_iter().next()?;
+    let mut steps = Path::body(table).0;
+    steps.extend([row as u32, cell as u32]);
+    steps.extend(inner.0);
+    Some(Pos::new(Path(steps), 0))
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -72,6 +154,69 @@ fn main() {
         0,
     );
     set_list(&mut document, &start, &at, Some(ListKind::Bullet));
+
+    // The first table: a row and a column added, another row removed.
+    let first_table = document
+        .body
+        .blocks
+        .iter()
+        .position(|b| matches!(b, Block::Table(_)));
+    if let Some(table) = first_table
+        && let Some(at) = in_table(&document, table, 0, 0)
+    {
+        insert_rows(&mut document, &at, &at, false);
+        insert_columns(&mut document, &at, &at, false);
+        let rows = document
+            .body
+            .blocks
+            .get(table)
+            .and_then(Block::as_table)
+            .map_or(0, |t| t.rows.len());
+        if rows > 2
+            && let Some(last) = in_table(&document, table, rows - 1, 0)
+        {
+            delete_rows(&mut document, &last, &last);
+        }
+    }
+
+    // A link on the first two words of the first paragraph with two words.
+    let words = document.paragraphs().into_iter().find_map(|(path, p)| {
+        let text = p.text();
+        let mut spans = text.split_whitespace().map(|w| {
+            let start = w.as_ptr() as usize - text.as_ptr() as usize;
+            (start, start + w.len())
+        });
+        let (first, second) = (spans.next()?, spans.next()?);
+        Some((path, first.0, second.1))
+    });
+    if let Some((path, from, to)) = words {
+        set_link(
+            &mut document,
+            &Pos::new(path.clone(), from),
+            &Pos::new(path, to),
+            Some(Link {
+                target: "https://example.org/".to_owned(),
+                tooltip: None,
+            }),
+        );
+    }
+
+    // A small picture at the end of the first paragraph, and a table after it.
+    let first = document
+        .paragraphs()
+        .first()
+        .map(|(path, p)| (path.clone(), p.len()))
+        .expect("a paragraph");
+    let end = Pos::new(first.0, first.1);
+    let end = insert_picture(
+        &mut document,
+        &end,
+        png(48, 32).into(),
+        (914_400, 609_600),
+        Some("A gradient".to_owned()),
+    )
+    .expect("a PNG is a picture");
+    insert_table(&mut document, &end, 2, 3, 6_000);
 
     let saved = save(source, &document).expect("the document saves");
     std::fs::write(&output, saved).expect("the output file is written");

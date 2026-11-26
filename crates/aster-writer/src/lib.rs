@@ -1183,8 +1183,24 @@ pub struct Cell {
     /// Left, top, right, bottom, final.
     pub margins: [Twips; 4],
     pub align: CellAlign,
+    /// What the table style gives the paragraphs of this cell below their
+    /// own paragraph style; `None` for nothing (the document defaults).
+    /// Style changes in the cell need it to give the same result the reader
+    /// would.
+    pub layer: Option<Arc<CellLayer>>,
     /// The `<w:tc>` element.
     pub source: Option<Range<usize>>,
+}
+
+/// The layer a table style adds between the document defaults and a
+/// paragraph's own style, for the cell it is on (its position in the table
+/// decides which conditional formats of the style apply). Both are final:
+/// document defaults with what the table style sets on top, so what the
+/// style does not set is what the defaults have.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellLayer {
+    pub run: RunLook,
+    pub para: ParaProps,
 }
 
 impl Default for Cell {
@@ -1197,6 +1213,7 @@ impl Default for Cell {
             shading: None,
             margins: [115, 0, 115, 0],
             align: CellAlign::Top,
+            layer: None,
             source: None,
         }
     }

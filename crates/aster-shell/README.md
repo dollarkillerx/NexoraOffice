@@ -922,7 +922,7 @@ Markdown 标签的工具栏按钮和新的“格式”菜单能用了：它们�
 
 | crate | 做什么 | 依赖 |
 | --- | --- | --- |
-| `aster-tools` | 工具目录（15 个工具，各带 JSON Schema 和 MCP 注解）、权限策略、审批接口、审计日志，以及每次调用都走的一条流水线：查工具 → 校验参数 → 找文档 → 判权限 → 需要时问用户 → 执行 → 截断 → 写审计 | `serde_json` |
+| `aster-tools` | 工具目录（21 个工具，各带 JSON Schema 和 MCP 注解）、权限策略、审批接口、审计日志，以及每次调用都走的一条流水线：查工具 → 校验参数 → 找文档 → 判权限 → 需要时问用户 → 执行 → 截断 → 写审计 | `serde_json` |
 | `aster-ai` | 内置助手的引擎：Claude（Messages API）和 OpenAI 兼容接口（OpenAI、DeepSeek、Ollama 之类的自定义地址），流式 HTTPS；最多 25 步的工具调用循环；固定的英文系统提示；发送前遮盖密钥；设置文件和系统钥匙串里的 API Key | `ureq` 3.5（rustls + ring，证书用系统的），`keyring`，`serde_json`，`aster-tools` |
 | `aster-mcp` | MCP 服务：本机套接字上按行分隔的 JSON-RPC，`initialize`、`ping`、`tools/list`、`tools/call`，资源（`resources/list`、`resources/read`、`resources/templates/list`），提示模板（`prompts/list`、`prompts/get`），`notifications/cancelled` | `aster-tools`，`serde_json`，`libc`（只在 Unix） |
 | `aster-mcp-bridge` | 编出 `aster-mcp` 这个程序：stdin/stdout 和套接字之间原样搬字节，不解析 JSON | `aster-mcp` |
@@ -931,7 +931,27 @@ Markdown 标签的工具栏按钮和新的“格式”菜单能用了：它们�
 
 ### 工具
 
-`list_documents`、`read_document`（带行号，长文档分段读）、`get_selection`、`search_document`、`get_outline`、`insert_text`、`replace_selection`、`replace_lines`、`find_and_replace`（支持正则和 `$1` 分组）、`create_document`、`save_document`、`open_file`、`list_folder`，以及表格的 `read_sheet` 和 `write_cells`（见“导出 PDF、表格和更多 AI 功能”一节）。改文字的工具每次调用在编辑器里占一步撤销，和用户自己的编辑一样进崩溃恢复记录、跟着高亮和预览。Markdown 文档和工作簿能读写；演示文稿出现在 `list_documents` 里，但读写会得到“暂不支持”。
+`list_documents`、`read_document`（带行号，长文档分段读）、`get_selection`、`search_document`、`get_outline`、`insert_text`、`replace_selection`、`replace_lines`、`find_and_replace`（支持正则和 `$1` 分组）、`create_document`、`save_document`、`open_file`、`list_folder`，以及表格的 `read_sheet` 和 `write_cells`（见“导出 PDF、表格和更多 AI 功能”一节）。改文字的工具每次调用在编辑器里占一步撤销，和用户自己的编辑一样进崩溃恢复记录、跟着高亮和预览。Markdown 文档、工作簿和 Word 文档能读写（Word 文档用下一小节的工具）；演示文稿出现在 `list_documents` 里，但读写会得到“暂不支持”。
+
+### 助手改 Word 文档
+
+Word 文档的工具在 `src/doc_tools.rs`（不依赖 Slint，有单元测试），照 `sheet_tools.rs` 的样子做：工具少、参数是结构化的、出错时说明哪里不对。内置助手和外部的 MCP 客户端看到的是同一份目录，所以这些工具两边都有，权限和审批也完全一样。
+
+| 工具 | 做什么 |
+| --- | --- |
+| `read_word` | 按“块”读正文。正文是一串块，每块是一个段落或一个表格，从 1 数起。段落给出样式名、文字、列表种类、对齐和链接；表格给出各行各格的文字。长文档用 `start_block` 和 `max_blocks` 分段读，长表格用 `start_row` 和 `max_rows`。结果里还列出文档有哪些段落样式 |
+| `replace_paragraphs` | 把第 `block` 块（到 `end_block`）的文字换成新文字，换行变成多个段落；第一段保留原来的样式和第一个字的字符格式 |
+| `insert_paragraphs` | 在某块之前或之后插入段落，可以指定样式；不指定时和旁边的段落一样（标题后面是正文，列表项接着列表） |
+| `delete_blocks` | 删一块或一段范围的块，包括整张表格；文档总留一个段落 |
+| `find_and_replace` | 原有的工具，Word 文档里按字面查找（不支持正则），包括表格里的文字；可以不区分大小写，`all: false` 或 `limit` 限制次数，返回替换了几处；新文字沿用被替换文字的字符格式 |
+| `format_text` | 整段或某个短语（`phrase`，段内每一处）的粗体、斜体、下划线、删除线、颜色、突出显示、字号、字体、链接；整段的样式（按 `read_word` 里看到的名字）、对齐、项目符号或编号 |
+| `edit_table` | `insert` 用给定的文字新建表格；`set_cell` 改一格的文字；`insert_row`、`delete_row`、`insert_column`、`delete_column` 增删行列 |
+
+地址：块号、行号、格号都从 1 数，格号是这一行里文件列出的第几个格子（合并的格子算一个）。每次调用都按调用那一刻的文档检查地址，越界或过期的地址得到的错误里写着有效的范围。**所有改动都经过标签，和用户自己的编辑一样**：一次调用是一步撤销（用户按 Cmd+Z 就撤掉助手这一次做的），在文档副本上做、做完才放进去，所以中途出错不会改一半；标签变“已修改”，进崩溃恢复记录，工具栏和大纲随之刷新。用户的输入法正在组字时，写入被拒绝，错误里写着稍后再试；读不受影响。
+
+审批和指纹同电子表格的写入工具：级别是“询问”时，卡片先说明要做什么（第几块、原来的文字、要写入的文字或格式清单，八种界面语言），指纹是文档的修订号，用户考虑期间文档有任何改动（包括用户自己打字、撤销），批准作废，调用方收到“文档在你决定期间改变了”。写入工具都按“改文字”走权限，没有放宽。参数里的文字最多 10 万字、2000 段；新建的表格最多 200 行、20 列、2000 格；短语最多 500 字。链接只接受 http、https、mailto 和 `#书签`，不接受 `file:` 之类。审计日志里 `phrase` 和 `link` 和别的文字参数一样只记长度。工具里没有任何读写文件的地方。
+
+不做的：图片和其他对象、页眉页脚、脚注尾注（模型看不到也改不了，工具描述里写明）。含图片、脚注引用、页码域、注音的段落不会被整段替换或删除，查找替换碰到它们的地方跳过并报告跳过了几处；含嵌套表格或图片的单元格不改；删光表格的最后一行或一列也拒绝，要删表格用 `delete_blocks`。保存 Word 文档还不能由助手做。
 
 ### 权限
 
@@ -1759,7 +1779,7 @@ Writer 标签现在是真的 Word 文档：`.docx` 和 `.docm` 文件可以打�
 | 关闭和退出 | 标签标题上有“已修改”的点；关标签、退出时有未保存的更改会问保存、不保存还是取消 |
 | 崩溃恢复 | 同 PowerPoint 标签：有未保存更改的文档每隔几秒把“现在存盘会写出的文件”写进恢复记录（在写线程上做，间隔至少是上一次耗时的五倍、不少于 2 秒），存盘或关闭后记录删除；崩溃后重新启动时问是否恢复，恢复出来的标签是“已修改”，仍指向原文件 |
 | 状态栏 | “第 3 页，共 12 页”、字数和字符数、“DOCX”（或 “DOCM”）、缩放比例；字数在停止输入 0.5 秒后重新数，大文档打字不被拖慢；不再写“只读” |
-| 助手和 MCP | 助手可以读 Word 文档：`read_document`（一段一行）、`search_document`、`get_selection`、`get_outline`；会改文档的工具（替换、插入等）明确拒绝并说明，保存也不行。以前这个类型的标签是纯文本原型，工具不碰它 |
+| 助手和 MCP | 助手可以读和改 Word 文档，见“助手改 Word 文档”一节：`read_word` 按块读，`replace_paragraphs`、`insert_paragraphs`、`delete_blocks`、`find_and_replace`、`format_text`、`edit_table` 改；`read_document`、`search_document`、`get_selection`、`get_outline` 仍可用；保存不行 |
 | 链接、大纲 | 同只读那一步：点链接按 Markdown 预览的规则打开网页和邮件链接；侧边栏大纲随编辑更新，光标所在的标题高亮 |
 
 ### 视图的接口
@@ -1794,7 +1814,7 @@ Writer 标签现在是真的 Word 文档：`.docx` 和 `.docm` 文件可以打�
 - 带格式的复制不含表格；剪贴板里的带格式段落只在程序内有效，粘到别的程序是纯文本。
 - 保存之后撤销历史清空（保存把模型换成从新文件读出来的那份，旧的历史里的位置对不上新文件的字节）。
 - 存盘时整个文档重新读一遍并重新排版（在写线程上读，排版在界面线程上，50 页约 70 ms）。
-- 助手不能改 Word 文档。
+- 助手能改 Word 文档的正文，但不能保存，也不能碰图片、页眉页脚和脚注。
 - “已修改”按修订号判断：改了又撤销回到原样，仍显示已修改。
 - 没有在真的窗口里试过输入法、拖选、剪贴板和所有按钮（见发给测试的清单）。
 

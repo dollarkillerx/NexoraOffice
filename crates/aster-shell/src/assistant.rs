@@ -53,10 +53,10 @@ pub fn run(editor: &mut MarkdownEditor, tool: &str, args: &Value) -> Result<Stri
     }
 }
 
-/// The tools that only read, on a Word document: its text is a line per
-/// paragraph, `selected` what is selected, `headings` its outline. The tools
-/// that change a document refuse: the assistant cannot edit Word documents
-/// yet.
+/// The tools that read the text of a Word document in lines: its text is a
+/// line per paragraph, `selected` what is selected, `headings` its outline.
+/// Block addresses and the changes to Word documents are in `doc_tools`,
+/// which calls this for these four tools.
 pub fn run_on_word(
     text: &str,
     selected: &str,
@@ -73,7 +73,7 @@ pub fn run_on_word(
         }
         "get_outline" => Ok(json!({ "headings": headings }).to_string()),
         other => Err(format!(
-            "`{other}` does not work on a Word document: the assistant can read Word documents but not change them yet"
+            "`{other}` does not work on a Word document: use read_word and the Word editing tools"
         )),
     }
 }
@@ -268,11 +268,14 @@ fn find_and_replace(editor: &mut MarkdownEditor, args: &Value) -> Result<String,
     let whole = editor.document.text().to_string();
     let never = std::sync::atomic::AtomicBool::new(false);
     let found = finder.find_all(&whole, &never, |_| {}).unwrap_or_default();
-    let count = if args["all"].as_bool().unwrap_or(true) {
+    let mut count = if args["all"].as_bool().unwrap_or(true) {
         found.matches.len()
     } else {
         found.matches.len().min(1)
     };
+    if let Some(limit) = args["limit"].as_u64() {
+        count = count.min(limit as usize);
+    }
     let Some((range, replaced)) = finder.replace_all(
         &whole,
         &found.matches[..count],

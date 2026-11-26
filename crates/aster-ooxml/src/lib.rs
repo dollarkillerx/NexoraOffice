@@ -15,6 +15,7 @@
 
 pub mod chart;
 pub mod docx;
+pub mod docx_save;
 pub mod drawingml;
 pub mod error;
 pub mod package;

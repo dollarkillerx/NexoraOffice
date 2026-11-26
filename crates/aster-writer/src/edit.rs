@@ -154,6 +154,19 @@ fn split_run(p: &mut Paragraph, offset: usize) -> usize {
     cut_index(p, offset)
 }
 
+/// Where a new run typed at `offset` goes: at the cut. After a page number
+/// (the result of a field) the field's end is zero-width and comes next;
+/// the new run goes behind it, not into the result.
+fn insert_index(p: &mut Paragraph, offset: usize) -> usize {
+    let mut index = split_run(p, offset);
+    if index > 0 && matches!(p.runs[index - 1].kind, Inline::PageNumber(_)) {
+        while index < p.runs.len() && p.runs[index].text.is_empty() {
+            index += 1;
+        }
+    }
+    index
+}
+
 /// Neighbouring text runs that have the same look and are one run's pieces
 /// (or were both made here) become one again.
 fn merge_runs(p: &mut Paragraph) {
@@ -241,7 +254,7 @@ macro_rules! rebase_fields {
 /// Where a look had what its paragraph's `old` base gave it, it now has what
 /// `new` gives: it was inherited, so it follows. What the run set itself
 /// stays.
-fn rebase_look(look: &mut RunLook, old: &RunLook, new: &RunLook) {
+pub fn rebase_look(look: &mut RunLook, old: &RunLook, new: &RunLook) {
     rebase_fields!(
         look, old, new: font, east_asian_font, size, bold, italic, underline, strike,
         double_strike, color, highlight, shading, position, caps, small_caps, hidden, spacing,
@@ -374,7 +387,7 @@ fn insert_plain(doc: &mut Document, at: &Pos, text: &str, look: Option<&RunLook>
         run.style = p.runs[i].style.clone();
         run.link = p.runs[i].link.clone();
     }
-    let index = split_run(p, offset);
+    let index = insert_index(p, offset);
     p.runs.insert(index, run);
     result
 }
@@ -395,7 +408,7 @@ fn insert_object(doc: &mut Document, at: &Pos, kind: Inline, look: Option<&RunLo
         run.link = p.runs[i].link.clone();
     }
     let size = run.text.len();
-    let index = split_run(p, offset);
+    let index = insert_index(p, offset);
     p.runs.insert(index, run);
     Pos::new(at.path.clone(), offset + size)
 }
@@ -465,9 +478,10 @@ fn split_raw(doc: &mut Document, at: &Pos, next_style: bool) -> Pos {
             .and_then(|id| styles.get(id))
             .filter(|style| style.kind == crate::StyleKind::Paragraph)
     {
+        let old = styles.paragraph_look(p.props.style.as_deref()).1;
         second.props = next.para.clone();
-        second.base = next.run.clone();
-        second.mark = next.run.clone();
+        second.base = rebased(&p.base, old, &next.run, &styles.default_run);
+        second.mark = second.base.clone();
         second.source = None;
     }
     let index = at.path.0.last().copied().unwrap_or(0) as usize;
@@ -761,6 +775,7 @@ pub fn apply_run_patch(doc: &mut Document, from: &Pos, to: &Pos, patch: &RunPatc
     let Some((f, t)) = ends(doc, from, to) else {
         return;
     };
+    let mut marks = false;
     for path in paths_between(doc, &f.path, &t.path) {
         let Some(p) = doc.paragraph(&path) else {
             continue;
@@ -780,6 +795,7 @@ pub fn apply_run_patch(doc: &mut Document, from: &Pos, to: &Pos, patch: &RunPatc
         };
         if mark_changes {
             patch.apply(&mut p.mark);
+            marks = true;
         }
         if run_changes {
             split_run(p, b);
@@ -794,6 +810,10 @@ pub fn apply_run_patch(doc: &mut Document, from: &Pos, to: &Pos, patch: &RunPatc
             }
             merge_runs(p);
         }
+    }
+    // A list label is made from the mark.
+    if marks {
+        doc.renumber();
     }
 }
 
@@ -920,7 +940,7 @@ pub fn set_style(doc: &mut Document, from: &Pos, to: &Pos, style_id: &str) {
     };
     let wanted = |p: &Paragraph| {
         let old = styles.paragraph_look(p.props.style.as_deref()).1;
-        p.props != style.para || rebased(&p.base, old, &style.run) != p.base
+        p.props != style.para || rebased(&p.base, old, &style.run, &styles.default_run) != p.base
     };
     for_paragraphs(
         doc,
@@ -928,7 +948,7 @@ pub fn set_style(doc: &mut Document, from: &Pos, to: &Pos, style_id: &str) {
         to,
         |p| {
             let old = styles.paragraph_look(p.props.style.as_deref()).1.clone();
-            let base = rebased(&p.base, &old, &style.run);
+            let base = rebased(&p.base, &old, &style.run, &styles.default_run);
             for run in &mut p.runs {
                 rebase_look(&mut run.look, &p.base, &base);
             }
@@ -941,9 +961,21 @@ pub fn set_style(doc: &mut Document, from: &Pos, to: &Pos, style_id: &str) {
     doc.renumber();
 }
 
-fn rebased(base: &RunLook, old: &RunLook, new: &RunLook) -> RunLook {
+/// The base look of a paragraph that moves from the style whose look is
+/// `old` to the one whose look is `new`: what it had from the old style
+/// follows; what a table style gave it stays unless the new style sets it
+/// (differs from the document defaults `defaults`).
+fn rebased(base: &RunLook, old: &RunLook, new: &RunLook, defaults: &RunLook) -> RunLook {
     let mut out = base.clone();
-    rebase_look(&mut out, old, new);
+    macro_rules! field {
+        ($($f:ident),+) => {
+            $( if out.$f == old.$f || new.$f != defaults.$f { out.$f = new.$f.clone(); } )+
+        };
+    }
+    field!(
+        font, east_asian_font, size, bold, italic, underline, strike, double_strike, color,
+        highlight, shading, position, caps, small_caps, hidden, spacing, scale, raise
+    );
     out
 }
 
@@ -1182,7 +1214,9 @@ pub fn plain_text(doc: &Document, from: &Pos, to: &Pos) -> String {
 /// The paragraphs of the range as detached copies, for copying inside the
 /// application: the first and last cut to the range. Only the paragraphs of
 /// the container the range starts in are taken; tables are left out in this
-/// version.
+/// version. Drawings, rubies and page numbers keep the source they were read
+/// from: saving the same document can write them again, saving another cannot
+/// and leaves them out.
 pub fn fragment(doc: &Document, from: &Pos, to: &Pos) -> Vec<Block> {
     let Some((f, t)) = ends(doc, from, to) else {
         return Vec::new();
@@ -1203,9 +1237,30 @@ pub fn fragment(doc: &Document, from: &Pos, to: &Pos) -> Vec<Block> {
         if path == f.path {
             remove_range(&mut copy, 0, f.offset);
         }
-        out.push(Block::paragraph(copy.detached()));
+        // What only exists as the bytes of a file (a drawing, a ruby, a page
+        // number) keeps where it came from, so that pasting it into this
+        // document can write those bytes again.
+        let kept: Vec<Option<Arc<crate::RunSource>>> = copy
+            .runs
+            .iter()
+            .filter(|r| !matches!(r.kind, Inline::Marker))
+            .map(|r| r.source.clone().filter(|_| only_in_file(r)))
+            .collect();
+        let mut detached = copy.detached();
+        for (run, source) in detached.runs.iter_mut().zip(kept) {
+            run.source = source;
+        }
+        out.push(Block::paragraph(detached));
     }
     out
+}
+
+/// A run whose content cannot be written again from the model.
+fn only_in_file(run: &Run) -> bool {
+    matches!(
+        run.kind,
+        Inline::Drawing(_) | Inline::Ruby(_) | Inline::PageNumber(_)
+    )
 }
 
 /// Put what [`fragment`] made at `at`; the caret's place after it. One
@@ -1231,12 +1286,25 @@ pub fn insert_fragment(doc: &mut Document, at: &Pos, blocks: &[Block]) -> Pos {
     // The paragraphs between, after the first half.
     let index = first_path.0.last().copied().unwrap_or(0) as usize;
     let mut tail_path = second.path.clone();
+    // Their base look is what their style gives them where they are now
+    // (in a table cell the table style says something too).
+    let styles = doc.styles.clone();
+    let target = doc
+        .paragraph(&first_path)
+        .map(|t| (t.props.style.clone(), t.base.clone()));
     if let Some(siblings) = doc.siblings_mut(&first_path) {
         for (k, p) in middle.iter().enumerate() {
             let mut copy = (*p).clone();
             copy.source = None;
             copy.section = None;
             copy.label = None;
+            if let Some((style, base)) = &target {
+                let old = styles.paragraph_look(style.as_deref()).1;
+                let new = styles.paragraph_look(copy.props.style.as_deref()).1;
+                let moved = rebased(base, old, new, &styles.default_run);
+                rebase_look(&mut copy.mark, &copy.base, &moved);
+                copy.base = moved;
+            }
             siblings.insert(index + 1 + k, Block::paragraph(copy));
         }
         *tail_path.0.last_mut().expect("a path has steps") += middle.len() as u32;
@@ -1260,7 +1328,9 @@ fn insert_runs(doc: &mut Document, at: &Pos, runs: &[Run]) -> Pos {
     let index = split_run(p, offset);
     for (k, run) in runs.iter().enumerate() {
         let mut run = run.clone();
-        run.source = None;
+        if !only_in_file(&run) {
+            run.source = None;
+        }
         p.runs.insert(index + k, run);
     }
     merge_runs(p);
@@ -1389,6 +1459,28 @@ fn seen(p: &Paragraph) -> Vec<Seen<'_>> {
     out
 }
 
+/// The same kind of run; drawings are compared by what they show, and the
+/// text boxes in them by their content.
+fn same_kind(a: &Inline, b: &Inline) -> bool {
+    match (a, b) {
+        (Inline::Drawing(x), Inline::Drawing(y)) => {
+            x.size == y.size
+                && x.float == y.float
+                && x.alt == y.alt
+                && match (&x.content, &y.content) {
+                    (crate::DrawingContent::TextBox(p), crate::DrawingContent::TextBox(q)) => {
+                        p.fill == q.fill
+                            && p.line == q.line
+                            && p.insets == q.insets
+                            && same_blocks(&p.blocks, &q.blocks)
+                    }
+                    (p, q) => p == q,
+                }
+        }
+        _ => a == b,
+    }
+}
+
 fn same_paragraph(a: &Paragraph, b: &Paragraph) -> bool {
     if a.props != b.props
         || a.base != b.base
@@ -1407,7 +1499,7 @@ fn same_paragraph(a: &Paragraph, b: &Paragraph) -> bool {
     x.len() == y.len()
         && x.iter().zip(&y).all(|(m, n)| {
             m.text == n.text
-                && m.kind == n.kind
+                && same_kind(m.kind, n.kind)
                 && m.look == n.look
                 && m.style == n.style
                 && m.link == n.link

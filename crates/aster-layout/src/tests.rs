@@ -1136,6 +1136,31 @@ fn keep_with_next_does_not_reach_into_a_section_on_a_new_page() {
 }
 
 #[test]
+fn a_next_column_section_needs_a_column_left_in_the_section_before() {
+    let build = |before_columns: u32| {
+        let mut before = small();
+        before.columns.count = before_columns;
+        before.columns.space = 400;
+        let mut first = paragraph("one");
+        first.section = Some(Arc::new(before));
+        let mut after = small();
+        after.start = SectionStart::NextColumn;
+        after.columns.count = 2;
+        after.columns.space = 400;
+        let mut document = doc(vec![Block::paragraph(first), pb("two")]);
+        document.last_section = Arc::new(after);
+        lay(&document)
+    };
+    // One column before: there is no next column, so a new page.
+    let layout = build(1);
+    assert_eq!(layout.pages.len(), 2);
+    assert_eq!(page_of(&layout, 1), 1);
+    // Two columns, the text in the first: the new section goes on the page.
+    let layout = build(2);
+    assert_eq!(layout.pages.len(), 1);
+}
+
+#[test]
 fn a_document_grid_rounds_lines_to_whole_pitches() {
     let mut section = small();
     section.grid = Some(DocGrid {

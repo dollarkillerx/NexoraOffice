@@ -409,7 +409,14 @@ impl Flow<'_, '_> {
                 self.col_empty = true;
                 self.prev = None;
             }
-            SectionStart::NextColumn if self.geom.cols.len() > 1 && same_size => {
+            // A column of the page above is left to go on in: when there is
+            // none (the section before is in its last column, or has only
+            // one) the break is a page break.
+            SectionStart::NextColumn
+                if self.geom.cols.len() > 1
+                    && same_size
+                    && self.col + 1 < self.region().cols.len() =>
+            {
                 self.new_column_in_new_region()
             }
             SectionStart::EvenPage | SectionStart::OddPage => {

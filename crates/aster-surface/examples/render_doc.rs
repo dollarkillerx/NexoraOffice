@@ -495,7 +495,7 @@ fn build() -> Document {
     body.push(para(
         vec![
             picture(90.0, 60.0, Some(float)),
-            text("This paragraph has a floating picture anchored at its start and placed at the right margin; the text continues below it (no text beside a picture in this version). 浮动图片在段落开头锚定。", &l),
+            text("This paragraph has a floating picture anchored at its start and placed at the right margin; the text runs beside it and goes back to the full width below it, the way Word wraps text around a square picture, and the next paragraph keeps clear of it too. 浮动图片在段落开头锚定，文字绕到图片的左边。", &l),
         ],
         props(),
     ));

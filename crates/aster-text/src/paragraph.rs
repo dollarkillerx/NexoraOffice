@@ -292,6 +292,44 @@ pub struct Extra<'a> {
     /// A line break at the very end of the text is followed by an empty line
     /// to put the caret on.
     pub trailing_line: bool,
+    /// Lines that give way to something beside or across the paragraph (a
+    /// floating picture the text flows around). `None`: every line is as
+    /// wide as the paragraph. Needs `Spec::width`.
+    pub flow: Option<Flow<'a>>,
+}
+
+/// Where a line is about to go, for [`Flow`]: its top and estimated height,
+/// and the stretch the paragraph allows it, from `left` to `right`. All in
+/// the paragraph's own coordinates (scaled like the rest of the layout).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Band {
+    pub top: f32,
+    pub height: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
+/// What of a [`Band`] is free: a stretch inside it (empty when nothing is),
+/// and `below`, the lowest edge of what was in the way. A line that does not
+/// get room for a word is moved down to `below`; it is only looked at where
+/// the stretch is narrower than the band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slot {
+    pub left: f32,
+    pub right: f32,
+    pub below: f32,
+}
+
+/// Answers, for the place a line may go, where it can be. The paragraph asks
+/// again with the height the line really has when that differs from the
+/// estimate, so the answer must not depend on anything but the band.
+#[derive(Clone, Copy)]
+pub struct Flow<'a>(pub &'a dyn Fn(Band) -> Slot);
+
+impl std::fmt::Debug for Flow<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Flow(..)")
+    }
 }
 
 impl Default for Extra<'_> {
@@ -314,6 +352,7 @@ impl Default for Extra<'_> {
             distribute: false,
             snap: true,
             trailing_line: false,
+            flow: None,
         }
     }
 }
@@ -798,8 +837,6 @@ impl Shaper {
         };
         let mut options = spec.rules.options(max_width);
         options.distribute = extra.distribute;
-        let broken = breaker::break_lines_shaped(&clusters, options, &shape);
-
         let mut paragraph = Paragraph {
             text: text.to_owned(),
             clusters,
@@ -808,7 +845,7 @@ impl Shaper {
             glyphs,
             styles,
             decor: extra.decor.to_vec(),
-            lines: Vec::with_capacity(broken.len()),
+            lines: Vec::new(),
             height: 0.0,
             width: 0.0,
             scale,
@@ -817,78 +854,107 @@ impl Shaper {
         let round = |value: f32| if snap { value.round() } else { value };
         let rule = extra.line;
         let grid = extra.grid.filter(|pitch| *pitch > 0.0).map(|p| p * scale);
-        let ends_in_break = broken.last().is_some_and(|line| {
-            line.kind == BreakKind::Hard && line.clusters.end == paragraph.clusters.len()
-        });
         let line_factor = spec.line_height;
-        let mut top = 0.0;
         // The paragraph mark sits at the end of the last line and counts in
         // its height.
         let mark = match &extra.mark {
             Some(mark) if !text.is_empty() => self.probe_style(spec, &mark.style, mark.natural),
             _ => None,
         };
+        // The height of a line and where its baseline is.
+        let measure =
+            |paragraph: &Paragraph, line: &breaker::Line, with_mark: bool| -> (f32, f32) {
+                let (mut ascent, mut descent, mut size) = (0.0f32, 0.0f32, 0.0f32);
+                let (mut leading, mut up, mut down, mut object) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for index in line.clusters.clone() {
+                    let look = &paragraph.looks[index];
+                    let style = &paragraph.styles[look.style];
+                    size = size.max(style.size * scale);
+                    if let Some([_, height]) = look.object {
+                        object = object.max(height);
+                    }
+                    if let Some(face) = look.face.map(|f| &paragraph.faces[f]) {
+                        let at = paragraph.clusters[index].text.start;
+                        let after = extra.natural.partition_point(|n| n.range.start <= at);
+                        let target = after
+                            .checked_sub(1)
+                            .map(|i| &extra.natural[i])
+                            .filter(|n| n.range.contains(&at))
+                            .map(|n| n.ratio * style.size * scale);
+                        let (fa, fd, fl) =
+                            scaled_metrics((face.ascent, face.descent, face.leading), target);
+                        let above_at = extra.above.partition_point(|n| n.range.start <= at);
+                        let room = above_at
+                            .checked_sub(1)
+                            .map(|i| &extra.above[i])
+                            .filter(|n| n.range.contains(&at))
+                            .map_or(0.0, |n| n.height * scale);
+                        ascent = ascent.max(fa);
+                        descent = descent.max(fd);
+                        leading = leading.max(fl);
+                        let rise = style.rise * scale;
+                        up = up.max(fa + rise + room);
+                        down = down.max(fd - rise);
+                    }
+                }
+                if let Some((ma, md, ml)) = mark
+                    && with_mark
+                {
+                    ascent = ascent.max(ma);
+                    descent = descent.max(md);
+                    leading = leading.max(ml);
+                    up = up.max(ma);
+                    down = down.max(md);
+                }
+                if size == 0.0 {
+                    size = spec.base.size * scale;
+                }
+                if ascent == 0.0 && descent == 0.0 {
+                    ascent = size * 0.8;
+                    descent = size * 0.2;
+                    (up, down) = (ascent, descent);
+                }
+                if matches!(rule, LineRule::Legacy) {
+                    let ascent = ascent.max(object);
+                    let height = round((size * line_factor).max(ascent + descent));
+                    let baseline = round((height - (ascent + descent)) / 2.0 + ascent);
+                    grid_fit(grid, height, baseline)
+                } else {
+                    line_extent(rule, grid, round, up.max(object), down, leading, scale, up)
+                }
+            };
+        let first_indent = extra.first_line * scale;
+        let (broken, places) = match (extra.flow, spec.width) {
+            (Some(flow), Some(container)) => {
+                let (lines, places) = flow_lines(
+                    &paragraph,
+                    options,
+                    &shape,
+                    flow,
+                    (container, first_indent, spec.base.size * scale * 1.2),
+                    &measure,
+                );
+                (lines, Some(places))
+            }
+            _ => (
+                breaker::break_lines_shaped(&paragraph.clusters, options, &shape),
+                None,
+            ),
+        };
+        let ends_in_break = broken.last().is_some_and(|line| {
+            line.kind == BreakKind::Hard && line.clusters.end == paragraph.clusters.len()
+        });
+        let mut top = 0.0;
         let last_line = broken.len().saturating_sub(1);
         for (line_number, line) in broken.into_iter().enumerate() {
-            let (mut ascent, mut descent, mut size) = (0.0f32, 0.0f32, 0.0f32);
-            let (mut leading, mut up, mut down, mut object) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for index in line.clusters.clone() {
-                let look = &paragraph.looks[index];
-                let style = &paragraph.styles[look.style];
-                size = size.max(style.size * scale);
-                if let Some([_, height]) = look.object {
-                    object = object.max(height);
-                }
-                if let Some(face) = look.face.map(|f| &paragraph.faces[f]) {
-                    let at = paragraph.clusters[index].text.start;
-                    let after = extra.natural.partition_point(|n| n.range.start <= at);
-                    let target = after
-                        .checked_sub(1)
-                        .map(|i| &extra.natural[i])
-                        .filter(|n| n.range.contains(&at))
-                        .map(|n| n.ratio * style.size * scale);
-                    let (fa, fd, fl) =
-                        scaled_metrics((face.ascent, face.descent, face.leading), target);
-                    let above_at = extra.above.partition_point(|n| n.range.start <= at);
-                    let room = above_at
-                        .checked_sub(1)
-                        .map(|i| &extra.above[i])
-                        .filter(|n| n.range.contains(&at))
-                        .map_or(0.0, |n| n.height * scale);
-                    ascent = ascent.max(fa);
-                    descent = descent.max(fd);
-                    leading = leading.max(fl);
-                    let rise = style.rise * scale;
-                    up = up.max(fa + rise + room);
-                    down = down.max(fd - rise);
-                }
+            let (height, baseline) = measure(
+                &paragraph,
+                &line,
+                line_number == last_line && !ends_in_break,
+            );
+            if let Some(places) = &places {
+                top = places[line_number].top;
             }
-            if let Some((ma, md, ml)) = mark
-                && line_number == last_line
-                && !ends_in_break
-            {
-                ascent = ascent.max(ma);
-                descent = descent.max(md);
-                leading = leading.max(ml);
-                up = up.max(ma);
-                down = down.max(md);
-            }
-            if size == 0.0 {
-                size = spec.base.size * scale;
-            }
-            if ascent == 0.0 && descent == 0.0 {
-                ascent = size * 0.8;
-                descent = size * 0.2;
-                (up, down) = (ascent, descent);
-            }
-            let (height, baseline) = if matches!(rule, LineRule::Legacy) {
-                let ascent = ascent.max(object);
-                let height = round((size * line_factor).max(ascent + descent));
-                let baseline = round((height - (ascent + descent)) / 2.0 + ascent);
-                grid_fit(grid, height, baseline)
-            } else {
-                line_extent(rule, grid, round, up.max(object), down, leading, scale, up)
-            };
             let width = from_fx(line.width);
             paragraph.width = paragraph.width.max(width);
             paragraph.lines.push(LineBox {
@@ -939,10 +1005,14 @@ impl Shaper {
         }
         paragraph.height = top;
         let container = spec.width.unwrap_or(paragraph.width);
-        let first_indent = extra.first_line * scale;
         for (n, line) in paragraph.lines.iter_mut().enumerate() {
-            let indent = if n == 0 { first_indent } else { 0.0 };
-            let room = container - indent;
+            // A line runs from `indent` to `end`: the paragraph's width,
+            // or the stretch a flowing line was given.
+            let (indent, end) = match places.as_ref().and_then(|p| p.get(n)) {
+                Some(place) => (place.left, place.right),
+                None => (if n == 0 { first_indent } else { 0.0 }, container),
+            };
+            let room = end - indent;
             line.left = indent
                 + match spec.align {
                     Align::Start => 0.0,
@@ -952,6 +1022,96 @@ impl Shaper {
         }
         paragraph
     }
+}
+
+/// Where a line of a flowing paragraph is: its top, and the stretch it has.
+struct Place {
+    top: f32,
+    left: f32,
+    right: f32,
+}
+
+/// Break a paragraph whose lines give way to something: each line is given
+/// the widest free stretch at the height it ends up at (its height is not
+/// known before it is broken, so it is asked for with an estimate and again
+/// with the real one). A line that cannot hold a word where it is goes down
+/// to below what is in the way, which leaves a gap above it.
+/// `size` is the paragraph's width, the first line's start and the first
+/// estimate of a line's height.
+fn flow_lines(
+    paragraph: &Paragraph,
+    options: Options,
+    shape: &Shape<'_>,
+    flow: Flow<'_>,
+    size: (f32, f32, f32),
+    measure: &dyn Fn(&Paragraph, &breaker::Line, bool) -> (f32, f32),
+) -> (Vec<breaker::Line>, Vec<Place>) {
+    const EPS: f32 = 0.01;
+    let (container, first, estimate) = size;
+    let clusters = &paragraph.clusters;
+    let count = clusters.len();
+    let tabbed = breaker::has_tabs_to_resolve(clusters, shape);
+    let mut lines: Vec<breaker::Line> = Vec::new();
+    let mut places = Vec::new();
+    let (mut start, mut top, mut guess) = (0, 0.0f32, estimate);
+    let mut moved = 0;
+    while start < count {
+        let base = if lines.is_empty() { first } else { 0.0 };
+        let mut tries = 0;
+        let (line, place, height) = loop {
+            tries += 1;
+            let asked = Band {
+                top,
+                height: guess,
+                left: base,
+                right: container,
+            };
+            let slot = (flow.0)(asked);
+            let mut left = slot.left.max(base).min(container);
+            let mut right = slot.right.min(container).max(left);
+            let narrowed = right - left < container - base - EPS;
+            let can_move = slot.below > top + EPS && moved < 200;
+            if right - left < 0.5 {
+                if can_move {
+                    top = slot.below;
+                    moved += 1;
+                    continue;
+                }
+                (left, right) = (base, container);
+            }
+            let line = breaker::break_line(
+                clusters,
+                options,
+                shape,
+                tabbed,
+                start,
+                to_fx(left),
+                to_fx(right),
+            );
+            // Not even a word fits beside the thing: below it.
+            if narrowed && line.kind == BreakKind::Emergency && can_move {
+                top = slot.below;
+                moved += 1;
+                continue;
+            }
+            let last = line.clusters.end == count;
+            let (height, _) = measure(paragraph, &line, last && line.kind != BreakKind::Hard);
+            if tries < 4 && (height - guess).abs() > EPS {
+                let truth = (flow.0)(Band { height, ..asked });
+                if (truth.left - slot.left).abs() > EPS || (truth.right - slot.right).abs() > EPS {
+                    guess = height;
+                    continue;
+                }
+            }
+            break (line, Place { top, left, right }, height);
+        };
+        start = line.clusters.end;
+        guess = height;
+        top += height;
+        lines.push(line);
+        places.push(place);
+    }
+    (lines, places)
 }
 
 /// Ascent, descent and line gap scaled so that they add up to `target`.
@@ -1788,6 +1948,110 @@ mod extra_tests {
         let b = shaper.lay_out_with(&spec(text, Some(120.0)), &Extra::default());
         assert_eq!(a.line_ranges(), b.line_ranges());
         assert_eq!(a.height(), b.height());
+    }
+
+    #[test]
+    fn a_flow_that_leaves_everything_free_changes_nothing() {
+        let mut shaper = Shaper::new();
+        let text = "Some words to wrap over a few lines of text, and a few more of them.";
+        let free = |band: Band| Slot {
+            left: band.left,
+            right: band.right,
+            below: band.top,
+        };
+        let a = shaper.lay_out_with(&spec(text, Some(120.0)), &fine());
+        let b = shaper.lay_out_with(
+            &spec(text, Some(120.0)),
+            &Extra {
+                flow: Some(Flow(&free)),
+                ..fine()
+            },
+        );
+        assert_eq!(a.lines().len(), b.lines().len());
+        for (x, y) in a.lines().iter().zip(b.lines()) {
+            assert_eq!((x.top, x.height, x.left), (y.top, y.height, y.left));
+            assert_eq!(x.clusters, y.clusters);
+        }
+    }
+
+    #[test]
+    fn lines_beside_something_are_shorter_and_shifted() {
+        let mut shaper = Shaper::new();
+        let text = "Some words to wrap over a few lines of text, and a few more of them, \
+                    so that there is enough to run past the thing on the left.";
+        // The left 60 points are taken down to y = 40.
+        let beside = |band: Band| {
+            if band.top < 40.0 {
+                Slot {
+                    left: band.left.max(60.0),
+                    right: band.right,
+                    below: 40.0,
+                }
+            } else {
+                Slot {
+                    left: band.left,
+                    right: band.right,
+                    below: band.top,
+                }
+            }
+        };
+        let p = shaper.lay_out_with(
+            &spec(text, Some(200.0)),
+            &Extra {
+                flow: Some(Flow(&beside)),
+                ..fine()
+            },
+        );
+        let lines = p.lines();
+        assert!(lines.len() > 3);
+        for line in lines {
+            if line.top < 40.0 {
+                assert!(line.left >= 60.0, "{}", line.left);
+                assert!(line.left + line.width <= 200.5);
+            } else {
+                assert_eq!(line.left, 0.0);
+            }
+        }
+        // Lines are in order and keep their text.
+        let total: usize = lines.iter().map(|l| l.clusters.len()).sum();
+        assert_eq!(total, text.chars().count());
+        // A click and a caret agree on a shifted line.
+        let (line, x) = p.caret(3);
+        assert_eq!(line, 0);
+        assert!(x >= 60.0);
+        assert_eq!(p.hit(x + 0.1, lines[0].top + 1.0), 3);
+    }
+
+    #[test]
+    fn a_line_with_no_room_for_a_word_goes_below() {
+        let mut shaper = Shaper::new();
+        let text = "Wonderful words";
+        // Only 10 points are left beside the thing, down to y = 50.
+        let narrow = |band: Band| {
+            if band.top < 50.0 {
+                Slot {
+                    left: band.left,
+                    right: band.left + 10.0,
+                    below: 50.0,
+                }
+            } else {
+                Slot {
+                    left: band.left,
+                    right: band.right,
+                    below: band.top,
+                }
+            }
+        };
+        let p = shaper.lay_out_with(
+            &spec(text, Some(300.0)),
+            &Extra {
+                flow: Some(Flow(&narrow)),
+                ..fine()
+            },
+        );
+        assert_eq!(p.lines()[0].top, 50.0);
+        assert_eq!(p.lines().len(), 1);
+        assert!(p.height() > 50.0);
     }
 
     #[test]

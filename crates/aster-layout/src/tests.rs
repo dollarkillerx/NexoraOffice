@@ -1188,7 +1188,7 @@ fn floating_drawings_push_text_down_unless_they_do_not_wrap() {
         ];
         doc(vec![Block::paragraph(p), pb("after")])
     };
-    let wrapped = lay(&build(Wrap::Square, false));
+    let wrapped = lay(&build(Wrap::TopAndBottom, false));
     assert!(caret_top(&wrapped, 0, 3) >= 20.0 + 50.0 - 0.01);
     assert!(
         wrapped.pages[0]
@@ -2158,4 +2158,337 @@ fn automatic_spacing_of_neighbours_does_not_add_up() {
     let base = gap(0, 0);
     assert!((gap(280, 280) - base - 14.0).abs() < 0.01);
     assert!((gap(200, 280) - base - 24.0).abs() < 0.01);
+}
+
+// ---------------------------------------------------------------------------
+// Text beside floating drawings
+// ---------------------------------------------------------------------------
+
+const WORDS: &str = "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly and \
+pack my box with five dozen liquor jugs, so that there is plenty of text to run past the picture. ";
+
+fn words(times: usize) -> String {
+    WORDS.repeat(times)
+}
+
+/// A picture wrapped as `wrap` at `x` from the margin and `y` points from
+/// the top of its paragraph, keeping `distance` points clear.
+fn beside(x: FloatAt, y: i64, wrap: Wrap, distance: i64) -> Float {
+    Float {
+        x: FloatAxis {
+            from: FloatFrom::Margin,
+            at: x,
+        },
+        y: FloatAxis {
+            from: FloatFrom::Paragraph,
+            at: FloatAt::Offset(y * 12_700),
+        },
+        wrap,
+        behind: false,
+        distance: [distance * 12_700; 4],
+    }
+}
+
+/// Left edge, top and right edge of the lines of a block, on its page.
+fn line_boxes(layout: &Layout, block: usize) -> Vec<(f32, f32, f32)> {
+    let path = Path::body(block);
+    let mut out = Vec::new();
+    for frag in layout.frags.iter().filter(|f| f.path == path && !f.repeat) {
+        let lines = frag.shaped.paragraph.lines();
+        for line in &lines[frag.lines.clone()] {
+            out.push((
+                frag.x + line.left,
+                frag.y + line.top,
+                frag.x + line.left + line.width,
+            ));
+        }
+    }
+    out
+}
+
+fn floated(float: Float, w: f64, h: f64, blocks_after: Vec<Block>) -> Document {
+    floated_n(3, float, w, h, blocks_after)
+}
+
+fn floated_n(times: usize, float: Float, w: f64, h: f64, blocks_after: Vec<Block>) -> Document {
+    let mut p = paragraph("");
+    p.runs = vec![picture(w, h, Some(float)), Run::text(words(times), look())];
+    let mut blocks = vec![Block::paragraph(p)];
+    blocks.extend(blocks_after);
+    doc(blocks)
+}
+
+#[test]
+fn text_flows_beside_a_square_picture_and_then_under_it() {
+    let layout = lay(&floated(
+        beside(FloatAt::Start, 0, Wrap::Square, 0),
+        50.0,
+        50.0,
+        vec![],
+    ));
+    let lines = line_boxes(&layout, 0);
+    assert!(lines.len() > 6, "{}", lines.len());
+    let (mut beside_count, mut under_count) = (0, 0);
+    for (x0, top, x1) in &lines {
+        if *top < 70.0 - 0.01 {
+            assert!(*x0 >= 70.0 - 0.01, "x {x0} at {top}");
+            beside_count += 1;
+        } else {
+            assert!((x0 - 20.0).abs() < 0.01, "x {x0} at {top}");
+            under_count += 1;
+        }
+        assert!(*x1 <= 280.5);
+    }
+    assert!(beside_count >= 3 && under_count >= 2);
+    // The first line is where the paragraph starts.
+    assert!((lines[0].1 - 20.0).abs() < 0.01);
+    // The picture is where it was put.
+    assert!(
+        layout.pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Picture(p) if p.rect.x0 == 20.0 && p.rect.y0 == 20.0))
+    );
+}
+
+#[test]
+fn a_picture_on_the_right_shortens_lines_from_the_right_and_distance_is_kept() {
+    let layout = lay(&floated(
+        beside(FloatAt::End, 0, Wrap::Square, 10),
+        50.0,
+        30.0,
+        vec![],
+    ));
+    // The picture is 230..280 and keeps 10 points clear all round.
+    for (x0, top, x1) in line_boxes(&layout, 0) {
+        if top < 20.0 + 30.0 + 10.0 - 0.01 {
+            assert!(x1 <= 220.0 + 0.01, "right {x1} at {top}");
+        }
+        assert!((x0 - 20.0).abs() < 0.01);
+    }
+}
+
+#[test]
+fn a_float_pushes_the_lines_of_the_paragraphs_after_its_own() {
+    let mut anchor = paragraph("");
+    anchor.runs = vec![
+        picture(60.0, 90.0, Some(beside(FloatAt::Start, 0, Wrap::Tight, 0))),
+        Run::text("Short.", look()),
+    ];
+    let layout = lay(&doc(vec![
+        Block::paragraph(anchor),
+        pb(&words(2)),
+        pb(&words(1)),
+    ]));
+    // 20..110 is taken at the left: Tight uses the bounding box.
+    let first = line_boxes(&layout, 0);
+    assert!(first[0].0 >= 80.0 - 0.01);
+    let second = line_boxes(&layout, 1);
+    assert!(second[0].0 >= 80.0 - 0.01);
+    assert!(second.iter().any(|(x, _, _)| (*x - 20.0).abs() < 0.01));
+    for (x0, top, _) in &second {
+        assert_eq!(*x0 >= 80.0 - 0.01, *top < 110.0 - 0.01, "{x0} {top}");
+    }
+    // The paragraph below it all is not affected.
+    for (x0, _, _) in line_boxes(&layout, 2) {
+        assert!((x0 - 20.0).abs() < 0.01);
+    }
+}
+
+#[test]
+fn text_takes_the_wider_side_of_a_picture_in_the_middle() {
+    // The picture is 120..170 of a column 20..280 wide: 100 on the left, 110
+    // on the right.
+    let layout = lay(&floated(
+        beside(FloatAt::Offset(100 * 12_700), 0, Wrap::Square, 0),
+        50.0,
+        40.0,
+        vec![],
+    ));
+    for (x0, top, x1) in line_boxes(&layout, 0) {
+        if top < 60.0 - 0.01 {
+            assert!(x0 >= 170.0 - 0.01, "{x0}");
+            assert!(x1 <= 280.5);
+        }
+    }
+    // Moved nearer to the right edge, the left side is the wider.
+    let layout = lay(&floated(
+        beside(FloatAt::Offset(150 * 12_700), 0, Wrap::Square, 0),
+        50.0,
+        40.0,
+        vec![],
+    ));
+    for (x0, top, x1) in line_boxes(&layout, 0) {
+        if top < 60.0 - 0.01 {
+            assert!((x0 - 20.0).abs() < 0.01);
+            assert!(x1 <= 170.0 + 0.01, "{x1}");
+        }
+    }
+}
+
+#[test]
+fn lines_with_no_room_for_a_word_skip_below_the_picture() {
+    // 250 of 260 points are taken: nothing fits beside it.
+    let layout = lay(&floated(
+        beside(FloatAt::Start, 0, Wrap::Square, 0),
+        250.0,
+        40.0,
+        vec![],
+    ));
+    let lines = line_boxes(&layout, 0);
+    assert!(lines[0].1 >= 60.0 - 0.01, "{}", lines[0].1);
+    assert!((lines[0].0 - 20.0).abs() < 0.01);
+}
+
+#[test]
+fn top_and_bottom_and_none_are_as_they_were() {
+    let layout = lay(&floated(
+        beside(FloatAt::Start, 0, Wrap::TopAndBottom, 0),
+        50.0,
+        50.0,
+        vec![],
+    ));
+    let lines = line_boxes(&layout, 0);
+    assert!(lines[0].1 >= 70.0 - 0.01);
+    assert!(lines.iter().all(|(x, _, _)| (*x - 20.0).abs() < 0.01));
+    let layout = lay(&floated(
+        beside(FloatAt::Start, 0, Wrap::None, 0),
+        50.0,
+        50.0,
+        vec![],
+    ));
+    let lines = line_boxes(&layout, 0);
+    assert!((lines[0].1 - 20.0).abs() < 0.01);
+    assert!(lines.iter().all(|(x, _, _)| (*x - 20.0).abs() < 0.01));
+}
+
+#[test]
+fn a_float_does_not_hold_text_on_the_next_page() {
+    // The picture sits near the bottom of the first page; the paragraph runs
+    // on to the second, where nothing is in the way.
+    let layout = lay(&floated_n(
+        5,
+        beside(FloatAt::Start, 130, Wrap::Square, 0),
+        60.0,
+        40.0,
+        vec![pb(&words(6))],
+    ));
+    assert!(layout.pages.len() >= 2);
+    let mut seen_beside = false;
+    for frag in layout.frags.iter().filter(|f| f.path == Path::body(0)) {
+        let lines = frag.shaped.paragraph.lines();
+        for line in &lines[frag.lines.clone()] {
+            let (x, top) = (frag.x + line.left, frag.y + line.top);
+            if x > 21.0 {
+                // Only lines that reach into the picture's 150..190 move.
+                assert!(
+                    frag.page == 0 && top + 8.0 > 150.0 && top < 190.0,
+                    "{x} {top}"
+                );
+                assert!(x >= 80.0 - 0.01, "{x} {top}");
+                seen_beside = true;
+            } else {
+                assert!((x - 20.0).abs() < 0.01);
+                assert!(frag.page > 0 || top + 12.0 <= 150.0 + 0.01 || top >= 189.0);
+            }
+        }
+    }
+    assert!(seen_beside);
+}
+
+/// The place in the body paragraph of `frag` for a byte offset of its shaped
+/// text (these paragraphs have no label or notes).
+fn shaped_pos(frag: &crate::cx::Frag, offset: usize) -> Pos {
+    Pos::new(frag.path.clone(), frag.shaped.to_orig(offset))
+}
+
+#[test]
+fn queries_are_right_on_lines_beside_a_picture() {
+    let layout = lay(&floated(
+        beside(FloatAt::Start, 0, Wrap::Square, 0),
+        50.0,
+        50.0,
+        vec![pb("tail")],
+    ));
+    let lines = line_boxes(&layout, 0);
+    let frag = layout
+        .frags
+        .iter()
+        .find(|f| f.path == Path::body(0))
+        .unwrap();
+    let paragraph = &frag.shaped.paragraph;
+    let ranges = paragraph.line_ranges();
+    assert!(lines[0].0 >= 70.0 - 0.01 && lines.last().unwrap().0 < 21.0);
+    // Where the line starts, the caret is at the line's left edge, and a
+    // click there comes back to the same place.
+    for n in [0usize, 1, lines.len() - 1] {
+        let start = shaped_pos(frag, ranges[n].start);
+        let caret = layout.caret(&start).unwrap();
+        assert!((caret.x - lines[n].0).abs() < 0.01, "{n}: {caret:?}");
+        assert!((caret.top - lines[n].1).abs() < 0.01);
+        let hit = layout.hit(0, lines[n].0 + 0.2, lines[n].1 + 2.0).unwrap();
+        assert_eq!(hit, start, "line {n}");
+        assert_eq!(layout.line_start(&hit).unwrap(), start);
+    }
+    // Clicks left of a shortened line go to its start, right of it to its end.
+    let first = shaped_pos(frag, ranges[0].start);
+    assert_eq!(layout.hit(0, 25.0, lines[0].1 + 2.0).unwrap(), first);
+    let end = layout.line_end(&first).unwrap();
+    assert_eq!(layout.hit(0, 279.0, lines[0].1 + 2.0).unwrap(), end);
+    let so = |pos: &Pos| frag.shaped.to_shaped(pos.offset);
+    assert!(so(&end) >= ranges[0].end - 1 && so(&end) <= ranges[0].end);
+    // Down and up keep to the goal column across lines of different widths.
+    let below = layout.below(&first, 100.0).unwrap();
+    let back = layout.above(&below, 100.0).unwrap();
+    assert_eq!(so(&layout.line_start(&below).unwrap()), ranges[1].start);
+    assert_eq!(so(&layout.line_start(&back).unwrap()), ranges[0].start);
+    // The last line beside the picture, then the first below it.
+    let last_beside = lines.iter().rposition(|l| l.0 > 60.0).unwrap();
+    let from = shaped_pos(frag, ranges[last_beside].start);
+    let next = layout.below(&from, 21.0).unwrap();
+    assert_eq!(
+        so(&layout.line_start(&next).unwrap()),
+        ranges[last_beside + 1].start
+    );
+    // A selection over two lines has a rectangle per line, each on its line.
+    let a = shaped_pos(frag, ranges[0].start + 2);
+    let b = shaped_pos(frag, ranges[1].start + 3);
+    let rects = layout.selection(&a, &b);
+    assert_eq!(rects.len(), 2);
+    assert!(rects[0].1.x0 >= 70.0 - 0.01 && rects[1].1.x0 >= 70.0 - 0.01);
+    assert!(rects[0].1.y0 < rects[1].1.y0);
+}
+
+#[test]
+fn flowing_around_a_picture_does_not_reshape_other_paragraphs() {
+    let mut blocks = vec![{
+        let mut p = paragraph("");
+        p.runs = vec![
+            picture(50.0, 50.0, Some(beside(FloatAt::Start, 0, Wrap::Square, 0))),
+            Run::text("anchor", look()),
+        ];
+        Block::paragraph(p)
+    }];
+    blocks.extend(numbered(60));
+    let before = doc(blocks);
+    let mut layouter = Layouter::new();
+    layouter.layout(&before);
+    let count = layouter.shaped_count();
+    layouter.layout(&before);
+    assert_eq!(layouter.shaped_count(), count);
+    // A paragraph far below the picture: only it is shaped again.
+    let mut after = before.clone();
+    after.paragraph_mut(&Path::body(50)).unwrap().runs[0]
+        .text
+        .push_str(" changed");
+    layouter.layout(&after);
+    assert_eq!(layouter.shaped_count(), count + 1);
+    // Text added to the anchor's own line, which stays one line: what is
+    // below does not move, so the paragraphs beside the picture are kept.
+    let mut again = after.clone();
+    again.paragraph_mut(&Path::body(0)).unwrap().runs[1]
+        .text
+        .push_str("ed");
+    layouter.layout(&again);
+    assert_eq!(layouter.shaped_count(), count + 3);
 }

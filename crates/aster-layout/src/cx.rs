@@ -279,7 +279,19 @@ pub(crate) fn border_color(border: &Border) -> Rgba {
 impl Cx<'_> {
     /// The paragraph shaped for a text area `width` wide.
     pub fn shaped(&mut self, para: &Arc<Paragraph>, width: f32) -> Arc<Shaped> {
+        self.shaped_around(para, width, &[])
+    }
+
+    /// The same for a paragraph whose text flows around `obstacles`
+    /// (rectangles from its top-left corner).
+    pub fn shaped_around(
+        &mut self,
+        para: &Arc<Paragraph>,
+        width: f32,
+        obstacles: &[Rect],
+    ) -> Arc<Shaped> {
         let env = Env {
+            obstacles,
             settings: &self.doc.settings,
             grid: self.grid,
             notes: &self.notes,
@@ -541,7 +553,7 @@ impl Cx<'_> {
         y: f32,
         ec: &EmitCtx,
         out: &mut Out<'_>,
-    ) -> Vec<Rect> {
+    ) -> Vec<(Rect, Wrap)> {
         let shaped = &entry.shaped;
         let paragraph = &shaped.paragraph;
         let all = paragraph.lines();
@@ -661,11 +673,9 @@ impl Cx<'_> {
             self.emit_drawing(&drawing, rect, layer, ec, out);
             if float.wrap != Wrap::None {
                 let [dl, dt, dr, db] = float.distance.map(emu_pt);
-                keep_clear.push(Rect::new(
-                    rect.x0 - dl,
-                    rect.y0 - dt,
-                    rect.x1 + dr,
-                    rect.y1 + db,
+                keep_clear.push((
+                    Rect::new(rect.x0 - dl, rect.y0 - dt, rect.x1 + dr, rect.y1 + db),
+                    float.wrap,
                 ));
             }
         }
@@ -789,7 +799,7 @@ impl Cx<'_> {
         s1: f32,
         ec: &EmitCtx,
         out: &mut Out<'_>,
-    ) -> Vec<Rect> {
+    ) -> Vec<(Rect, Wrap)> {
         let shift = if s0.is_finite() { s0 } else { 0.0 };
         let mut clear = Vec::new();
         for entry in &stack.entries {

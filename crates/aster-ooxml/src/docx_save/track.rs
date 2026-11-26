@@ -115,13 +115,15 @@ pub fn edit_marks(w: &str, ppr: &str, then: &ParaChanges, now: &ParaChanges) -> 
         out.clear();
     }
     let mut records = String::new();
-    if now.inserted_mark.is_some() && then.inserted_mark.is_none() {
-        let change = now.inserted_mark.as_ref().expect("checked");
+    if let Some(change) = now.inserted_mark.as_ref()
+        && then.inserted_mark.is_none()
+    {
         let name = if change.moved { "moveTo" } else { "ins" };
         records.push_str(&format!("<{w}{name}{}/>", attributes(w, change)));
     }
-    if now.deleted_mark.is_some() && then.deleted_mark.is_none() {
-        let change = now.deleted_mark.as_ref().expect("checked");
+    if let Some(change) = now.deleted_mark.as_ref()
+        && then.deleted_mark.is_none()
+    {
         let name = if change.moved { "moveFrom" } else { "del" };
         records.push_str(&format!("<{w}{name}{}/>", attributes(w, change)));
     }
@@ -168,6 +170,34 @@ fn add_to_mark(w: &str, ppr: &str, records: &str) -> String {
     let mut out = ppr.to_owned();
     let at = stop.unwrap_or_else(|| out.rfind("</").unwrap_or(out.len()));
     out.insert_str(at, &format!("<{w}rPr>{records}</{w}rPr>"));
+    out
+}
+
+/// `out` without insertion wrappers that nothing is left in (the runs were
+/// rejected or moved out).
+pub fn without_empty_wrappers(w: &str, out: &str) -> String {
+    let mut out = out.to_owned();
+    for name in ["ins", "moveTo"] {
+        let open = format!("<{w}{name} ");
+        let close = format!("</{w}{name}>");
+        let mut from = 0;
+        while let Some(i) = out[from..].find(&open) {
+            let start = from + i;
+            let Some(gt) = out[start..].find('>') else {
+                break;
+            };
+            let after = start + gt + 1;
+            // A self-closing one is a record, not a wrapper.
+            if out[..after].ends_with("/>") {
+                from = after;
+            } else if out[after..].starts_with(&close) {
+                out.replace_range(start..after + close.len(), "");
+                from = start;
+            } else {
+                from = after;
+            }
+        }
+    }
     out
 }
 
@@ -243,32 +273,4 @@ mod tests {
             "<w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r>"
         );
     }
-}
-
-/// `out` without insertion wrappers that nothing is left in (the runs were
-/// rejected or moved out).
-pub fn without_empty_wrappers(w: &str, out: &str) -> String {
-    let mut out = out.to_owned();
-    for name in ["ins", "moveTo"] {
-        let open = format!("<{w}{name} ");
-        let close = format!("</{w}{name}>");
-        let mut from = 0;
-        while let Some(i) = out[from..].find(&open) {
-            let start = from + i;
-            let Some(gt) = out[start..].find('>') else {
-                break;
-            };
-            let after = start + gt + 1;
-            // A self-closing one is a record, not a wrapper.
-            if out[..after].ends_with("/>") {
-                from = after;
-            } else if out[after..].starts_with(&close) {
-                out.replace_range(start..after + close.len(), "");
-                from = start;
-            } else {
-                from = after;
-            }
-        }
-    }
-    out
 }

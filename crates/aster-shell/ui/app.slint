@@ -15,6 +15,7 @@ import { StatusBar } from "statusbar.slint";
 import { AssistantPanel } from "assistant.slint";
 import { Dialog } from "dialog.slint";
 import { LinkDialog } from "link_dialog.slint";
+import { TableDialog } from "table_dialog.slint";
 import { PromptDialog } from "prompt_dialog.slint";
 import { CopyDialog } from "copy_dialog.slint";
 import { EncodingDialog } from "encoding_dialog.slint";
@@ -96,6 +97,13 @@ export component AppWindow inherits Window {
     in-out property <string> link-address;
     callback link-accept();
     callback link-cancel();
+    // The insert table dialog of a Word document: open, and the rows and
+    // columns typed.
+    in property <bool> table-open;
+    in-out property <string> table-rows;
+    in-out property <string> table-columns;
+    callback table-accept();
+    callback table-cancel();
     // A question asking for one line of text: go to line, rename.
     in property <bool> prompt-open;
     in property <string> prompt-title;
@@ -164,11 +172,14 @@ export component AppWindow inherits Window {
     // A dialog with a text field is open. The Edit menu's text commands
     // step aside, so their shortcuts (Cmd+A, Cmd+C ...) reach the field
     // rather than the document behind it.
-    property <bool> dialog-text: root.prompt-open || root.link-open;
+    property <bool> dialog-text: root.prompt-open || root.link-open || root.table-open;
     // Its source is on screen, so the Format menu can write into it.
     property <bool> formatting: root.editing && root.view-mode != 2;
     // The caret is in a table: the table's row and column commands apply.
     in property <bool> in-table;
+    // The tab in front is a Word document: the Format menu's link, picture
+    // and table items and the table submenu act on it.
+    property <bool> doc-editing: root.viewer == 4 && root.can-save;
     // The styles at the caret, for check marks in the Format menu: block 0
     // none, 1 bullets, 2 numbers, 3 tasks, 4 quote; heading 0 body text.
     in property <bool> mark-bold;
@@ -269,6 +280,9 @@ export component AppWindow inherits Window {
     in property <int> slide-cursor;
     // Shift is held while the pointer moves with the button down.
     out property <bool> drag-shift;
+    // Command (Control elsewhere) is held with the pointer: a click on a
+    // link in a Word document opens it.
+    out property <bool> pointer-primary;
     // The Slide menu: 0 new slide, 1 duplicate slide, 2 delete slide,
     // 3 duplicate shape, 4 delete shape, 5 bring to front, 6 send to back,
     // 7 and 8 list level up and down, 9 start the slide show.
@@ -629,7 +643,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.menu-export-pdf;
-                enabled: root.editing;
+                enabled: root.editing || root.doc-editing;
                 activated => {
                     root.file-export-pdf();
                 }
@@ -1094,7 +1108,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.format-link;
                 shortcut: @keys(Control + K);
-                enabled: root.formatting;
+                enabled: root.formatting || root.doc-editing;
                 activated => {
                     root.format(8);
                 }
@@ -1102,7 +1116,7 @@ export component AppWindow inherits Window {
 
             MenuItem {
                 title: Strings.format-image;
-                enabled: root.formatting;
+                enabled: root.formatting || root.doc-editing;
                 activated => {
                     root.format(9);
                 }
@@ -1111,7 +1125,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.format-table;
                 shortcut: @keys(Control + Alt + T);
-                enabled: root.formatting;
+                enabled: root.formatting || root.doc-editing;
                 activated => {
                     root.format(10);
                 }
@@ -1148,7 +1162,7 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-row-above;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(30);
                     }
@@ -1156,7 +1170,7 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-row-below;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(31);
                     }
@@ -1166,7 +1180,7 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-column-left;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(32);
                     }
@@ -1174,7 +1188,7 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-column-right;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(33);
                     }
@@ -1184,7 +1198,7 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-delete-row;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(34);
                     }
@@ -1192,9 +1206,17 @@ export component AppWindow inherits Window {
 
                 MenuItem {
                     title: Strings.table-delete-column;
-                    enabled: root.formatting && root.in-table;
+                    enabled: (root.formatting || root.doc-editing) && root.in-table;
                     activated => {
                         root.format(35);
+                    }
+                }
+
+                MenuItem {
+                    title: Strings.table-delete-table;
+                    enabled: root.doc-editing && root.in-table;
+                    activated => {
+                        root.format(39);
                     }
                 }
 
@@ -1664,10 +1686,11 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.resize-cursor == 5 ? MouseCursor.pointer : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
+                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.resize-cursor == 5 ? MouseCursor.pointer : root.resize-cursor == 6 ? MouseCursor.nwse-resize : root.resize-cursor == 7 ? MouseCursor.nesw-resize : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();
+                                            root.pointer-primary = event.modifiers.control;
                                             root.pointer-down(self.mouse-x, self.mouse-y, event.modifiers.shift);
                                         }
                                         if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
@@ -1675,6 +1698,7 @@ export component AppWindow inherits Window {
                                         }
                                         if (event.kind == PointerEventKind.move) {
                                             root.drag-shift = event.modifiers.shift;
+                                            root.pointer-primary = event.modifiers.control;
                                         }
                                     }
                                     changed mouse-x => {
@@ -2228,6 +2252,17 @@ export component AppWindow inherits Window {
         }
         dismissed => {
             root.prompt-cancel();
+        }
+    }
+
+    if root.table-open: TableDialog {
+        rows <=> root.table-rows;
+        columns <=> root.table-columns;
+        confirmed => {
+            root.table-accept();
+        }
+        dismissed => {
+            root.table-cancel();
         }
     }
 

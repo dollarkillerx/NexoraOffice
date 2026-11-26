@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aster_surface::Action;
+use aster_surface::doc_pdf::{DocPdfInfo, export_document};
 use aster_surface::doc_view::{
-    Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, Move, Tri, Unit, Zoom,
+    Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, LinkInfo, Move, Tri,
+    Unit, Zoom,
 };
 use aster_writer::{Break, Document, OBJECT};
 
@@ -58,6 +60,8 @@ pub struct DocTab {
     pub shown_look: Option<(DocLook, bool, bool)>,
     /// Edits that the status bar's counts do not show yet.
     pub stats_due: bool,
+    /// The address of the link under the pointer, for the status bar.
+    pub hover_link: Option<String>,
 }
 
 /// What a save of a document writes.
@@ -94,6 +98,156 @@ impl DocSave {
     }
 }
 
+/// A change to the table the caret is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableEdit {
+    RowAbove,
+    RowBelow,
+    ColumnLeft,
+    ColumnRight,
+    DeleteRow,
+    DeleteColumn,
+    DeleteTable,
+}
+
+/// The most rows and columns the insert table dialog makes.
+pub const TABLE_MAX_ROWS: usize = 500;
+pub const TABLE_MAX_COLUMNS: usize = 63;
+
+/// What a Word document is exported to a PDF from: the document as it was
+/// when the export began, to be laid out and written on a worker thread.
+pub struct DocPdf {
+    document: Document,
+    info: DocPdfInfo,
+}
+
+impl DocPdf {
+    /// The PDF file's bytes.
+    pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        export_document(&self.document, &self.info)
+    }
+}
+
+/// Why a file was not put in a document as a picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureProblem {
+    /// Not a PNG, JPEG, GIF, BMP or TIFF file, or one that is damaged.
+    NotAPicture,
+    /// More pixels than pictures may have.
+    TooLarge,
+}
+
+/// A picture file's bytes and size in pixels, if it is one a Word document
+/// takes: PNG, JPEG, GIF, BMP or TIFF, with at most
+/// [`aster_image::MAX_PIXELS`] pixels. PNG and JPEG are decoded (at a small
+/// size) to see that they can be; for the others the header is trusted.
+pub fn read_picture(bytes: &[u8]) -> Result<(u32, u32), PictureProblem> {
+    if aster_writer::edit::image_format(bytes).is_none() {
+        return Err(PictureProblem::NotAPicture);
+    }
+    let (w, h) = image_size(bytes).ok_or(PictureProblem::NotAPicture)?;
+    if w == 0 || h == 0 {
+        return Err(PictureProblem::NotAPicture);
+    }
+    if u64::from(w) * u64::from(h) > aster_image::MAX_PIXELS {
+        return Err(PictureProblem::TooLarge);
+    }
+    if matches!(
+        aster_image::sniff(bytes),
+        aster_image::Kind::Png | aster_image::Kind::Jpeg
+    ) {
+        match aster_image::decode(bytes, 64) {
+            Ok(_) => {}
+            Err(aster_image::Error::TooLarge { .. }) => return Err(PictureProblem::TooLarge),
+            Err(_) => return Err(PictureProblem::NotAPicture),
+        }
+    }
+    Ok((w, h))
+}
+
+/// The width and height in pixels a PNG, JPEG, GIF, BMP or TIFF file's
+/// header gives.
+pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u32::from(u16::from_be_bytes([b[0], b[1]])))
+    };
+    let le16 = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let le32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let be32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if bytes.starts_with(b"\x89PNG") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut at = 2;
+        while at + 9 < bytes.len() {
+            if bytes[at] != 0xFF {
+                at += 1;
+                continue;
+            }
+            let marker = bytes[at + 1];
+            if marker == 0xFF {
+                at += 1;
+                continue;
+            }
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                return Some((be16(at + 7)?, be16(at + 5)?));
+            }
+            at += 2 + be16(at + 2)? as usize;
+        }
+        return None;
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some((le16(6)?, le16(8)?));
+    }
+    if bytes.starts_with(b"BM") {
+        // The size of the header says which kind it is.
+        return if le32(14)? == 12 {
+            Some((le16(18)?, le16(20)?))
+        } else {
+            let height = le32(22)? as i32;
+            Some((le32(18)?, height.unsigned_abs()))
+        };
+    }
+    let big = match bytes.get(..4)? {
+        b"II*\0" => false,
+        b"MM\0*" => true,
+        _ => return None,
+    };
+    let u16_at = |at: usize| if big { be16(at) } else { le16(at) };
+    let u32_at = |at: usize| if big { be32(at) } else { le32(at) };
+    let entries = u16_at(u32_at(4)? as usize)? as usize;
+    let first = u32_at(4)? as usize + 2;
+    let (mut width, mut height) = (None, None);
+    for i in 0..entries.min(200) {
+        let at = first + i * 12;
+        let value = match u16_at(at + 2)? {
+            3 => u16_at(at + 8)?,
+            4 => u32_at(at + 8)?,
+            _ => continue,
+        };
+        match u16_at(at)? {
+            256 => width = Some(value),
+            257 => height = Some(value),
+            _ => {}
+        }
+    }
+    Some((width?, height?))
+}
+
 /// The find bar of a document tab.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DocFind {
@@ -105,13 +259,16 @@ pub struct DocFind {
 }
 
 /// Where the pointer went down, to tell a click from the start of a drag.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Press {
     pub x: f64,
     pub y: f64,
     pub clicks: u8,
     /// The pointer has moved far enough since to be a drag.
     pub dragged: bool,
+    /// The address of the link the press was on with Command (Control
+    /// elsewhere) held: letting go without a drag opens it.
+    pub link: Option<String>,
 }
 
 /// How far (physical pixels) the pointer may move and still be a click.
@@ -148,6 +305,7 @@ impl DocTab {
             disk,
             shown_look: None,
             stats_due: false,
+            hover_link: None,
         }
     }
 
@@ -184,6 +342,64 @@ impl DocTab {
         true
     }
 
+    // --- Tables, links and pictures ---
+
+    /// A table of `rows` by `columns` at the caret.
+    pub fn insert_table(&mut self, rows: usize, columns: usize) -> bool {
+        self.view.command(DocCommand::InsertTable {
+            rows: rows.clamp(1, TABLE_MAX_ROWS),
+            columns: columns.clamp(1, TABLE_MAX_COLUMNS),
+        })
+    }
+
+    /// A change to the table the caret is in.
+    pub fn edit_table(&mut self, edit: TableEdit) -> bool {
+        self.view.command(match edit {
+            TableEdit::RowAbove => DocCommand::InsertRows { above: true },
+            TableEdit::RowBelow => DocCommand::InsertRows { above: false },
+            TableEdit::ColumnLeft => DocCommand::InsertColumns { left: true },
+            TableEdit::ColumnRight => DocCommand::InsertColumns { left: false },
+            TableEdit::DeleteRow => DocCommand::DeleteRows,
+            TableEdit::DeleteColumn => DocCommand::DeleteColumns,
+            TableEdit::DeleteTable => DocCommand::DeleteTable,
+        })
+    }
+
+    /// What the link dialog starts from.
+    pub fn link_info(&self) -> LinkInfo {
+        self.view.link_info()
+    }
+
+    /// The link dialog's result: see [`DocCommand::EditLink`].
+    pub fn edit_link(&mut self, text: &str, target: &str) -> bool {
+        self.view.command(DocCommand::EditLink {
+            text: text.to_owned(),
+            target: target.to_owned(),
+        })
+    }
+
+    /// Put a picture file's bytes in at the caret; `pixels` is its size.
+    /// False when nothing was put in.
+    pub fn insert_picture(&mut self, bytes: Vec<u8>, pixels: (u32, u32)) -> bool {
+        self.view
+            .insert_picture(Arc::from(bytes), pixels, None)
+            .unwrap_or(false)
+    }
+
+    // --- Export ---
+
+    /// What a PDF export of the document as it is now needs: the document
+    /// (cheap to copy), the title, and the language of its settings.
+    pub fn pdf_job(&self, title: &str) -> DocPdf {
+        DocPdf {
+            document: self.view.document().clone(),
+            info: DocPdfInfo {
+                title: Some(title.to_owned()).filter(|t| !t.is_empty()),
+                language: self.view.document().settings.language.clone(),
+            },
+        }
+    }
+
     // --- Saving ---
 
     /// What to write, unless a save is running.
@@ -199,27 +415,22 @@ impl DocTab {
         })
     }
 
-    /// A save has finished. On success the tab goes on from the file that
-    /// was written: its bytes are the ones saving starts from and the model
-    /// is the document read from them, with the caret and the scroll where
-    /// they were. If the document was edited while the file was being
-    /// written, the model is kept (it still matches the bytes it started
-    /// from) and stays modified.
+    /// A save has finished. On success the tab remembers what it wrote: the
+    /// document as it was when the save began is what the file holds, and
+    /// the tab is modified exactly when its document differs from that (so
+    /// undoing back to it clears the mark). Nothing else changes: the undo
+    /// history, the caret and the scroll stay, and saving goes on starting
+    /// from the bytes the tab was opened from, which the blocks' sources
+    /// refer to. A document edited while the file was being written stays
+    /// modified.
     pub fn finish_save(&mut self, job: &DocSave, path: &Path, written: Option<Written>) {
         self.saving = false;
         let Some(written) = written else {
             return;
         };
-        // A composition in progress is not dropped for this: the model is
-        // kept, as when the document was edited while writing.
         self.disk = Some(aster_storage::Fingerprint::of(path, &written.bytes));
         self.path = Some(path.to_owned());
-        if self.view.revision() == job.revision && !self.view.is_composing() {
-            self.source = Arc::new(written.bytes);
-            self.view.set_document(written.document);
-            self.stats_revision = self.view.revision();
-            self.shown_look = None;
-        }
+        self.view.mark_saved_as(job.document.clone(), job.revision);
     }
 
     /// The file as saving would write it now, made later on the record
@@ -325,12 +536,32 @@ impl DocTab {
     /// The pointer went down on the pages (physical pixels): `clicks` is 1,
     /// 2 or 3. Returns whether the picture changed.
     pub fn pointer_down(&mut self, x: f64, y: f64, clicks: u8, shift: bool) -> bool {
+        self.pointer_down_with(x, y, clicks, shift, false)
+    }
+
+    /// Like [`DocTab::pointer_down`]; with `primary` (Command, Control
+    /// elsewhere) held, a click on a link opens it when the button goes up.
+    /// Without it a click on a link only places the caret.
+    pub fn pointer_down_with(
+        &mut self,
+        x: f64,
+        y: f64,
+        clicks: u8,
+        shift: bool,
+        primary: bool,
+    ) -> bool {
         self.link_refused = false;
+        let link = if primary && !shift && clicks == 1 && !self.view.is_composing() {
+            self.view.link_at(x, y)
+        } else {
+            None
+        };
         self.press = Some(Press {
             x,
             y,
             clicks,
             dragged: false,
+            link,
         });
         self.view.press(x, y, clicks, shift)
     }
@@ -345,14 +576,15 @@ impl DocTab {
         self.view.drag(x, y)
     }
 
-    /// The button went up. If it was a click on a link, the link's target.
+    /// The button went up. If it was a click on a link with Command (or
+    /// Control) held, the link's target.
     pub fn pointer_up(&mut self) -> Option<String> {
         self.view.release();
         let press = self.press.take()?;
         if press.dragged || press.clicks != 1 || self.view.has_selection() {
             return None;
         }
-        self.view.link_at(press.x, press.y)
+        press.link
     }
 
     // --- The keys ---
@@ -607,6 +839,7 @@ pub fn doc_style(tokens: &theme::Tokens) -> DocStyle {
         .to_array(),
         hit: theme::Rgba::rgb(0xffe135).with_alpha(0.55).to_array(),
         current_hit: theme::Rgba::rgb(0xff8c00).with_alpha(0.65).to_array(),
+        object: c.accent.to_array(),
     }
 }
 
@@ -736,7 +969,10 @@ mod tests {
         tab.finish_save(&job, &path, Some(written));
         assert!(!tab.is_modified());
         assert_eq!(tab.path.as_deref(), Some(path.as_path()));
-        assert_eq!(*tab.source, bytes, "the kept bytes are the file's");
+        // Saving goes on from the bytes the tab was opened from, which the
+        // document's blocks refer to; the undo history stays.
+        assert_eq!(*tab.source, sample_bytes());
+        assert!(tab.view.can_undo());
         assert_eq!(tab.view.caret().cloned(), caret_before);
         // The file reads back as what the tab holds, and saving again from
         // the kept bytes works.
@@ -880,11 +1116,139 @@ mod tests {
         tab.zoom(None);
         tab.pointer_down(300.0, 200.0, 1, false);
         tab.pointer_drag(302.0, 201.0);
-        assert!(!tab.press.expect("pressed").dragged);
+        assert!(!tab.press.as_ref().expect("pressed").dragged);
         tab.pointer_drag(340.0, 201.0);
-        assert!(tab.press.expect("pressed").dragged);
+        assert!(tab.press.as_ref().expect("pressed").dragged);
         assert_eq!(tab.pointer_up(), None);
         assert!(tab.press.is_none());
+    }
+
+    /// A 1 by 1 pixel PNG file.
+    const DOT: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn picture_files_are_measured_from_their_headers_and_checked() {
+        assert_eq!(read_picture(&DOT), Ok((1, 1)));
+        // GIF: little-endian width and height after the signature.
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend([3, 0, 2, 0, 0, 0, 0]);
+        assert_eq!(read_picture(&gif), Ok((3, 2)));
+        // BMP: a 40-byte header; a negative height is a top-down picture.
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(14, 0);
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend(5i32.to_le_bytes());
+        bmp.extend((-4i32).to_le_bytes());
+        bmp.resize(54, 0);
+        assert_eq!(read_picture(&bmp), Ok((5, 4)));
+        // TIFF, both byte orders: the first directory's width and height.
+        for big in [false, true] {
+            let u16b = |v: u16| {
+                if big {
+                    v.to_be_bytes()
+                } else {
+                    v.to_le_bytes()
+                }
+            };
+            let u32b = |v: u32| {
+                if big {
+                    v.to_be_bytes()
+                } else {
+                    v.to_le_bytes()
+                }
+            };
+            let mut tiff = if big {
+                b"MM\0*".to_vec()
+            } else {
+                b"II*\0".to_vec()
+            };
+            tiff.extend(u32b(8));
+            tiff.extend(u16b(2));
+            for (tag, value) in [(256u16, 7u16), (257, 9)] {
+                tiff.extend(u16b(tag));
+                tiff.extend(u16b(3));
+                tiff.extend(u32b(1));
+                tiff.extend(u16b(value));
+                tiff.extend([0, 0]);
+            }
+            tiff.extend(u32b(0));
+            assert_eq!(read_picture(&tiff), Ok((7, 9)), "big endian: {big}");
+        }
+        // JPEG: the start of frame after another segment.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00,
+            0x10, 0x00, 0x20, 0x01, 0x01, 0x11, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(image_size(&jpeg), Some((32, 16)));
+        // Not pictures, and ones that say they have no size or too many.
+        assert_eq!(read_picture(b"hello"), Err(PictureProblem::NotAPicture));
+        assert_eq!(read_picture(b""), Err(PictureProblem::NotAPicture));
+        assert_eq!(read_picture(&DOT[..20]), Err(PictureProblem::NotAPicture));
+        let mut broken = DOT.to_vec();
+        broken[40] ^= 0xFF;
+        assert!(read_picture(&broken).is_err() || read_picture(&broken) == Ok((1, 1)));
+        let mut huge = DOT[..24].to_vec();
+        huge[16..20].copy_from_slice(&20_000u32.to_be_bytes());
+        huge[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+        assert_eq!(read_picture(&huge), Err(PictureProblem::TooLarge));
+        let mut flat = DOT[..24].to_vec();
+        flat[16..20].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(read_picture(&flat), Err(PictureProblem::NotAPicture));
+    }
+
+    #[test]
+    fn a_link_opens_only_on_a_click_with_the_command_key_held() {
+        let mut tab = DocTab::blank(&Tokens::of(ThemeMode::Light)).expect("the template reads");
+        tab.view.resize(900, 700, 1.0);
+        tab.key(&Action::Insert("go to the site now".into()));
+        let start = tab.view.document().start().unwrap();
+        let at = |offset: usize| aster_writer::Pos::new(start.path.clone(), offset);
+        tab.view.set_selection(at(6), at(14));
+        assert!(
+            tab.view
+                .command(DocCommand::SetLink(Some("https://example.com/".into())))
+        );
+        tab.view.go_to(&at(9));
+        let (x, y, _, h) = tab.view.caret_rect().unwrap();
+        let (x, y) = (x + 1.0, y + h / 2.0);
+        // A plain click only places the caret.
+        tab.pointer_down(x, y, 1, false);
+        assert_eq!(tab.pointer_up(), None);
+        assert!(tab.view.caret().is_some());
+        // With the command key held, letting go opens it.
+        tab.pointer_down_with(x, y, 1, false, true);
+        assert_eq!(tab.pointer_up().as_deref(), Some("https://example.com/"));
+        // Not when the pointer was dragged, on a double click, or off it.
+        tab.pointer_down_with(x, y, 1, false, true);
+        tab.pointer_drag(x + 30.0, y);
+        assert_eq!(tab.pointer_up(), None);
+        tab.pointer_down_with(x, y, 2, false, true);
+        assert_eq!(tab.pointer_up(), None);
+        tab.view.go_to(&at(1));
+        let (x, y, _, h) = tab.view.caret_rect().unwrap();
+        tab.pointer_down_with(x + 1.0, y + h / 2.0, 1, false, true);
+        assert_eq!(tab.pointer_up(), None);
+        // Saving keeps the link in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link.docx");
+        let job = tab.begin_save().unwrap();
+        let written = job.write(&path).expect("it writes");
+        tab.finish_save(&job, &path, Some(written));
+        let read = aster_ooxml::docx::read(std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            read.paragraphs()
+                .iter()
+                .any(|(_, p)| p.runs.iter().any(|r| r
+                    .link
+                    .as_ref()
+                    .is_some_and(|l| l.target == "https://example.com/")))
+        );
     }
 
     #[test]

@@ -901,6 +901,13 @@ impl SlideView {
                 let delta = Vec2::new(delta.x / per, delta.y / per);
                 let line = found.geometry == Geometry::Line;
                 let resized = resize(frame, handle, delta, shift, line);
+                let resized = keep_anchor(
+                    frame,
+                    resized,
+                    handle,
+                    found.rotation,
+                    (found.flip_h, found.flip_v),
+                );
                 self.set_frame(shape, resized)
             }
             Drag::Text { shape } => {
@@ -2270,6 +2277,49 @@ fn resize(frame: Frame, handle: Handle, delta: Vec2, keep: bool, line: bool) -> 
     )
 }
 
+/// Where the point `(ax, ay)` (shares of the frame) lies on the page, in
+/// EMU, after the shape's flips and rotation about the frame's centre.
+fn page_point(frame: Frame, at: (f64, f64), rotation: f64, flips: (bool, bool)) -> (f64, f64) {
+    let mut dx = frame.width as f64 * (at.0 - 0.5);
+    let mut dy = frame.height as f64 * (at.1 - 0.5);
+    if flips.0 {
+        dx = -dx;
+    }
+    if flips.1 {
+        dy = -dy;
+    }
+    let (sin, cos) = rotation.to_radians().sin_cos();
+    (
+        frame.x as f64 + frame.width as f64 / 2.0 + dx * cos - dy * sin,
+        frame.y as f64 + frame.height as f64 / 2.0 + dx * sin + dy * cos,
+    )
+}
+
+/// A resized frame moved so that the point opposite the dragged handle stays
+/// where it was on the page. A rotated or flipped shape turns about the
+/// centre of its frame, so changing the size would otherwise move it.
+fn keep_anchor(
+    old: Frame,
+    new: Frame,
+    handle: Handle,
+    rotation: f64,
+    flips: (bool, bool),
+) -> Frame {
+    if rotation == 0.0 && flips == (false, false) {
+        return new;
+    }
+    let (fx, fy) = handle.at();
+    let anchor = (1.0 - fx, 1.0 - fy);
+    let before = page_point(old, anchor, rotation, flips);
+    let after = page_point(new, anchor, rotation, flips);
+    Frame::new(
+        (new.x as f64 + before.0 - after.0).round() as i64,
+        (new.y as f64 + before.1 - after.1).round() as i64,
+        new.width,
+        new.height,
+    )
+}
+
 fn distance_to_segment(p: Point, a: Point, b: Point) -> f64 {
     let ab = b - a;
     let length = ab.hypot2();
@@ -2429,6 +2479,90 @@ mod tests {
         assert_eq!(view.presentation().slides[0].shapes.len(), 4);
         assert!(view.delete(false));
         assert_eq!(view.presentation().slides[0].shapes.len(), 3);
+    }
+
+    /// The page position (EMU) of a share of a frame, as drawn on screen.
+    fn drawn_point(view: &SlideView, shape: usize, share: (f64, f64)) -> (f64, f64) {
+        let found = &view.presentation().slides[0].shapes[shape];
+        let (page, per) = view.page();
+        let (rect, transform) = view.placed(found);
+        let p = transform
+            * Point::new(
+                rect.x0 + rect.width() * share.0,
+                rect.y0 + rect.height() * share.1,
+            );
+        ((p.x - page.x0) / per, (p.y - page.y0) / per)
+    }
+
+    /// Drag `handle` of a rotated and flipped rectangle: the opposite point
+    /// must stay where it is on the page.
+    fn drag_keeps_anchor(rotation: f64, flips: (bool, bool), handle: Handle, by: (f64, f64)) {
+        let mut view = view();
+        assert!(view.insert_shape(NewShape::Rect));
+        let index = view.selection().shape().unwrap();
+        {
+            let slide = &mut Arc::make_mut(&mut view.presentation).slides[0];
+            let shape = &mut slide.shapes[index];
+            shape.rotation = rotation;
+            shape.flip_h = flips.0;
+            shape.flip_v = flips.1;
+        }
+        let (fx, fy) = handle.at();
+        let anchor = (1.0 - fx, 1.0 - fy);
+        let before = drawn_point(&view, index, anchor);
+        let size = view.presentation().slides[0].shapes[index].frame;
+        let grab = {
+            let found = &view.presentation().slides[0].shapes[index];
+            view.handles(found)
+                .into_iter()
+                .find(|(h, _)| *h == handle)
+                .unwrap()
+                .1
+        };
+        view.press(grab.x, grab.y, false, 1);
+        view.drag(grab.x + by.0, grab.y + by.1, false);
+        view.release();
+        let after = drawn_point(&view, index, anchor);
+        let now = view.presentation().slides[0].shapes[index].frame;
+        assert_ne!((now.width, now.height), (size.width, size.height));
+        assert!((before.0 - after.0).abs() <= 2.0, "{before:?} {after:?}");
+        assert!((before.1 - after.1).abs() <= 2.0, "{before:?} {after:?}");
+    }
+
+    #[test]
+    fn resizing_a_rotated_shape_keeps_the_opposite_point_fixed() {
+        for handle in Handle::ALL {
+            drag_keeps_anchor(30.0, (false, false), handle, (47.0, 31.0));
+            drag_keeps_anchor(30.0, (true, false), handle, (-25.0, 40.0));
+            drag_keeps_anchor(-70.0, (true, true), handle, (33.0, -20.0));
+            drag_keeps_anchor(0.0, (false, true), handle, (20.0, 30.0));
+        }
+    }
+
+    #[test]
+    fn unrotated_shapes_resize_exactly_as_before() {
+        let old = Frame::new(1_000_000, 2_000_000, 3_000_000, 1_500_000);
+        let new = resize(
+            old,
+            Handle::BottomRight,
+            Vec2::new(500_000.0, 70_000.0),
+            false,
+            false,
+        );
+        assert_eq!(
+            keep_anchor(old, new, Handle::BottomRight, 0.0, (false, false)),
+            new
+        );
+        assert_eq!(new, Frame::new(1_000_000, 2_000_000, 3_500_000, 1_570_000));
+        // Without rotation the anchor of a flipped-free frame never moves it.
+        let new = resize(
+            old,
+            Handle::TopLeft,
+            Vec2::new(-200_000.0, -100_000.0),
+            false,
+            false,
+        );
+        assert_eq!((new.x, new.y), (800_000, 1_900_000));
     }
 
     #[test]

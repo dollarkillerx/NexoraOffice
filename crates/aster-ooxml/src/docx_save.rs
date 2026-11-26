@@ -91,6 +91,7 @@ use crate::xml_edit::{
 
 mod blank;
 mod props;
+mod table;
 mod xml;
 
 pub use blank::blank;
@@ -375,6 +376,10 @@ struct Saver<'a> {
     needs_rel_namespace: bool,
     paras: HashMap<(usize, usize), &'a Paragraph>,
     tables: HashMap<(usize, usize), &'a Table>,
+    /// The rows and cells of the original tables, by where they were read
+    /// from.
+    rows: HashMap<(usize, usize), &'a Row>,
+    cells: HashMap<(usize, usize), &'a aster_writer::Cell>,
     runs: HashMap<RunKey, &'a RunSource>,
     /// The base look of the paragraph each original run was in.
     run_bases: HashMap<RunKey, &'a RunLook>,
@@ -404,6 +409,8 @@ struct Saver<'a> {
 struct Index<'a> {
     paras: HashMap<(usize, usize), &'a Paragraph>,
     tables: HashMap<(usize, usize), &'a Table>,
+    rows: HashMap<(usize, usize), &'a Row>,
+    cells: HashMap<(usize, usize), &'a aster_writer::Cell>,
     runs: HashMap<RunKey, &'a RunSource>,
     /// The base look of the paragraph each run was in.
     bases: HashMap<RunKey, &'a RunLook>,
@@ -432,7 +439,13 @@ fn index_blocks<'a>(blocks: &'a [Block], index: &mut Index<'a>) {
                     index.tables.insert(range_key(range), t);
                 }
                 for row in &t.rows {
+                    if let Some(range) = &row.source {
+                        index.rows.insert(range_key(range), row);
+                    }
                     for cell in &row.cells {
+                        if let Some(range) = &cell.source {
+                            index.cells.insert(range_key(range), cell);
+                        }
                         index_blocks(&cell.blocks, index);
                     }
                 }
@@ -489,6 +502,8 @@ impl<'a> Saver<'a> {
         let Index {
             paras,
             tables,
+            rows,
+            cells,
             runs,
             bases: run_bases,
             drawings,
@@ -524,6 +539,8 @@ impl<'a> Saver<'a> {
             r: r.unwrap_or_else(|| "r:".to_owned()),
             paras,
             tables,
+            rows,
+            cells,
             runs,
             run_bases,
             drawings,
@@ -729,406 +746,6 @@ impl<'a> Saver<'a> {
                 self.table_from_model(t)
             }
         }
-    }
-
-    // -- tables -----------------------------------------------------------
-
-    /// A table that is where it was. What is kept of the original bytes
-    /// depends on what changed:
-    ///
-    /// - only the content of cells: the bytes of the table, with the content
-    ///   of the cells that changed written again;
-    /// - rows added or removed, columns as they were: the table's start
-    ///   (`tblPr`, `tblGrid`) and every row that is as read are copied, the
-    ///   rows made here are written from the model;
-    /// - columns added or removed: the table's `tblPr` is kept (its width
-    ///   follows the grid where it was the grid's sum), the grid and every
-    ///   row are written from the model, with each cell's content as for
-    ///   any block (paragraphs that are as read are copied).
-    fn table_in_place(&mut self, model: &Table, range: &Range<usize>) -> String {
-        let Some(ot) = self.tables.get(&range_key(range)).copied() else {
-            return self.table_from_model(model);
-        };
-        if model.props != ot.props {
-            return self.table_from_model(model);
-        }
-        if same_structure(model, ot) {
-            let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
-            for (row, orow) in model.rows.iter().zip(&ot.rows) {
-                match self.cell_replacements(row, orow) {
-                    Some(found) => replacements.extend(found),
-                    None => return self.table_from_model(model),
-                }
-            }
-            return self.apply(range, replacements);
-        }
-        self.table_rewritten(model, ot, range)
-    }
-
-    /// The original bytes of `range` with the replacements put in.
-    fn apply(&self, range: &Range<usize>, replacements: Vec<(Range<usize>, String)>) -> String {
-        let mut out = String::new();
-        let mut at = range.start;
-        for (region, content) in replacements {
-            out.push_str(&self.text[at..region.start]);
-            out.push_str(&content);
-            at = region.end;
-        }
-        out.push_str(&self.text[at..range.end]);
-        out
-    }
-
-    /// The content of the cells of `row` that changed, written again, with
-    /// the part of the original bytes it replaces. `None` if the bytes do
-    /// not fit the model.
-    fn cell_replacements(
-        &mut self,
-        row: &aster_writer::Row,
-        orow: &aster_writer::Row,
-    ) -> Option<Vec<(Range<usize>, String)>> {
-        let mut out = Vec::new();
-        for (cell, ocell) in row.cells.iter().zip(&orow.cells) {
-            if cell_unchanged(cell, ocell) {
-                continue;
-            }
-            let crange = ocell.source.as_ref()?;
-            let element = self.slice(crange)?;
-            let (open, close) = inner(element);
-            let region = crange.start + open..crange.start + close;
-            self.in_cell += 1;
-            let content = self.container(region.clone(), &ocell.blocks, &cell.blocks);
-            self.in_cell -= 1;
-            out.push((region, content));
-        }
-        Some(out)
-    }
-
-    /// A table whose rows or columns changed, over the original's bytes.
-    fn table_rewritten(&mut self, model: &Table, ot: &Table, range: &Range<usize>) -> String {
-        let Some(element) = self.slice(range) else {
-            return self.table_from_model(model);
-        };
-        let kids = children(element);
-        let Some(grid) = kids.iter().find(|c| c.name == "tblGrid") else {
-            return self.table_from_model(model);
-        };
-        let (_, close) = inner(element);
-        if grid.end > close {
-            return self.table_from_model(model);
-        }
-        let region = range.start + grid.end..range.start + close;
-        let columns_changed = model.columns != ot.columns;
-
-        // The start: kept, with the table's width following the grid.
-        let mut out = String::new();
-        match kids.iter().find(|c| c.name == "tblPr") {
-            Some(pr) if columns_changed && pr.end <= grid.start => {
-                out.push_str(&element[..pr.start]);
-                out.push_str(&self.patch_table_width(
-                    &element[pr.start..pr.end],
-                    ot.columns.iter().sum(),
-                    model.columns.iter().sum(),
-                ));
-                out.push_str(&element[pr.end..grid.start]);
-            }
-            _ => out.push_str(&element[..grid.start]),
-        }
-        if columns_changed {
-            out.push_str(&self.grid_xml(&model.columns));
-        } else {
-            out.push_str(&element[grid.start..grid.end]);
-        }
-
-        // The rows of the original, in order and inside the region.
-        let mut ranges: Vec<(Range<usize>, usize)> = Vec::new();
-        for (i, row) in ot.rows.iter().enumerate() {
-            if let Some(r) = &row.source
-                && r.start >= ranges.last().map_or(region.start, |(r, _)| r.end)
-                && r.end <= region.end
-                && r.start < r.end
-            {
-                ranges.push((r.clone(), i));
-            }
-        }
-        let index: HashMap<(usize, usize), usize> = ranges
-            .iter()
-            .enumerate()
-            .map(|(i, (r, _))| (range_key(r), i))
-            .collect();
-        let n = ranges.len();
-        let gap = |g: usize| -> Range<usize> {
-            let start = if g == 0 {
-                region.start
-            } else {
-                ranges[g - 1].0.end
-            };
-            let end = if g == n {
-                region.end
-            } else {
-                ranges[g].0.start
-            };
-            start..end
-        };
-        out.push_str(&self.text[gap(0)]);
-        let mut next_gap = 1;
-        let mut last: isize = -1;
-        for row in &model.rows {
-            let matched = row
-                .source
-                .as_ref()
-                .and_then(|r| index.get(&range_key(r)).copied())
-                .filter(|&i| i as isize > last);
-            let Some(i) = matched else {
-                out.push_str(&self.row_xml(&model.columns, row, None));
-                continue;
-            };
-            for g in next_gap..=i {
-                out.push_str(&self.text[gap(g)]);
-            }
-            next_gap = next_gap.max(i + 1);
-            last = i as isize;
-            let (rrange, oi) = (&ranges[i].0, ranges[i].1);
-            let orow = &ot.rows[oi];
-            let text = if !columns_changed && same_row(row, orow) {
-                match self.cell_replacements(row, orow) {
-                    Some(found) => self.apply(rrange, found),
-                    None => self.row_xml(&model.columns, row, None),
-                }
-            } else {
-                let kept = if row_props_equal(row, orow) {
-                    self.kept_row_start(rrange)
-                } else {
-                    None
-                };
-                self.row_xml(&model.columns, row, kept)
-            };
-            out.push_str(&text);
-        }
-        for g in next_gap..=n {
-            out.push_str(&self.text[gap(g)]);
-        }
-        out.push_str(&element[close..]);
-        out
-    }
-
-    /// The row element's start tag, its `trPr` (and `tblPrEx`) as they were
-    /// and its end tag: what a row written again keeps. `None` if the row
-    /// does not start with them.
-    fn kept_row_start(&self, range: &Range<usize>) -> Option<(String, String, String)> {
-        let element = self.slice(range)?;
-        if !is_element(element, "tr") {
-            return None;
-        }
-        let (open, _) = inner(element);
-        if element[..open].ends_with("/>") {
-            return None;
-        }
-        let kids = children(element);
-        let first = kids.iter().position(|c| c.name == "tc")?;
-        if !kids[..first]
-            .iter()
-            .all(|c| c.name == "trPr" || c.name == "tblPrEx")
-        {
-            return None;
-        }
-        Some((
-            element[..open].to_owned(),
-            element[open..kids[first].start].to_owned(),
-            format!("</{}>", qualified_name(element)),
-        ))
-    }
-
-    /// `tblPr` with the width following the grid: where it is in twips and
-    /// was the sum of the old columns, it is the sum of the new ones.
-    fn patch_table_width(&self, pr: &str, old: i32, new: i32) -> String {
-        let Some(width) = children(pr).into_iter().find(|c| c.name == "tblW") else {
-            return pr.to_owned();
-        };
-        let element = &pr[width.start..width.end];
-        let is_dxa =
-            attribute(element, &format!("{}type", self.w)).is_none_or(|kind| kind == "dxa");
-        let value = format!("{}w", self.w);
-        if is_dxa && attribute(element, &value).as_deref() == Some(old.to_string().as_str()) {
-            return format!(
-                "{}{}{}",
-                &pr[..width.start],
-                set_attribute(element, &value, &new.to_string()),
-                &pr[width.end..]
-            );
-        }
-        pr.to_owned()
-    }
-
-    fn grid_xml(&self, columns: &[i32]) -> String {
-        let w = &self.w;
-        let mut out = format!("<{w}tblGrid>");
-        for column in columns {
-            out.push_str(&format!("<{w}gridCol {w}w=\"{column}\"/>"));
-        }
-        out.push_str(&format!("</{w}tblGrid>"));
-        out
-    }
-
-    /// A table written from the model: grid, rows, cells, spans, merges,
-    /// borders and shading.
-    fn table_from_model(&mut self, table: &Table) -> String {
-        let w = self.w.clone();
-        let mut out = format!("<{w}tbl><{w}tblPr>");
-        if let Some(style) = &table.props.style {
-            out.push_str(&format!(
-                "<{w}tblStyle {w}val=\"{}\"/>",
-                escape_attribute(style)
-            ));
-        }
-        let total: i32 = table.columns.iter().sum();
-        out.push_str(&format!("<{w}tblW {w}w=\"{total}\" {w}type=\"dxa\"/>"));
-        match table.props.align {
-            Align::Center => out.push_str(&format!("<{w}jc {w}val=\"center\"/>")),
-            Align::Right => out.push_str(&format!("<{w}jc {w}val=\"right\"/>")),
-            _ => {}
-        }
-        out.push_str(&format!(
-            "<{w}tblInd {w}w=\"{}\" {w}type=\"dxa\"/>",
-            table.props.indent
-        ));
-        // Borders that every cell has alike are the table's too.
-        if let Some(sides) = common_borders(table) {
-            let mut borders = borders_element(
-                &w,
-                "tblBorders",
-                &sides,
-                None,
-                ["left", "top", "right", "bottom"],
-            );
-            let inside = format!(
-                "{}{}</{w}tblBorders>",
-                border_element(&w, "insideH", sides[1].as_ref()),
-                border_element(&w, "insideV", sides[0].as_ref())
-            );
-            borders = borders.replace(&format!("</{w}tblBorders>"), &inside);
-            out.push_str(&borders);
-        }
-        if table.props.fixed_layout {
-            out.push_str(&format!("<{w}tblLayout {w}type=\"fixed\"/>"));
-        }
-        let [left, top, right, bottom] = table.props.cell_margins;
-        out.push_str(&format!(
-            "<{w}tblCellMar><{w}top {w}w=\"{top}\" {w}type=\"dxa\"/><{w}left {w}w=\"{left}\" {w}type=\"dxa\"/><{w}bottom {w}w=\"{bottom}\" {w}type=\"dxa\"/><{w}right {w}w=\"{right}\" {w}type=\"dxa\"/></{w}tblCellMar>"
-        ));
-        // What Word asks of a table style by default.
-        out.push_str(&format!(
-            "<{w}tblLook {w}val=\"04A0\" {w}firstRow=\"1\" {w}lastRow=\"0\" {w}firstColumn=\"1\" {w}lastColumn=\"0\" {w}noHBand=\"0\" {w}noVBand=\"1\"/>"
-        ));
-        out.push_str(&format!("</{w}tblPr>"));
-        out.push_str(&self.grid_xml(&table.columns));
-        for row in &table.rows {
-            out.push_str(&self.row_xml(&table.columns, row, None));
-        }
-        out.push_str(&format!("</{w}tbl>"));
-        out
-    }
-
-    /// The `trPr` of a row, from the model.
-    fn row_pr(&self, row: &aster_writer::Row) -> String {
-        let w = &self.w;
-        let mut pr = String::new();
-        if row.grid_before > 0 {
-            pr.push_str(&format!("<{w}gridBefore {w}val=\"{}\"/>", row.grid_before));
-        }
-        if row.grid_after > 0 {
-            pr.push_str(&format!("<{w}gridAfter {w}val=\"{}\"/>", row.grid_after));
-        }
-        if row.cant_split {
-            pr.push_str(&format!("<{w}cantSplit/>"));
-        }
-        match row.height {
-            RowHeight::Auto => {}
-            RowHeight::AtLeast(h) => pr.push_str(&format!(
-                "<{w}trHeight {w}val=\"{h}\" {w}hRule=\"atLeast\"/>"
-            )),
-            RowHeight::Exactly(h) => {
-                pr.push_str(&format!("<{w}trHeight {w}val=\"{h}\" {w}hRule=\"exact\"/>"))
-            }
-        }
-        if row.header {
-            pr.push_str(&format!("<{w}tblHeader/>"));
-        }
-        if pr.is_empty() {
-            pr
-        } else {
-            format!("<{w}trPr>{pr}</{w}trPr>")
-        }
-    }
-
-    /// A row from the model: its cells with their widths from `columns`,
-    /// spans, merges, borders, shading, margins and alignment, and their
-    /// content as for any block. With `kept` (the start tag, the row
-    /// properties and the end tag it had) the row keeps those bytes.
-    fn row_xml(
-        &mut self,
-        columns: &[i32],
-        row: &aster_writer::Row,
-        kept: Option<(String, String, String)>,
-    ) -> String {
-        let w = self.w.clone();
-        let (start, end) = match kept {
-            Some((tag, pr, end)) => (format!("{tag}{pr}"), end),
-            None => (format!("<{w}tr>{}", self.row_pr(row)), format!("</{w}tr>")),
-        };
-        let mut out = start;
-        let mut column = row.grid_before as usize;
-        for cell in &row.cells {
-            let span = cell.span.max(1) as usize;
-            let width: i32 = columns.iter().skip(column).take(span).sum();
-            column += span;
-            out.push_str(&format!(
-                "<{w}tc><{w}tcPr><{w}tcW {w}w=\"{width}\" {w}type=\"dxa\"/>"
-            ));
-            if span > 1 {
-                out.push_str(&format!("<{w}gridSpan {w}val=\"{span}\"/>"));
-            }
-            match cell.merge {
-                VMerge::None => {}
-                VMerge::Start => out.push_str(&format!("<{w}vMerge {w}val=\"restart\"/>")),
-                VMerge::Continue => out.push_str(&format!("<{w}vMerge/>")),
-            }
-            if cell.borders.iter().any(Option::is_some) {
-                out.push_str(&borders_element(
-                    &w,
-                    "tcBorders",
-                    &cell.borders,
-                    None,
-                    ["left", "top", "right", "bottom"],
-                ));
-            }
-            if let Some(fill) = cell.shading {
-                out.push_str(&format!(
-                    "<{w}shd {w}val=\"clear\" {w}color=\"auto\" {w}fill=\"{}\"/>",
-                    hex(fill)
-                ));
-            }
-            let [l, t, r, b] = cell.margins;
-            out.push_str(&format!(
-                "<{w}tcMar><{w}top {w}w=\"{t}\" {w}type=\"dxa\"/><{w}left {w}w=\"{l}\" {w}type=\"dxa\"/><{w}bottom {w}w=\"{b}\" {w}type=\"dxa\"/><{w}right {w}w=\"{r}\" {w}type=\"dxa\"/></{w}tcMar>"
-            ));
-            match cell.align {
-                CellAlign::Top => {}
-                CellAlign::Center => out.push_str(&format!("<{w}vAlign {w}val=\"center\"/>")),
-                CellAlign::Bottom => out.push_str(&format!("<{w}vAlign {w}val=\"bottom\"/>")),
-            }
-            out.push_str(&format!("</{w}tcPr>"));
-            self.in_cell += 1;
-            for block in &cell.blocks {
-                out.push_str(&self.block_elsewhere(block));
-            }
-            self.in_cell -= 1;
-            if cell.blocks.last().is_none_or(|b| b.as_table().is_some()) {
-                out.push_str(&format!("<{w}p/>"));
-            }
-            out.push_str(&format!("</{w}tc>"));
-        }
-        out.push_str(&end);
-        out
     }
 
     // -- paragraphs -------------------------------------------------------

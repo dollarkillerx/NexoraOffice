@@ -694,6 +694,15 @@ impl<'a> Saver<'a> {
                 out.push_str(&stories::with_references(&text[range.clone()], refs));
                 out.push_str(&text[range.end..]);
             }
+            // No `sectPr` in the body: one is written, for the references.
+            _ if self.document.last_section.source.is_none()
+                && self.new_refs.contains_key(&stories::NO_SECTION) =>
+            {
+                let w = &self.w;
+                let refs = &self.new_refs[&stories::NO_SECTION];
+                out.push_str(&format!("<{w}sectPr>{refs}</{w}sectPr>"));
+                out.push_str(&text[region.end..]);
+            }
             _ => out.push_str(&text[region.end..]),
         }
         if self.needs_rel_namespace && self.rels.changed {

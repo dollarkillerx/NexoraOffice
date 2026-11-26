@@ -612,3 +612,24 @@ fn the_corpus_style_edge_cases_do_not_panic() {
     let back = read(&saved);
     assert_eq!(back.footnotes.notes.len(), 1);
 }
+
+#[test]
+fn a_body_with_no_section_properties_gets_them_for_the_header() {
+    let source = docx_doc::doc("<w:p><w:r><w:t>Plain</w:t></w:r></w:p>").bytes();
+    let mut doc = read(&source);
+    let story = ensure_marginal(&mut doc, 0, MarginalKind::Header, MarginalSlot::Default).unwrap();
+    put_start(&mut doc, story, "Made");
+    let (saved, back) = check(
+        &source,
+        &doc,
+        &[
+            "[Content_Types].xml",
+            "word/_rels/document.xml.rels",
+            "word/document.xml",
+            "word/header1.xml",
+        ],
+    );
+    let main = part(&saved, "word/document.xml");
+    assert!(main.contains("</w:p><w:sectPr><w:headerReference w:type=\"default\""));
+    assert_eq!(marginal_texts(&back), [vec!["Made".to_owned()]]);
+}

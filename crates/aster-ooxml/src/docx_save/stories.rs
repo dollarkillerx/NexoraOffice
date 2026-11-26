@@ -43,6 +43,9 @@ const DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const CT: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml";
 
+/// The key of the references of a last section that has no `sectPr`.
+pub(super) const NO_SECTION: (usize, usize) = (usize::MAX, usize::MAX);
+
 const SLOTS: [MarginalSlot; 3] = [
     MarginalSlot::Default,
     MarginalSlot::First,
@@ -140,8 +143,13 @@ pub(super) fn plan(
     // predecessor does not: the later sections follow it.
     let (w, r) = (saver.w.clone(), saver.r.clone());
     for (n, (_, section)) in sections.iter().enumerate() {
-        let Some(range) = &section.source else {
-            continue;
+        // A body with no section properties at all has the last section
+        // made up by the reader; its references go into a `sectPr` that is
+        // written at the end of the body.
+        let key = match &section.source {
+            Some(range) => range_key(range),
+            None if n + 1 == sections.len() => NO_SECTION,
+            None => continue,
         };
         let mut xml = String::new();
         for (kind, slots) in [
@@ -176,7 +184,7 @@ pub(super) fn plan(
             }
         }
         if !xml.is_empty() {
-            saver.new_refs.insert(range_key(range), xml);
+            saver.new_refs.insert(key, xml);
         }
     }
     let footnotes = (original.footnotes.part.is_none() && !document.footnotes.notes.is_empty())

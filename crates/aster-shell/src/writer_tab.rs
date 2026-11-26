@@ -473,12 +473,13 @@ impl DocTab {
         self.view.command(doc)
     }
 
-    /// The style names the paragraph style list offers, in order.
-    pub fn style_names(&self) -> Vec<String> {
+    /// The style names the paragraph style list offers, in order, in the
+    /// interface language where the style is a built-in one.
+    pub fn style_names(&self, strings: &Strings) -> Vec<String> {
         self.view
             .paragraph_styles()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|(_, name)| shown_style_name(strings, name))
             .collect()
     }
 
@@ -501,6 +502,12 @@ impl DocTab {
 /// are not counted.
 pub fn count(document: &Document) -> TextStats {
     TextStats::of(&document.plain_text().replace(OBJECT, ""))
+}
+
+/// The name of a style as the interface shows it: a built-in style in the
+/// interface language, any other as the file gives it.
+pub fn shown_style_name(strings: &Strings, name: String) -> String {
+    strings.style_name(&name).unwrap_or(name)
 }
 
 fn look_of(state: &FormatState, view: &DocView) -> DocLook {
@@ -776,7 +783,49 @@ mod tests {
         assert!(tab.look().bold);
         tab.run(Command::AlignCenter);
         assert_eq!(tab.look().align, 2);
-        assert!(!tab.style_names().is_empty());
+        assert!(!tab.style_names(i18n::Language::En.strings()).is_empty());
+    }
+
+    #[test]
+    fn style_names_are_shown_in_the_interface_language_and_picking_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tab = tab(dir.path());
+        let raw: Vec<String> = tab
+            .view
+            .paragraph_styles()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        let zh = i18n::Language::ZhHans.strings();
+        let shown = tab.style_names(zh);
+        // Same entries in the same order; built-in names are translated.
+        assert_eq!(shown.len(), raw.len());
+        let mut translated = 0;
+        for (file, name) in raw.iter().zip(&shown) {
+            match zh.style_name(file) {
+                Some(expected) => {
+                    assert_eq!(name, &expected);
+                    translated += 1;
+                }
+                None => assert_eq!(name, file),
+            }
+        }
+        assert!(translated > 0, "{raw:?}");
+        let index = raw
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("heading 1"))
+            .expect("the sample has a first-level heading style");
+        assert_eq!(shown[index], "标题 1");
+        // Choosing the entry by its index applies that style, and the style
+        // box then shows the same text as the list entry.
+        assert!(tab.option(Command::ParagraphStyle, index));
+        let look = tab.look();
+        assert!(
+            look.style.eq_ignore_ascii_case("heading 1"),
+            "{}",
+            look.style
+        );
+        assert_eq!(shown_style_name(zh, look.style), shown[index]);
     }
 
     #[test]

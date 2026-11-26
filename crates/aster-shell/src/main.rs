@@ -47,7 +47,7 @@ use aster_shell::stats::{ImeState, TextStats, group_digits};
 use aster_shell::tabs::{DocKind, TabId, Tabs};
 use aster_shell::theme::{self, Rgba, ThemeMode};
 use aster_shell::toolbar::{self, CellLook, Command, Control, ViewMode, ViewState, zoom_step};
-use aster_shell::writer_tab::DocTab;
+use aster_shell::writer_tab::{DocTab, shown_style_name};
 use aster_storage::{
     Contents, Event, FileState, Fingerprint, RecordKey, RecordWriter, RecoveryRoot,
 };
@@ -1334,6 +1334,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_menu_file(strings.menu_file.into());
     s.set_menu_edit(strings.menu_edit.into());
     s.set_menu_new_markdown(strings.menu_new_markdown.into());
+    s.set_menu_new_writer(strings.menu_new_writer.into());
+    s.set_menu_new_sheets(strings.menu_new_sheets.into());
+    s.set_menu_new_slides(strings.menu_new_slides.into());
     s.set_menu_open(strings.menu_open.into());
     s.set_menu_save(strings.menu_save.into());
     s.set_menu_save_as(strings.menu_save_as.into());
@@ -1560,6 +1563,9 @@ fn apply_language(ui: &AppWindow, language: Language) {
 
 /// Lists that never change while the window is open.
 fn apply_static_models(ui: &AppWindow) {
+    ui.set_writer_kind(DocKind::Writer.index() as i32);
+    ui.set_sheets_kind(DocKind::Sheets.index() as i32);
+    ui.set_slides_kind(DocKind::Slides.index() as i32);
     ui.set_languages(model(
         Language::ALL
             .into_iter()
@@ -1729,6 +1735,12 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
             ..CellLook::default()
         };
         doc_look = look;
+        // The file names built-in styles in English; the box shows Word's
+        // name in the interface language, as the list does.
+        doc_look.style = shown_style_name(
+            shell.language.strings(),
+            std::mem::take(&mut doc_look.style),
+        );
     }
     if let Some(tab) = shell.active_slides() {
         let (cell, text, list, has_slide) = slides_ui::toolbar_state(tab);
@@ -1767,7 +1779,7 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
         slides_ui::fill_lists(&mut items, tab, strings);
     }
     if let Some(tab) = shell.active_doc() {
-        let styles = tab.style_names();
+        let styles = tab.style_names(strings);
         for item in &mut items {
             match item.command {
                 Some(Command::ParagraphStyle) => item.options = styles.clone(),
@@ -9765,6 +9777,32 @@ mod ui_tests {
         // The PDF card opens the file dialog (skipped in tests) and no tab.
         ui.invoke_new_document(DocKind::Pdf.index() as i32);
         assert_eq!(count(), before + 2);
+    }
+
+    /// The File menu's items call `new-document` with the kinds the window
+    /// holds in properties (the menu items themselves cannot be activated
+    /// from a test), so this goes through the same callback and properties.
+    #[test]
+    fn the_file_menu_makes_word_excel_and_powerpoint_documents() {
+        let app = app();
+        let ui = &app.ui;
+        let kind_of_front_tab = || app.shell.borrow().tabs.active().unwrap().kind;
+        let before = app.shell.borrow().tabs.len();
+        ui.invoke_new_document(ui.get_writer_kind());
+        assert_eq!(kind_of_front_tab(), DocKind::Writer);
+        assert!(app.shell.borrow_mut().active_doc().is_some());
+        ui.invoke_new_document(ui.get_sheets_kind());
+        assert_eq!(kind_of_front_tab(), DocKind::Sheets);
+        ui.invoke_new_document(ui.get_slides_kind());
+        assert_eq!(kind_of_front_tab(), DocKind::Slides);
+        assert_eq!(app.shell.borrow().tabs.len(), before + 3);
+        // The labels are set in every language.
+        for language in Language::ALL {
+            let strings = language.strings();
+            assert!(!strings.menu_new_writer.is_empty());
+            assert!(!strings.menu_new_sheets.is_empty());
+            assert!(!strings.menu_new_slides.is_empty());
+        }
     }
 
     /// A document asked for on the command line is ready for typing when the

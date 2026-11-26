@@ -831,6 +831,11 @@ impl Builder {
     }
 }
 
+/// Width of the font size field. A select field spends 8 + 4 on its
+/// paddings, 2 on the gap and 14 on the chevron, which leaves 28 for the
+/// text at 13: "22.5" and "10.5" take about 27.
+const SIZE_FIELD_WIDTH: f32 = 56.0;
+
 /// Body text, then heading levels 1 to 6, as the paragraph style field of
 /// a Markdown tab lists them.
 pub fn heading_names(strings: &Strings) -> Vec<String> {
@@ -886,7 +891,7 @@ pub fn toolbar_for(kind: DocKind, view: ViewState, doc: &DocLook, strings: &Stri
             )
             .sep()
             .icon(Icon::Minus, Command::FontSizeDown)
-            .select(&size_text(doc.size), 44.0, Command::FontSize)
+            .select(&size_text(doc.size), SIZE_FIELD_WIDTH, Command::FontSize)
             .icon(Icon::Plus, Command::FontSizeUp)
             .sep()
             .emphasis()

@@ -139,6 +139,32 @@ macro_rules! strings {
         }
 
         impl Strings {
+    /// The name Word shows for a built-in paragraph style, given the name a
+    /// file stores (English, any case). None for any other name.
+    pub fn style_name(&self, name: &str) -> Option<String> {
+        let lower = name.trim().to_lowercase();
+        if let Some(level) = lower.strip_prefix("heading ") {
+            return match level.parse::<u8>() {
+                Ok(level @ 1..=9) => Some(fill(self.heading_level, "level", &level.to_string())),
+                _ => None,
+            };
+        }
+        let shown = match lower.as_str() {
+            "normal" => self.docstyle_normal,
+            "title" => self.docstyle_title,
+            "subtitle" => self.docstyle_subtitle,
+            "list paragraph" => self.docstyle_list_paragraph,
+            "quote" => self.docstyle_quote,
+            "intense quote" => self.docstyle_intense_quote,
+            "caption" => self.docstyle_caption,
+            "no spacing" => self.docstyle_no_spacing,
+            "header" => self.docstyle_header,
+            "footer" => self.docstyle_footer,
+            _ => return None,
+        };
+        Some(shown.to_owned())
+    }
+
             /// Field names with their text, for checks that must cover all of them.
             pub fn fields(&self) -> Vec<(&'static str, &'static str)> {
                 vec![$((stringify!($field), self.$field),)+]
@@ -329,6 +355,9 @@ strings! {
     menu_file,
     menu_edit,
     menu_new_markdown,
+    menu_new_writer,
+    menu_new_sheets,
+    menu_new_slides,
     menu_open,
     menu_save,
     menu_save_as,
@@ -722,6 +751,18 @@ strings! {
     office_broken,
     /// The paragraph style field of a Markdown tab. `{level}` is 1 to 6.
     heading_level,
+    /// The names Word gives its built-in paragraph styles, shown for the
+    /// names a file stores in English. Heading names use `heading_level`.
+    docstyle_normal,
+    docstyle_title,
+    docstyle_subtitle,
+    docstyle_list_paragraph,
+    docstyle_quote,
+    docstyle_intense_quote,
+    docstyle_caption,
+    docstyle_no_spacing,
+    docstyle_header,
+    docstyle_footer,
     /// The Format menu: Markdown syntax the editor writes for the user.
     menu_format,
     format_bold,
@@ -980,6 +1021,9 @@ pub const ZH_HANS: Strings = Strings {
     menu_file: "文件",
     menu_edit: "编辑",
     menu_new_markdown: "新建 Markdown 文档",
+    menu_new_writer: "新建 Word 文档",
+    menu_new_sheets: "新建 Excel 工作簿",
+    menu_new_slides: "新建 PowerPoint 演示文稿",
     menu_open: "打开…",
     menu_save: "保存",
     menu_save_as: "另存为…",
@@ -1294,6 +1338,16 @@ pub const ZH_HANS: Strings = Strings {
     office_too_large: "这个文件超出了安全限制（部件太多、太大，或压缩得异常），没有打开。",
     office_broken: "文件已损坏，读不出来：{reason}",
     heading_level: "标题 {level}",
+    docstyle_normal: "正文",
+    docstyle_title: "标题",
+    docstyle_subtitle: "副标题",
+    docstyle_list_paragraph: "列表段落",
+    docstyle_quote: "引用",
+    docstyle_intense_quote: "明显引用",
+    docstyle_caption: "题注",
+    docstyle_no_spacing: "无间隔",
+    docstyle_header: "页眉",
+    docstyle_footer: "页脚",
     menu_format: "格式",
     format_bold: "粗体",
     format_italic: "斜体",
@@ -1494,6 +1548,9 @@ pub const JA: Strings = Strings {
     menu_file: "ファイル",
     menu_edit: "編集",
     menu_new_markdown: "新規 Markdown 文書",
+    menu_new_writer: "新規 Word 文書",
+    menu_new_sheets: "新規 Excel ブック",
+    menu_new_slides: "新規 PowerPoint プレゼンテーション",
     menu_open: "開く…",
     menu_save: "保存",
     menu_save_as: "名前を付けて保存…",
@@ -1808,6 +1865,16 @@ pub const JA: Strings = Strings {
     office_too_large: "このファイルは安全上の制限（部品の数、大きさ、異常な圧縮率）を超えているため、開きませんでした。",
     office_broken: "ファイルが壊れていて読み取れません：{reason}",
     heading_level: "見出し {level}",
+    docstyle_normal: "標準",
+    docstyle_title: "表題",
+    docstyle_subtitle: "副題",
+    docstyle_list_paragraph: "リスト段落",
+    docstyle_quote: "引用文",
+    docstyle_intense_quote: "引用文 2",
+    docstyle_caption: "図表番号",
+    docstyle_no_spacing: "行間詰め",
+    docstyle_header: "ヘッダー",
+    docstyle_footer: "フッター",
     menu_format: "書式",
     format_bold: "太字",
     format_italic: "斜体",
@@ -2008,6 +2075,9 @@ pub const EN: Strings = Strings {
     menu_file: "File",
     menu_edit: "Edit",
     menu_new_markdown: "New Markdown Document",
+    menu_new_writer: "New Word Document",
+    menu_new_sheets: "New Excel Workbook",
+    menu_new_slides: "New PowerPoint Presentation",
     menu_open: "Open…",
     menu_save: "Save",
     menu_save_as: "Save As…",
@@ -2322,6 +2392,16 @@ pub const EN: Strings = Strings {
     office_too_large: "This file is over a safety limit (too many parts, parts too large, or unusually compressed) and was not opened.",
     office_broken: "The file is damaged and can’t be read: {reason}",
     heading_level: "Heading {level}",
+    docstyle_normal: "Normal",
+    docstyle_title: "Title",
+    docstyle_subtitle: "Subtitle",
+    docstyle_list_paragraph: "List Paragraph",
+    docstyle_quote: "Quote",
+    docstyle_intense_quote: "Intense Quote",
+    docstyle_caption: "Caption",
+    docstyle_no_spacing: "No Spacing",
+    docstyle_header: "Header",
+    docstyle_footer: "Footer",
     menu_format: "Format",
     format_bold: "Bold",
     format_italic: "Italic",
@@ -2515,6 +2595,9 @@ pub const ZH_HANT: Strings = Strings {
     menu_file: "檔案",
     menu_edit: "編輯",
     menu_new_markdown: "新增 Markdown 文件",
+    menu_new_writer: "新增 Word 文件",
+    menu_new_sheets: "新增 Excel 活頁簿",
+    menu_new_slides: "新增 PowerPoint 簡報",
     menu_open: "開啟…",
     menu_save: "儲存",
     menu_save_as: "另存新檔…",
@@ -2829,6 +2912,16 @@ pub const ZH_HANT: Strings = Strings {
     office_too_large: "這個檔案超出了安全限制（部件太多、太大，或壓縮得異常），沒有開啟。",
     office_broken: "檔案已損壞，讀不出來：{reason}",
     heading_level: "標題 {level}",
+    docstyle_normal: "內文",
+    docstyle_title: "標題",
+    docstyle_subtitle: "副標題",
+    docstyle_list_paragraph: "清單段落",
+    docstyle_quote: "引文",
+    docstyle_intense_quote: "鮮明引文",
+    docstyle_caption: "標號",
+    docstyle_no_spacing: "無間距",
+    docstyle_header: "頁首",
+    docstyle_footer: "頁尾",
     menu_format: "格式",
     format_bold: "粗體",
     format_italic: "斜體",
@@ -3022,6 +3115,9 @@ pub const FR: Strings = Strings {
     menu_file: "Fichier",
     menu_edit: "Édition",
     menu_new_markdown: "Nouveau document Markdown",
+    menu_new_writer: "Nouveau document Word",
+    menu_new_sheets: "Nouveau classeur Excel",
+    menu_new_slides: "Nouvelle présentation PowerPoint",
     menu_open: "Ouvrir…",
     menu_save: "Enregistrer",
     menu_save_as: "Enregistrer sous…",
@@ -3336,6 +3432,16 @@ pub const FR: Strings = Strings {
     office_too_large: "Ce fichier dépasse une limite de sécurité (trop de parties, parties trop grandes ou compression anormale) et n’a pas été ouvert.",
     office_broken: "Le fichier est endommagé et illisible : {reason}",
     heading_level: "Titre {level}",
+    docstyle_normal: "Normal",
+    docstyle_title: "Titre",
+    docstyle_subtitle: "Sous-titre",
+    docstyle_list_paragraph: "Paragraphe de liste",
+    docstyle_quote: "Citation",
+    docstyle_intense_quote: "Citation intense",
+    docstyle_caption: "Légende",
+    docstyle_no_spacing: "Sans interligne",
+    docstyle_header: "En-tête",
+    docstyle_footer: "Pied de page",
     menu_format: "Format",
     format_bold: "Gras",
     format_italic: "Italique",
@@ -3529,6 +3635,9 @@ pub const DE: Strings = Strings {
     menu_file: "Datei",
     menu_edit: "Bearbeiten",
     menu_new_markdown: "Neues Markdown-Dokument",
+    menu_new_writer: "Neues Word-Dokument",
+    menu_new_sheets: "Neue Excel-Arbeitsmappe",
+    menu_new_slides: "Neue PowerPoint-Präsentation",
     menu_open: "Öffnen…",
     menu_save: "Speichern",
     menu_save_as: "Speichern unter…",
@@ -3843,6 +3952,16 @@ pub const DE: Strings = Strings {
     office_too_large: "Diese Datei überschreitet eine Sicherheitsgrenze (zu viele oder zu große Teile oder ungewöhnlich stark komprimiert) und wurde nicht geöffnet.",
     office_broken: "Die Datei ist beschädigt und kann nicht gelesen werden: {reason}",
     heading_level: "Überschrift {level}",
+    docstyle_normal: "Standard",
+    docstyle_title: "Titel",
+    docstyle_subtitle: "Untertitel",
+    docstyle_list_paragraph: "Listenabsatz",
+    docstyle_quote: "Zitat",
+    docstyle_intense_quote: "Intensives Zitat",
+    docstyle_caption: "Beschriftung",
+    docstyle_no_spacing: "Kein Leerraum",
+    docstyle_header: "Kopfzeile",
+    docstyle_footer: "Fußzeile",
     menu_format: "Format",
     format_bold: "Fett",
     format_italic: "Kursiv",
@@ -4036,6 +4155,9 @@ pub const ES: Strings = Strings {
     menu_file: "Archivo",
     menu_edit: "Edición",
     menu_new_markdown: "Nuevo documento Markdown",
+    menu_new_writer: "Nuevo documento de Word",
+    menu_new_sheets: "Nuevo libro de Excel",
+    menu_new_slides: "Nueva presentación de PowerPoint",
     menu_open: "Abrir…",
     menu_save: "Guardar",
     menu_save_as: "Guardar como…",
@@ -4350,6 +4472,16 @@ pub const ES: Strings = Strings {
     office_too_large: "Este archivo supera un límite de seguridad (demasiadas partes, partes demasiado grandes o una compresión inusual) y no se abrió.",
     office_broken: "El archivo está dañado y no se puede leer: {reason}",
     heading_level: "Título {level}",
+    docstyle_normal: "Normal",
+    docstyle_title: "Título",
+    docstyle_subtitle: "Subtítulo",
+    docstyle_list_paragraph: "Párrafo de lista",
+    docstyle_quote: "Cita",
+    docstyle_intense_quote: "Cita destacada",
+    docstyle_caption: "Descripción",
+    docstyle_no_spacing: "Sin espaciado",
+    docstyle_header: "Encabezado",
+    docstyle_footer: "Pie de página",
     menu_format: "Formato",
     format_bold: "Negrita",
     format_italic: "Cursiva",
@@ -4543,6 +4675,9 @@ pub const KO: Strings = Strings {
     menu_file: "파일",
     menu_edit: "편집",
     menu_new_markdown: "새 Markdown 문서",
+    menu_new_writer: "새 Word 문서",
+    menu_new_sheets: "새 Excel 통합 문서",
+    menu_new_slides: "새 PowerPoint 프레젠테이션",
     menu_open: "열기…",
     menu_save: "저장",
     menu_save_as: "다른 이름으로 저장…",
@@ -4857,6 +4992,16 @@ pub const KO: Strings = Strings {
     office_too_large: "이 파일은 안전 한도(부분이 너무 많거나 크거나 비정상적으로 압축됨)를 넘어서 열지 않았습니다.",
     office_broken: "파일이 손상되어 읽을 수 없습니다: {reason}",
     heading_level: "제목 {level}",
+    docstyle_normal: "표준",
+    docstyle_title: "제목",
+    docstyle_subtitle: "부제",
+    docstyle_list_paragraph: "목록 단락",
+    docstyle_quote: "인용",
+    docstyle_intense_quote: "강한 인용",
+    docstyle_caption: "캡션",
+    docstyle_no_spacing: "간격 없음",
+    docstyle_header: "머리글",
+    docstyle_footer: "바닥글",
     menu_format: "서식",
     format_bold: "굵게",
     format_italic: "기울임꼴",
@@ -4910,6 +5055,22 @@ mod tests {
     }
 
     #[test]
+    fn built_in_style_names_are_shown_in_the_interface_language() {
+        let zh = Language::ZhHans.strings();
+        assert_eq!(zh.style_name("Normal").as_deref(), Some("正文"));
+        assert_eq!(zh.style_name("heading 3").as_deref(), Some("标题 3"));
+        assert_eq!(zh.style_name("Heading 9").as_deref(), Some("标题 9"));
+        assert_eq!(zh.style_name("List Paragraph").as_deref(), Some("列表段落"));
+        let de = Language::De.strings();
+        assert_eq!(de.style_name("heading 1").as_deref(), Some("Überschrift 1"));
+        assert_eq!(de.style_name("footer").as_deref(), Some("Fußzeile"));
+        // A custom name, or a heading beyond the ninth, stays as the file has it.
+        assert_eq!(zh.style_name("My Style"), None);
+        assert_eq!(zh.style_name("heading 10"), None);
+        assert_eq!(zh.style_name("heading"), None);
+    }
+
+    #[test]
     fn no_language_has_empty_text() {
         for language in Language::ALL {
             for (name, text) in language.strings().fields() {
@@ -4952,6 +5113,8 @@ mod tests {
             "comment_title",
             // "Name" in German.
             "formula_hint_name",
+            // "Normal" in French and Spanish.
+            "docstyle_normal",
         ];
         let english = EN.fields();
         for language in Language::ALL {

@@ -289,6 +289,10 @@ export component AppWindow inherits Window {
 
     callback tab-activate(int);
     callback tab-close(int);
+    // The kind indices the File menu's new-document items hand over.
+    in property <int> writer-kind;
+    in property <int> sheets-kind;
+    in property <int> slides-kind;
     callback new-document(int);
     callback show-start();
     // 0 open, 1 show in the file manager, 2 take off the list; from the
@@ -504,6 +508,27 @@ export component AppWindow inherits Window {
                 shortcut: @keys(Control + N);
                 activated => {
                     root.file-new();
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-new-writer;
+                activated => {
+                    root.new-document(root.writer-kind);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-new-sheets;
+                activated => {
+                    root.new-document(root.sheets-kind);
+                }
+            }
+
+            MenuItem {
+                title: Strings.menu-new-slides;
+                activated => {
+                    root.new-document(root.slides-kind);
                 }
             }
 

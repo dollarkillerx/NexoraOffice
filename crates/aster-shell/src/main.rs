@@ -4624,6 +4624,7 @@ fn refresh_viewer(ui: &AppWindow, shell: &mut Shell) {
         ui.set_cell_content(content.into());
         ui.set_viewer_note(note.into());
         ui.set_sheet_filtered(view.sheet().is_some_and(|s| s.auto_filter.is_some()));
+        writer_ui::sync_menu_marks(ui, false);
         ui.set_sheet_has_print_area(view.sheet().is_some_and(|s| !s.print_area.is_empty()));
         ui.set_cell_has_comment(tab.comment().is_some());
         show_comment(ui, shell);
@@ -6424,6 +6425,24 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
         shell.doc_split_for = None;
         ui.invoke_focus_document();
     }));
+    // Not through `handler!`: the marks are made right even when the command
+    // was skipped because the shell was busy.
+    ui.on_menu_marks({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                writer_ui::sync_menu_marks(&ui, true);
+            }
+        }
+    });
+    ui.on_comments_close({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                writer_ui::close_comments(&ui);
+            }
+        }
+    });
     ui.on_review(handler!(|ui, shell, code| {
         writer_ui::review(&ui, shell, code);
     }));
@@ -10910,6 +10929,290 @@ mod ui_tests {
         let before = with_doc(&app, |tab| tab.view.document().clone());
         ui.invoke_format(51);
         assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+    }
+
+    /// The text the toolbar's font size box shows.
+    fn shown_font_size(app: &App) -> String {
+        use slint::Model;
+        let items = app.ui.get_toolbar_items();
+        (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .find(|item| item.command == Command::FontSize.id())
+            .expect("a font size box")
+            .text
+            .to_string()
+    }
+
+    #[test]
+    fn the_toolbar_follows_a_click_into_a_paragraph_with_another_look() {
+        use aster_writer::{Block, Paragraph, Path, Pos, Run, RunLook};
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        let paragraph = |size: f32| {
+            let look = RunLook {
+                size,
+                ..RunLook::default()
+            };
+            Block::paragraph(Paragraph {
+                runs: vec![Run::text("some text", look.clone())],
+                base: look.clone(),
+                mark: look,
+                ..Paragraph::default()
+            })
+        };
+        with_doc(&app, |tab| {
+            tab.view.edit_document(|doc, _| {
+                doc.body.blocks = vec![paragraph(12.0), paragraph(30.0)];
+                doc.renumber();
+                Some(aster_writer::edit::Selection::caret(Pos::new(
+                    Path::body(0),
+                    0,
+                )))
+            });
+        });
+        writer_ui::after_edit(ui, &mut app.shell.borrow_mut());
+        assert_eq!(shown_font_size(&app), "12");
+        // Where each paragraph's caret is (moved without scrolling), with
+        // the caret back in the first one and the window not told.
+        let place = |app: &App, n: usize| {
+            with_doc(app, |tab| {
+                let at = Pos::new(Path::body(n), 2);
+                tab.view.set_selection(at.clone(), at);
+                let (x, y, _, h) = tab.view.caret_rect().expect("a caret");
+                (x, y + h / 2.0)
+            })
+        };
+        let (first, second) = (place(&app, 0), place(&app, 1));
+        assert!(second.1 > first.1 + 5.0, "{first:?} {second:?}");
+        with_doc(&app, |tab| {
+            let at = Pos::new(Path::body(0), 0);
+            tab.view.set_selection(at.clone(), at);
+        });
+        // A press in the second, and no key at all.
+        click_document(&app, second);
+        assert_eq!(shown_font_size(&app), "30");
+        // And back.
+        click_document(&app, first);
+        assert_eq!(shown_font_size(&app), "12");
+    }
+
+    /// The six check marks of the picture wrap menu.
+    fn wrap_marks(ui: &AppWindow) -> [bool; 6] {
+        [
+            ui.get_mark_wrap_0(),
+            ui.get_mark_wrap_1(),
+            ui.get_mark_wrap_2(),
+            ui.get_mark_wrap_3(),
+            ui.get_mark_wrap_4(),
+            ui.get_mark_wrap_5(),
+        ]
+    }
+
+    /// Flip the check mark of the wrap item `index` as Slint does when the
+    /// item is chosen (`checked` is set to its opposite before `activated`
+    /// runs). The test window has no native menu to choose from, so this is
+    /// done by hand here, in the properties the items are bound to.
+    fn slint_flips_wrap_mark(ui: &AppWindow, index: usize) {
+        match index {
+            0 => ui.set_mark_wrap_0(!ui.get_mark_wrap_0()),
+            1 => ui.set_mark_wrap_1(!ui.get_mark_wrap_1()),
+            2 => ui.set_mark_wrap_2(!ui.get_mark_wrap_2()),
+            3 => ui.set_mark_wrap_3(!ui.get_mark_wrap_3()),
+            4 => ui.set_mark_wrap_4(!ui.get_mark_wrap_4()),
+            _ => ui.set_mark_wrap_5(!ui.get_mark_wrap_5()),
+        }
+    }
+
+    #[test]
+    fn the_menu_marks_follow_the_state_whatever_the_menu_item_did() {
+        use aster_surface::doc_view::PictureLayout;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "ab");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let size = aster_shell::writer_tab::read_picture(&DOT_PNG).unwrap();
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::place_picture(
+                ui,
+                &mut shell,
+                id,
+                std::path::Path::new("点.png"),
+                Ok((DOT_PNG.to_vec(), size)),
+            );
+        }
+        with_doc(&app, |tab| {
+            let start = tab.view.document().start().unwrap();
+            let mut a = start.clone();
+            let mut b = start;
+            a.offset = 2;
+            b.offset = 2 + aster_writer::OBJECT.len();
+            tab.view.set_selection(a, b);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        let epoch = |ui: &AppWindow| ui.get_menu_epoch().to_rgba8().map(|b| b.as_slice()[0]);
+        // In the line, then square, top and bottom, tight, and tight again
+        // (which changes nothing): one mark, the picture's layout.
+        let layouts = [
+            PictureLayout::Inline,
+            PictureLayout::Square,
+            PictureLayout::Tight,
+            PictureLayout::TopAndBottom,
+        ];
+        for index in [0usize, 1, 3, 2, 2] {
+            let before = epoch(ui);
+            slint_flips_wrap_mark(ui, index);
+            ui.invoke_format(50 + index as i32);
+            ui.invoke_menu_marks();
+            let marks = wrap_marks(ui);
+            assert_eq!(marks.iter().filter(|m| **m).count(), 1, "{marks:?}");
+            assert!(marks[index], "{marks:?} after {index}");
+            assert_eq!(
+                with_doc(&app, |tab| tab.view.picture_layout()),
+                Some(layouts[[0usize, 1, 2, 3].iter().position(|i| *i == index).unwrap()])
+            );
+            assert_ne!(
+                epoch(ui),
+                before,
+                "every activation makes the native items be built anew"
+            );
+        }
+        // With nothing selected, a wrap item asked for anyway is refused and
+        // no mark is left on.
+        with_doc(&app, |tab| {
+            let at = tab.view.document().start().unwrap();
+            tab.view.go_to(&at);
+        });
+        writer_ui::after_move(ui, &mut app.shell.borrow_mut());
+        assert_eq!(wrap_marks(ui), [false; 6]);
+        slint_flips_wrap_mark(ui, 4);
+        ui.invoke_format(54);
+        ui.invoke_menu_marks();
+        assert_eq!(wrap_marks(ui), [false; 6]);
+    }
+
+    #[test]
+    fn the_comments_mark_follows_the_panel_and_its_close_button() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        make_reviewed(&app);
+        assert!(!ui.get_mark_comments());
+        // Chosen in the menu: Slint flips the mark (done by hand here, see
+        // `slint_flips_wrap_mark`), the command opens the panel.
+        let choose = |ui: &AppWindow| {
+            ui.set_mark_comments(!ui.get_mark_comments());
+            ui.invoke_review(7);
+            ui.invoke_menu_marks();
+        };
+        choose(ui);
+        assert!(ui.get_comments_open());
+        assert!(ui.get_mark_comments());
+        // Closed by the panel's own button: the mark goes off.
+        ui.invoke_comments_close();
+        assert!(!ui.get_comments_open());
+        assert!(!ui.get_mark_comments());
+        // And the menu opens it again, and closes it.
+        choose(ui);
+        assert!(ui.get_comments_open());
+        assert!(ui.get_mark_comments());
+        choose(ui);
+        assert!(!ui.get_comments_open());
+        assert!(!ui.get_mark_comments());
+        // The markup item is a mark of its own.
+        assert!(ui.get_mark_markup());
+        ui.set_mark_markup(!ui.get_mark_markup());
+        ui.invoke_review(0);
+        ui.invoke_menu_marks();
+        assert!(!ui.get_mark_markup());
+        assert!(!with_doc(&app, |tab| tab.view.show_markup()));
+    }
+
+    #[test]
+    fn the_comments_panel_scrolls_to_the_comment_that_was_clicked_in_the_text() {
+        use aster_writer::{
+            Annotation, Block, Comment, Inline, Paragraph, Path, Pos, Run, RunLook,
+        };
+        use std::sync::Arc;
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        let look = RunLook {
+            size: 12.0,
+            ..RunLook::default()
+        };
+        let marker = |annotation: Annotation| {
+            let mut run = Run::object(Inline::Marker, look.clone());
+            run.annotation = Some(annotation);
+            run
+        };
+        let count = 12;
+        with_doc(&app, |tab| {
+            tab.view.edit_document(|doc, _| {
+                doc.body.blocks = (0..count)
+                    .map(|i| {
+                        Block::paragraph(Paragraph {
+                            runs: vec![
+                                marker(Annotation::CommentStart(i + 1)),
+                                Run::text(format!("text {i}"), look.clone()),
+                                marker(Annotation::CommentEnd(i + 1)),
+                                marker(Annotation::CommentReference(i + 1)),
+                            ],
+                            base: look.clone(),
+                            mark: look.clone(),
+                            ..Paragraph::default()
+                        })
+                    })
+                    .collect();
+                doc.comments = (0..count)
+                    .map(|i| {
+                        Arc::new(Comment {
+                            id: i + 1,
+                            author: "Cy".into(),
+                            initials: "C".into(),
+                            date: None,
+                            // Rows of different heights.
+                            paragraphs: vec![
+                                "a comment that is long enough to wrap "
+                                    .repeat(1 + (i as usize % 3) * 3),
+                            ],
+                        })
+                    })
+                    .collect();
+                doc.renumber();
+                Some(aster_writer::edit::Selection::caret(Pos::new(
+                    Path::body(0),
+                    0,
+                )))
+            });
+        });
+        writer_ui::after_edit(ui, &mut app.shell.borrow_mut());
+        ui.invoke_review(7);
+        assert_eq!(ui.get_comments().row_count(), count as usize);
+        let settle = || slint::platform::update_timers_and_animations();
+        settle();
+        assert_eq!(ui.get_comments_scroll(), 0.0);
+        let click_comment = |id: i64| {
+            let at = find_point(&app, |view, x, y| view.comment_at(x, y) == Some(id));
+            click_document(&app, at);
+            settle();
+        };
+        // The last comment's row is below the fold: the list goes there.
+        click_comment(count);
+        let down = ui.get_comments_scroll();
+        assert!(down < 0.0, "the list scrolled: {down}");
+        // One that is in view is not scrolled to.
+        click_comment(count - 1);
+        let near = ui.get_comments_scroll();
+        assert!(near >= down && near <= 0.0, "{near} after {down}");
+        // The first: back at the top.
+        click_comment(1);
+        assert_eq!(ui.get_comments_scroll(), 0.0);
+        // And the next one on the first screen leaves it there.
+        click_comment(2);
+        assert_eq!(ui.get_comments_scroll(), 0.0);
     }
 
     /// A document with, in its first paragraph, text inserted by Ann and

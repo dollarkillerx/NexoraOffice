@@ -12,7 +12,9 @@ use aster_writer::{
     Paragraph, Path, StoryId, Wrap,
 };
 
-use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
+use crate::display::{
+    FrameItem, Item, LeaderItem, PictureItem, PictureSource, Rect, Rgba, RuleStyle, TextItem,
+};
 use crate::fonts::Families;
 use crate::query::TableGrid;
 use crate::shape::{
@@ -521,6 +523,7 @@ impl Cx<'_> {
     pub fn emit_drawing(
         &mut self,
         drawing: &Drawing,
+        source: Option<(&Path, usize)>,
         rect: Rect,
         layer: Layer,
         ec: &EmitCtx,
@@ -532,6 +535,12 @@ impl Cx<'_> {
                     image: picture.image.clone(),
                     rect,
                     crop: picture.crop,
+                    source: source.map(|(path, offset)| {
+                        Arc::new(PictureSource {
+                            path: path.clone(),
+                            offset,
+                        })
+                    }),
                 });
                 layer.of(out.layers).push(item);
             }
@@ -657,7 +666,8 @@ impl Cx<'_> {
                 if !lines.contains(&rect.line) {
                     continue;
                 }
-                let Some((_, drawing)) = shaped.objects.iter().find(|(o, _)| *o == rect.offset)
+                let Some((_, drawing, at)) =
+                    shaped.objects.iter().find(|(o, _, _)| *o == rect.offset)
                 else {
                     continue;
                 };
@@ -668,7 +678,8 @@ impl Cx<'_> {
                     y + rect.y + rect.height,
                 );
                 let drawing = drawing.clone();
-                self.emit_drawing(&drawing, r, Layer::Body, ec, out);
+                let source = entry.path.as_ref().map(|path| (path, *at));
+                self.emit_drawing(&drawing, source, r, Layer::Body, ec, out);
             }
         }
         for ruby in &shaped.rubies {
@@ -701,7 +712,7 @@ impl Cx<'_> {
             }));
         }
         let mut keep_clear = Vec::new();
-        for (n, (offset, drawing)) in shaped.floats.iter().enumerate() {
+        for (n, (offset, drawing, at)) in shaped.floats.iter().enumerate() {
             let (line_index, caret_x) = paragraph.caret(*offset);
             if !lines.contains(&line_index) {
                 continue;
@@ -727,7 +738,8 @@ impl Cx<'_> {
                 Layer::Front
             };
             let drawing = drawing.clone();
-            self.emit_drawing(&drawing, rect, layer, ec, out);
+            let source = entry.path.as_ref().map(|path| (path, *at));
+            self.emit_drawing(&drawing, source, rect, layer, ec, out);
             if float.wrap != Wrap::None {
                 let [dl, dt, dr, db] = float.distance.map(emu_pt);
                 keep_clear.push((

@@ -202,6 +202,7 @@ fn items_page() -> (Document, Layout) {
             image: Arc::from(image),
             rect,
             crop,
+            source: None,
         })
     };
     let png = docx_sample::png(48, 32);

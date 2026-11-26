@@ -234,10 +234,32 @@ impl DocView {
         self.select_and_show(start, end)
     }
 
+    /// Select the text between two places and bring it into view: the view
+    /// scrolls only when the text is not all in the window already.
     fn select_and_show(&mut self, start: Pos, end: Pos) -> bool {
+        if self.compose.is_none() && self.in_window(&start, &end) {
+            return self.set_selection(start, end);
+        }
         let moved = self.go_to(&start);
         let selected = self.set_selection(start, end);
         moved || selected
+    }
+
+    /// Whether the lines from `start` to `end` are wholly in the window.
+    fn in_window(&self, start: &Pos, end: &Pos) -> bool {
+        let rows = |pos: &Pos| {
+            let caret = self
+                .layout
+                .caret_on(self.page_for(pos.path.story), pos)
+                .or_else(|| self.layout.caret(pos))?;
+            let top =
+                self.page_rect(caret.page).y0 + f64::from(caret.top) * self.pixels_per_point();
+            Some((top, top + f64::from(caret.height) * self.pixels_per_point()))
+        };
+        match (rows(start), rows(end)) {
+            (Some((top, _)), Some((_, bottom))) => top >= 0.0 && bottom <= f64::from(self.height),
+            _ => false,
+        }
     }
 
     /// Every change in reading order.

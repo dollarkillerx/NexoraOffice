@@ -247,6 +247,29 @@ fn next_and_previous_step_through_the_changes_and_wrap() {
 }
 
 #[test]
+fn going_to_a_change_or_comment_scrolls_only_when_it_is_not_in_view() {
+    let mut view = view();
+    let top = view.scroll_y;
+    view.set_selection(pos(0, 0), pos(0, 0));
+    // The first changes and the comment are on the first screen: it stays.
+    assert!(view.next_change());
+    assert_eq!(view.selected_text(), "two ");
+    assert!(view.next_change());
+    assert!(view.go_to_comment(7));
+    assert_eq!(view.selected_text(), "cd");
+    assert_eq!(view.scroll_y, top, "what is in view is not moved");
+    // The late one is far below: the view goes there.
+    assert!(view.next_change());
+    assert_eq!(view.selected_text(), "change");
+    assert!(view.scroll_y > top);
+    let there = view.scroll_y;
+    // After the last comes the first, which is off the screen now.
+    assert!(view.next_change());
+    assert_eq!(view.selected_text(), "two ");
+    assert!(view.scroll_y < there);
+}
+
+#[test]
 fn accepting_and_rejecting_by_selection_are_one_step_of_undo_each() {
     let mut view = view();
     view.set_selection(pos(0, 4), pos(0, 8));

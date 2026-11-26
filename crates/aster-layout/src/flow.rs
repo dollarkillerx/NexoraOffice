@@ -1083,7 +1083,7 @@ impl Flow<'_, '_> {
                     let ec = self.ec(false);
                     let origin_y = y0 - plain.lines()[0].top;
                     let origin_x = col_x + pt(props.indent_left);
-                    for (n, (offset, drawing)) in plain.floats.iter().enumerate() {
+                    for (n, (offset, drawing, _)) in plain.floats.iter().enumerate() {
                         let Some(float) = drawing.float else {
                             continue;
                         };

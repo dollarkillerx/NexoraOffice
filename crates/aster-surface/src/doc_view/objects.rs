@@ -54,6 +54,19 @@ use super::DocView;
 use super::stories::Area;
 use super::text::{sanitized, text_between};
 
+/// Whether the run that starts at the byte `offset` of a paragraph's text
+/// is a picture.
+fn drawing_at(paragraph: &aster_writer::Paragraph, offset: usize) -> bool {
+    let mut start = 0;
+    for run in &paragraph.runs {
+        if start == offset {
+            return matches!(&run.kind, Inline::Drawing(d) if matches!(d.content, DrawingContent::Picture(_)));
+        }
+        start += run.text.len();
+    }
+    false
+}
+
 /// EMU in a point, and in a twip.
 const EMU_PT: f64 = 12_700.0;
 const EMU_TWIP: i64 = 635;
@@ -540,20 +553,38 @@ impl DocView {
         let only = matches!(at.path.story, StoryId::Marginal(_))
             .then(|| caret.map(|c| c.page))
             .flatten();
+        // The layout says which drawing each picture is; only a picture
+        // that does not say (one in a text box) is looked for by its image
+        // and size.
         let mut found: Vec<(usize, PageRect)> = Vec::new();
+        let mut guessed: Vec<(usize, PageRect)> = Vec::new();
         for (index, page) in self.layout.pages.iter().enumerate() {
             if only.is_some_and(|p| p != index) {
                 continue;
             }
             for item in &page.items {
-                if let Item::Picture(p) = item
-                    && Arc::ptr_eq(&p.image, image)
-                    && (f64::from(p.rect.width()) - w).abs() < 1.0
-                    && (f64::from(p.rect.height()) - h).abs() < 1.0
-                {
-                    found.push((index, p.rect));
+                let Item::Picture(p) = item else {
+                    continue;
+                };
+                match &p.source {
+                    Some(source) => {
+                        if source.path == at.path && source.offset == at.offset {
+                            found.push((index, p.rect));
+                        }
+                    }
+                    None => {
+                        if Arc::ptr_eq(&p.image, image)
+                            && (f64::from(p.rect.width()) - w).abs() < 1.0
+                            && (f64::from(p.rect.height()) - h).abs() < 1.0
+                        {
+                            guessed.push((index, p.rect));
+                        }
+                    }
                 }
             }
+        }
+        if found.is_empty() {
+            found = guessed;
         }
         found.into_iter().min_by(|(pa, ra), (pb, rb)| {
             let distance = |page: usize, rect: &PageRect| match caret {
@@ -598,6 +629,17 @@ impl DocView {
             Item::Picture(p) if p.rect.contains(px, py) => Some(p),
             _ => None,
         })?;
+        // The layout says which drawing this is.
+        if let Some(source) = &hit.source
+            && self
+                .document
+                .paragraph(&source.path)
+                .is_some_and(|p| drawing_at(p, source.offset))
+        {
+            let found = Pos::new(source.path.clone(), source.offset);
+            let end = Pos::new(source.path.clone(), source.offset + OBJECT.len());
+            return Some((found, end, page));
+        }
         let near = self.layout.hit_in(page, story, px, py);
         let size = |s: (i64, i64)| {
             (s.0 as f64 / EMU_PT - f64::from(hit.rect.width())).abs() < 1.0

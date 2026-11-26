@@ -648,6 +648,131 @@ fn a_floating_picture_is_selected_and_deleted_and_has_handles_too() {
     assert!(!texts(&view)[0].contains('\u{FFFC}'));
 }
 
+/// Every picture on page 0, in the window's pixels (left, top, right,
+/// bottom), in the order of the layout's items.
+fn picture_boxes(view: &DocView) -> Vec<(f64, f64, f64, f64)> {
+    let origin = view.page_rect(0);
+    let ppp = view.pixels_per_point();
+    view.layout().pages[0]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            aster_layout::Item::Picture(p) => Some((
+                origin.x0 + f64::from(p.rect.x0) * ppp,
+                origin.y0 + f64::from(p.rect.y0) * ppp,
+                origin.x0 + f64::from(p.rect.x1) * ppp,
+                origin.y0 + f64::from(p.rect.y1) * ppp,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where the floating picture of a paragraph is put on the page.
+fn float_offsets(view: &DocView, block: usize) -> (FloatAt, FloatAt) {
+    let p = view.document().paragraph(&Path::body(block)).unwrap();
+    p.runs
+        .iter()
+        .find_map(|r| match &r.kind {
+            aster_writer::Inline::Drawing(d) => d.float.map(|f| (f.x.at, f.y.at)),
+            _ => None,
+        })
+        .expect("a floating drawing")
+}
+
+#[test]
+fn the_same_picture_three_times_is_told_apart_by_where_it_is_anchored() {
+    let image = png();
+    let drawing = |float: Option<(i64, i64)>| Drawing {
+        size: (40 * PT, 30 * PT),
+        content: DrawingContent::Picture(Picture {
+            image: image.clone(),
+            crop: [0.0; 4],
+        }),
+        float: float.map(|(x, y)| Float {
+            x: FloatAxis {
+                from: FloatFrom::Page,
+                at: FloatAt::Offset(x * PT),
+            },
+            y: FloatAxis {
+                from: FloatFrom::Page,
+                at: FloatAt::Offset(y * PT),
+            },
+            wrap: Wrap::None,
+            behind: false,
+            distance: [0; 4],
+        }),
+        alt: None,
+    };
+    let with = |text: &str, drawing: Drawing| {
+        let mut p = paragraph(text);
+        p.runs.push(aster_writer::Run::object(
+            aster_writer::Inline::Drawing(Arc::new(drawing)),
+            look(),
+        ));
+        Block::paragraph(p)
+    };
+    // A's picture floats at the right of the page's top; B's is far from B,
+    // lower on the page; C has its picture in the line.
+    let mut view = view_of(doc(vec![
+        with("aa", drawing(Some((150, 40)))),
+        with("bb", drawing(Some((150, 120)))),
+        with("cc", drawing(None)),
+    ]));
+    let boxes = picture_boxes(&view);
+    assert_eq!(boxes.len(), 3);
+    let centre = |b: (f64, f64, f64, f64)| ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0);
+    // The rectangle of the selected picture in the window's pixels.
+    let selected_box = |view: &DocView| {
+        let object = view.selected_object().expect("a picture is selected");
+        let origin = view.page_rect(object.page);
+        let ppp = view.pixels_per_point();
+        (
+            origin.x0 + f64::from(object.rect.x0) * ppp,
+            origin.y0 + f64::from(object.rect.y0) * ppp,
+        )
+    };
+    // A press on each picture selects its own drawing, and the rectangle of
+    // the selection is the one that was pressed.
+    let mut selected: Vec<usize> = Vec::new();
+    for &b in &boxes {
+        let (x, y) = centre(b);
+        click_at(&mut view, x, y);
+        let object = view.selected_object().expect("a picture is selected");
+        assert_eq!(object.pos.offset, 2);
+        selected.push(object.pos.path.steps[0] as usize);
+        let (sx, sy) = selected_box(&view);
+        assert!(
+            (sx - b.0).abs() < 1.5 && (sy - b.1).abs() < 1.5,
+            "{:?} against {b:?}",
+            (sx, sy)
+        );
+    }
+    selected.sort_unstable();
+    assert_eq!(selected, vec![0, 1, 2], "each picture selects its own");
+    // Dragging the second moves the second and leaves the first where it was.
+    let first_before = float_offsets(&view, 0);
+    let second_before = float_offsets(&view, 1);
+    let second = *boxes
+        .iter()
+        .find(|b| {
+            click_at(&mut view, centre(**b).0, centre(**b).1);
+            view.selected_object().unwrap().pos.path == Path::body(1)
+        })
+        .unwrap();
+    let (cx, cy) = centre(second);
+    view.press(cx, cy, 1, false);
+    assert!(view.drag(cx + 30.0, cy + 12.0));
+    view.release();
+    assert_eq!(float_offsets(&view, 0), first_before);
+    assert_ne!(float_offsets(&view, 1), second_before);
+    assert_eq!(
+        view.selected_object().unwrap().pos.path,
+        Path::body(1),
+        "the moved picture stays selected"
+    );
+}
+
 #[test]
 fn tables_links_and_pictures_wait_for_an_input_method() {
     let mut document = grid();

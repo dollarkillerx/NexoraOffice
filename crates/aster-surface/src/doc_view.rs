@@ -17,7 +17,10 @@
 //! Building a view lays the document out, which for a large document takes a
 //! few hundred milliseconds: do it on a worker thread, [`DocView`] is `Send`.
 
+mod compose;
 mod editing;
+mod format;
+mod modify;
 mod search;
 #[cfg(test)]
 mod tests;
@@ -28,7 +31,8 @@ use std::sync::Arc;
 
 use aster_layout::{Item, Layout, Layouter, OutlineEntry, Page, Rect as PageRect};
 use aster_text::Shaper;
-use aster_writer::{Document, Path, Pos};
+use aster_writer::edit::History;
+use aster_writer::{Document, Path, Pos, RunPatch};
 use vello_cpu::kurbo::{Affine, Rect};
 use vello_cpu::peniko::{Color, Fill as FillRule};
 use vello_cpu::{Pixmap, RenderContext, Resources};
@@ -39,7 +43,10 @@ use crate::picture::draw_image;
 use crate::text_surface::{HAN_FALLBACK_FAMILIES, Rgba8};
 
 pub use crate::pdf_view::{LINE_STEP, ZOOM_MAX, ZOOM_MIN, Zoom};
+pub use aster_writer::{Align, Break, LineSpacing};
 pub use editing::Move;
+pub use modify::Unit;
+pub use format::{DocCommand, FormatState, Tri};
 pub use search::{DocQuery, MAX_MATCHES, Match};
 pub use text::text_between;
 
@@ -98,11 +105,17 @@ struct Shot {
     width: u32,
     pixmap: Arc<Pixmap>,
     used: u64,
+    /// What the page held when it was painted; the paragraphs are kept so
+    /// that an address in the print cannot be reused by another one.
+    print: u64,
+    _held: Vec<Arc<aster_text::Paragraph>>,
 }
 
 /// The part of a large page painted, in pixels of the whole page.
 struct Band {
     page: usize,
+    print: u64,
+    _held: Vec<Arc<aster_text::Paragraph>>,
     width: u32,
     x0: u32,
     y0: u32,
@@ -157,6 +170,17 @@ pub struct DocView {
     drawn: Option<Drawn>,
     /// Bumped whenever something that is painted over the pages changes.
     version: u64,
+    history: History,
+    /// Bumped by every change to the document, undo and redo included.
+    revision: u64,
+    saved_revision: u64,
+    /// A look chosen with only a caret, for the text typed next.
+    pending: Option<RunPatch>,
+    compose: Option<compose::Compose>,
+    /// Where the last typing step was made, to end a step after a pause.
+    last_edit: Option<std::time::Instant>,
+    /// One print per page of the layout (see [`page_print`]).
+    prints: Vec<u64>,
 }
 
 impl DocView {
@@ -197,6 +221,13 @@ impl DocView {
             resources: Resources::new(),
             drawn: None,
             version: 0,
+            history: History::default(),
+            revision: 0,
+            saved_revision: 0,
+            pending: None,
+            compose: None,
+            last_edit: None,
+            prints: Vec::new(),
         };
         view.lay_out();
         view.sel = view.document.start().map(|start| Sel {
@@ -211,8 +242,10 @@ impl DocView {
     /// still is valid.
     pub fn set_document(&mut self, document: Document) {
         self.document = document;
-        self.layout = self.layouter.layout(&self.document);
-        self.lay_out();
+        self.compose = None;
+        self.history = History::default();
+        self.pending = None;
+        self.relayout();
         self.shots.clear();
         self.band = None;
         let keep = self.sel.take().and_then(|sel| {
@@ -231,8 +264,21 @@ impl DocView {
         self.find = None;
         self.hit_rects.clear();
         self.press = None;
+        self.revision += 1;
+        self.saved_revision = self.revision;
         self.clamp();
         self.touch();
+    }
+
+    /// Lay the document out again (with what is being composed in it), keep
+    /// the sizes and the parts of what was painted that did not change.
+    fn relayout(&mut self) {
+        let shown = self.compose.as_ref().map(|c| &c.shown);
+        let document = shown.unwrap_or(&self.document);
+        self.layout = self.layouter.layout(document);
+        self.lay_out();
+        self.sel_rects = None;
+        self.hit_rects.clear();
     }
 
     fn lay_out(&mut self) {
@@ -250,6 +296,10 @@ impl DocView {
             top += f64::from(*height);
         }
         self.tops.push(top);
+        self.prints = self.layout.pages.iter().map(|p| page_print(p).0).collect();
+        // Pages that are not there any more are not kept.
+        let pages = self.sizes.len();
+        self.shots.retain(|page, _| *page < pages);
     }
 
     pub fn document(&self) -> &Document {
@@ -552,10 +602,7 @@ impl DocView {
         if let Some(rect) = self.caret_rect()
             && rect.1 >= 0.0
             && rect.1 + rect.3 <= f64::from(self.height)
-            && let Some(page) = self
-                .sel
-                .as_ref()
-                .and_then(|s| self.layout.page_of(&s.focus))
+            && let Some(page) = self.caret_pos().and_then(|p| self.layout.page_of(&p))
         {
             return page;
         }
@@ -596,7 +643,7 @@ impl DocView {
     /// the window.
     fn caret_shown(&self) -> bool {
         self.caret_on
-            && self.sel.as_ref().is_some_and(|s| s.anchor == s.focus)
+            && (self.compose.is_some() || self.sel.as_ref().is_some_and(|s| s.anchor == s.focus))
             && self
                 .caret_rect()
                 .is_some_and(|(_, y, _, h)| y + h > 0.0 && y < f64::from(self.height))
@@ -608,8 +655,10 @@ impl DocView {
         let (pw, _) = self.page_px(index);
         let width = pw as u32;
         self.clock += 1;
+        let print = self.prints.get(index).copied().unwrap_or(0);
         if let Some(shot) = self.shots.get_mut(&index)
             && shot.width == width
+            && shot.print == print
         {
             shot.used = self.clock;
             return shot.pixmap.clone();
@@ -617,12 +666,15 @@ impl DocView {
         let page = &self.layout.pages[index];
         let scale = paint_scale(pw, page.width.max(1.0));
         let pixmap = Arc::new(self.painter.render(page, scale));
+        let (print, held) = page_print(page);
         self.shots.insert(
             index,
             Shot {
                 width,
                 pixmap: pixmap.clone(),
                 used: self.clock,
+                print,
+                _held: held,
             },
         );
         pixmap
@@ -646,8 +698,10 @@ impl DocView {
         if vx1 <= vx0 || vy1 <= vy0 {
             return;
         }
+        let print = self.prints.get(index).copied().unwrap_or(0);
         let reusable = self.band.as_ref().is_some_and(|band| {
             band.page == index
+                && band.print == print
                 && f64::from(band.width) == pw
                 && f64::from(band.x0) <= vx0
                 && f64::from(band.y0) <= vy0
@@ -670,8 +724,11 @@ impl DocView {
             ];
             let cropped = crop_page(&self.layout.pages[index], area);
             let pixmap = Arc::new(self.painter.render(&cropped, scale));
+            let (print, held) = page_print(&self.layout.pages[index]);
             self.band = Some(Band {
                 page: index,
+                print,
+                _held: held,
                 width: pw as u32,
                 x0: (area[0] * scale).round() as u32,
                 y0: (area[1] * scale).round() as u32,
@@ -798,9 +855,8 @@ impl DocView {
         }
         if self.caret_shown()
             && let Some(caret) = self
-                .sel
-                .as_ref()
-                .and_then(|s| self.layout.caret(&s.focus))
+                .caret_pos()
+                .and_then(|p| self.layout.caret(&p))
                 .filter(|c| c.page == index)
         {
             let width = (1.5 * self.s()).round().max(1.0);
@@ -819,8 +875,7 @@ impl DocView {
     /// The caret's rectangle: x, y, width, height, physical pixels from the
     /// window's top-left corner; `None` without a caret.
     pub fn caret_rect(&self) -> Option<(f64, f64, f64, f64)> {
-        let sel = self.sel.as_ref()?;
-        let caret = self.layout.caret(&sel.focus)?;
+        let caret = self.layout.caret(&self.caret_pos()?)?;
         let rect = self.page_rect(caret.page);
         let ppp = self.pixels_per_point();
         let width = (1.5 * self.s()).round().max(1.0);
@@ -837,9 +892,9 @@ impl DocView {
         self.caret_rect().unwrap_or((0.0, 0.0, 0.0, 0.0))
     }
 
-    /// No input method composition yet: the view is read-only.
+    /// An input method is composing text at the caret.
     pub fn is_composing(&self) -> bool {
-        false
+        self.compose.is_some()
     }
 
     /// The whole text of the body, one paragraph per line.
@@ -1006,4 +1061,82 @@ fn crop_page(page: &Page, area: [f64; 4]) -> Page {
         section: page.section,
         items,
     }
+}
+
+/// A number that changes when what a page shows changes, and the paragraphs
+/// it was made from: those are held by whatever keeps the print, so that two
+/// different paragraphs never have the same address while it exists.
+fn page_print(page: &Page) -> (u64, Vec<Arc<aster_text::Paragraph>>) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut held = Vec::new();
+    let rect = |h: &mut std::collections::hash_map::DefaultHasher, r: &PageRect| {
+        for v in [r.x0, r.y0, r.x1, r.y1] {
+            v.to_bits().hash(h);
+        }
+    };
+    (page.width.to_bits(), page.height.to_bits(), page.items.len()).hash(&mut hasher);
+    for item in &page.items {
+        match item {
+            Item::Fill { rect: r, color } => {
+                1u8.hash(&mut hasher);
+                rect(&mut hasher, r);
+                color.hash(&mut hasher);
+            }
+            Item::Rule {
+                from,
+                to,
+                width,
+                color,
+                style,
+            } => {
+                2u8.hash(&mut hasher);
+                for v in [from.0, from.1, to.0, to.1, *width] {
+                    v.to_bits().hash(&mut hasher);
+                }
+                color.hash(&mut hasher);
+                (*style as u8).hash(&mut hasher);
+            }
+            Item::Text(text) => {
+                3u8.hash(&mut hasher);
+                (Arc::as_ptr(&text.paragraph) as usize).hash(&mut hasher);
+                text.x.to_bits().hash(&mut hasher);
+                text.y.to_bits().hash(&mut hasher);
+                (text.lines.start, text.lines.end).hash(&mut hasher);
+                held.push(text.paragraph.clone());
+            }
+            Item::Leader(leader) => {
+                4u8.hash(&mut hasher);
+                for v in [leader.x0, leader.x1, leader.baseline, leader.size] {
+                    v.to_bits().hash(&mut hasher);
+                }
+                leader.color.hash(&mut hasher);
+                format!("{:?}", leader.kind).hash(&mut hasher);
+            }
+            Item::Picture(picture) => {
+                5u8.hash(&mut hasher);
+                (picture.image.as_ptr() as usize, picture.image.len()).hash(&mut hasher);
+                rect(&mut hasher, &picture.rect);
+                for v in picture.crop {
+                    v.to_bits().hash(&mut hasher);
+                }
+            }
+            Item::Frame(frame) => {
+                6u8.hash(&mut hasher);
+                rect(&mut hasher, &frame.rect);
+                format!("{:?}{:?}", frame.fill, frame.line).hash(&mut hasher);
+            }
+            Item::Placeholder { rect: r, label } => {
+                7u8.hash(&mut hasher);
+                rect(&mut hasher, r);
+                label.hash(&mut hasher);
+            }
+            Item::PushClip(r) => {
+                8u8.hash(&mut hasher);
+                rect(&mut hasher, r);
+            }
+            Item::PopClip => 9u8.hash(&mut hasher),
+        }
+    }
+    (hasher.finish(), held)
 }

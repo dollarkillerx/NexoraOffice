@@ -38,6 +38,7 @@
 //! Nothing here reads files; `aster-ooxml` turns DOCX packages into this
 //! model. Nothing here knows about layout or the GUI toolkit either.
 
+pub mod edit;
 pub mod numbering;
 
 use std::ops::Range;

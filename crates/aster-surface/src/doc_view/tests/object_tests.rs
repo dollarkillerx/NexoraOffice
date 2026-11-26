@@ -524,9 +524,20 @@ fn dragging_a_corner_resizes_the_picture_in_proportion_as_one_step() {
     let mut view = with_picture();
     let (x0, y0, x1, y1) = picture_box(&view);
     click_at(&mut view, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    assert_eq!(view.handle_at(x1, y1), Some(Corner::BottomRight));
-    assert_eq!(view.handle_at(x0, y0), Some(Corner::TopLeft));
-    assert_eq!(view.handle_at((x0 + x1) / 2.0, (y0 + y1) / 2.0), None);
+    assert_eq!(
+        view.handle_at(x1, y1),
+        Some(Handle::Corner(Corner::BottomRight))
+    );
+    assert_eq!(
+        view.handle_at(x0, y0),
+        Some(Handle::Corner(Corner::TopLeft))
+    );
+    // Over the picture itself it is moved by dragging.
+    assert_eq!(
+        view.handle_at((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+        Some(Handle::Move)
+    );
+    assert_eq!(view.handle_at(x1 + 40.0, y1 + 40.0), None);
     let start = (40 * PX, 20 * PX);
 
     // Drag the bottom right corner out by half the size.
@@ -590,7 +601,7 @@ fn a_press_and_release_on_a_handle_without_moving_is_no_step() {
 }
 
 #[test]
-fn a_floating_picture_is_selected_and_deleted_but_has_no_handles() {
+fn a_floating_picture_is_selected_and_deleted_and_has_handles_too() {
     let drawing = Drawing {
         size: (40 * PT, 30 * PT),
         content: DrawingContent::Picture(Picture {
@@ -622,11 +633,16 @@ fn a_floating_picture_is_selected_and_deleted_but_has_no_handles() {
     click_at(&mut view, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let object = view.selected_object().expect("selected");
     assert!(!object.inline);
-    assert_eq!(view.handle_at(x1, y1), None);
-    // Pressing where a corner would be does not start a resize.
+    assert_eq!(
+        view.handle_at(x1, y1),
+        Some(Handle::Corner(Corner::BottomRight))
+    );
+    // Pressing on a corner starts a resize, and letting go without moving
+    // changes nothing.
     view.press(x1, y1, 1, false);
-    assert!(!view.is_resizing());
-    view.release();
+    assert!(view.is_resizing());
+    assert!(view.release());
+    assert_eq!(object.size, view.selected_object().unwrap().size);
     click_at(&mut view, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
     assert!(view.delete_forward(Unit::Cluster));
     assert!(!texts(&view)[0].contains('\u{FFFC}'));

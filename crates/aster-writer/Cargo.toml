@@ -1,0 +1,10 @@
+[package]
+name = "aster-writer"
+version.workspace = true
+license.workspace = true
+description = "The Writer document model: paragraphs, tables, sections and styles of a word-processing document"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

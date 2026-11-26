@@ -1,0 +1,12 @@
+[package]
+name = "aster-layout"
+version.workspace = true
+license.workspace = true
+description = "Page layout of Writer documents: lines, tables, pages, and where every place in the text is on them"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aster-text = { workspace = true }
+aster-writer = { workspace = true }

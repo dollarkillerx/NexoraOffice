@@ -9,11 +9,13 @@ publish.workspace = true
 
 [dependencies]
 aster-image = { workspace = true }
+aster-layout = { workspace = true }
 aster-markdown = { workspace = true }
 aster-platform = { workspace = true }
 aster-sheets = { workspace = true }
 aster-slides = { workspace = true }
 aster-text = { workspace = true }
+aster-writer = { workspace = true }
 ropey = { workspace = true }
 slint = { workspace = true }
 parley = { workspace = true }

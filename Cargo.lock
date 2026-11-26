@@ -371,6 +371,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-layout"
+version = "0.0.1"
+dependencies = [
+ "aster-text",
+ "aster-writer",
+]
+
+[[package]]
 name = "aster-markdown"
 version = "0.0.1"
 dependencies = [
@@ -408,6 +416,7 @@ version = "0.0.1"
 dependencies = [
  "aster-sheets",
  "aster-slides",
+ "aster-writer",
  "quick-xml 0.42.0",
  "zip",
 ]
@@ -486,12 +495,14 @@ version = "0.0.1"
 dependencies = [
  "aster-calc",
  "aster-image",
+ "aster-layout",
  "aster-markdown",
  "aster-ooxml",
  "aster-platform",
  "aster-sheets",
  "aster-slides",
  "aster-text",
+ "aster-writer",
  "bytemuck",
  "krilla",
  "parley 0.13.0",
@@ -528,6 +539,10 @@ dependencies = [
  "icu_normalizer",
  "tempfile",
 ]
+
+[[package]]
+name = "aster-writer"
+version = "0.0.1"
 
 [[package]]
 name = "async-broadcast"

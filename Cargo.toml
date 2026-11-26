@@ -4,6 +4,7 @@ members = [
     "crates/aster-ai",
     "crates/aster-calc",
     "crates/aster-image",
+    "crates/aster-layout",
     "crates/aster-markdown",
     "crates/aster-mcp",
     "crates/aster-mcp-bridge",
@@ -18,6 +19,7 @@ members = [
     "crates/aster-text",
     "crates/aster-tools",
     "crates/aster-workspace",
+    "crates/aster-writer",
     "spikes/g1-ime",
     "spikes/g2-frame",
     "spikes/g3-cjk",
@@ -44,6 +46,7 @@ aster-ai = { path = "crates/aster-ai" }
 aster-calc = { path = "crates/aster-calc" }
 aster-markdown = { path = "crates/aster-markdown" }
 aster-image = { path = "crates/aster-image" }
+aster-layout = { path = "crates/aster-layout" }
 aster-mcp = { path = "crates/aster-mcp" }
 aster-ooxml = { path = "crates/aster-ooxml" }
 aster-pdf = { path = "crates/aster-pdf" }
@@ -55,6 +58,7 @@ aster-surface = { path = "crates/aster-surface" }
 aster-text = { path = "crates/aster-text" }
 aster-tools = { path = "crates/aster-tools" }
 aster-workspace = { path = "crates/aster-workspace" }
+aster-writer = { path = "crates/aster-writer" }
 slint = { version = "~1.19.0", default-features = false, features = [
     "std",
     "compat-1-2",

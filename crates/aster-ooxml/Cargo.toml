@@ -10,5 +10,6 @@ publish.workspace = true
 [dependencies]
 aster-sheets = { workspace = true }
 aster-slides = { workspace = true }
+aster-writer = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }

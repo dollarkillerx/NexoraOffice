@@ -38,6 +38,29 @@ pub fn wrapper_close(w: &str, change: &Change) -> String {
     format!("</{w}{name}>")
 }
 
+/// `bytes`, a run as written, inside the wrapper of `change`. A page-number
+/// field written as `w:fldSimple` cannot be inside one: its run is.
+pub fn wrap(w: &str, change: &Change, bytes: &str) -> String {
+    let field = format!("<{w}fldSimple");
+    if bytes.starts_with(&field)
+        && let Some(open) = bytes.find('>')
+        && let Some(close) = bytes.rfind(&format!("</{w}fldSimple>"))
+    {
+        return format!(
+            "{}{}{}{}",
+            &bytes[..=open],
+            wrapper_open(w, change),
+            &bytes[open + 1..close],
+            wrapper_close(w, change)
+        ) + &bytes[close..];
+    }
+    format!(
+        "{}{bytes}{}",
+        wrapper_open(w, change),
+        wrapper_close(w, change)
+    )
+}
+
 /// The wrapper opened by `bytes` is for the change with this id.
 pub fn wrapper_is_for(w: &str, bytes: &str, id: i64) -> bool {
     bytes.contains(&format!("{w}id=\"{id}\""))
@@ -173,11 +196,11 @@ fn add_to_mark(w: &str, ppr: &str, records: &str) -> String {
     out
 }
 
-/// `out` without insertion wrappers that nothing is left in (the runs were
-/// rejected or moved out).
+/// `out` without insertion wrappers, and hyperlinks, that nothing is left in
+/// (the runs were rejected or moved out).
 pub fn without_empty_wrappers(w: &str, out: &str) -> String {
     let mut out = out.to_owned();
-    for name in ["ins", "moveTo"] {
+    for name in ["hyperlink", "ins", "moveTo"] {
         let open = format!("<{w}{name} ");
         let close = format!("</{w}{name}>");
         let mut from = 0;
@@ -214,6 +237,19 @@ mod tests {
             date: Some(Arc::from("2024-01-01T00:00:00Z")),
             moved: false,
         })
+    }
+
+    #[test]
+    fn a_page_number_in_an_insertion_is_wrapped_inside_the_field() {
+        let field = "<w:fldSimple w:instr=\" PAGE \"><w:r><w:t>1</w:t></w:r></w:fldSimple>";
+        assert_eq!(
+            wrap("w:", &change(3), field),
+            "<w:fldSimple w:instr=\" PAGE \"><w:ins w:id=\"3\" w:author=\"Ann\" w:date=\"2024-01-01T00:00:00Z\"><w:r><w:t>1</w:t></w:r></w:ins></w:fldSimple>"
+        );
+        assert_eq!(
+            wrap("w:", &change(3), "<w:r/>"),
+            "<w:ins w:id=\"3\" w:author=\"Ann\" w:date=\"2024-01-01T00:00:00Z\"><w:r/></w:ins>"
+        );
     }
 
     #[test]

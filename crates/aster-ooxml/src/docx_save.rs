@@ -1174,6 +1174,7 @@ impl<'a> Saver<'a> {
             out: String::new(),
             open: Vec::new(),
             suspended: Vec::new(),
+            dropped: Vec::new(),
             wrapper_links,
         };
         let mut k = 0usize;
@@ -1213,7 +1214,7 @@ impl<'a> Saver<'a> {
                     };
                     if relinked || reinserted {
                         let w = self.w.clone();
-                        let bytes = em.in_insertion(inserted_of(run), bytes, &w);
+                        let bytes = em.in_insertion(inserted_of(run), &run.link, bytes, &w);
                         let mut opener = |link: &Link| self.hyperlink_open(link);
                         em.place(&run.link, &bytes, &w, &mut opener);
                     } else {
@@ -1227,7 +1228,7 @@ impl<'a> Saver<'a> {
                     };
                     let w = self.w.clone();
                     em.leave_after(&run.link, &after, k);
-                    let bytes = em.in_insertion(inserted_of(run), bytes, &w);
+                    let bytes = em.in_insertion(inserted_of(run), &run.link, bytes, &w);
                     let mut opener = |link: &Link| self.hyperlink_open(link);
                     em.place(&run.link, &bytes, &w, &mut opener);
                     after = None;
@@ -1302,6 +1303,17 @@ impl<'a> Saver<'a> {
             while j < p.runs.len() && p.runs[j].link == link {
                 if let Some(bytes) = self.run_xml(&p.runs[j], &p.base) {
                     let now = inserted_of(&p.runs[j]);
+                    // A field is wrapped inside, run by run.
+                    if let Some(change) = now
+                        && bytes.starts_with(&format!("<{w}fldSimple"))
+                    {
+                        if let Some(change) = open.take() {
+                            group.push_str(&track::wrapper_close(&w, &change));
+                        }
+                        group.push_str(&track::wrap(&w, change, &bytes));
+                        j += 1;
+                        continue;
+                    }
                     if open.as_ref().map(|c| c.id) != now.map(|c| c.id) {
                         if let Some(change) = open.take() {
                             group.push_str(&track::wrapper_close(&w, &change));
@@ -1942,6 +1954,10 @@ struct Em<'t> {
     /// Wrappers closed for a run that does not belong inside them and not
     /// yet opened again.
     suspended: Vec<Wrapper>,
+    /// Names of wrappers whose opening bytes were taken back out of the
+    /// output while others inside them stayed: their closing tags are not
+    /// written.
+    dropped: Vec<String>,
     /// For a hyperlink opened in a gap: the link of the run that follows.
     wrapper_links: Vec<Option<Arc<Link>>>,
 }
@@ -1956,8 +1972,14 @@ impl Em<'_> {
         }
     }
 
-    fn close(&mut self, bytes: &str) {
+    fn close(&mut self, name: &str, bytes: &str) {
         if self.suspended.pop().is_some() {
+            return;
+        }
+        if self.open.last().is_none_or(|w| w.name != name)
+            && let Some(i) = self.dropped.iter().rposition(|n| n == name)
+        {
+            self.dropped.remove(i);
             return;
         }
         self.open.pop();
@@ -1998,7 +2020,7 @@ impl Em<'_> {
                         link,
                     });
                 }
-                Tok::Close(_, bytes) => self.close(bytes),
+                Tok::Close(name, bytes) => self.close(name, bytes),
                 Tok::Other(bytes) => {
                     self.reopen();
                     self.out.push_str(bytes);
@@ -2010,27 +2032,54 @@ impl Em<'_> {
     }
 
     /// A run that is inside a tracked insertion (or is not) is about to be
-    /// written: step out of an insertion wrapper that is not its own, and
-    /// give back `bytes` in a wrapper of their own when it has none open.
-    fn in_insertion(&mut self, inserted: Option<&Change>, bytes: String, w: &str) -> String {
+    /// written with `link`: the insertion's wrapper is the innermost one
+    /// around a run, so a linked run leaves it (the hyperlink goes outside
+    /// and gets a wrapper of its own inside), and a run that is no longer
+    /// inserted leaves it, staying in the hyperlink the wrapper holds.
+    /// Gives back `bytes` in a wrapper of their own when the run needs one
+    /// and has none open.
+    fn in_insertion(
+        &mut self,
+        inserted: Option<&Change>,
+        link: &Option<Arc<Link>>,
+        bytes: String,
+        w: &str,
+    ) -> String {
         let open = self
             .open
             .iter()
             .rposition(|x| matches!(local(&x.name), "ins" | "moveTo"));
         if let Some(i) = open {
-            if inserted.is_some_and(|c| track::wrapper_is_for(w, &self.open[i].bytes, c.id)) {
+            // A hyperlink written inside the insertion, as some writers do.
+            let link_inside = self.open[i + 1..].iter().any(|x| x.link.is_some());
+            let same =
+                inserted.is_some_and(|c| track::wrapper_is_for(w, &self.open[i].bytes, c.id));
+            if same && (link.is_none() || link_inside) {
                 return bytes;
             }
-            self.step_out(i);
+            if inserted.is_none() && link_inside {
+                self.drop_wrapper(i);
+            } else {
+                self.step_out(i);
+            }
         }
         match inserted {
-            Some(change) => format!(
-                "{}{bytes}{}",
-                track::wrapper_open(w, change),
-                track::wrapper_close(w, change)
-            ),
+            Some(change) => track::wrap(w, change, &bytes),
             None => bytes,
         }
+    }
+
+    /// Take back the opening bytes of the open wrapper `i`, keeping those
+    /// inside it open; its closing tag will not be written.
+    fn drop_wrapper(&mut self, i: usize) {
+        let wrapper = self.open.remove(i);
+        let len = wrapper.body_at - wrapper.out_at;
+        self.out.replace_range(wrapper.out_at..wrapper.body_at, "");
+        for inner in &mut self.open[i..] {
+            inner.out_at -= len;
+            inner.body_at -= len;
+        }
+        self.dropped.push(wrapper.name);
     }
 
     /// Close the open wrappers from `i` on (the one that is not written to
@@ -2070,7 +2119,7 @@ impl Em<'_> {
                 {
                     for tok in toks {
                         match tok {
-                            Tok::Close(_, b) => self.close(b),
+                            Tok::Close(name, b) => self.close(name, b),
                             Tok::Space(b) => self.out.push_str(b),
                             _ => {}
                         }

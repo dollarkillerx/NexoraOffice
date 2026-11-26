@@ -479,3 +479,118 @@ fn a_tab_or_line_break_typed_into_an_insertion_is_inserted_too() {
     assert!(main_xml(&saved)[start..].contains("<w:tab/>"));
     assert_eq!(back.changes()[0].end.offset, 9);
 }
+
+const EDGE: &str = concat!(
+    "<w:p><w:r><w:t>start-up</w:t></w:r>",
+    "<w:del w:id=\"1\" w:author=\"A\"><w:r><w:delText xml:space=\"preserve\"> entry</w:delText></w:r></w:del>",
+    "<w:ins w:id=\"2\" w:author=\"A\"><w:r><w:t>s</w:t></w:r></w:ins>",
+    "<w:r><w:t xml:space=\"preserve\"> grow.</w:t></w:r></w:p>"
+);
+
+fn target() -> aster_writer::Link {
+    aster_writer::Link {
+        target: "https://example.org/".to_owned(),
+        tooltip: None,
+    }
+}
+
+#[test]
+fn a_link_over_inserted_text_has_the_insertion_inside_it() {
+    let bytes = docx_doc::doc(EDGE).bytes();
+    let mut doc = read(&bytes);
+    // "start-up" and the inserted "s".
+    set_link(&mut doc, &at(0, 0), &at(0, 9), Some(target()));
+    let (saved, back) = round_trip(&bytes, &doc);
+    let xml = main_xml(&saved);
+    assert!(
+        xml.contains("<w:hyperlink r:id=\"rId1\" w:history=\"1\"><w:ins w:id=\"2\""),
+        "{xml}"
+    );
+    assert!(
+        !xml.contains("<w:ins w:id=\"2\" w:author=\"A\"><w:hyperlink"),
+        "{xml}"
+    );
+    assert!(xml.contains("</w:ins></w:hyperlink>"), "{xml}");
+    // Valid nesting reads back and resolves.
+    let mut again = back.clone();
+    assert!(accept_all(&mut again) >= 2);
+    let (saved, back) = round_trip(&saved, &again);
+    let xml = main_xml(&saved);
+    assert!(!xml.contains("<w:ins") && !xml.contains("<w:del"), "{xml}");
+    assert!(xml.contains("<w:hyperlink"));
+    assert_eq!(back.plain_text(), "start-ups grow.");
+    assert!(
+        back.paragraph(&Path::body(0))
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.text == "s" && r.link.is_some())
+    );
+}
+
+#[test]
+fn adjacent_inserted_runs_with_one_link_share_one_hyperlink() {
+    let bytes = docx_doc::doc(
+        "<w:p><w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>ab</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>cd</w:t></w:r></w:ins></w:p>",
+    )
+    .bytes();
+    let mut doc = read(&bytes);
+    set_link(&mut doc, &at(0, 0), &at(0, 4), Some(target()));
+    let (saved, _) = round_trip(&bytes, &doc);
+    let xml = main_xml(&saved);
+    assert_eq!(xml.matches("<w:hyperlink").count(), 1, "{xml}");
+    assert!(
+        !xml.contains("<w:ins w:id=\"1\" w:author=\"A\"><w:hyperlink"),
+        "{xml}"
+    );
+}
+
+const ODD: &str = concat!(
+    "<w:p><w:r><w:t xml:space=\"preserve\">a </w:t></w:r>",
+    "<w:ins w:id=\"1\" w:author=\"A\"><w:hyperlink w:anchor=\"b\"><w:r><w:t>new</w:t></w:r></w:hyperlink></w:ins>",
+    "<w:r><w:t xml:space=\"preserve\"> z</w:t></w:r></w:p>"
+);
+
+#[test]
+fn an_insertion_around_a_hyperlink_is_read_and_resolved() {
+    let bytes = docx_doc::doc(ODD).bytes();
+    let doc = read(&bytes);
+    assert_eq!(doc.changes().len(), 1);
+    // Unedited, it is as it was.
+    assert_eq!(save(bytes.clone(), &doc).unwrap(), bytes);
+    // Accepted: no change left, the run stays in its hyperlink.
+    let mut accepted = doc.clone();
+    assert_eq!(accept_all(&mut accepted), 1);
+    let (saved, back) = round_trip(&bytes, &accepted);
+    let xml = main_xml(&saved);
+    assert!(!xml.contains("<w:ins"), "{xml}");
+    let at_link = xml.find("<w:hyperlink").unwrap();
+    assert!(
+        xml[at_link..].starts_with("<w:hyperlink w:anchor=\"b\"><w:r>"),
+        "{xml}"
+    );
+    assert!(!back.has_changes());
+    assert_eq!(back.plain_text(), "a new z");
+    assert!(
+        back.paragraph(&Path::body(0))
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.text == "new" && r.link.is_some())
+    );
+    // Rejected: the text is gone and nothing is left of the wrapper.
+    let mut rejected = doc.clone();
+    assert_eq!(reject_all(&mut rejected), 1);
+    let (saved, back) = round_trip(&bytes, &rejected);
+    let xml = main_xml(&saved);
+    assert!(!xml.contains("<w:ins") && !xml.contains("new"), "{xml}");
+    assert_eq!(back.plain_text(), "a  z");
+    // Typed into: stays inside the insertion.
+    let mut typed = doc.clone();
+    insert_text(&mut typed, &at(0, 4), "X", None);
+    let (_, back) = round_trip(&bytes, &typed);
+    assert_eq!(
+        back.changes()[0].end.offset - back.changes()[0].start.offset,
+        4
+    );
+}

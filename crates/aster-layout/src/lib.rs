@@ -31,7 +31,9 @@ pub use cx::Layouter;
 pub use display::{
     FrameItem, Item, LeaderItem, Page, PictureItem, Rect, Rgba, RuleStyle, TextItem,
 };
-pub use query::{Caret, Layout, LinkRect, OutlineEntry};
+pub use query::{Caret, Layout, LinkRect, OutlineEntry, PageInfo};
 
+#[cfg(test)]
+mod story_tests;
 #[cfg(test)]
 mod tests;

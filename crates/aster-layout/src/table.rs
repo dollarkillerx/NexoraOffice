@@ -239,10 +239,10 @@ impl Cx<'_> {
                         // What the covered cell shows is the start cell's: a
                         // place in it is a place there.
                         let (sr, sc) = cells[start].at;
-                        let mut key = table_path.0.clone();
+                        let mut key = table_path.steps.clone();
                         key.extend([r as u32, c as u32]);
                         self.redirects
-                            .push((Path(key), table_path.cell_block(sr, sc, 0)));
+                            .push((table_path.with_steps(key), table_path.cell_block(sr, sc, 0)));
                     }
                     start
                 } else {

@@ -1257,7 +1257,7 @@ fn text_boxes_hold_blocks_and_other_drawings_are_placeholders() {
             .any(|i| matches!(i, Item::Placeholder { label, .. } if label == "chart"))
     );
     // Text in the box cannot be pointed at: only the body is answered for.
-    assert!(layout.frags.iter().all(|f| f.path.0.len() == 1));
+    assert!(layout.frags.iter().all(|f| f.path.steps.len() == 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,7 +1458,7 @@ fn the_outline_lists_headings_with_their_pages() {
 #[test]
 fn queries_for_places_that_do_not_exist_give_nothing() {
     let layout = lay(&sample());
-    let nowhere = Pos::new(Path(vec![99]), 0);
+    let nowhere = Pos::new(Path::from(vec![99]), 0);
     assert!(layout.caret(&nowhere).is_none());
     assert!(layout.line_start(&nowhere).is_none());
     assert!(layout.line_end(&nowhere).is_none());
@@ -1470,7 +1470,11 @@ fn queries_for_places_that_do_not_exist_give_nothing() {
     // An offset past the end is clamped.
     assert!(layout.caret(&Pos::new(Path::body(0), 10_000)).is_some());
     // A path into a paragraph as if it were a table.
-    assert!(layout.caret(&Pos::new(Path(vec![0, 1, 2, 3]), 0)).is_none());
+    assert!(
+        layout
+            .caret(&Pos::new(Path::from(vec![0, 1, 2, 3]), 0))
+            .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------

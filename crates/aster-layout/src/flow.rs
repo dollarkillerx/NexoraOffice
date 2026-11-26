@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use aster_writer::numbering::format_number;
 use aster_writer::{
-    Block, Break, Document, Inline, Marginals, Paragraph, Path, Pos, Section, SectionStart, Table,
-    Wrap,
+    Block, Break, Document, Inline, MarginalSlot, Marginals, Paragraph, Path, Pos, Section,
+    SectionStart, StoryId, Table, Wrap,
 };
 
 use crate::cx::{
@@ -18,7 +18,7 @@ use crate::cx::{
     space_before,
 };
 use crate::display::{Item, Page, Rect, RuleStyle};
-use crate::query::{Layout, OutlineEntry};
+use crate::query::{Layout, OutlineEntry, PageInfo};
 use crate::shape::{NoteNumbers, PageValues, emu_pt, outline_text, pt};
 use crate::table::{Slice, TableLayout};
 
@@ -441,19 +441,29 @@ impl Flow<'_, '_> {
     ) -> Option<Stack> {
         let story = self.doc.marginals.get(which?)?;
         self.cx.page_values = Some(values.clone());
-        let stack = self.cx.layout_stack(&story.blocks, &Paths::None, width, 0);
+        let stack = self.cx.layout_stack(
+            &story.blocks,
+            &Paths::Story(StoryId::Marginal(which?)),
+            width,
+            0,
+        );
         self.cx.page_values = None;
         Some(stack)
     }
 
-    fn pick(&self, set: &Marginals, number: u32, first: bool) -> Option<usize> {
-        if first && self.sec.title_page {
-            set.first
+    /// Which of a section's headers (or footers) a page shows.
+    fn slot(&self, sec: &Section, number: u32, first: bool) -> MarginalSlot {
+        if first && sec.title_page {
+            MarginalSlot::First
         } else if self.doc.settings.even_and_odd_headers && number.is_multiple_of(2) {
-            set.even
+            MarginalSlot::Even
         } else {
-            set.default
+            MarginalSlot::Default
         }
+    }
+
+    fn pick(&self, set: &Marginals, number: u32, first: bool) -> Option<usize> {
+        set.get(self.slot(&self.sec, number, first))
     }
 
     fn page_values(
@@ -1115,6 +1125,7 @@ impl Flow<'_, '_> {
             if first_fragment
                 && let Some(level) = props.outline_level
                 && let Some(p) = &path
+                && p.story.is_body()
             {
                 let page_index = self.pages.len() - 1;
                 self.outline.push(OutlineEntry {
@@ -1186,7 +1197,12 @@ impl Flow<'_, '_> {
                 continue;
             };
             let width = self.pages.last().map_or(1.0, |p| p.margin.width());
-            let stack = self.cx.layout_stack(&note.blocks, &Paths::None, width, 0);
+            let stack = self.cx.layout_stack(
+                &note.blocks,
+                &Paths::Story(StoryId::Footnote(*id)),
+                width,
+                0,
+            );
             out.push((*id, Arc::new(stack)));
         }
         out
@@ -1349,7 +1365,10 @@ impl Flow<'_, '_> {
             };
             for (i, block) in note.blocks.iter().enumerate() {
                 match block {
-                    Block::Paragraph(p) => self.place_with_chain(&note.blocks, i, None, p),
+                    Block::Paragraph(p) => {
+                        let path = Some(Path::in_story(StoryId::Endnote(id), i));
+                        self.place_with_chain(&note.blocks, i, path, p)
+                    }
                     Block::Table(_) => {}
                 }
             }
@@ -1366,6 +1385,8 @@ impl Flow<'_, '_> {
         let section_pages = self.sections_pages.clone();
         let sections = self.doc.sections();
         let mut pages = Vec::with_capacity(count);
+        let mut infos = Vec::with_capacity(count);
+        let mut marginal_frags = Vec::new();
         let states = std::mem::take(&mut self.pages);
         for (index, mut state) in states.into_iter().enumerate() {
             let sec = state.sec.clone();
@@ -1378,6 +1399,8 @@ impl Flow<'_, '_> {
             );
             let width = state.margin.width();
             let page_rect = Rect::new(0.0, 0.0, state.width, state.height);
+            // Headers, footers and notes are pointed at too: their paragraphs
+            // are recorded with paths that name their story.
             let ec = EmitCtx {
                 page: index,
                 page_rect,
@@ -1385,9 +1408,17 @@ impl Flow<'_, '_> {
                 column: state.margin,
                 bounds: None,
                 repeat: false,
-                record: false,
+                record: true,
                 depth: 0,
             };
+            infos.push(PageInfo {
+                section: state.section,
+                header: state.header,
+                footer: state.footer,
+                slot: self.slot(&sec, state.number, state.page_in_section == 0),
+                header_area: Rect::new(0.0, 0.0, state.width, state.body_top),
+                footer_area: Rect::new(0.0, state.body_bottom, state.width, state.height),
+            });
             self.cx.grid = sections
                 .get(state.section)
                 .and_then(|(_, s)| s.grid)
@@ -1424,11 +1455,10 @@ impl Flow<'_, '_> {
                     frag.bounds = frag.bounds.shifted(dy);
                 }
             }
-            let mut scratch = Vec::new();
             {
                 let mut out = Out {
                     layers: &mut layers,
-                    frags: &mut scratch,
+                    frags: &mut marginal_frags,
                 };
                 if let Some(stack) = &header {
                     let y = pt(sec.margins.header).max(0.0);
@@ -1519,7 +1549,9 @@ impl Flow<'_, '_> {
             });
         }
         let redirects = std::mem::take(&mut self.cx.redirects);
-        Layout::new(pages, self.frags, self.outline, redirects)
+        // After the body's, so that reading order within a story holds.
+        self.frags.append(&mut marginal_frags);
+        Layout::new(pages, self.frags, self.outline, redirects).with_page_info(infos)
     }
 }
 

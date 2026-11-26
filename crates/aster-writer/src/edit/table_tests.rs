@@ -1268,3 +1268,108 @@ fn a_picture_in_a_table_cell() {
 
 #[allow(dead_code)]
 fn unused(_: Section, _: Drawing) {}
+
+// ---------------------------------------------------------------------------
+// Widths
+// ---------------------------------------------------------------------------
+
+/// A4 with margins of 1,000 and 800 twips: 11,906 - 1,800 = 10,106 wide.
+fn page_doc(blocks: Vec<Block>) -> Document {
+    let mut doc = Document::default();
+    doc.body.blocks = blocks;
+    let mut section = Section::default();
+    section.margins.left = 1_000;
+    section.margins.right = 800;
+    doc.last_section = Arc::new(section);
+    doc
+}
+
+#[test]
+fn the_space_for_a_block_is_the_text_width_or_the_cell() {
+    let mut table = labelled(1, 2);
+    table.columns = vec![3_000, 2_000];
+    table.rows[0].cells[0].margins = [100, 0, 150, 0];
+    let doc = page_doc(vec![Block::paragraph(text_para("x")), Block::table(table)]);
+    assert_eq!(available_width(&doc, &pos(0, 0)), 10_106);
+    // In a cell: its column less its margins.
+    assert_eq!(space_for_block(&doc, &cpos(1, 0, 0, 0).path), 3_000 - 250);
+    // A cell's own margins default to 115 on each side.
+    assert_eq!(available_width(&doc, &cpos(1, 0, 1, 0)), 2_000 - 230);
+
+    // Columns in the section: one column's width.
+    let mut doc = page_doc(vec![Block::paragraph(text_para("x"))]);
+    let mut section = (*doc.last_section).clone();
+    section.columns.count = 2;
+    section.columns.space = 706;
+    doc.last_section = Arc::new(section);
+    assert_eq!(available_width(&doc, &pos(0, 0)), (10_106 - 706) / 2);
+
+    // The section the block is in: an earlier one ends at its paragraph.
+    let mut first = text_para("a");
+    let mut narrow = Section::default();
+    narrow.margins.left = 2_000;
+    narrow.margins.right = 2_000;
+    first.section = Some(Arc::new(narrow));
+    let mut doc = page_doc(vec![
+        Block::paragraph(first),
+        Block::paragraph(text_para("b")),
+    ]);
+    doc.last_section = Arc::new(Section::default());
+    assert_eq!(available_width(&doc, &pos(0, 0)), 11_906 - 4_000);
+    assert_eq!(available_width(&doc, &pos(1, 0)), 11_906 - 2_880);
+}
+
+#[test]
+fn a_table_wider_than_its_space_is_scaled_down_in_proportion() {
+    let mut table = labelled(2, 3);
+    table.columns = vec![6_000, 3_000, 3_000];
+    let mut doc = page_doc(vec![Block::table(table)]);
+    assert!(fit_table(&mut doc, &Path::body(0)));
+    let columns = table_at(&doc, 0).columns.clone();
+    assert_eq!(columns.iter().sum::<i32>(), 10_106, "{columns:?}");
+    assert!((columns[0] - 2 * columns[1]).abs() <= 2, "{columns:?}");
+    assert_valid(&doc);
+    // It fits now, and one that fits is left alone.
+    assert!(!fit_table(&mut doc, &Path::body(0)));
+    let mut table = labelled(1, 2);
+    table.columns = vec![1_000, 1_000];
+    let mut doc = page_doc(vec![Block::table(table)]);
+    assert!(!fit_table(&mut doc, &Path::body(0)));
+    assert_eq!(table_at(&doc, 0).columns, vec![1_000, 1_000]);
+    // The indent counts: the table starts that far in.
+    let mut table = labelled(1, 2);
+    table.columns = vec![5_000, 5_000];
+    table.props.indent = 1_000;
+    let mut doc = page_doc(vec![Block::table(table)]);
+    assert!(fit_table(&mut doc, &Path::body(0)));
+    assert_eq!(
+        table_at(&doc, 0).columns.iter().sum::<i32>(),
+        10_106 - 1_000
+    );
+    // Nothing to do for a path that is no table.
+    let mut doc = page_doc(vec![Block::paragraph(text_para("x"))]);
+    assert!(!fit_table(&mut doc, &Path::body(0)));
+}
+
+#[test]
+fn a_nested_table_is_fitted_to_the_cell_it_is_in() {
+    let mut outer = labelled(1, 1);
+    outer.columns = vec![4_000];
+    let mut doc = page_doc(vec![Block::table(outer)]);
+    let at = cpos(0, 0, 0, 0);
+    let width = available_width(&doc, &at);
+    assert_eq!(width, 4_000 - 230);
+    insert_table(&mut doc, &at, 2, 3, width);
+    let inner_path = Path::body(0).cell_block(0, 0, 0);
+    let inner = doc.block(&inner_path).and_then(|b| b.as_table()).unwrap();
+    assert_eq!(inner.columns.iter().sum::<i32>(), 4_000 - 230);
+    // A fourth column wider than the cell: scaled to the cell's width.
+    let caret = Pos::new(inner_path.cell_block(0, 0, 0), 0);
+    let caret = insert_columns(&mut doc, &caret, &caret, false);
+    let table = cell_at(&doc, &caret).unwrap().table;
+    assert!(fit_table(&mut doc, &table));
+    let inner = doc.block(&inner_path).and_then(|b| b.as_table()).unwrap();
+    assert_eq!(inner.columns.len(), 4);
+    assert_eq!(inner.columns.iter().sum::<i32>(), 4_000 - 230);
+    assert_valid(&doc);
+}

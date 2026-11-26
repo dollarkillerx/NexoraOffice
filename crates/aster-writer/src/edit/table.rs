@@ -161,6 +161,94 @@ fn cell_start(table_path: &Path, table: &Table, row: usize, cell: usize) -> Opti
 }
 
 // ---------------------------------------------------------------------------
+// Widths
+// ---------------------------------------------------------------------------
+
+/// The width in twips of the space a block at `path` (a paragraph or a
+/// table) sits in: the cell it is in (the grid columns it covers less the
+/// cell's left and right margins), or else the text width of its section (a
+/// column's, in a section with columns: the first). At least 1.
+pub fn space_for_block(doc: &Document, path: &Path) -> Twips {
+    let steps = &path.0;
+    if steps.len() >= 4 {
+        let n = steps.len();
+        let table_path = Path(steps[..n - 3].to_vec());
+        let (row, cell) = (steps[n - 3] as usize, steps[n - 2] as usize);
+        if let Some(table) = table_of(doc, &table_path)
+            && let Some(r) = table.rows.get(row)
+            && let Some(c) = r.cells.get(cell)
+        {
+            let column = r.grid_before as usize
+                + r.cells[..cell]
+                    .iter()
+                    .map(|c| c.span.max(1) as usize)
+                    .sum::<usize>();
+            let span = c.span.max(1) as usize;
+            let width: Twips = table.columns.iter().skip(column).take(span).copied().sum();
+            return (width - c.margins[0] - c.margins[2]).max(1);
+        }
+    }
+    let top = path.top();
+    let section = doc
+        .sections()
+        .into_iter()
+        .find(|(last, _)| *last >= top)
+        .map_or(&*doc.last_section, |(_, section)| &**section);
+    let text =
+        section.page.0 - section.margins.left - section.margins.right - section.margins.gutter;
+    let columns = &section.columns;
+    let width = if columns.count > 1 {
+        match columns.widths.first() {
+            Some((width, _)) => *width,
+            None => (text - columns.space * (columns.count as Twips - 1)) / columns.count as Twips,
+        }
+    } else {
+        text
+    };
+    width.max(1)
+}
+
+/// The width a table made at `at` has room for: [`space_for_block`] of the
+/// paragraph the table goes before or after. Pass it to [`insert_table`].
+pub fn available_width(doc: &Document, at: &Pos) -> Twips {
+    space_for_block(doc, &at.path)
+}
+
+/// Scale the columns of the table at `table` down, in proportion, when the
+/// table (its columns and its indent) is wider than the space it sits in
+/// ([`space_for_block`]); each column keeps at least 1 twip and the widths
+/// add up to the space exactly. Returns whether anything changed. A table
+/// that fits is left alone.
+pub fn fit_table(doc: &mut Document, table: &Path) -> bool {
+    let space = space_for_block(doc, table);
+    let Some(t) = table_of(doc, table) else {
+        return false;
+    };
+    let room = (space - t.props.indent).max(t.columns.len() as Twips);
+    let total: i64 = t.columns.iter().map(|w| i64::from(*w)).sum();
+    if total <= i64::from(room) || t.columns.is_empty() {
+        return false;
+    }
+    let mut widths: Vec<Twips> = t
+        .columns
+        .iter()
+        .map(|w| ((i64::from(*w) * i64::from(room) + total / 2) / total).max(1) as Twips)
+        .collect();
+    // Rounding: the last column takes up the difference.
+    let sum: Twips = widths.iter().sum();
+    if let Some(last) = widths.last_mut() {
+        *last = (*last + (room - sum)).max(1);
+    }
+    match table_mut(doc, table) {
+        Some(t) => {
+            t.columns = widths;
+            true
+        }
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Checking
 // ---------------------------------------------------------------------------
 

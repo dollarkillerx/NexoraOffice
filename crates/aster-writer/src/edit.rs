@@ -35,8 +35,8 @@ use crate::{
 pub use link::{insert_link, link_range, set_link};
 pub use picture::{ImageFormat, PictureError, image_format, insert_picture, resize_drawing};
 pub use table::{
-    CellPos, cell_at, check_table, delete_columns, delete_rows, delete_table, insert_columns,
-    insert_rows, insert_table,
+    CellPos, available_width, cell_at, check_table, delete_columns, delete_rows, delete_table,
+    fit_table, insert_columns, insert_rows, insert_table, space_for_block,
 };
 
 /// How far one step of indenting moves a paragraph, in twips (half an inch).
@@ -1421,14 +1421,16 @@ fn insert_runs(doc: &mut Document, at: &Pos, runs: &[Run]) -> Pos {
 
 /// Two documents have the same content: the same blocks with the same text,
 /// kinds, looks and properties, the same tables, sections and lists. Where
-/// they were read from (sources) and whether blocks are the same `Arc` do not
-/// matter; neither does how neighbouring markers or neighbouring text runs of
-/// the same look are split up.
+/// they were read from (sources) do not matter; neither does how
+/// neighbouring markers or neighbouring text runs of the same look are split
+/// up. Blocks that are the same `Arc` count as the same without being looked
+/// into, which makes comparing a document with an edited copy of itself cost
+/// about the blocks that changed.
 pub fn same_content(a: &Document, b: &Document) -> bool {
     same_blocks(&a.body.blocks, &b.body.blocks)
         && same_section(&a.last_section, &b.last_section)
-        && same_numbering(&a.numbering, &b.numbering)
-        && a.styles == b.styles
+        && (Arc::ptr_eq(&a.numbering, &b.numbering) || same_numbering(&a.numbering, &b.numbering))
+        && (Arc::ptr_eq(&a.styles, &b.styles) || a.styles == b.styles)
         && a.settings == b.settings
         && a.marginals.len() == b.marginals.len()
         && a.marginals
@@ -1460,7 +1462,8 @@ pub fn same_blocks(a: &[Block], b: &[Block]) -> bool {
 
 fn same_block(a: &Block, b: &Block) -> bool {
     match (a, b) {
-        (Block::Paragraph(x), Block::Paragraph(y)) => same_paragraph(x, y),
+        (Block::Paragraph(x), Block::Paragraph(y)) => Arc::ptr_eq(x, y) || same_paragraph(x, y),
+        (Block::Table(x), Block::Table(y)) if Arc::ptr_eq(x, y) => true,
         (Block::Table(x), Block::Table(y)) => {
             x.columns == y.columns
                 && x.props == y.props

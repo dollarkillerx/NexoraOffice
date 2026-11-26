@@ -680,6 +680,8 @@ pub fn finalize_para(p: &ParaPartial, size_pt: f32, pitch: Twips) -> ParaProps {
         first_line: p.first.map_or(0, |l| l.resolve(size_pt)),
         space_before: p.before.map_or(0, |s| s.resolve(pitch)),
         space_after: p.after.map_or(0, |s| s.resolve(pitch)),
+        space_before_auto: p.before.is_some_and(|s| s.auto),
+        space_after_auto: p.after.is_some_and(|s| s.auto),
         line: p.line.unwrap_or(def.line),
         contextual_spacing: p.contextual.unwrap_or(false),
         keep_next: p.keep_next.unwrap_or(false),
@@ -773,6 +775,7 @@ mod tests {
         let props = finalize_para(&p, 10.0, 312);
         assert_eq!(props.space_before, 156);
         assert_eq!(props.space_after, 280);
+        assert!(props.space_after_auto && !props.space_before_auto);
         assert_eq!(props.line, LineSpacing::Multiple(1.5));
         let p = ppr(r#"<w:spacing w:line="400" w:lineRule="exact"/>"#);
         assert_eq!(finalize_para(&p, 10.0, 240).line, LineSpacing::Exactly(400));

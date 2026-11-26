@@ -2148,16 +2148,34 @@ fn the_paragraph_mark_counts_in_the_last_line_and_a_picture_line_is_not_stretche
 
 #[test]
 fn automatic_spacing_of_neighbours_does_not_add_up() {
-    let gap = |a: i32, b: i32| {
+    // `after` and `before` in twips; a flag says it is automatic (and then
+    // the number is what the reader puts there, 14 points).
+    let gap = |a: (i32, bool), b: (i32, bool), items: bool| {
+        let list = items.then_some(ListRef { list: 1, level: 0 });
         let layout = lay(&doc(vec![
-            with("one", |p| p.space_after = a),
-            with("two", |p| p.space_before = b),
+            with("one", |p| {
+                (p.space_after, p.space_after_auto) = a;
+                p.list = list;
+            }),
+            with("two", |p| {
+                (p.space_before, p.space_before_auto) = b;
+                p.list = list;
+            }),
         ]));
         caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
     };
-    let base = gap(0, 0);
-    assert!((gap(280, 280) - base - 14.0).abs() < 0.01);
-    assert!((gap(200, 280) - base - 24.0).abs() < 0.01);
+    let base = gap((0, false), (0, false), false);
+    // Two automatic spaces are one.
+    assert!((gap((280, true), (280, true), false) - base - 14.0).abs() < 0.01);
+    // Automatic and a set one add up.
+    assert!((gap((200, false), (280, true), false) - base - 24.0).abs() < 0.01);
+    assert!((gap((280, true), (100, false), false) - base - 19.0).abs() < 0.01);
+    // The same numbers as set spaces are not automatic: they add up.
+    assert!((gap((280, false), (280, false), false) - base - 28.0).abs() < 0.01);
+    // Between list items there is none of the automatic kind.
+    assert!((gap((280, true), (280, true), true) - base).abs() < 0.01);
+    assert!((gap((180, false), (280, true), true) - base - 9.0).abs() < 0.01);
+    assert!((gap((200, false), (280, false), true) - base - 24.0).abs() < 0.01);
 }
 
 // ---------------------------------------------------------------------------
@@ -2656,4 +2674,42 @@ fn a_footnote_longer_than_a_page_runs_over_several() {
         .rposition(|p| !note_lines(p).is_empty())
         .unwrap();
     assert!(page_of(&layout, 5) <= end + 1);
+}
+
+#[test]
+fn a_paragraph_hidden_altogether_takes_no_room() {
+    let hidden_look = || RunLook {
+        hidden: true,
+        ..look()
+    };
+    let make = |mark_hidden: bool, run_hidden: bool| {
+        let mut p = paragraph("");
+        p.runs = vec![Run::text(
+            "hidden words",
+            if run_hidden { hidden_look() } else { look() },
+        )];
+        if mark_hidden {
+            p.mark = hidden_look();
+        }
+        p.props.space_before = 400;
+        p.props.space_after = 400;
+        Block::paragraph(p)
+    };
+    let step = |middle: Option<Block>| {
+        let mut blocks = vec![pb("one")];
+        blocks.extend(middle);
+        blocks.push(pb("two"));
+        let two = blocks.len() - 1;
+        let layout = lay(&doc(blocks));
+        caret_top(&layout, two, 0) - caret_top(&layout, 0, 0)
+    };
+    let none = step(None);
+    // Mark and text hidden: it is as if it were not there, spaces included.
+    assert!((step(Some(make(true, true))) - none).abs() < 0.01);
+    // Only the text hidden, or only the mark: the paragraph is still there.
+    assert!(step(Some(make(false, true))) > none + 10.0);
+    assert!(step(Some(make(true, false))) > none + 10.0);
+    // Its place can still be asked for.
+    let layout = lay(&doc(vec![pb("one"), make(true, true), pb("two")]));
+    assert!(layout.caret(&Pos::new(Path::body(1), 0)).is_some());
 }

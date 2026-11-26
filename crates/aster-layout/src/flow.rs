@@ -15,6 +15,7 @@ use aster_writer::{
 
 use crate::cx::{
     Cx, EmitCtx, Entry, Frag, Layers, Layouter, Out, ParaBox, ParaEntry, Paths, Stack, gap, pads,
+    space_before,
 };
 use crate::display::{Item, Page, Rect, RuleStyle};
 use crate::query::{Layout, OutlineEntry};
@@ -644,9 +645,7 @@ impl Flow<'_, '_> {
             };
             let shaped = self.cx.shaped(p, Cx::text_width(p, width));
             let lines = shaped.lines();
-            let space = prev
-                .as_deref()
-                .map_or(pt(p.props.space_before), |q| gap(q, p));
+            let space = prev.as_deref().map_or(space_before(p), |q| gap(q, p));
             let all = shaped.paragraph.height();
             let unit = if p.props.keep_lines || lines.len() <= 4 {
                 all
@@ -814,7 +813,7 @@ impl Flow<'_, '_> {
                 });
             let base_space = match &self.prev {
                 Some(prev) => gap(prev, para),
-                None => pt(props.space_before),
+                None => space_before(para),
             };
             let space = if line > 0 || (self.col_empty && self.overflowed && self.prev.is_none()) {
                 0.0

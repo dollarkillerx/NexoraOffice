@@ -558,6 +558,12 @@ pub struct ParaProps {
     pub first_line: Twips,
     pub space_before: Twips,
     pub space_after: Twips,
+    /// The space before is "automatic" (`beforeAutospacing`, what HTML
+    /// paragraphs have): `space_before` then holds the 14 points Word
+    /// shows, and the layout decides where it applies.
+    pub space_before_auto: bool,
+    /// The same for the space after.
+    pub space_after_auto: bool,
     pub line: LineSpacing,
     /// No space between this paragraph and a neighbour of the same style.
     pub contextual_spacing: bool,
@@ -594,6 +600,8 @@ impl Default for ParaProps {
             first_line: 0,
             space_before: 0,
             space_after: 0,
+            space_before_auto: false,
+            space_after_auto: false,
             line: LineSpacing::default(),
             contextual_spacing: false,
             keep_next: false,

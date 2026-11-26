@@ -528,6 +528,35 @@ fn a_paragraph_style_gives_its_properties_below_direct_ones() {
     assert_eq!(p(&d, 2).props.align, Align::Justify);
 }
 
+#[test]
+fn automatic_spacing_is_kept_as_a_flag_and_follows_the_layers() {
+    let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Web"><w:name w:val="Web"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="100" w:beforeAutospacing="1" w:after="100" w:afterAutospacing="1"/></w:pPr></w:style>"#;
+    let d = doc(
+        r#"<w:p><w:pPr><w:spacing w:before="100" w:beforeAutospacing="1" w:after="180"/></w:pPr></w:p>
+<w:p><w:pPr><w:pStyle w:val="Web"/></w:pPr></w:p>
+<w:p><w:pPr><w:pStyle w:val="Web"/><w:spacing w:before="60" w:after="0" w:afterAutospacing="0"/></w:pPr></w:p>
+<w:p><w:pPr><w:spacing w:after="120"/></w:pPr></w:p>"#,
+    )
+    .styles(styles)
+    .read();
+    // Direct: automatic before (what is written beside it is ignored), set after.
+    let direct = &p(&d, 0).props;
+    assert!(direct.space_before_auto && !direct.space_after_auto);
+    assert_eq!((direct.space_before, direct.space_after), (280, 180));
+    // From a style.
+    let styled = &p(&d, 1).props;
+    assert!(styled.space_before_auto && styled.space_after_auto);
+    assert_eq!((styled.space_before, styled.space_after), (280, 280));
+    // Direct formatting on top of it turns what it sets off.
+    let over = &p(&d, 2).props;
+    assert!(!over.space_before_auto && !over.space_after_auto);
+    assert_eq!((over.space_before, over.space_after), (60, 0));
+    // Nothing automatic where nothing says so.
+    let plain = &p(&d, 3).props;
+    assert!(!plain.space_before_auto && !plain.space_after_auto);
+}
+
 // ---------------------------------------------------------------------------
 // The style sheet
 // ---------------------------------------------------------------------------

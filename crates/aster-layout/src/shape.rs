@@ -612,6 +612,7 @@ pub(crate) fn shape(
 
     let grid = if props.snap_to_grid { env.grid } else { None };
     let line = match props.line {
+        _ if fully_hidden(para) => LineRule::Exactly(0.0),
         LineSpacing::Multiple(m) => LineRule::Multiple(m.max(0.0)),
         LineSpacing::AtLeast(v) => LineRule::AtLeast(pt(v)),
         LineSpacing::Exactly(v) => LineRule::Exactly(pt(v)),
@@ -674,6 +675,16 @@ pub(crate) fn shape(
         has_tabs,
         rubies: builder.rubies,
     }
+}
+
+/// A paragraph Word does not show at all: its mark is hidden and so is
+/// everything in it. It takes no room, spaces included.
+pub(crate) fn fully_hidden(para: &Paragraph) -> bool {
+    para.mark.hidden
+        && para.runs.iter().all(|run| {
+            run.look.hidden
+                || (matches!(run.kind, Inline::Text | Inline::Marker) && run.text.is_empty())
+        })
 }
 
 /// The widest stretch of a band that none of `obstacles` covers, and where

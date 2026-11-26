@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 
 use aster_surface::Action;
 use aster_surface::doc_view::{
-    Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, Move, Tri, Unit,
-    Zoom,
+    Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, Move, Tri, Unit, Zoom,
 };
 use aster_writer::{Break, Document, OBJECT};
 

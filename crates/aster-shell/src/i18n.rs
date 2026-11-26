@@ -977,7 +977,6 @@ pub const ZH_HANS: Strings = Strings {
     mcp_failed: "MCP 无法启动：{error}",
     mcp_no_bridge: "找不到 aster-mcp 程序，请从安装包运行 Aster Office",
 
-
     menu_file: "文件",
     menu_edit: "编辑",
     menu_new_markdown: "新建 Markdown 文档",
@@ -1492,7 +1491,6 @@ pub const JA: Strings = Strings {
     mcp_failed: "MCP を開始できません：{error}",
     mcp_no_bridge: "aster-mcp が見つかりません。インストールした Aster Office から起動してください",
 
-
     menu_file: "ファイル",
     menu_edit: "編集",
     menu_new_markdown: "新規 Markdown 文書",
@@ -2006,7 +2004,6 @@ pub const EN: Strings = Strings {
     mcp_copy: "Copy",
     mcp_failed: "MCP could not start: {error}",
     mcp_no_bridge: "The aster-mcp program is missing; run Aster Office from its installed package",
-
 
     menu_file: "File",
     menu_edit: "Edit",
@@ -5081,5 +5078,4 @@ mod tests {
             assert_eq!(Language::from_tag(tag), Some(Language::ZhHant), "{tag}");
         }
     }
-
 }

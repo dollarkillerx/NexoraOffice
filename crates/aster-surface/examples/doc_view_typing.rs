@@ -23,7 +23,8 @@ fn paragraph(text: &str) -> Block {
 }
 
 fn document(paragraphs: usize) -> Document {
-    let latin = "The quick brown fox jumps over the lazy dog while the office suite lays out text. ";
+    let latin =
+        "The quick brown fox jumps over the lazy dog while the office suite lays out text. ";
     let chinese = "我们喜欢办公软件，也喜欢把文档排得整整齐齐。";
     let blocks = (0..paragraphs)
         .map(|i| {

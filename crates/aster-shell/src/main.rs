@@ -7542,7 +7542,11 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_find_replacement_edited(handler!(|ui, shell, text| {
-        if writer_ui::find(&ui, shell, writer_ui::FindAction::Replacement(text.to_string())) {
+        if writer_ui::find(
+            &ui,
+            shell,
+            writer_ui::FindAction::Replacement(text.to_string()),
+        ) {
             return;
         }
         if let Some(tab) = shell.active_sheet() {
@@ -8231,7 +8235,12 @@ mod tests {
         };
         assert!(tab.is_modified());
         assert_eq!(tab.path.as_deref(), Some(file.as_path()));
-        assert!(tab.view.document().plain_text().starts_with("未保存の変更 "));
+        assert!(
+            tab.view
+                .document()
+                .plain_text()
+                .starts_with("未保存の変更 ")
+        );
         // Saving it starts from the bytes the record held.
         let job = again
             .contents
@@ -8549,9 +8558,15 @@ mod tests {
         shell.open_untitled(DocKind::Writer);
         assert!(shell.run(Command::ZoomReset));
         assert!(shell.run(Command::ZoomIn));
-        assert_eq!(shell.active_doc().expect("writer tab").view.zoom_percent(), 125.0);
+        assert_eq!(
+            shell.active_doc().expect("writer tab").view.zoom_percent(),
+            125.0
+        );
         assert!(shell.run(Command::ZoomOut));
-        assert_eq!(shell.active_doc().expect("writer tab").view.zoom_percent(), 100.0);
+        assert_eq!(
+            shell.active_doc().expect("writer tab").view.zoom_percent(),
+            100.0
+        );
         // A command with nothing to act on changes nothing.
         assert!(!shell.run(Command::Undo));
         assert!(!shell.run(Command::Print));
@@ -8569,7 +8584,10 @@ mod tests {
             aster_surface::doc_view::Zoom::FitWidth
         );
         shell.activate(0);
-        assert_eq!(shell.active_doc().expect("first").view.zoom_percent(), 125.0);
+        assert_eq!(
+            shell.active_doc().expect("first").view.zoom_percent(),
+            125.0
+        );
     }
 
     #[test]
@@ -9812,7 +9830,10 @@ mod ui_tests {
             assert!(enabled.contains(&command.id()), "{command:?}");
         }
         assert!(!enabled.contains(&Command::Print.id()));
-        assert!(!enabled.contains(&Command::Undo.id()), "nothing to undo yet");
+        assert!(
+            !enabled.contains(&Command::Undo.id()),
+            "nothing to undo yet"
+        );
         // The status bar says the page, the counts, the format and the zoom,
         // and no longer says "read-only".
         assert!(
@@ -9823,7 +9844,10 @@ mod ui_tests {
         assert_eq!(ui.get_status_format().as_str(), "DOCX");
         assert!(ui.get_status_zoom().ends_with('%'));
         assert!(ui.get_zoom_enabled());
-        assert!(!ui.get_status_note().contains(app.shell.borrow().language.strings().read_only_note));
+        assert!(
+            !ui.get_status_note()
+                .contains(app.shell.borrow().language.strings().read_only_note)
+        );
         // The outline lists the headings.
         let headings = with_doc(&app, |tab| tab.view.outline().len());
         assert!(headings > 0);
@@ -9853,7 +9877,11 @@ mod ui_tests {
         assert!(!app.shell.borrow().tabs.active().unwrap().modified);
         type_text(ui, "typed");
         assert!(app.shell.borrow().tabs.active().unwrap().modified);
-        assert!(with_doc(&app, |tab| tab.view.document().plain_text().contains("typed")));
+        assert!(with_doc(&app, |tab| tab
+            .view
+            .document()
+            .plain_text()
+            .contains("typed")));
         // The undo buttons come alive; undo goes back to the opened text.
         let items = ui.get_toolbar_items();
         let undo = (0..items.row_count())
@@ -9869,7 +9897,11 @@ mod ui_tests {
         ui.invoke_edit_redo();
         key(ui, Key::Backspace);
         key(ui, Key::Return);
-        assert!(with_doc(&app, |tab| tab.view.document().plain_text().len() > 0));
+        assert!(with_doc(&app, |tab| !tab
+            .view
+            .document()
+            .plain_text()
+            .is_empty()));
         // Select all, copy, and the Format menu's bold.
         command(ui, "a");
         assert!(with_doc(&app, |tab| tab.view.selected_text().len() > 200));

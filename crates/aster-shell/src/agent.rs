@@ -747,7 +747,12 @@ fn context(shell: &mut Shell) -> TurnContext {
     let Some((id, title)) = shell
         .tabs
         .active()
-        .filter(|tab| matches!(tab.kind, DocKind::Markdown | DocKind::Sheets | DocKind::Writer))
+        .filter(|tab| {
+            matches!(
+                tab.kind,
+                DocKind::Markdown | DocKind::Sheets | DocKind::Writer
+            )
+        })
         .map(|tab| (tab.id, tab.title.clone()))
     else {
         return context;

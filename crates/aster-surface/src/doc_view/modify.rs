@@ -331,7 +331,9 @@ impl DocView {
         };
         let &(r, c) = cells.get(next)?;
         let target = &table.rows[r].cells[c];
-        let (inner, _) = aster_writer::paragraphs_of(&target.blocks).into_iter().next()?;
+        let (inner, _) = aster_writer::paragraphs_of(&target.blocks)
+            .into_iter()
+            .next()?;
         let mut steps = table_path.0.clone();
         steps.extend([r as u32, c as u32]);
         steps.extend(inner.0);
@@ -370,7 +372,9 @@ impl DocView {
         }
         self.apply(None, false, |document, selection| {
             let at = Self::clear_range(document, selection);
-            Some(Selection::caret(edit::insert_text(document, &at, &text, None)))
+            Some(Selection::caret(edit::insert_text(
+                document, &at, &text, None,
+            )))
         })
     }
 
@@ -381,7 +385,9 @@ impl DocView {
         }
         self.apply(None, false, |document, selection| {
             let at = Self::clear_range(document, selection);
-            Some(Selection::caret(edit::insert_fragment(document, &at, blocks)))
+            Some(Selection::caret(edit::insert_fragment(
+                document, &at, blocks,
+            )))
         })
     }
 

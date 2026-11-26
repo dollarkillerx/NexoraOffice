@@ -1,9 +1,9 @@
 //! Tests of editing through the view: typing, composing, deleting, the
 //! clipboard, formatting, undo, replace and saving.
 
-use aster_writer::edit::same_content;
 use super::*;
 use crate::text_surface::ImeEvent;
+use aster_writer::edit::same_content;
 
 /// The text of the first paragraph the page's layout draws.
 trait LayoutText {
@@ -114,7 +114,12 @@ fn a_look_chosen_with_only_a_caret_goes_on_the_next_text_and_is_dropped_when_it_
     view.type_text("BOLD");
     view.type_text("er");
     let p = view.document().paragraph(&Path::body(0)).unwrap();
-    let bold: String = p.runs.iter().filter(|r| r.look.bold).map(|r| r.text.as_str()).collect();
+    let bold: String = p
+        .runs
+        .iter()
+        .filter(|r| r.look.bold)
+        .map(|r| r.text.as_str())
+        .collect();
     assert_eq!(bold, "BOLDer");
     // Chosen, then the caret moves: dropped.
     caret_at(&mut view, 0, 2);
@@ -159,7 +164,11 @@ fn enter_splits_and_breaks_are_inserted() {
 
 #[test]
 fn deleting_by_cluster_word_and_line_and_joining_paragraphs() {
-    let mut view = view_of(doc(vec![pb("ae\u{301}x"), pb("alpha beta  gamma"), pb("tail")]));
+    let mut view = view_of(doc(vec![
+        pb("ae\u{301}x"),
+        pb("alpha beta  gamma"),
+        pb("tail"),
+    ]));
     caret_at(&mut view, 0, 4);
     assert!(view.backspace(Unit::Cluster));
     assert_eq!(texts(&view)[0], "ax");
@@ -355,7 +364,9 @@ fn cut_copy_and_paste_keep_formatting_through_the_fragment() {
     // Fragment paste: the bold survives.
     assert!(view.paste_fragment(&fragment));
     let last = view.document().paragraph(&Path::body(1)).unwrap();
-    assert!(last.text().ends_with("bold text") || view.document().plain_text().contains("bold text"));
+    assert!(
+        last.text().ends_with("bold text") || view.document().plain_text().contains("bold text")
+    );
     let bold_chars: usize = view
         .document()
         .paragraphs()
@@ -380,7 +391,10 @@ fn formatting_commands_and_the_state_the_toolbar_shows() {
     let mut view = view_of(doc(vec![pb("one two three"), pb("four")]));
     select(&mut view, pos(0, 4), pos(0, 7));
     for (command, check) in [
-        (DocCommand::Bold, (|s: &FormatState| s.bold) as fn(&FormatState) -> Tri),
+        (
+            DocCommand::Bold,
+            (|s: &FormatState| s.bold) as fn(&FormatState) -> Tri,
+        ),
         (DocCommand::Italic, |s| s.italic),
         (DocCommand::Underline, |s| s.underline),
         (DocCommand::Strikethrough, |s| s.strike),
@@ -414,7 +428,10 @@ fn formatting_commands_and_the_state_the_toolbar_shows() {
     view.command(DocCommand::Color(Some([255, 0, 0, 255])));
     assert_eq!(view.format_state().color, Some(Some([255, 0, 0, 255])));
     view.command(DocCommand::Highlight(Some([255, 255, 0, 255])));
-    assert_eq!(view.format_state().highlight, Some(Some([255, 255, 0, 255])));
+    assert_eq!(
+        view.format_state().highlight,
+        Some(Some([255, 255, 0, 255]))
+    );
     view.command(DocCommand::Color(None));
     assert_eq!(view.format_state().color, Some(None));
     select(&mut view, pos(0, 0), pos(1, 2));
@@ -426,7 +443,11 @@ fn formatting_commands_and_the_state_the_toolbar_shows() {
     assert_eq!(view.format_state().align, Some(Align::Justify));
     view.command(DocCommand::Indent(2));
     let indent = |view: &DocView, i| {
-        view.document().paragraph(&Path::body(i)).unwrap().props.indent_left
+        view.document()
+            .paragraph(&Path::body(i))
+            .unwrap()
+            .props
+            .indent_left
     };
     assert_eq!((indent(&view, 0), indent(&view, 1)), (1440, 1440));
     view.command(DocCommand::Indent(-1));
@@ -532,7 +553,11 @@ fn edits_change_the_pages_and_only_changed_pages_are_painted_again() {
     view.type_text("X");
     assert!(view.revision() > revision);
     view.render();
-    assert_ne!(first, page(&view, 0), "the page that changed is painted again");
+    assert_ne!(
+        first,
+        page(&view, 0),
+        "the page that changed is painted again"
+    );
     // Pages after it that have the same content keep their pixels when they
     // are visible and unchanged.
     view.go_to_page(3);
@@ -542,7 +567,11 @@ fn edits_change_the_pages_and_only_changed_pages_are_painted_again() {
     view.go_to_page(3);
     view.render();
     assert!(view.layout_text(0).starts_with("XY"));
-    assert_eq!(before, page(&view, 3), "an edit on page 1 does not repaint page 4");
+    assert_eq!(
+        before,
+        page(&view, 3),
+        "an edit on page 1 does not repaint page 4"
+    );
 }
 
 #[test]

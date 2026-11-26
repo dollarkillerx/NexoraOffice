@@ -94,8 +94,18 @@ const SIZES: [f32; 17] = [
 
 /// Typefaces that are for East Asian text: choosing one sets that face too.
 const EAST_ASIAN: [&str; 12] = [
-    "SimSun", "SimHei", "KaiTi", "FangSong", "Microsoft YaHei", "宋体", "黑体", "楷体", "仿宋",
-    "MS Mincho", "MS Gothic", "Yu Mincho",
+    "SimSun",
+    "SimHei",
+    "KaiTi",
+    "FangSong",
+    "Microsoft YaHei",
+    "宋体",
+    "黑体",
+    "楷体",
+    "仿宋",
+    "MS Mincho",
+    "MS Gothic",
+    "Yu Mincho",
 ];
 
 fn kind_of(document: &Document, paragraph: &Paragraph) -> Option<ListKind> {
@@ -369,7 +379,10 @@ impl DocView {
         self.apply(None, true, |document, selection| {
             let (from, to) = selection.ordered();
             change(document, &from, &to);
-            Some(Selection::new(selection.anchor.clone(), selection.focus.clone()))
+            Some(Selection::new(
+                selection.anchor.clone(),
+                selection.focus.clone(),
+            ))
         })
     }
 
@@ -392,7 +405,10 @@ impl DocView {
         self.apply(None, true, |document, selection| {
             let (from, to) = selection.ordered();
             edit::apply_run_patch(document, &from, &to, &patch);
-            Some(Selection::new(selection.anchor.clone(), selection.focus.clone()))
+            Some(Selection::new(
+                selection.anchor.clone(),
+                selection.focus.clone(),
+            ))
         })
     }
 

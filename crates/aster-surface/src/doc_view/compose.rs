@@ -38,7 +38,8 @@ pub(super) fn blank_paragraph(document: &Document) -> Paragraph {
 
 /// `document` with a paragraph in its body if it had none.
 pub(super) fn with_paragraph(document: &mut Document) -> bool {
-    if document.paragraphs().is_empty() && document.body.blocks.iter().all(|b| b.as_table().is_none())
+    if document.paragraphs().is_empty()
+        && document.body.blocks.iter().all(|b| b.as_table().is_none())
     {
         let paragraph = blank_paragraph(document);
         document.body.blocks.push(Block::paragraph(paragraph));

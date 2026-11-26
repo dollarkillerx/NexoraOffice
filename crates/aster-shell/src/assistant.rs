@@ -68,8 +68,9 @@ pub fn run_on_word(
     match tool {
         "read_document" => Ok(read(&rope, args)),
         "search_document" => search(&rope, args),
-        "get_selection" => Ok(json!({ "text": selected.chars().take(20_000).collect::<String>() })
-            .to_string()),
+        "get_selection" => {
+            Ok(json!({ "text": selected.chars().take(20_000).collect::<String>() }).to_string())
+        }
         "get_outline" => Ok(json!({ "headings": headings }).to_string()),
         other => Err(format!(
             "`{other}` does not work on a Word document: the assistant can read Word documents but not change them yet"

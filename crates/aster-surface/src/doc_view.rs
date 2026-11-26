@@ -45,8 +45,8 @@ use crate::text_surface::{HAN_FALLBACK_FAMILIES, Rgba8};
 pub use crate::pdf_view::{LINE_STEP, ZOOM_MAX, ZOOM_MIN, Zoom};
 pub use aster_writer::{Align, Break, LineSpacing};
 pub use editing::Move;
-pub use modify::Unit;
 pub use format::{DocCommand, FormatState, Tri};
+pub use modify::Unit;
 pub use search::{DocQuery, MAX_MATCHES, Match};
 pub use text::text_between;
 
@@ -1075,7 +1075,12 @@ fn page_print(page: &Page) -> (u64, Vec<Arc<aster_text::Paragraph>>) {
             v.to_bits().hash(h);
         }
     };
-    (page.width.to_bits(), page.height.to_bits(), page.items.len()).hash(&mut hasher);
+    (
+        page.width.to_bits(),
+        page.height.to_bits(),
+        page.items.len(),
+    )
+        .hash(&mut hasher);
     for item in &page.items {
         match item {
             Item::Fill { rect: r, color } => {

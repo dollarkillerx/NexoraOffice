@@ -298,6 +298,9 @@ pub(crate) fn copy(ui: &AppWindow, shell: &mut Shell) {
     let Some(tab) = shell.active_doc() else {
         return;
     };
+    if tab.view.is_composing() {
+        return;
+    }
     let text = clean(&tab.view.selected_text());
     let fragment = tab.view.selected_fragment();
     if text.is_empty() {
@@ -312,6 +315,9 @@ pub(crate) fn cut(ui: &AppWindow, shell: &mut Shell) {
     let Some(tab) = shell.active_doc() else {
         return;
     };
+    if tab.view.is_composing() {
+        return;
+    }
     let Some((text, fragment)) = tab.view.cut() else {
         return;
     };
@@ -324,6 +330,13 @@ pub(crate) fn cut(ui: &AppWindow, shell: &mut Shell) {
 /// Paste: the formatted paragraphs if the clipboard still holds the text
 /// last copied from a Writer document, else the plain text.
 pub(crate) fn paste(ui: &AppWindow, shell: &mut Shell) {
+    // Everything waits for a composition to end.
+    if shell
+        .active_doc()
+        .is_some_and(|tab| tab.view.is_composing())
+    {
+        return;
+    }
     let text = ui.invoke_clipboard_text().to_string();
     if text.is_empty() {
         return;
@@ -578,12 +591,18 @@ pub(crate) fn find(ui: &AppWindow, shell: &mut Shell, action: FindAction) -> boo
         }
         FindAction::Replacement(text) => tab.find.replacement = text,
         FindAction::ReplaceOne => {
+            if tab.view.is_composing() {
+                return true;
+            }
             let with = tab.find.replacement.clone();
             tab.view.replace_current(&with);
             after_edit(ui, shell);
             return true;
         }
         FindAction::ReplaceAll => {
+            if tab.view.is_composing() {
+                return true;
+            }
             let with = tab.find.replacement.clone();
             tab.view.replace_all(&with);
             after_edit(ui, shell);

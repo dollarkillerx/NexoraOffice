@@ -74,6 +74,9 @@ impl DocView {
     /// Select from `anchor` to `focus`, moved onto valid places. Returns
     /// whether anything changed.
     pub fn set_selection(&mut self, anchor: Pos, focus: Pos) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let (Some(anchor), Some(focus)) = (
             sanitized(&self.document, anchor),
             sanitized(&self.document, focus),
@@ -103,6 +106,9 @@ impl DocView {
 
     /// Select the whole body.
     pub fn select_all(&mut self) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let (Some(start), Some(end)) = (self.document.start(), self.document.end()) else {
             return false;
         };
@@ -112,6 +118,9 @@ impl DocView {
 
     /// Drop the selection, leaving the caret where it was.
     pub fn clear_selection(&mut self) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         match self.sel.clone() {
             Some(sel) => self.set_sel(sel.focus.clone(), sel.focus),
             None => false,
@@ -120,6 +129,9 @@ impl DocView {
 
     /// Put the caret at `pos` and show it near the top of the window.
     pub fn go_to(&mut self, pos: &Pos) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(pos) = sanitized(&self.document, pos.clone()) else {
             return false;
         };
@@ -179,6 +191,9 @@ impl DocView {
     /// single click grows the selection from where it was. Returns whether
     /// the picture changed.
     pub fn press(&mut self, x: f64, y: f64, clicks: u8, extend: bool) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(pos) = self.pos_at(x, y) else {
             return false;
         };
@@ -265,6 +280,9 @@ impl DocView {
     /// Scrolls to keep the caret in the window. Returns whether anything
     /// changed.
     pub fn move_caret(&mut self, movement: Move, select: bool) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
@@ -578,6 +596,9 @@ impl DocView {
     /// current match and the selection, and is shown. From no current match
     /// the search starts at the caret. False when there are no matches.
     pub fn find_step(&mut self, forward: bool) -> bool {
+        if self.compose.is_some() {
+            return false;
+        }
         let caret = self.caret().cloned();
         let Some(find) = &self.find else {
             return false;

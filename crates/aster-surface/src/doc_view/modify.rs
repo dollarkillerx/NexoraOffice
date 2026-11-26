@@ -149,6 +149,13 @@ impl DocView {
         if text.is_empty() {
             return false;
         }
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
+
         let pending = self.pending.clone();
         let kind = if self.has_selection() {
             None
@@ -172,6 +179,12 @@ impl DocView {
 
     /// Enter: the selection goes and the paragraph is split.
     pub fn enter(&mut self) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         self.apply(None, false, |document, selection| {
             let at = Self::clear_range(document, selection);
             Some(Selection::caret(edit::split_paragraph(document, &at)))
@@ -180,6 +193,12 @@ impl DocView {
 
     /// A line, page or column break.
     pub fn insert_break(&mut self, kind: Break) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         self.apply(None, false, |document, selection| {
             let at = Self::clear_range(document, selection);
             Some(Selection::caret(edit::insert_break(document, &at, kind)))
@@ -190,6 +209,12 @@ impl DocView {
     /// the start of a paragraph it leaves its list or joins the paragraph
     /// before.
     pub fn backspace(&mut self, unit: Unit) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
@@ -231,6 +256,12 @@ impl DocView {
     /// Delete: the selection, else forward by `unit`; at the end of a
     /// paragraph the next one is joined.
     pub fn delete_forward(&mut self, unit: Unit) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
@@ -277,6 +308,12 @@ impl DocView {
     /// out); in a table to the next cell (the previous with Shift); else a
     /// tab character (Shift does nothing).
     pub fn tab(&mut self, shift: bool) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         let Some(sel) = self.sel.clone() else {
             return false;
         };
@@ -352,6 +389,12 @@ impl DocView {
 
     /// Take the selection out and give it: its text and its fragment.
     pub fn cut(&mut self) -> Option<(String, Option<Vec<Block>>)> {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return None;
+        }
         if !self.has_selection() {
             return None;
         }
@@ -366,6 +409,12 @@ impl DocView {
     /// Paste plain text: it replaces the selection; line breaks start
     /// paragraphs, tabs are tabs.
     pub fn paste_text(&mut self, text: &str) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.is_empty() {
             return false;
@@ -380,6 +429,12 @@ impl DocView {
 
     /// Paste what [`DocView::selected_fragment`] gave, formatting and all.
     pub fn paste_fragment(&mut self, blocks: &[Block]) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         if blocks.is_empty() {
             return false;
         }
@@ -394,9 +449,13 @@ impl DocView {
     // --- Undo ---
 
     pub fn undo(&mut self) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
         if self.compose.is_some() {
             return false;
         }
+
         match self.history.undo(&self.document) {
             Some((document, selection)) => {
                 self.restore_step(document, selection);
@@ -407,9 +466,13 @@ impl DocView {
     }
 
     pub fn redo(&mut self) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
         if self.compose.is_some() {
             return false;
         }
+
         match self.history.redo(&self.document) {
             Some((document, selection)) => {
                 self.restore_step(document, selection);
@@ -450,6 +513,12 @@ impl DocView {
     /// Replace the current match of the search with `with`. One step of
     /// undo. The search is made again afterwards.
     pub fn replace_current(&mut self, with: &str) -> bool {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return false;
+        }
         let Some((start, end)) = self
             .current_hit()
             .and_then(|i| self.hit(i))
@@ -477,6 +546,12 @@ impl DocView {
     /// Replace every match with `with`, as one step of undo. Returns how
     /// many there were.
     pub fn replace_all(&mut self, with: &str) -> usize {
+        // While an input method is composing, keys, typed text and commands
+        // wait for it to end, as in the Markdown editor; only a commit
+        // enters composed text.
+        if self.compose.is_some() {
+            return 0;
+        }
         let matches: Vec<(Pos, Pos)> = (0..self.hit_count())
             .filter_map(|i| self.hit(i).map(|(a, b)| (a.clone(), b.clone())))
             .collect();

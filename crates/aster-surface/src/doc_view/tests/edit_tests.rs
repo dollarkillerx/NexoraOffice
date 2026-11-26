@@ -643,3 +643,108 @@ fn saving_marks_the_view_and_a_new_document_starts_clean() {
     view.mark_unsaved();
     assert!(view.is_modified());
 }
+
+/// While an input method composes, keys, typed text and commands wait for
+/// it: each leaves the document, the selection and the preedit as they are,
+/// and returns false. A commit then puts the composed text in the right
+/// place, and the next command works.
+#[test]
+fn every_command_during_a_composition_waits_for_it() {
+    type Run = fn(&mut DocView) -> bool;
+    let commands: Vec<(&str, Run)> = vec![
+        ("type", |v| v.type_text("X")),
+        ("enter", |v| v.enter()),
+        ("break", |v| v.insert_break(Break::Line)),
+        ("backspace", |v| v.backspace(Unit::Cluster)),
+        ("delete", |v| v.delete_forward(Unit::Cluster)),
+        ("tab", |v| v.tab(false)),
+        ("paste", |v| v.paste_text("P")),
+        ("paste fragment", |v| {
+            v.paste_fragment(&[aster_writer::Block::paragraph(
+                aster_writer::Paragraph::default(),
+            )])
+        }),
+        ("cut", |v| v.cut().is_some()),
+        ("bold", |v| v.command(DocCommand::Bold)),
+        ("align", |v| v.command(DocCommand::Align(Align::Center))),
+        ("list", |v| v.command(DocCommand::Bullets)),
+        ("style", |v| v.command(DocCommand::Style("Heading1".into()))),
+        ("undo", |v| v.undo()),
+        ("redo", |v| v.redo()),
+        ("replace", |v| {
+            v.set_find(query("keep"));
+            v.replace_current("R")
+        }),
+        ("replace all", |v| {
+            v.set_find(query("keep"));
+            v.replace_all("R") > 0
+        }),
+        ("find step", |v| v.find_step(true)),
+        ("press", |v| v.press(100.0, 50.0, 1, false)),
+        ("move", |v| v.move_caret(Move::Right, false)),
+        ("select all", |v| v.select_all()),
+        ("clear selection", |v| v.clear_selection()),
+        ("go to", |v| v.go_to(&pos(1, 1))),
+        ("set selection", |v| v.set_selection(pos(1, 0), pos(1, 2))),
+    ];
+    for (name, run) in commands {
+        for selected in [false, true] {
+            let mut view = view_of(doc(vec![pb("keep this"), pb("tail")]));
+            // Something to undo and redo.
+            caret_at(&mut view, 1, 4);
+            view.type_text("1");
+            view.seal_history();
+            view.type_text("2");
+            view.undo();
+            if selected {
+                select(&mut view, pos(0, 5), pos(0, 9));
+            } else {
+                caret_at(&mut view, 0, 2);
+            }
+            view.ime(ImeEvent::Preedit {
+                text: "ni".into(),
+                cursor: Some((2, 2)),
+            });
+            let before = view.document().clone();
+            let selection = view.selection().map(|(a, b)| (a.clone(), b.clone()));
+            let caret_before = caret(&view);
+            let shown = view.layout_text(0);
+            let changed = run(&mut view);
+            assert!(!changed, "{name} returned true");
+            assert!(view.is_composing(), "{name} ended the composition");
+            assert_eq!(*view.document(), before, "{name}");
+            assert_eq!(
+                view.selection().map(|(a, b)| (a.clone(), b.clone())),
+                selection,
+                "{name}"
+            );
+            assert_eq!(caret(&view), caret_before, "{name}");
+            assert_eq!(view.layout_text(0), shown, "{name}");
+            // The commit puts the composed text in the right place.
+            assert!(view.ime(ImeEvent::Commit("你".into())), "{name}");
+            assert!(!view.is_composing());
+            let text = texts(&view)[0].clone();
+            if selected {
+                assert_eq!(text, "keep 你", "{name}");
+            } else {
+                assert_eq!(text, "ke你ep this", "{name}");
+            }
+            // And a following command works.
+            assert!(view.type_text("Z"), "{name}");
+            assert!(view.document().plain_text().contains('Z'), "{name}");
+        }
+    }
+}
+
+/// `set_document` replaces everything: a composition does not outlive it.
+#[test]
+fn replacing_the_document_drops_a_composition() {
+    let mut view = view_of(doc(vec![pb("keep")]));
+    view.ime(ImeEvent::Preedit {
+        text: "ni".into(),
+        cursor: Some((2, 2)),
+    });
+    view.set_document(doc(vec![pb("new")]));
+    assert!(!view.is_composing());
+    assert_eq!(texts(&view), ["new"]);
+}

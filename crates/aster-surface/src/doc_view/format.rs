@@ -256,6 +256,7 @@ impl DocView {
 
     /// Carry out a command. Returns whether anything changed.
     pub fn command(&mut self, command: DocCommand) -> bool {
+        // Commands wait for a composition to end.
         if self.compose.is_some() {
             return false;
         }

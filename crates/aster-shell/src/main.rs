@@ -7933,15 +7933,6 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             // no caret to blink.
             let editor_moved = mode.shows_source() && size != surface.size();
             let mut dirty = editor_moved || focused != was_focused || preview_moved;
-            // A composition is dropped when the document loses the keyboard.
-            if was_focused
-                && !focused
-                && shell
-                    .active_doc()
-                    .is_some_and(|tab| tab.view.cancel_composition())
-            {
-                dirty = true;
-            }
             was_focused = focused;
             if blink_due {
                 shell.last_blink = Instant::now();
@@ -9950,6 +9941,42 @@ mod ui_tests {
         assert!(!app.shell.borrow().tabs.active().unwrap().modified);
         let again = aster_ooxml::docx::read(std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(again.plain_text(), "hello");
+    }
+
+    #[test]
+    fn typed_text_and_enter_wait_for_a_composition_in_a_writer_tab() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_new_document(DocKind::Writer.index() as i32);
+        ui.invoke_focus_document();
+        type_text(ui, "ab");
+        with_doc(&app, |tab| {
+            tab.view.ime(ImeEvent::Preedit {
+                text: "ni".into(),
+                cursor: Some((2, 2)),
+            });
+        });
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        // The keys an automation delivers while the input method has the
+        // composition open: letters, Enter, Backspace, Tab.
+        type_text(ui, "xy");
+        key(ui, Key::Return);
+        key(ui, Key::Backspace);
+        key(ui, Key::Tab);
+        command(ui, "b");
+        assert!(with_doc(&app, |tab| tab.view.is_composing()));
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        // The commit is the only way composed text gets in.
+        with_doc(&app, |tab| tab.view.ime(ImeEvent::Commit("你".into())));
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "ab你"
+        );
+        type_text(ui, "c");
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "ab你c"
+        );
     }
 
     #[test]

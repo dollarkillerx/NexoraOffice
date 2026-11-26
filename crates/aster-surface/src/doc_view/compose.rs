@@ -92,6 +92,9 @@ impl DocView {
     }
 
     fn preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) -> bool {
+        // On purpose: while a mouse button is held (`press` is set by the
+        // pointer and cleared by `release`) a preedit is dropped: the
+        // selection is being made and a composition must not start in it.
         if self.press.is_some() {
             return false;
         }

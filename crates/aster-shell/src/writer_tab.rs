@@ -210,9 +210,11 @@ impl DocTab {
         let Some(written) = written else {
             return;
         };
+        // A composition in progress is not dropped for this: the model is
+        // kept, as when the document was edited while writing.
         self.disk = Some(aster_storage::Fingerprint::of(path, &written.bytes));
         self.path = Some(path.to_owned());
-        if self.view.revision() == job.revision {
+        if self.view.revision() == job.revision && !self.view.is_composing() {
             self.source = Arc::new(written.bytes);
             self.view.set_document(written.document);
             self.stats_revision = self.view.revision();
@@ -406,6 +408,9 @@ impl DocTab {
 
     /// A toolbar button. Returns whether the document or the view changed.
     pub fn run(&mut self, command: Command) -> bool {
+        if self.view.is_composing() {
+            return false;
+        }
         let view = &mut self.view;
         let doc = match command {
             Command::Undo => DocCommand::Undo,
@@ -432,6 +437,9 @@ impl DocTab {
     /// An entry chosen from a toolbar list: a paragraph style, a font, a
     /// size, a line spacing, or a colour (index 0 for automatic or none).
     pub fn option(&mut self, command: Command, index: usize) -> bool {
+        if self.view.is_composing() {
+            return false;
+        }
         let doc = match command {
             Command::ParagraphStyle => {
                 let styles = self.view.paragraph_styles();

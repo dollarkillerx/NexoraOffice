@@ -16,8 +16,10 @@
 //!
 //! The functions take the whole document or the changes a range touches, and
 //! return how many changes they resolved. A caret touches the change it is in
-//! or at the edge of; a range touches every change it overlaps, and a
-//! deletion or a paragraph mark inside it or at its ends.
+//! or at the edge of; a range touches every change it overlaps, a deletion
+//! or paragraph mark it goes over, and a paragraph mark at its ends, but a
+//! deletion at an end only when that is the start or the end of the
+//! paragraph.
 
 use std::collections::HashSet;
 
@@ -65,8 +67,20 @@ fn ordered(from: &Pos, to: &Pos) -> Option<(Pos, Pos)> {
     })
 }
 
-/// Does the stretch `a..b` of the paragraph at `path` lie in the range?
-fn touched(range: &Option<(Pos, Pos)>, path: &Path, a: usize, b: usize) -> bool {
+/// Does the stretch `a..b` of the paragraph at `path` (`len` long) lie in
+/// the range? A caret touches what it is in or at the edge of. A stretch
+/// with no width (a deletion, a paragraph mark) is touched by a range that
+/// goes over it; at the edge of the range only a paragraph mark counts, and a
+/// deletion at the very start or end of its paragraph when the range goes up
+/// to there (selecting "two " does not accept the deletion after it).
+fn touched(
+    range: &Option<(Pos, Pos)>,
+    path: &Path,
+    a: usize,
+    b: usize,
+    len: usize,
+    mark: bool,
+) -> bool {
     let Some((f, t)) = range else {
         return true;
     };
@@ -75,7 +89,9 @@ fn touched(range: &Option<(Pos, Pos)>, path: &Path, a: usize, b: usize) -> bool 
     if f == t {
         start <= *f && *f <= end
     } else if a == b {
-        *f <= start && start <= *t
+        (*f < start && start < *t)
+            || (start == *f && (mark || a == 0))
+            || (start == *t && (mark || a == len))
     } else {
         start < *t && end > *f
     }
@@ -84,20 +100,24 @@ fn touched(range: &Option<(Pos, Pos)>, path: &Path, a: usize, b: usize) -> bool 
 /// There is something to resolve in the paragraph, found before changing it
 /// so that a paragraph with nothing to do stays shared.
 fn has_work(range: &Option<(Pos, Pos)>, path: &Path, p: &Paragraph, accept: bool) -> bool {
-    let end = p.len();
+    let len = p.len();
     let marks = p.changes.inserted_mark.is_some() || p.changes.deleted_mark.is_some();
-    if marks && touched(range, path, end, end) {
+    if marks && touched(range, path, len, len, len, true) {
         return true;
     }
-    if accept && p.changes.formatting && touched(range, path, 0, end) {
+    if accept && p.changes.formatting && touched(range, path, 0, len, len, false) {
         return true;
     }
     let mut at = 0;
     for run in &p.runs {
         let stop = at + run.text.len();
         match &run.annotation {
-            Some(Annotation::Inserted(_)) if touched(range, path, at, stop) => return true,
-            Some(Annotation::Deleted(_)) if touched(range, path, at, at) => return true,
+            Some(Annotation::Inserted(_)) if touched(range, path, at, stop, len, false) => {
+                return true;
+            }
+            Some(Annotation::Deleted(_)) if touched(range, path, at, at, len, false) => {
+                return true;
+            }
             _ => {}
         }
         at = stop;
@@ -149,13 +169,14 @@ fn resolve_paragraph(
     p: &mut Paragraph,
     accept: bool,
 ) -> (usize, bool) {
+    let len = p.len();
     let mut seen: HashSet<(bool, i64)> = HashSet::new();
     let mut runs: Vec<Run> = Vec::with_capacity(p.runs.len());
     let mut at = 0;
     for run in std::mem::take(&mut p.runs) {
         let end = at + run.text.len();
         match run.annotation.clone() {
-            Some(Annotation::Inserted(change)) if touched(range, path, at, end) => {
+            Some(Annotation::Inserted(change)) if touched(range, path, at, end, len, false) => {
                 seen.insert((true, change.id));
                 if accept {
                     let mut run = run;
@@ -163,7 +184,7 @@ fn resolve_paragraph(
                     runs.push(run);
                 }
             }
-            Some(Annotation::Deleted(deleted)) if touched(range, path, at, at) => {
+            Some(Annotation::Deleted(deleted)) if touched(range, path, at, at, len, false) => {
                 seen.insert((false, deleted.change.id));
                 if !accept {
                     for mut shown in deleted.shown(&p.base) {
@@ -181,7 +202,7 @@ fn resolve_paragraph(
     merge_runs(p);
     let mut count = seen.len();
     let mut join = false;
-    if touched(range, path, at, at) {
+    if touched(range, path, at, at, len, true) {
         if p.changes.inserted_mark.take().is_some() {
             count += 1;
             join = !accept;
@@ -191,7 +212,7 @@ fn resolve_paragraph(
             join = accept;
         }
     }
-    if accept && p.changes.formatting && touched(range, path, 0, at) {
+    if accept && p.changes.formatting && touched(range, path, 0, at, len, false) {
         p.changes.formatting = false;
         count += 1;
     }

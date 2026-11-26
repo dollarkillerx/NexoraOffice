@@ -334,6 +334,12 @@ impl Layouter {
     pub fn layout(&mut self, document: &Document) -> Layout {
         self.begin();
         let notes = collect_notes(document);
+        let markup = self.markup().then(|| crate::shape::Markup::new(document));
+        let authors = markup
+            .as_ref()
+            .map(|m| m.authors.clone())
+            .unwrap_or_default();
+        let shown = markup.is_some();
         let sections = document.sections();
         let first: Arc<Section> = sections
             .first()
@@ -350,6 +356,7 @@ impl Layouter {
             background: None,
             redirects: Vec::new(),
             page_values: None,
+            markup,
         };
         let mut flow = Flow {
             cx: &mut cx,
@@ -374,7 +381,9 @@ impl Layouter {
             cap: None,
         };
         flow.run();
-        let layout = flow.finish();
+        let mut layout = flow.finish();
+        layout.markup = shown;
+        layout.authors = authors;
         self.finish();
         layout
     }
@@ -1640,6 +1649,7 @@ impl Flow<'_, '_> {
                 slot: self.slot(&sec, state.number, state.page_in_section == 0),
                 header_area: Rect::new(0.0, 0.0, state.width, state.body_top),
                 footer_area: Rect::new(0.0, state.body_bottom, state.width, state.height),
+                margin: state.margin,
             });
             self.cx.grid = sections
                 .get(state.section)

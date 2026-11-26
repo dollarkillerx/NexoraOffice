@@ -209,10 +209,17 @@ fn a_selection_resolves_only_what_it_touches() {
     assert_eq!(d.plain_text(), "one three");
     assert_eq!(d.changes().len(), 1);
 
-    // A range that covers the deletion's place resolves it.
+    // A range that covers the deletion's place resolves it; one that only
+    // ends or starts there does not.
     let mut d = sample();
     assert_eq!(reject_in(&mut d, &at(0, 7), &at(0, 9)), 2);
     assert_eq!(d.plain_text(), "one gone three");
+    let mut d = sample();
+    assert_eq!(accept_in(&mut d, &at(0, 4), &at(0, 8)), 1);
+    assert_eq!(d.changes()[0].kind, ChangeKind::Deleted);
+    // At the end of the paragraph a range that goes up to it has it.
+    let mut d = doc(vec![para(vec![plain("ab"), deleted("x", 5, "Bob")])]);
+    assert_eq!(accept_in(&mut d, &at(0, 0), &at(0, 2)), 1);
     // Nothing touched, nothing done.
     let mut d = sample();
     assert_eq!(accept_in(&mut d, &at(0, 0), &at(0, 2)), 0);

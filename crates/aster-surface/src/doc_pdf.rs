@@ -107,9 +107,20 @@ pub fn export_doc_pdf(
 /// the document (cloning one is cheap) but not the view's layout. The same
 /// shaping fonts as the view's, so the pages are the ones on screen.
 pub fn export_document(document: &Document, info: &DocPdfInfo) -> Result<Vec<u8>, String> {
+    export_document_with(document, info, true)
+}
+
+/// The same, with tracked changes and comments shown as on the screen
+/// (`show_markup`) or the document as if every change was accepted.
+pub fn export_document_with(
+    document: &Document,
+    info: &DocPdfInfo,
+    show_markup: bool,
+) -> Result<Vec<u8>, String> {
     let mut shaper = aster_text::Shaper::new();
     shaper.set_han_fallbacks(&crate::text_surface::HAN_FALLBACK_FAMILIES);
     let mut layouter = aster_layout::Layouter::with_shaper(shaper);
+    layouter.set_markup(show_markup);
     let layout = layouter.layout(document);
     export_doc_pdf(&layout, document, info)
 }

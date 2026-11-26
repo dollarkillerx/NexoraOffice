@@ -34,6 +34,8 @@ pub use display::{
 pub use query::{Caret, Layout, LinkRect, OutlineEntry, PageInfo};
 
 #[cfg(test)]
+mod markup_tests;
+#[cfg(test)]
 mod story_tests;
 #[cfg(test)]
 mod tests;

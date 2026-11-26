@@ -65,6 +65,9 @@ pub struct PageInfo {
     /// header or footer in them.
     pub header_area: Rect,
     pub footer_area: Rect,
+    /// The page inside its margins: where change bars and comment marks
+    /// are beside.
+    pub margin: Rect,
 }
 
 /// A laid-out document.
@@ -77,6 +80,11 @@ pub struct Layout {
     redirects: HashMap<Path, Path>,
     outline: Vec<OutlineEntry>,
     infos: Vec<PageInfo>,
+    /// Changes and comments are shown on the pages.
+    pub markup: bool,
+    /// The authors of changes and comments, in the order their colours go:
+    /// [`Layout::author_color`]. Empty with markup off.
+    pub authors: Vec<std::sync::Arc<str>>,
 }
 
 impl Layout {
@@ -99,7 +107,15 @@ impl Layout {
             redirects: redirects.into_iter().collect(),
             outline,
             infos: Vec::new(),
+            markup: false,
+            authors: Vec::new(),
         }
+    }
+
+    /// The colour the pages show `author`'s changes and comments in.
+    pub fn author_color(&self, author: &str) -> [u8; 4] {
+        let index = self.authors.iter().position(|a| &**a == author);
+        crate::shape::author_color(index.unwrap_or(0))
     }
 
     pub(crate) fn with_page_info(mut self, infos: Vec<PageInfo>) -> Self {

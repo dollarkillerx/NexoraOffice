@@ -15,7 +15,7 @@ use aster_writer::{
 use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
 use crate::fonts::Families;
 use crate::shape::{
-    Env, NoteNumbers, PageValues, Shaped, context, emu_pt, fully_hidden, pt, shape,
+    Env, Markup, NoteNumbers, PageValues, Shaped, context, emu_pt, fully_hidden, pt, shape,
 };
 use crate::table::TableLayout;
 
@@ -162,6 +162,7 @@ pub struct Layouter {
     cache: HashMap<Key, Entry2>,
     generation: u64,
     shaped_count: usize,
+    markup: bool,
 }
 
 impl Default for Layouter {
@@ -188,7 +189,19 @@ impl Layouter {
             cache: HashMap::new(),
             generation: 0,
             shaped_count: 0,
+            markup: true,
         }
+    }
+
+    /// Show tracked changes and comments (the default) or the document as
+    /// if every change was accepted and with no comment marks. What is
+    /// shaped is kept for either.
+    pub fn set_markup(&mut self, on: bool) {
+        self.markup = on;
+    }
+
+    pub fn markup(&self) -> bool {
+        self.markup
     }
 
     /// How many paragraphs have been shaped (not found in the cache) since
@@ -223,6 +236,8 @@ pub(crate) struct Cx<'a> {
     /// Cells covered by a vertical merge, and where their places are.
     pub redirects: Vec<(Path, Path)>,
     pub page_values: Option<PageValues>,
+    /// How changes and comments are shown; `None` with markup off.
+    pub markup: Option<Markup>,
 }
 
 /// Space a paragraph's borders take above and below the text.
@@ -326,6 +341,7 @@ impl Cx<'_> {
         limit: f32,
     ) -> Arc<Shaped> {
         let env = Env {
+            markup: self.markup.as_ref(),
             obstacles,
             limit,
             settings: &self.doc.settings,
@@ -608,6 +624,7 @@ impl Cx<'_> {
             y,
             lines: lines.clone(),
         }));
+        self.emit_markup(entry, &lines, y, ec, out);
         for (range, color) in &shaped.backs {
             for r in paragraph.text_rects_in(range.clone(), lines.clone()) {
                 out.layers.shade.push(Item::Fill {
@@ -739,6 +756,79 @@ impl Cx<'_> {
             });
         }
         keep_clear
+    }
+
+    /// Change bars in the left margin beside the lines that have a change of
+    /// any kind, and a mark in the right margin on the first line of each
+    /// comment's range.
+    fn emit_markup(
+        &mut self,
+        entry: &ParaEntry,
+        lines: &Range<usize>,
+        y: f32,
+        ec: &EmitCtx,
+        out: &mut Out<'_>,
+    ) {
+        let shaped = &entry.shaped;
+        // Text boxes have no margins to put marks in.
+        if ec.depth > 0
+            || (shaped.changes.is_empty()
+                && shaped.bar_all.is_none()
+                && shaped.bar_last.is_none()
+                && shaped.comment_marks.is_empty())
+        {
+            return;
+        }
+        let paragraph = &shaped.paragraph;
+        let all = paragraph.lines();
+        let mut bars: Vec<(usize, Rgba)> = Vec::new();
+        let mut bar = |line: usize, color: Rgba| {
+            if lines.contains(&line) && !bars.iter().any(|(l, _)| *l == line) {
+                bars.push((line, color));
+            }
+        };
+        for (range, color) in &shaped.changes {
+            for r in paragraph.text_rects_in(range.clone(), lines.clone()) {
+                let mid = (r[1] + r[3]) / 2.0;
+                if let Some(line) = lines
+                    .clone()
+                    .find(|&i| all[i].top <= mid && mid <= all[i].top + all[i].height)
+                {
+                    bar(line, *color);
+                }
+            }
+        }
+        if let Some(color) = shaped.bar_all {
+            for line in lines.clone() {
+                bar(line, color);
+            }
+        }
+        if let Some(color) = shaped.bar_last {
+            bar(all.len().saturating_sub(1), color);
+        }
+        let bar_x = (ec.margin.x0 - 5.0).max(1.5);
+        for (line, color) in bars {
+            let (top, bottom) = (y + all[line].top, y + all[line].top + all[line].height);
+            out.layers.rules.push(Item::Rule {
+                from: (bar_x, top),
+                to: (bar_x, bottom),
+                width: 1.5,
+                color,
+                style: RuleStyle::Single,
+            });
+        }
+        for (offset, color) in &shaped.comment_marks {
+            let (line, _) = paragraph.caret(*offset);
+            if !lines.contains(&line) {
+                continue;
+            }
+            let top = y + all[line].top + 1.0;
+            let left = ec.margin.x1 + 4.0;
+            out.layers.rules.push(Item::Fill {
+                rect: Rect::new(left, top, left + 7.0, top + 6.0),
+                color: *color,
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

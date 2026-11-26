@@ -574,9 +574,8 @@ impl Flow<'_, '_> {
         let mut guard = 0;
         loop {
             guard += 1;
-            if guard > nlines * 4 + 64 {
-                break;
-            }
+            // Something keeps pushing the text away: put what is left down.
+            let force = guard > nlines * 4 + 64;
             let (col_x, col_w) = self.col_rect();
             let joined = has_box
                 && self.prev.as_deref().is_some_and(|p| {
@@ -646,12 +645,20 @@ impl Flow<'_, '_> {
             let mut pending_height = 0.0f32;
             let mut bump: Option<f32> = None;
             let mut explicit = false;
-            for j in line..nlines {
+            if force {
+                used = lines[line..].iter().map(|l| l.height).sum();
+                k = nlines - line;
+            }
+            for j in if force { nlines..nlines } else { line..nlines } {
                 let h = lines[j].height;
                 let j_top = y0 + used;
                 if let Some(b) = self.obstruction(j_top, j_top + h) {
-                    bump = Some(b);
-                    break;
+                    // A bump past the bottom of an empty column would only
+                    // move the problem to the next page.
+                    if !(b > bottom_edge && self.col_empty && used == 0.0) {
+                        bump = Some(b);
+                        break;
+                    }
                 }
                 let ids: Vec<i32> = pending.iter().map(|(_, id, _)| *id).collect();
                 let new_notes = self.notes_of_line(&shaped, j, &ids);

@@ -36,7 +36,7 @@ pub struct Caret {
 pub struct Layout {
     /// At least one.
     pub pages: Vec<Page>,
-    frags: Vec<Frag>,
+    pub(crate) frags: Vec<Frag>,
     by_path: HashMap<Path, Vec<usize>>,
     outline: Vec<OutlineEntry>,
 }

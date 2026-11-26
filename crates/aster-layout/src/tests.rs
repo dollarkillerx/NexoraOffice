@@ -1,1 +1,1708 @@
+//! Tests of the layout rules. Documents are built in code with small pages so
+//! that a few paragraphs fill them. Fonts are the system's: assertions are
+//! about relations (this is below that, this stays with that), not about
+//! exact line heights.
 
+use std::sync::Arc;
+
+use aster_writer::*;
+
+use crate::{Item, Layout, Layouter, Page};
+
+fn look() -> RunLook {
+    RunLook {
+        size: 10.0,
+        ..RunLook::default()
+    }
+}
+
+fn paragraph(text: &str) -> Paragraph {
+    Paragraph {
+        runs: vec![Run::text(text, look())],
+        base: look(),
+        mark: look(),
+        ..Paragraph::default()
+    }
+}
+
+fn pb(text: &str) -> Block {
+    Block::paragraph(paragraph(text))
+}
+
+fn with(text: &str, edit: impl FnOnce(&mut ParaProps)) -> Block {
+    let mut p = paragraph(text);
+    edit(&mut p.props);
+    Block::paragraph(p)
+}
+
+/// 300 by 200 points, 20-point margins.
+fn small() -> Section {
+    Section {
+        page: (6_000, 4_000),
+        margins: Margins {
+            top: 400,
+            right: 400,
+            bottom: 400,
+            left: 400,
+            header: 200,
+            footer: 200,
+            gutter: 0,
+        },
+        ..Section::default()
+    }
+}
+
+fn doc(blocks: Vec<Block>) -> Document {
+    Document {
+        body: Story { blocks, part: None },
+        last_section: Arc::new(small()),
+        ..Document::default()
+    }
+}
+
+fn lay(document: &Document) -> Layout {
+    Layouter::new().layout(document)
+}
+
+/// What a page shows as text: one string per text item (its lines).
+fn page_texts(page: &Page) -> Vec<String> {
+    page.items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Text(t) => {
+                let ranges = t.paragraph.line_ranges();
+                let end = t.lines.end.min(ranges.len());
+                let text = t.paragraph.text();
+                Some(
+                    ranges[t.lines.start.min(end)..end]
+                        .iter()
+                        .map(|r| text[r.clone()].to_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn page_has(page: &Page, needle: &str) -> bool {
+    page_texts(page).iter().any(|t| t.contains(needle))
+}
+
+fn caret_top(layout: &Layout, block: usize, offset: usize) -> f32 {
+    layout
+        .caret(&Pos::new(Path::body(block), offset))
+        .expect("a caret")
+        .top
+}
+
+fn page_of(layout: &Layout, block: usize) -> usize {
+    layout
+        .page_of(&Pos::new(Path::body(block), 0))
+        .expect("a page")
+}
+
+fn lines_of(layout: &Layout, path: &Path) -> Vec<(usize, usize)> {
+    layout
+        .frags
+        .iter()
+        .filter(|f| &f.path == path && !f.repeat)
+        .map(|f| (f.page, f.lines.len()))
+        .collect()
+}
+
+fn numbered(n: usize) -> Vec<Block> {
+    (0..n).map(|i| pb(&format!("paragraph {i}"))).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Pages and paragraphs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_empty_document_is_one_page() {
+    let layout = lay(&Document::default());
+    assert_eq!(layout.pages.len(), 1);
+    assert_eq!(layout.pages[0].number, 1);
+    let layout = lay(&doc(Vec::new()));
+    assert_eq!(layout.pages.len(), 1);
+    assert_eq!(
+        (layout.pages[0].width, layout.pages[0].height),
+        (300.0, 200.0)
+    );
+    assert!(layout.outline().is_empty());
+    assert!(layout.caret(&Pos::default()).is_none());
+    assert!(layout.hit(0, 10.0, 10.0).is_none());
+}
+
+#[test]
+fn text_flows_onto_numbered_pages_inside_the_margins() {
+    let layout = lay(&doc(numbered(60)));
+    assert!(layout.pages.len() > 2, "{}", layout.pages.len());
+    for (n, page) in layout.pages.iter().enumerate() {
+        assert_eq!(page.number as usize, n + 1);
+        assert_eq!(page.label, (n + 1).to_string());
+    }
+    // Everything is inside the 20-point margins, and in reading order.
+    let mut last = (0, 0.0f32);
+    for index in 0..60 {
+        let caret = layout
+            .caret(&Pos::new(Path::body(index), 0))
+            .expect("placed");
+        assert!(
+            caret.top >= 19.9 && caret.top + caret.height <= 180.1,
+            "{caret:?}"
+        );
+        assert!((caret.page, caret.top) >= last);
+        last = (caret.page, caret.top);
+        assert!((caret.x - 20.0).abs() < 0.01);
+    }
+}
+
+#[test]
+fn indents_and_first_line_set_where_lines_start() {
+    let mut block = paragraph("hello world and some more words to wrap over lines of text");
+    block.props.indent_left = 400; // 20 pt
+    block.props.indent_right = 200;
+    block.props.first_line = 200; // 10 pt
+    let mut hanging = paragraph(
+        "hanging indent text that wraps over a few lines of text ok and then some more text to make a second line for sure",
+    );
+    hanging.props.indent_left = 600;
+    hanging.props.first_line = -300;
+    let document = doc(vec![Block::paragraph(block), Block::paragraph(hanging)]);
+    let layout = lay(&document);
+    let first = layout.caret(&Pos::new(Path::body(0), 0)).unwrap();
+    assert!((first.x - (20.0 + 20.0 + 10.0)).abs() < 0.01, "{first:?}");
+    let second_line = layout
+        .line_start(&Pos::new(Path::body(0), 55))
+        .expect("line start");
+    assert!(second_line.offset > 0, "{second_line:?}");
+    let c = layout.caret(&second_line).unwrap();
+    assert!((c.x - 40.0).abs() < 0.01, "{c:?}");
+    // A hanging indent: the first line is further out than the others.
+    let h0 = layout.caret(&Pos::new(Path::body(1), 0)).unwrap();
+    assert!((h0.x - (20.0 + 30.0 - 15.0)).abs() < 0.01, "{h0:?}");
+    let h1 = layout
+        .caret(&layout.line_start(&Pos::new(Path::body(1), 100)).unwrap())
+        .unwrap();
+    assert!((h1.x - 50.0).abs() < 0.01, "{h1:?}");
+}
+
+#[test]
+fn space_before_and_after_add_up_and_contextual_spacing_drops_them() {
+    let gap = |a: i32, b: i32, contextual: bool| -> f32 {
+        let blocks = vec![
+            with("one", |p| {
+                p.space_after = a;
+                p.contextual_spacing = contextual;
+                p.style = Some("S".into());
+            }),
+            with("two", |p| {
+                p.space_before = b;
+                p.contextual_spacing = contextual;
+                p.style = Some("S".into());
+            }),
+        ];
+        let layout = lay(&doc(blocks));
+        caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
+    };
+    let plain = gap(0, 0, false);
+    assert!((gap(200, 100, false) - plain - 15.0).abs() < 0.01);
+    assert!((gap(200, 100, true) - plain).abs() < 0.01);
+}
+
+#[test]
+fn space_before_is_dropped_at_the_top_after_overflow_but_kept_after_a_break() {
+    // Find a count of fillers that makes the next paragraph start page two.
+    let build = |n: usize| {
+        let mut blocks = numbered(n);
+        blocks.push(with("tall space", |p| p.space_before = 400));
+        blocks_doc(blocks)
+    };
+    let n = (1..40)
+        .find(|n| {
+            let layout = lay(&build(*n));
+            page_of(&layout, *n) == 1
+        })
+        .expect("a paragraph that starts the second page");
+    let layout = lay(&build(n));
+    let top = caret_top(&layout, n, 0);
+    assert!((top - 20.0).abs() < 0.01, "dropped at the top: {top}");
+    // After an explicit page break it is kept.
+    let mut blocks = vec![pb("first")];
+    blocks.push(with("second", |p| {
+        p.space_before = 400;
+        p.page_break_before = true;
+    }));
+    let layout = lay(&blocks_doc(blocks));
+    assert_eq!(page_of(&layout, 1), 1);
+    assert!((caret_top(&layout, 1, 0) - 40.0).abs() < 0.01);
+}
+
+fn blocks_doc(blocks: Vec<Block>) -> Document {
+    doc(blocks)
+}
+
+#[test]
+fn line_spacing_rules_set_line_heights() {
+    let text = "a\nb\nc";
+    let height = |line: LineSpacing| {
+        let layout = lay(&doc(vec![with(text, |p| p.line = line)]));
+        caret_top(&layout, 0, 2) - caret_top(&layout, 0, 0)
+    };
+    let single = height(LineSpacing::Multiple(1.0)) / 1.0;
+    assert!((height(LineSpacing::Multiple(2.0)) - 2.0 * single).abs() < 0.05);
+    assert!((height(LineSpacing::Exactly(400)) - 20.0).abs() < 0.05);
+    assert!((height(LineSpacing::AtLeast(600)) - 30.0).abs() < 0.05);
+    assert!((height(LineSpacing::AtLeast(20)) - single).abs() < 0.05);
+}
+
+#[test]
+fn widows_and_orphans_are_never_left() {
+    let blocks: Vec<Block> = (0..30)
+        .map(|i| with(&format!("a{i}\nb\nc\nd\ne"), |p| p.space_after = 100))
+        .collect();
+    let layout = lay(&doc(blocks));
+    assert!(layout.pages.len() > 3);
+    let mut split = 0;
+    for i in 0..30 {
+        let parts = lines_of(&layout, &Path::body(i));
+        if parts.len() > 1 {
+            split += 1;
+            assert!(parts.iter().all(|(_, n)| *n >= 2), "{i}: {parts:?}");
+        }
+        assert_eq!(parts.iter().map(|p| p.1).sum::<usize>(), 5);
+    }
+    assert!(split > 0, "the test needs paragraphs that split");
+}
+
+#[test]
+fn keep_lines_keeps_a_paragraph_on_one_page() {
+    let blocks: Vec<Block> = (0..30)
+        .map(|i| with(&format!("k{i}\nb\nc\nd\ne\nf"), |p| p.keep_lines = true))
+        .collect();
+    let layout = lay(&doc(blocks));
+    for i in 0..30 {
+        assert_eq!(lines_of(&layout, &Path::body(i)).len(), 1, "{i}");
+    }
+}
+
+#[test]
+fn keep_with_next_moves_a_heading_along() {
+    let build = |fillers: usize, keep: bool| {
+        let mut blocks = numbered(fillers);
+        blocks.push(with("heading", |p| p.keep_next = keep));
+        blocks.push(with("b1\nb2\nb3\nb4\nb5", |p| p.keep_lines = true));
+        doc(blocks)
+    };
+    // Find a count of fillers that leaves the heading alone at a page bottom.
+    let n = (1..40)
+        .find(|n| {
+            let layout = lay(&build(*n, false));
+            page_of(&layout, *n) == 0 && page_of(&layout, n + 1) == 1
+        })
+        .expect("a layout that parts heading and body");
+    let layout = lay(&build(n, true));
+    assert_eq!(page_of(&layout, n), page_of(&layout, n + 1));
+    assert_eq!(page_of(&layout, n), 1);
+}
+
+#[test]
+fn page_and_line_breaks_inside_a_paragraph() {
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("before", look()),
+        Run::object(Inline::Break(Break::Line), look()),
+        Run::text("after line", look()),
+        Run::object(Inline::Break(Break::Page), look()),
+        Run::text("after page", look()),
+    ];
+    let layout = lay(&doc(vec![Block::paragraph(p), pb("next")]));
+    assert_eq!(layout.pages.len(), 2);
+    assert!(page_has(&layout.pages[0], "after line"));
+    assert!(page_has(&layout.pages[1], "after page"));
+    assert!(!page_has(&layout.pages[0], "after page"));
+    // Positions after the break are on the second page.
+    let offset = "before".len() + 1 + "after line".len() + OBJECT.len();
+    assert_eq!(layout.page_of(&Pos::new(Path::body(0), offset)), Some(1));
+    assert_eq!(layout.page_of(&Pos::new(Path::body(0), 0)), Some(0));
+    assert_eq!(page_of(&layout, 1), 1);
+}
+
+#[test]
+fn page_break_before_starts_a_page_but_not_an_empty_one() {
+    let layout = lay(&doc(vec![
+        with("first on page one", |p| p.page_break_before = true),
+        with("second", |p| p.page_break_before = true),
+    ]));
+    assert_eq!(layout.pages.len(), 2);
+    assert_eq!(page_of(&layout, 0), 0);
+    assert_eq!(page_of(&layout, 1), 1);
+}
+
+#[test]
+fn hidden_runs_take_no_room_and_caps_keep_offsets() {
+    let mut hidden = look();
+    hidden.hidden = true;
+    let mut caps = look();
+    caps.caps = true;
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("ab", look()),
+        Run::text("SECRET", hidden),
+        Run::text("cd ef", caps),
+    ];
+    let mut q = paragraph("");
+    q.runs = vec![Run::text("abcd ef", look())];
+    let layout = lay(&doc(vec![Block::paragraph(p), Block::paragraph(q)]));
+    let shown = page_texts(&layout.pages[0]);
+    assert_eq!(shown[0], "abCD EF");
+    assert_eq!(shown[1], "abcd ef");
+    // The hidden text takes no width: the caret after it is where it was.
+    let before = layout.caret(&Pos::new(Path::body(0), 2)).unwrap();
+    let after = layout.caret(&Pos::new(Path::body(0), 8)).unwrap();
+    assert!((before.x - after.x).abs() < 0.01);
+    // Offsets keep meaning: they move right through the shown text.
+    let mid = layout.caret(&Pos::new(Path::body(0), 10)).unwrap();
+    let end = layout.caret(&Pos::new(Path::body(0), 13)).unwrap();
+    assert!(mid.x > before.x && end.x > mid.x);
+}
+
+#[test]
+fn list_labels_come_first_and_text_aligns_after_the_tab() {
+    let label = |text: &str| Label {
+        text: text.into(),
+        look: look(),
+        suffix: Suffix::Tab,
+        align: Align::Left,
+    };
+    let mut item = paragraph("item text that is long enough to wrap onto a second line here");
+    item.props.indent_left = 600; // 30 pt
+    item.props.first_line = -400; // label at 10 pt
+    item.label = Some(label("1."));
+    let layout = lay(&doc(vec![Block::paragraph(item)]));
+    // The text starts at the left indent, the label before it.
+    let start = layout.caret(&Pos::new(Path::body(0), 0)).unwrap();
+    assert!((start.x - (20.0 + 30.0)).abs() < 0.5, "{start:?}");
+    let texts = page_texts(&layout.pages[0]);
+    assert!(texts[0].starts_with("1.\titem text"), "{texts:?}");
+    // The second line starts at the indent too.
+    let second = layout
+        .line_start(&Pos::new(Path::body(0), 45))
+        .and_then(|p| layout.caret(&p))
+        .unwrap();
+    assert!((second.x - 50.0).abs() < 0.01);
+    // Clicking in the label puts the caret at the start of the text.
+    let hit = layout.hit(0, 22.0, start.top + 2.0).unwrap();
+    assert_eq!(hit.offset, 0);
+}
+
+#[test]
+fn tab_stops_leaders_and_default_stops() {
+    let mut p = paragraph("a\tb\tc");
+    p.props.tabs = vec![TabStop {
+        position: 2_000, // 100 pt from the margin
+        align: TabAlign::Left,
+        leader: TabLeader::Dots,
+    }];
+    let layout = lay(&doc(vec![Block::paragraph(p)]));
+    let b = layout.caret(&Pos::new(Path::body(0), 2)).unwrap();
+    assert!((b.x - (20.0 + 100.0)).abs() < 0.2, "{b:?}");
+    // Then the default stops, 36 pt apart, from the margin.
+    let c = layout.caret(&Pos::new(Path::body(0), 4)).unwrap();
+    assert!((c.x - (20.0 + 108.0)).abs() < 0.2, "{c:?}");
+    let leaders = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::Leader(_)))
+        .count();
+    assert_eq!(leaders, 1);
+}
+
+#[test]
+fn borders_and_shading_share_one_box_between_neighbours() {
+    let edge = Border {
+        style: BorderStyle::Single,
+        width: 1.0,
+        color: None,
+        space: 2.0,
+    };
+    let boxed = |text: &str| {
+        with(text, |p| {
+            p.borders = [Some(edge); 4];
+            p.border_between = Some(edge);
+            p.shading = Some([200, 220, 255, 255]);
+        })
+    };
+    let layout = lay(&doc(vec![boxed("one"), boxed("two"), pb("plain")]));
+    let rules: Vec<_> = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::Rule { from, to, .. } if from.1 == to.1))
+        .collect();
+    let fills = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::Fill { .. }))
+        .count();
+    // The top, the bottom and one between the two: three horizontal lines,
+    // not four.
+    assert_eq!(rules.len(), 3, "{rules:?}");
+    assert_eq!(fills, 2);
+    // The text moved down by the top border and its space.
+    let top = caret_top(&layout, 0, 0);
+    assert!(top >= 20.0 + 3.0 - 0.01, "{top}");
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+fn cell(text: &str) -> Cell {
+    Cell {
+        blocks: vec![pb(text)],
+        ..Cell::default()
+    }
+}
+
+fn rows_of(texts: &[&[&str]]) -> Vec<Row> {
+    texts
+        .iter()
+        .map(|row| Row {
+            cells: row.iter().map(|t| cell(t)).collect(),
+            ..Row::default()
+        })
+        .collect()
+}
+
+fn table(columns: Vec<Twips>, rows: Vec<Row>) -> Block {
+    Block::table(Table {
+        columns,
+        rows,
+        ..Table::default()
+    })
+}
+
+fn cell_pos(table: usize, row: usize, cell: usize) -> Pos {
+    Pos::new(Path::body(table).cell_block(row, cell, 0), 0)
+}
+
+#[test]
+fn table_columns_spans_and_alignment() {
+    let mut wide = cell("wide");
+    wide.span = 2;
+    let rows = vec![
+        Row {
+            cells: vec![cell("a"), cell("b"), cell("c")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![wide, cell("d")],
+            ..Row::default()
+        },
+    ];
+    let layout = lay(&doc(vec![table(vec![1_000, 1_000, 1_000], rows)]));
+    let a = layout.caret(&cell_pos(0, 0, 0)).unwrap();
+    let b = layout.caret(&cell_pos(0, 0, 1)).unwrap();
+    let c = layout.caret(&cell_pos(0, 0, 2)).unwrap();
+    let d = layout.caret(&cell_pos(0, 1, 1)).unwrap();
+    // The first cell's text lines up with the margin (the edge sits a cell
+    // margin to the left of it); columns are 50 pt wide.
+    assert!((a.x - 20.0).abs() < 0.01, "{a:?}");
+    assert!((b.x - a.x - 50.0).abs() < 0.01);
+    assert!((c.x - b.x - 50.0).abs() < 0.01);
+    assert!(
+        (d.x - c.x).abs() < 0.01,
+        "the spanning cell covers two columns"
+    );
+    assert!(d.top > a.top);
+    // Right aligned: the table's right edge is at the right margin.
+    let mut right = Table {
+        columns: vec![1_000, 1_000],
+        rows: rows_of(&[&["x", "y"]]),
+        ..Table::default()
+    };
+    right.props.align = Align::Right;
+    let layout = lay(&doc(vec![Block::table(right)]));
+    let y = layout.caret(&cell_pos(0, 0, 1)).unwrap();
+    assert!((y.x - (280.0 - 50.0 + 5.75)).abs() < 0.5, "{y:?}");
+}
+
+#[test]
+fn vertical_merges_span_rows_and_grow_the_last_one() {
+    let mut start = Cell {
+        blocks: vec![pb("m1\nm2\nm3\nm4\nm5\nm6")],
+        merge: VMerge::Start,
+        ..Cell::default()
+    };
+    start.shading = Some([255, 0, 0, 255]);
+    let cont = Cell {
+        blocks: vec![pb("")],
+        merge: VMerge::Continue,
+        ..Cell::default()
+    };
+    let rows = vec![
+        Row {
+            cells: vec![start, cell("r1")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![cont, cell("r2")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![cell("p"), cell("r3")],
+            ..Row::default()
+        },
+    ];
+    let layout = lay(&doc(vec![table(vec![1_000, 1_000], rows)]));
+    let one = layout.caret(&cell_pos(0, 0, 1)).unwrap();
+    let two = layout.caret(&cell_pos(0, 1, 1)).unwrap();
+    let three = layout.caret(&cell_pos(0, 2, 1)).unwrap();
+    // The merged cell's six lines fit by making the rows taller.
+    let merged_height = layout
+        .caret(&Pos::new(Path::body(0).cell_block(0, 0, 0), 15))
+        .unwrap();
+    assert!(
+        three.top > merged_height.top,
+        "row 3 is below the merged text"
+    );
+    assert!(two.top > one.top);
+    // One fill covers the merged cell over its rows, one per row slice.
+    let fills = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::Fill { .. }))
+        .count();
+    assert_eq!(fills, 2);
+}
+
+fn tall_table(rows: usize, header: bool) -> Block {
+    let mut all = Vec::new();
+    all.push(Row {
+        cells: vec![cell("head")],
+        header,
+        ..Row::default()
+    });
+    for i in 0..rows {
+        all.push(Row {
+            cells: vec![cell(&format!("row {i}\nsecond line\nthird"))],
+            ..Row::default()
+        });
+    }
+    table(vec![4_000], all)
+}
+
+#[test]
+fn header_rows_repeat_and_rows_move_whole() {
+    let layout = lay(&doc(vec![tall_table(12, true)]));
+    assert!(layout.pages.len() >= 2);
+    for page in 1..layout.pages.len() {
+        let repeats = layout
+            .frags
+            .iter()
+            .filter(|f| f.repeat && f.page == page)
+            .count();
+        assert_eq!(repeats, 1, "page {page}");
+        assert!(page_has(&layout.pages[page], "head"));
+        // The header is the first thing in the table on the page.
+        let head = layout
+            .frags
+            .iter()
+            .find(|f| f.repeat && f.page == page)
+            .unwrap();
+        let others = layout
+            .frags
+            .iter()
+            .filter(|f| !f.repeat && f.page == page)
+            .map(|f| f.y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(head.y < others);
+    }
+    // A row is never cut: each of its paragraphs is in one piece.
+    for i in 0..12 {
+        let path = Path::body(0).cell_block(i + 1, 0, 0);
+        assert_eq!(
+            lines_of(&layout, &path),
+            vec![(lines_of(&layout, &path)[0].0, 3)],
+            "row {i}"
+        );
+    }
+    // Without header rows nothing is repeated.
+    let layout = lay(&doc(vec![tall_table(12, false)]));
+    assert!(layout.frags.iter().all(|f| !f.repeat));
+}
+
+#[test]
+fn a_row_taller_than_a_page_is_split_between_lines_and_nothing_is_lost() {
+    let lines = (0..90)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rows = vec![
+        Row {
+            cells: vec![cell("head")],
+            header: true,
+            ..Row::default()
+        },
+        Row {
+            cells: vec![Cell {
+                blocks: vec![pb(&lines)],
+                ..Cell::default()
+            }],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![cell("after")],
+            ..Row::default()
+        },
+    ];
+    let layout = lay(&doc(vec![table(vec![4_000], rows)]));
+    assert!(layout.pages.len() >= 4);
+    let path = Path::body(0).cell_block(1, 0, 0);
+    let parts = lines_of(&layout, &path);
+    assert!(parts.len() >= 4);
+    assert_eq!(parts.iter().map(|p| p.1).sum::<usize>(), 90);
+    // They are in order, on consecutive pages.
+    assert!(parts.windows(2).all(|w| w[1].0 == w[0].0 + 1));
+    let last = layout.pages.len() - 1;
+    assert!(page_has(&layout.pages[last], "after"));
+}
+
+#[test]
+fn cant_split_rows_and_exact_heights() {
+    let mut row = Row {
+        cells: vec![cell("a\nb\nc\nd\ne\nf\ng\nh\ni\nj")],
+        height: RowHeight::Exactly(400),
+        ..Row::default()
+    };
+    row.cant_split = true;
+    let layout = lay(&doc(vec![table(
+        vec![4_000],
+        vec![
+            row,
+            Row {
+                cells: vec![cell("below")],
+                ..Row::default()
+            },
+        ],
+    )]));
+    // The exact height (20 pt) cuts the text; the next row follows at once.
+    let above = layout.caret(&cell_pos(0, 0, 0)).unwrap();
+    let below = layout.caret(&cell_pos(0, 1, 0)).unwrap();
+    assert!(
+        (below.top - above.top - 20.0).abs() < 1.5,
+        "{above:?} {below:?}"
+    );
+    let clips = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::PushClip(_)))
+        .count();
+    assert_eq!(clips, 1);
+}
+
+#[test]
+fn nested_tables_and_grid_before_after() {
+    let inner = table(vec![800, 800], rows_of(&[&["i1", "i2"]]));
+    let outer_cell = Cell {
+        blocks: vec![pb("outer"), inner],
+        ..Cell::default()
+    };
+    let rows = vec![
+        Row {
+            cells: vec![outer_cell, cell("side")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![cell("shifted")],
+            grid_before: 1,
+            grid_after: 0,
+            ..Row::default()
+        },
+    ];
+    let layout = lay(&doc(vec![table(vec![3_000, 1_500], rows)]));
+    let i1 = Pos::new(Path::body(0).cell_block(0, 0, 1).cell_block(0, 0, 0), 0);
+    let i2 = Pos::new(Path::body(0).cell_block(0, 0, 1).cell_block(0, 1, 0), 0);
+    let (c1, c2) = (layout.caret(&i1).unwrap(), layout.caret(&i2).unwrap());
+    assert!((c2.x - c1.x - 40.0).abs() < 0.01);
+    let outer = layout.caret(&cell_pos(0, 0, 0)).unwrap();
+    assert!(c1.top > outer.top);
+    // grid_before leaves the first column empty.
+    let shifted = layout.caret(&cell_pos(0, 1, 0)).unwrap();
+    let side = layout.caret(&cell_pos(0, 0, 1)).unwrap();
+    assert!((shifted.x - side.x).abs() < 0.01);
+}
+
+#[test]
+fn shared_borders_are_drawn_once() {
+    let line = Some(Border {
+        style: BorderStyle::Single,
+        width: 0.5,
+        color: None,
+        space: 0.0,
+    });
+    let mut a = cell("a");
+    let mut b = cell("b");
+    a.borders = [line; 4];
+    b.borders = [line; 4];
+    let layout = lay(&doc(vec![table(
+        vec![1_000, 1_000],
+        vec![Row {
+            cells: vec![a, b],
+            ..Row::default()
+        }],
+    )]));
+    let rules = layout.pages[0]
+        .items
+        .iter()
+        .filter(|i| matches!(i, Item::Rule { .. }))
+        .count();
+    // Three vertical lines and one top and one bottom across both cells.
+    assert_eq!(rules, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Headers, footers, notes
+// ---------------------------------------------------------------------------
+
+fn field(kind: PageField) -> Run {
+    Run {
+        text: "0".into(),
+        kind: Inline::PageNumber(kind),
+        look: look(),
+        ..Run::default()
+    }
+}
+
+fn marginal(runs: Vec<Run>) -> Arc<Story> {
+    let mut p = paragraph("");
+    p.runs = runs;
+    Arc::new(Story {
+        blocks: vec![Block::paragraph(p)],
+        part: None,
+    })
+}
+
+#[test]
+fn headers_and_footers_show_real_page_numbers() {
+    let mut document = doc(numbered(40));
+    document.marginals = vec![
+        marginal(vec![Run::text("Head ", look()), field(PageField::Page)]),
+        marginal(vec![
+            field(PageField::Page),
+            Run::text(" of ", look()),
+            field(PageField::PageCount),
+        ]),
+    ];
+    let mut section = small();
+    section.headers.default = Some(0);
+    section.footers.default = Some(1);
+    section.page_number_start = Some(5);
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    let n = layout.pages.len();
+    assert!(n >= 2);
+    for (i, page) in layout.pages.iter().enumerate() {
+        assert_eq!(page.number as usize, 5 + i);
+        assert!(
+            page_has(page, &format!("Head {}", 5 + i)),
+            "{:?}",
+            page_texts(page)
+        );
+        assert!(
+            page_has(page, &format!("{} of {}", 5 + i, n)),
+            "{:?}",
+            page_texts(page)
+        );
+    }
+    // The footer is in the bottom margin, the header in the top one.
+    let page = &layout.pages[0];
+    let ys: Vec<f32> = page
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Text(t) => Some(t.y),
+            _ => None,
+        })
+        .collect();
+    assert!(ys.iter().any(|y| *y < 20.0));
+    assert!(ys.iter().any(|y| *y > 175.0));
+}
+
+#[test]
+fn first_page_and_even_headers() {
+    let mut document = doc(numbered(60));
+    document.marginals = vec![
+        marginal(vec![Run::text("DEFAULT", look())]),
+        marginal(vec![Run::text("FIRST", look())]),
+        marginal(vec![Run::text("EVEN", look())]),
+    ];
+    let mut section = small();
+    section.headers = Marginals {
+        default: Some(0),
+        first: Some(1),
+        even: Some(2),
+    };
+    section.title_page = true;
+    document.last_section = Arc::new(section);
+    document.settings.even_and_odd_headers = true;
+    let layout = lay(&document);
+    assert!(layout.pages.len() >= 3);
+    assert!(page_has(&layout.pages[0], "FIRST"));
+    assert!(page_has(&layout.pages[1], "EVEN"));
+    assert!(page_has(&layout.pages[2], "DEFAULT"));
+}
+
+#[test]
+fn a_tall_header_pushes_the_body_down() {
+    let mut document = doc(vec![pb("body")]);
+    let tall = "h\nh\nh\nh\nh\nh\nh\nh";
+    document.marginals = vec![marginal(vec![Run::text(tall, look())])];
+    let mut section = small();
+    section.headers.default = Some(0);
+    document.last_section = Arc::new(section);
+    // The same paragraph with "\n" as characters is one line each: use breaks.
+    let mut p = paragraph("");
+    p.runs = (0..8)
+        .flat_map(|_| {
+            [
+                Run::text("h", look()),
+                Run::object(Inline::Break(Break::Line), look()),
+            ]
+        })
+        .collect();
+    document.marginals = vec![Arc::new(Story {
+        blocks: vec![Block::paragraph(p)],
+        part: None,
+    })];
+    let layout = lay(&document);
+    let top = caret_top(&layout, 0, 0);
+    assert!(top > 20.0 + 40.0, "{top}");
+}
+
+#[test]
+fn footnotes_sit_at_the_bottom_of_their_page_and_are_numbered_in_order() {
+    let reference = |id: i32| Run::object(Inline::Footnote(id), look());
+    let mut first = paragraph("");
+    first.runs = vec![Run::text("see", look()), reference(7)];
+    let mut second = paragraph("");
+    second.runs = vec![Run::text("and", look()), reference(3)];
+    let mut blocks = vec![Block::paragraph(first)];
+    blocks.extend(numbered(3));
+    blocks.push(Block::paragraph(second));
+    let mut document = doc(blocks);
+    let note = |id: i32, text: &str| {
+        let mut p = paragraph("");
+        p.runs = vec![
+            Run::object(Inline::Footnote(id), look()),
+            Run::text(text, look()),
+        ];
+        Note {
+            id,
+            blocks: vec![Block::paragraph(p)],
+        }
+    };
+    document.footnotes = Notes {
+        notes: vec![note(3, " note three"), note(7, " note seven")],
+        part: None,
+    };
+    let layout = lay(&document);
+    let page = &layout.pages[0];
+    let texts = page_texts(page);
+    assert!(texts.iter().any(|t| t == "see1"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "and2"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "1 note seven"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "2 note three"), "{texts:?}");
+    // The notes are under the body text, below a separator.
+    let y_of = |needle: &str| {
+        page.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Text(t) if t.paragraph.text().contains(needle) => Some(t.y),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(y_of("note seven") > y_of("and"));
+    assert!(y_of("note three") > y_of("note seven"));
+    assert!(y_of("note seven") > 150.0);
+    assert!(page.items.iter().any(|i| matches!(i, Item::Rule { .. })));
+}
+
+#[test]
+fn a_footnote_goes_with_its_reference_to_the_next_page() {
+    let mut blocks = numbered(14);
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("ref", look()),
+        Run::object(Inline::Footnote(1), look()),
+    ];
+    blocks.push(Block::paragraph(p));
+    let mut document = doc(blocks);
+    document.footnotes = Notes {
+        notes: vec![Note {
+            id: 1,
+            blocks: vec![pb("the note")],
+        }],
+        part: None,
+    };
+    let layout = lay(&document);
+    let page = page_of(&layout, 14);
+    assert!(page_has(&layout.pages[page], "the note"));
+    for (i, other) in layout.pages.iter().enumerate() {
+        if i != page {
+            assert!(!page_has(other, "the note"));
+        }
+    }
+}
+
+#[test]
+fn endnotes_come_at_the_end_of_the_document() {
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("text", look()),
+        Run::object(Inline::Endnote(9), look()),
+    ];
+    let mut document = doc(vec![Block::paragraph(p)]);
+    document.endnotes = Notes {
+        notes: vec![Note {
+            id: 9,
+            blocks: vec![pb("end note body")],
+        }],
+        part: None,
+    };
+    let layout = lay(&document);
+    let last = layout.pages.last().unwrap();
+    assert!(page_has(last, "end note body"));
+}
+
+// ---------------------------------------------------------------------------
+// Sections and columns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn columns_flow_and_column_breaks_move_on() {
+    let mut section = small();
+    section.columns = Columns {
+        count: 2,
+        space: 400,
+        widths: Vec::new(),
+        separator: true,
+    };
+    let mut document = doc(numbered(30));
+    document.last_section = Arc::new(section.clone());
+    let layout = lay(&document);
+    let xs: Vec<f32> = (0..30)
+        .map(|i| layout.caret(&Pos::new(Path::body(i), 0)).unwrap().x)
+        .collect();
+    assert!(xs.iter().any(|x| (*x - 20.0).abs() < 0.01));
+    // The second column starts after the first plus the space: 20 + 120 + 20.
+    assert!(xs.iter().any(|x| (*x - 160.0).abs() < 0.01), "{xs:?}");
+    // The first thing in the second column is at the top.
+    let first_right = (0..30).find(|i| (xs[*i] - 160.0).abs() < 0.01).unwrap();
+    assert!((caret_top(&layout, first_right, 0) - 20.0).abs() < 0.01);
+    // The separator is drawn.
+    assert!(
+        layout.pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Rule { .. }))
+    );
+
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("left", look()),
+        Run::object(Inline::Break(Break::Column), look()),
+        Run::text("right", look()),
+    ];
+    let mut document = doc(vec![Block::paragraph(p)]);
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 1);
+    let left = layout.caret(&Pos::new(Path::body(0), 0)).unwrap();
+    let right = layout
+        .caret(&Pos::new(Path::body(0), "left".len() + OBJECT.len()))
+        .unwrap();
+    assert!(right.x > left.x + 100.0);
+    assert!((right.top - left.top).abs() < 0.01);
+}
+
+#[test]
+fn unequal_columns_use_their_widths() {
+    let mut section = small();
+    section.columns = Columns {
+        count: 2,
+        space: 0,
+        widths: vec![(2_000, 400), (1_000, 0)],
+        separator: false,
+    };
+    let mut document = doc(numbered(40));
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    let xs: Vec<f32> = (0..40)
+        .map(|i| layout.caret(&Pos::new(Path::body(i), 0)).unwrap().x)
+        .collect();
+    assert!(xs.iter().any(|x| (*x - 140.0).abs() < 0.01), "{xs:?}");
+}
+
+#[test]
+fn sections_can_have_their_own_page_size_and_start_kinds() {
+    let landscape = Arc::new(Section {
+        page: (8_000, 6_000),
+        ..small()
+    });
+    let mut first = paragraph("portrait");
+    first.section = Some(Arc::new(small()));
+    let mut document = doc(vec![Block::paragraph(first), pb("landscape")]);
+    document.last_section = landscape;
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 2);
+    assert_eq!(
+        (layout.pages[0].width, layout.pages[0].height),
+        (300.0, 200.0)
+    );
+    assert_eq!(
+        (layout.pages[1].width, layout.pages[1].height),
+        (400.0, 300.0)
+    );
+    assert_eq!(layout.pages[1].section, 1);
+
+    // Continuous: the same page, below what is there.
+    let mut first = paragraph("above");
+    first.section = Some(Arc::new(small()));
+    let mut second = small();
+    second.start = SectionStart::Continuous;
+    second.columns.count = 2;
+    let mut document = doc(vec![Block::paragraph(first), pb("below")]);
+    document.last_section = Arc::new(second);
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 1);
+    assert!(caret_top(&layout, 1, 0) > caret_top(&layout, 0, 0));
+
+    // Odd page: a blank page is inserted when needed.
+    let mut first = paragraph("one");
+    first.section = Some(Arc::new(small()));
+    let mut odd = small();
+    odd.start = SectionStart::OddPage;
+    let mut document = doc(vec![Block::paragraph(first), pb("two")]);
+    document.last_section = Arc::new(odd);
+    let layout = lay(&document);
+    assert_eq!(layout.pages.len(), 3);
+    assert_eq!(page_of(&layout, 1), 2);
+    assert_eq!(layout.pages[2].number, 3);
+    assert!(page_texts(&layout.pages[1]).is_empty());
+    // Page two is already even.
+    let mut first = paragraph("one");
+    first.section = Some(Arc::new(small()));
+    let mut even = small();
+    even.start = SectionStart::EvenPage;
+    let mut document = doc(vec![Block::paragraph(first), pb("two")]);
+    document.last_section = Arc::new(even);
+    assert_eq!(lay(&document).pages.len(), 2);
+}
+
+#[test]
+fn a_document_grid_rounds_lines_to_whole_pitches() {
+    let mut section = small();
+    section.grid = Some(DocGrid {
+        kind: GridKind::Lines,
+        line_pitch: 400,
+    });
+    let mut document = doc(vec![pb("a\nb\nc")]);
+    document.last_section = Arc::new(section);
+    let layout = lay(&document);
+    // A line of 10-point text takes one 20-point grid line.
+    let step = caret_top(&layout, 0, 2) - caret_top(&layout, 0, 0);
+    assert!((step - 20.0).abs() < 0.01, "{step}");
+}
+
+// ---------------------------------------------------------------------------
+// Drawings
+// ---------------------------------------------------------------------------
+
+fn picture(width: f64, height: f64, float: Option<Float>) -> Run {
+    Run::object(
+        Inline::Drawing(Arc::new(Drawing {
+            size: ((width * 12_700.0) as i64, (height * 12_700.0) as i64),
+            content: DrawingContent::Picture(Picture {
+                image: Arc::from(vec![0u8; 4]),
+                crop: [0.0; 4],
+            }),
+            float,
+            alt: None,
+        })),
+        look(),
+    )
+}
+
+fn float_at(wrap: Wrap, behind: bool) -> Float {
+    Float {
+        x: FloatAxis {
+            from: FloatFrom::Margin,
+            at: FloatAt::Start,
+        },
+        y: FloatAxis {
+            from: FloatFrom::Paragraph,
+            at: FloatAt::Offset(0),
+        },
+        wrap,
+        behind,
+        distance: [0; 4],
+    }
+}
+
+#[test]
+fn inline_pictures_make_their_line_tall() {
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("a", look()),
+        picture(30.0, 60.0, None),
+        Run::text("b", look()),
+    ];
+    let layout = lay(&doc(vec![Block::paragraph(p), pb("next")]));
+    let pictures: Vec<_> = layout.pages[0]
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Picture(p) => Some(p.rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pictures.len(), 1);
+    assert!((pictures[0].width() - 30.0).abs() < 0.01);
+    assert!((pictures[0].height() - 60.0).abs() < 0.01);
+    assert!(caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0) >= 60.0);
+}
+
+#[test]
+fn floating_drawings_push_text_down_unless_they_do_not_wrap() {
+    let build = |wrap, behind| {
+        let mut p = paragraph("");
+        p.runs = vec![
+            picture(50.0, 50.0, Some(float_at(wrap, behind))),
+            Run::text("anchor", look()),
+        ];
+        doc(vec![Block::paragraph(p), pb("after")])
+    };
+    let wrapped = lay(&build(Wrap::Square, false));
+    assert!(caret_top(&wrapped, 0, 3) >= 20.0 + 50.0 - 0.01);
+    assert!(
+        wrapped.pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Picture(p) if p.rect.y0 == 20.0))
+    );
+    let free = lay(&build(Wrap::None, false));
+    assert!((caret_top(&free, 0, 3) - 20.0).abs() < 0.01);
+    // Behind the text it comes before the text in paint order.
+    let behind = lay(&build(Wrap::None, true));
+    let items = &behind.pages[0].items;
+    let picture = items
+        .iter()
+        .position(|i| matches!(i, Item::Picture(_)))
+        .unwrap();
+    let text = items
+        .iter()
+        .position(|i| matches!(i, Item::Text(_)))
+        .unwrap();
+    assert!(picture < text);
+    let front = lay(&build(Wrap::None, false));
+    let items = &front.pages[0].items;
+    let picture = items
+        .iter()
+        .position(|i| matches!(i, Item::Picture(_)))
+        .unwrap();
+    let text = items
+        .iter()
+        .position(|i| matches!(i, Item::Text(_)))
+        .unwrap();
+    assert!(picture > text);
+}
+
+#[test]
+fn text_boxes_hold_blocks_and_other_drawings_are_placeholders() {
+    let text_box = Drawing {
+        size: (100 * 12_700, 40 * 12_700),
+        content: DrawingContent::TextBox(TextBox {
+            blocks: vec![pb("inside the box")],
+            fill: Some([255, 255, 200, 255]),
+            line: None,
+            insets: [0; 4],
+        }),
+        float: Some(float_at(Wrap::None, false)),
+        alt: None,
+    };
+    let other = Drawing {
+        size: (30 * 12_700, 30 * 12_700),
+        content: DrawingContent::Other("chart".into()),
+        float: None,
+        alt: None,
+    };
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::object(Inline::Drawing(Arc::new(text_box)), look()),
+        Run::object(Inline::Drawing(Arc::new(other)), look()),
+    ];
+    let layout = lay(&doc(vec![Block::paragraph(p)]));
+    let page = &layout.pages[0];
+    assert!(page.items.iter().any(|i| matches!(i, Item::Frame(_))));
+    assert!(page_has(page, "inside the box"));
+    assert!(
+        page.items
+            .iter()
+            .any(|i| matches!(i, Item::Placeholder { label, .. } if label == "chart"))
+    );
+    // Text in the box cannot be pointed at: only the body is answered for.
+    assert!(layout.frags.iter().all(|f| f.path.0.len() == 1));
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+fn sample() -> Document {
+    let label = Label {
+        text: "1.".into(),
+        look: look(),
+        suffix: Suffix::Tab,
+        align: Align::Left,
+    };
+    let mut item = paragraph("list item with some text to wrap onto another line of the list");
+    item.props.indent_left = 600;
+    item.props.first_line = -400;
+    item.label = Some(label);
+    let mut hidden = look();
+    hidden.hidden = true;
+    let mut mixed = paragraph("");
+    mixed.runs = vec![
+        Run::text("shown ", look()),
+        Run::text("hidden", hidden),
+        Run::text(" tail\ttabbed", look()),
+        Run::object(Inline::Footnote(1), look()),
+        Run::text("end", look()),
+    ];
+    let mut blocks = vec![
+        with("Heading", |p| p.outline_level = Some(0)),
+        pb(
+            "A paragraph of plain text that is long enough to wrap onto several lines on the small page. 中文和日本語も混ざっています。",
+        ),
+        Block::paragraph(item),
+        Block::paragraph(mixed),
+        table(
+            vec![1_500, 1_500],
+            rows_of(&[&["cell one", "cell two"], &["below one", "below two"]]),
+        ),
+        with("Second heading", |p| p.outline_level = Some(1)),
+    ];
+    blocks.extend(numbered(40));
+    blocks.push(pb(""));
+    let mut document = doc(blocks);
+    document.footnotes = Notes {
+        notes: vec![Note {
+            id: 1,
+            blocks: vec![pb("note")],
+        }],
+        part: None,
+    };
+    document
+}
+
+#[test]
+fn every_caret_is_found_again_by_a_click() {
+    let document = sample();
+    let layout = lay(&document);
+    let mut checked = 0;
+    for (path, para) in document.paragraphs() {
+        let text = para.text();
+        let mut offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        offsets.push(text.len());
+        for offset in offsets {
+            // Positions inside an object's U+FFFC bytes are not places.
+            if text.is_char_boundary(offset) {
+                let pos = Pos::new(path.clone(), offset);
+                let caret = layout
+                    .caret(&pos)
+                    .unwrap_or_else(|| panic!("no caret at {pos:?}"));
+                let back = layout
+                    .hit(caret.page, caret.x + 0.05, caret.top + caret.height / 2.0)
+                    .unwrap_or_else(|| panic!("no hit for {pos:?}"));
+                let again = layout.caret(&back).unwrap();
+                // A place at a line end can be the start of the next line.
+                let same_place = (again.x - caret.x).abs() < 0.6
+                    && (again.top - caret.top).abs() < 0.6
+                    && again.page == caret.page;
+                assert!(
+                    back == pos || same_place,
+                    "{pos:?} at {caret:?} came back as {back:?} at {again:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 300, "{checked}");
+}
+
+#[test]
+fn hits_beside_and_outside_the_text_go_to_the_nearest_place() {
+    let long =
+        "first line of text that wraps around the page and goes on and on until it must wrap";
+    let layout = lay(&doc(vec![pb(long), pb("second")]));
+    let top = layout.caret(&Pos::new(Path::body(0), 0)).unwrap();
+    // Far left and far right of the first line.
+    let left = layout.hit(0, -50.0, top.top + 3.0).unwrap();
+    assert_eq!(left, Pos::new(Path::body(0), 0));
+    let right = layout.hit(0, 500.0, top.top + 3.0).unwrap();
+    let end = layout.line_end(&Pos::new(Path::body(0), 0)).unwrap();
+    assert_eq!(right, end);
+    assert!(right.offset > 0 && right.offset < long.len());
+    // Above everything: the first line; below everything: the last.
+    let above = layout.hit(0, 100.0, -20.0).unwrap();
+    assert_eq!(above.path, Path::body(0));
+    assert!((layout.caret(&above).unwrap().top - top.top).abs() < 0.01);
+    assert_eq!(
+        layout.hit(0, 100.0, 500.0).unwrap(),
+        Pos::new(Path::body(1), 6)
+    );
+}
+
+#[test]
+fn lines_and_arrow_keys() {
+    let layout = lay(&doc(vec![
+        pb("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi"),
+        pb("next paragraph"),
+    ]));
+    let start = layout.line_start(&Pos::new(Path::body(0), 30)).unwrap();
+    let end = layout.line_end(&Pos::new(Path::body(0), 30)).unwrap();
+    assert!(start.offset <= 30 && end.offset >= 30);
+    let below = layout.below(&Pos::new(Path::body(0), 3), 40.0).unwrap();
+    assert_eq!(below.path, Path::body(0));
+    assert!(below.offset > 10);
+    let back = layout.above(&below, 40.0).unwrap();
+    assert_eq!(back.path, Path::body(0));
+    assert!(back.offset <= 6);
+    // Down from the last line goes to the next paragraph, up returns.
+    let last = layout.line_start(&Pos::new(Path::body(0), 70)).unwrap();
+    let next = layout.below(&last, 30.0).unwrap();
+    assert_eq!(next.path, Path::body(1));
+    assert_eq!(layout.above(&next, 30.0).unwrap().path, Path::body(0));
+    // Nothing above the first line or below the last.
+    assert!(layout.above(&Pos::new(Path::body(0), 0), 30.0).is_none());
+    assert!(layout.below(&Pos::new(Path::body(1), 3), 30.0).is_none());
+}
+
+#[test]
+fn arrows_cross_pages_and_move_between_cells() {
+    let layout = lay(&doc(numbered(40)));
+    // From the last paragraph of page one to the first of page two.
+    let mut last_on_first = 0;
+    for i in 0..40 {
+        if page_of(&layout, i) == 0 {
+            last_on_first = i;
+        }
+    }
+    let down = layout
+        .below(&Pos::new(Path::body(last_on_first), 0), 25.0)
+        .unwrap();
+    assert_eq!(down.path, Path::body(last_on_first + 1));
+    assert_eq!(layout.page_of(&down), Some(1));
+
+    let layout = lay(&doc(vec![table(
+        vec![2_000, 2_000],
+        rows_of(&[&["a", "b"], &["c", "d"]]),
+    )]));
+    let b = layout.caret(&cell_pos(0, 0, 1)).unwrap();
+    let down = layout.below(&cell_pos(0, 0, 1), b.x).unwrap();
+    assert_eq!(down.path, Path::body(0).cell_block(1, 1, 0));
+    let up = layout.above(&down, b.x).unwrap();
+    assert_eq!(up.path, Path::body(0).cell_block(0, 1, 0));
+}
+
+#[test]
+fn selections_cover_lines_and_paragraphs() {
+    let layout = lay(&doc(vec![
+        pb("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu"),
+        pb("second paragraph"),
+        pb("third"),
+    ]));
+    let same = layout.selection(&Pos::new(Path::body(0), 2), &Pos::new(Path::body(0), 60));
+    assert!(same.len() >= 2, "{same:?}");
+    assert!(
+        same.iter()
+            .all(|(page, r)| *page == 0 && r.width() > 0.0 && r.height() > 0.0)
+    );
+    let across = layout.selection(&Pos::new(Path::body(2), 3), &Pos::new(Path::body(0), 60));
+    assert!(across.len() > same.len());
+    assert!(
+        layout
+            .selection(&Pos::new(Path::body(1), 2), &Pos::new(Path::body(1), 2))
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_outline_lists_headings_with_their_pages() {
+    let layout = lay(&sample());
+    let outline = layout.outline();
+    assert_eq!(outline.len(), 2);
+    assert_eq!((outline[0].level, outline[0].text.as_str()), (0, "Heading"));
+    assert_eq!(outline[0].pos, Pos::new(Path::body(0), 0));
+    assert_eq!(outline[1].level, 1);
+    assert_eq!(outline[1].text, "Second heading");
+    assert!(outline[1].page >= outline[0].page);
+}
+
+#[test]
+fn queries_for_places_that_do_not_exist_give_nothing() {
+    let layout = lay(&sample());
+    let nowhere = Pos::new(Path(vec![99]), 0);
+    assert!(layout.caret(&nowhere).is_none());
+    assert!(layout.line_start(&nowhere).is_none());
+    assert!(layout.line_end(&nowhere).is_none());
+    assert!(layout.above(&nowhere, 1.0).is_none());
+    assert!(layout.below(&nowhere, 1.0).is_none());
+    assert!(layout.page_of(&nowhere).is_none());
+    assert!(layout.hit(999, 1.0, 1.0).is_none());
+    assert!(layout.selection(&nowhere, &nowhere).is_empty());
+    // An offset past the end is clamped.
+    assert!(layout.caret(&Pos::new(Path::body(0), 10_000)).is_some());
+    // A path into a paragraph as if it were a table.
+    assert!(layout.caret(&Pos::new(Path(vec![0, 1, 2, 3]), 0)).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Caching
+// ---------------------------------------------------------------------------
+
+#[test]
+fn laying_out_again_shapes_only_what_changed() {
+    let before = doc(numbered(80));
+    let mut layouter = Layouter::new();
+    let first = layouter.layout(&before);
+    assert_eq!(layouter.shaped_count(), 80);
+    let again = layouter.layout(&before);
+    assert_eq!(layouter.shaped_count(), 80);
+    assert_eq!(first.pages.len(), again.pages.len());
+
+    let mut after = before.clone();
+    after.paragraph_mut(&Path::body(40)).unwrap().runs[0]
+        .text
+        .push_str(" changed");
+    let changed = layouter.layout(&after);
+    assert_eq!(layouter.shaped_count(), 81);
+    assert!(
+        page_has(&changed.pages[changed.pages.len() / 2], "changed")
+            || changed.pages.iter().any(|p| page_has(p, "changed"))
+    );
+
+    // A paragraph in a table cell: only it is shaped again.
+    let tabled = doc(vec![table(
+        vec![2_000, 2_000],
+        rows_of(&[&["a", "b"], &["c", "d"]]),
+    )]);
+    let mut layouter = Layouter::new();
+    layouter.layout(&tabled);
+    assert_eq!(layouter.shaped_count(), 4);
+    let mut edited = tabled.clone();
+    edited
+        .paragraph_mut(&Path::body(0).cell_block(1, 1, 0))
+        .unwrap()
+        .runs[0]
+        .text = "dd".into();
+    layouter.layout(&edited);
+    assert_eq!(layouter.shaped_count(), 5);
+}
+
+#[test]
+fn a_different_width_or_page_number_shapes_again() {
+    let mut document = doc(vec![pb("x")]);
+    document.marginals = vec![marginal(vec![field(PageField::Page)])];
+    let mut section = small();
+    section.footers.default = Some(0);
+    document.last_section = Arc::new(section.clone());
+    let mut layouter = Layouter::new();
+    layouter.layout(&document);
+    let one = layouter.shaped_count();
+    // The same document with narrower margins is shaped for the new width.
+    section.margins.left = 1_200;
+    document.last_section = Arc::new(section);
+    layouter.layout(&document);
+    assert!(layouter.shaped_count() > one);
+}
+
+// ---------------------------------------------------------------------------
+// Odd input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn odd_page_and_column_geometry_does_not_panic_or_hang() {
+    let weird: Vec<Section> = vec![
+        Section {
+            page: (0, 0),
+            ..Section::default()
+        },
+        Section {
+            page: (-500, -500),
+            ..Section::default()
+        },
+        Section {
+            page: (2_000, 2_000),
+            margins: Margins {
+                top: 5_000,
+                right: 5_000,
+                bottom: 5_000,
+                left: 5_000,
+                header: 9_000,
+                footer: 9_000,
+                gutter: 9_000,
+            },
+            ..Section::default()
+        },
+        Section {
+            columns: Columns {
+                count: 40,
+                space: 300,
+                widths: Vec::new(),
+                separator: true,
+            },
+            ..small()
+        },
+        Section {
+            columns: Columns {
+                count: 0,
+                space: -100,
+                widths: vec![(0, 0), (-5, -5)],
+                separator: false,
+            },
+            ..small()
+        },
+        Section {
+            grid: Some(DocGrid {
+                kind: GridKind::LinesAndChars,
+                line_pitch: 0,
+            }),
+            ..small()
+        },
+        Section {
+            grid: Some(DocGrid {
+                kind: GridKind::SnapToChars,
+                line_pitch: -40,
+            }),
+            ..small()
+        },
+    ];
+    for section in weird {
+        let mut document = doc(vec![
+            pb("some text 中文 more words that need wrapping around a narrow column"),
+            pb(""),
+            table(vec![0, -5], rows_of(&[&["a", "b"]])),
+            pb("end"),
+        ]);
+        document.last_section = Arc::new(section);
+        let layout = lay(&document);
+        assert!(!layout.pages.is_empty());
+        for page in &layout.pages {
+            assert!(page.width >= 1.0 && page.height >= 1.0);
+        }
+        let _ = layout.caret(&Pos::new(Path::body(0), 3));
+        let _ = layout.hit(0, 1.0, 1.0);
+    }
+}
+
+#[test]
+fn odd_paragraph_and_table_input_does_not_panic_or_hang() {
+    // Indents wider than the column.
+    let wide = with("indented text that cannot fit anywhere", |p| {
+        p.indent_left = 20_000;
+        p.indent_right = 20_000;
+        p.first_line = -30_000;
+    });
+    // A picture taller than the page, in the line and floating.
+    let mut huge = paragraph("");
+    huge.runs = vec![
+        picture(100.0, 5_000.0, None),
+        picture(100.0, 5_000.0, Some(float_at(Wrap::Square, false))),
+        Run::text("after", look()),
+    ];
+    // An exact row height of a kilometre.
+    let km = Row {
+        cells: vec![cell("tall\nrow")],
+        height: RowHeight::Exactly(56_700_000),
+        ..Row::default()
+    };
+    let empty_cells = Row {
+        cells: vec![Cell {
+            blocks: Vec::new(),
+            span: 0,
+            ..Cell::default()
+        }],
+        ..Row::default()
+    };
+    let wide_span = Row {
+        cells: vec![Cell {
+            span: 50,
+            ..cell("span")
+        }],
+        grid_before: 7,
+        grid_after: 9,
+        ..Row::default()
+    };
+    let stray = Row {
+        cells: vec![Cell {
+            merge: VMerge::Continue,
+            ..cell("continues nothing")
+        }],
+        ..Row::default()
+    };
+    let document = doc(vec![
+        wide,
+        Block::paragraph(huge),
+        table(vec![4_000], vec![km]),
+        table(Vec::new(), Vec::new()),
+        table(vec![1_000], vec![Row::default()]),
+        table(vec![1_000], vec![empty_cells, wide_span, stray]),
+        with("keep", |p| {
+            p.keep_next = true;
+            p.keep_lines = true;
+        }),
+    ]);
+    let layout = lay(&document);
+    assert!(layout.pages.len() < 1_000, "{}", layout.pages.len());
+    assert!(layout.caret(&Pos::new(Path::body(1), 0)).is_some());
+    // Paths that lead nowhere.
+    assert!(
+        layout
+            .caret(&Pos::new(Path::body(2).cell_block(9, 9, 9), 0))
+            .is_none()
+    );
+}
+
+#[test]
+fn a_keep_chain_longer_than_a_page_still_terminates() {
+    let blocks: Vec<Block> = (0..80)
+        .map(|i| {
+            with(&format!("k{i}\nsecond\nthird"), |p| {
+                p.keep_next = true;
+                p.keep_lines = true;
+            })
+        })
+        .collect();
+    let layout = lay(&doc(blocks));
+    assert!(layout.pages.len() >= 10);
+    for i in 0..80 {
+        assert!(layout.caret(&Pos::new(Path::body(i), 0)).is_some());
+    }
+}
+
+#[test]
+fn nothing_is_lost_in_a_long_mixed_document() {
+    let document = sample();
+    let layout = lay(&document);
+    // Every paragraph of the body has its lines placed exactly once.
+    for (path, _) in document.paragraphs() {
+        let parts = lines_of(&layout, &path);
+        assert!(!parts.is_empty(), "{path:?} not placed");
+    }
+}

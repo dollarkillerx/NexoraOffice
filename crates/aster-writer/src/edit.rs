@@ -48,11 +48,11 @@ pub use story::{
     insert_page_number,
 };
 pub use table::{
-    CellPos, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, available_width,
-    can_merge_cells, can_split_cell, can_unmerge_cell, cell_at, check_table, delete_columns,
-    delete_rows, delete_table, fit_table, insert_columns, insert_rows, insert_table, merge_cells,
-    move_column_border, set_column_width, set_row_height, space_for_block, split_cell,
-    unmerge_cell,
+    CellPos, CellRange, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW,
+    available_width, can_merge_cells, can_split_cell, can_unmerge_cell, cell_at, cell_range,
+    check_table, delete_columns, delete_rows, delete_table, fit_table, insert_columns, insert_rows,
+    insert_table, merge_cells, move_column_border, row_start, set_column_width, set_row_height,
+    space_for_block, split_cell, unmerge_cell,
 };
 
 /// How far one step of indenting moves a paragraph, in twips (half an inch).

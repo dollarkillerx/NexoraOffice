@@ -445,3 +445,40 @@ fn merges_and_splits_keep_the_markers_and_every_table_valid() {
         assert_valid(&doc);
     }
 }
+
+#[test]
+fn a_selection_over_two_cells_selects_the_block_between() {
+    let doc = doc3x3();
+    let range = cell_range(&doc, &cpos(1, 0, 2, 0), &cpos(1, 1, 0, 0)).expect("two cells");
+    assert_eq!(range.table, crate::Path::body(1));
+    assert_eq!((range.rows, range.columns), ((0, 1), (0, 3)));
+    // Inside one cell it is text; so it is outside tables.
+    assert!(cell_range(&doc, &cpos(1, 1, 1, 0), &cpos(1, 1, 1, 2)).is_none());
+    let outside = crate::Pos::new(crate::Path::body(0), 0);
+    assert!(cell_range(&doc, &outside, &cpos(1, 0, 0, 0)).is_none());
+}
+
+#[test]
+fn the_block_of_cells_takes_in_merged_cells_whole() {
+    let mut doc = doc3x3();
+    merge_cells(&mut doc, &cpos(1, 0, 1, 0), &cpos(1, 1, 1, 0));
+    // The merged cell sticks out of the block asked for.
+    let range = cell_range(&doc, &cpos(1, 0, 0, 0), &cpos(1, 0, 1, 0)).unwrap();
+    assert_eq!((range.rows, range.columns), ((0, 1), (0, 2)));
+}
+
+#[test]
+fn a_row_has_a_place_to_start_from() {
+    let mut doc = doc3x3();
+    let at = row_start(&doc, &crate::Path::body(1), 2).unwrap();
+    assert_eq!(at, cpos(1, 2, 0, 0));
+    assert!(row_start(&doc, &crate::Path::body(1), 9).is_none());
+    assert!(set_row_height(
+        &mut doc,
+        &at,
+        &at,
+        crate::RowHeight::AtLeast(600)
+    ));
+    assert_eq!(t(&doc).rows[2].height, crate::RowHeight::AtLeast(600));
+    assert_eq!(t(&doc).rows[1].height, crate::RowHeight::Auto);
+}

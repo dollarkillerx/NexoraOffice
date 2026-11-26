@@ -84,6 +84,34 @@ pub enum DocCommand {
     Bullets,
     Numbering,
     Style(String),
+    /// A table of this many rows and columns at the caret.
+    InsertTable {
+        rows: usize,
+        columns: usize,
+    },
+    InsertRows {
+        above: bool,
+    },
+    InsertColumns {
+        left: bool,
+    },
+    DeleteRows,
+    DeleteColumns,
+    DeleteTable,
+    /// Put this address on the selection or the link around the caret;
+    /// `None` takes the link off.
+    SetLink(Option<String>),
+    /// What the link dialog gives: the text and the address (see
+    /// [`DocView::link_info`]); an empty address removes the link.
+    EditLink {
+        text: String,
+        target: String,
+    },
+    /// Type `text` as a link to `target` in place of the selection.
+    InsertLink {
+        text: String,
+        target: String,
+    },
 }
 
 /// Sizes the size steps go through, in points.
@@ -372,6 +400,15 @@ impl DocView {
             DocCommand::Style(id) => self.paragraph_edit(move |d, f, t| {
                 edit::set_style(d, f, t, &id);
             }),
+            DocCommand::InsertTable { rows, columns } => self.insert_table(rows, columns),
+            DocCommand::InsertRows { above } => self.insert_rows(above),
+            DocCommand::InsertColumns { left } => self.insert_columns(left),
+            DocCommand::DeleteRows => self.delete_rows(),
+            DocCommand::DeleteColumns => self.delete_columns(),
+            DocCommand::DeleteTable => self.delete_table(),
+            DocCommand::SetLink(target) => self.set_link_command(target),
+            DocCommand::EditLink { text, target } => self.edit_link(&text, &target),
+            DocCommand::InsertLink { text, target } => self.insert_linked_text(&text, &target),
         }
     }
 

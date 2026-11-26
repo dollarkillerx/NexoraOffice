@@ -193,6 +193,9 @@ impl Command {
                     | Command::LineSpacing
                     | Command::BulletList
                     | Command::NumberedList
+                    | Command::InsertLink
+                    | Command::InsertImage
+                    | Command::InsertTable
             ),
             DocKind::Markdown => {
                 matches!(
@@ -1262,6 +1265,9 @@ mod tests {
                         Command::LineSpacing,
                         Command::BulletList,
                         Command::NumberedList,
+                        Command::InsertLink,
+                        Command::InsertImage,
+                        Command::InsertTable,
                     ]
                 ),
                 DocKind::Markdown => assert_eq!(

@@ -15,7 +15,7 @@ use super::text::{
 use super::{DocView, Sel};
 
 /// A pause this long ends a step of typing.
-const PAUSE: Duration = Duration::from_millis(1500);
+pub(super) const PAUSE: Duration = Duration::from_millis(1500);
 
 /// How far one deletion goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,9 +30,25 @@ pub enum Unit {
 impl DocView {
     // --- State ---
 
-    /// The document has changes since it was read or last saved.
+    /// The document differs from what it was when it was read or last
+    /// saved. Undoing back to that state makes it so again that it is not
+    /// modified. Comparing is cheap when most blocks are the very ones that
+    /// were saved (they are shared), and is done once for a revision.
     pub fn is_modified(&self) -> bool {
-        self.revision != self.saved_revision
+        if self.revision == self.saved_revision {
+            return false;
+        }
+        let Some(saved) = &self.saved else {
+            return true;
+        };
+        if let Some((revision, modified)) = self.modified.get()
+            && revision == self.revision
+        {
+            return modified;
+        }
+        let modified = !edit::same_content(&self.document, saved);
+        self.modified.set(Some((self.revision, modified)));
+        modified
     }
 
     /// Bumped by every change to the document, undo and redo included.
@@ -43,11 +59,22 @@ impl DocView {
     /// What is in the document now is what the file holds.
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.revision;
+        self.saved = Some(self.document.clone());
+    }
+
+    /// The file holds `document`, which the view had at `revision`: what
+    /// was written while edits went on. The view is modified exactly when
+    /// it differs from `document`. Nothing else changes: the history stays.
+    pub fn mark_saved_as(&mut self, document: Document, revision: u64) {
+        self.saved_revision = revision;
+        self.saved = Some(document);
+        self.modified.set(None);
     }
 
     /// The document counts as changed (it came back from a recovery record).
     pub fn mark_unsaved(&mut self) {
         self.revision += 1;
+        self.saved = None;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -90,7 +117,8 @@ impl DocView {
         check: bool,
         edit: impl FnOnce(&mut Document, &Selection) -> Option<Selection>,
     ) -> bool {
-        if self.compose.is_some() || !self.ensure_paragraph() {
+        // A picture being resized finishes first.
+        if self.compose.is_some() || self.resizing.is_some() || !self.ensure_paragraph() {
             return false;
         }
         let Some(selection) = self.selection_value() else {
@@ -132,7 +160,7 @@ impl DocView {
     }
 
     /// The caret after the selection is taken out (a caret stays).
-    fn clear_range(document: &mut Document, selection: &Selection) -> Pos {
+    pub(super) fn clear_range(document: &mut Document, selection: &Selection) -> Pos {
         let (from, to) = selection.ordered();
         if selection.is_caret() {
             from
@@ -305,7 +333,8 @@ impl DocView {
     }
 
     /// Tab: in a list item at its start the item goes a level in (Shift
-    /// out); in a table to the next cell (the previous with Shift); else a
+    /// out); in a table to the next cell (the previous with Shift), and in
+    /// the last cell a row is added below and the caret goes into it; else a
     /// tab character (Shift does nothing).
     pub fn tab(&mut self, shift: bool) -> bool {
         // While an input method is composing, keys, typed text and commands
@@ -338,6 +367,7 @@ impl DocView {
         if focus.path.in_cell().is_some() {
             return match self.cell_neighbour(&focus.path, !shift) {
                 Some(target) => self.set_selection(target.clone(), target),
+                None if !shift => self.add_row_after_last_cell(),
                 None => false,
             };
         }
@@ -452,7 +482,7 @@ impl DocView {
         // While an input method is composing, keys, typed text and commands
         // wait for it to end, as in the Markdown editor; only a commit
         // enters composed text.
-        if self.compose.is_some() {
+        if self.compose.is_some() || self.resizing.is_some() {
             return false;
         }
 
@@ -469,7 +499,7 @@ impl DocView {
         // While an input method is composing, keys, typed text and commands
         // wait for it to end, as in the Markdown editor; only a commit
         // enters composed text.
-        if self.compose.is_some() {
+        if self.compose.is_some() || self.resizing.is_some() {
             return false;
         }
 

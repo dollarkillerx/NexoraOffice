@@ -295,6 +295,10 @@ struct Shell {
     /// The link dialog is open for this tab, over this range of its text as
     /// it was at this version, for an image or not.
     link_edit: Option<(TabId, std::ops::Range<usize>, u64, bool)>,
+    /// The link dialog is open for this Word document; and the insert table
+    /// dialog.
+    doc_link_for: Option<TabId>,
+    doc_table_for: Option<TabId>,
     /// Whether the remembered folder has been looked up; until then the
     /// sidebar state is not written back.
     workspace_loaded: bool,
@@ -362,6 +366,8 @@ impl Shell {
             outline_of: None,
             outline_timer: Timer::default(),
             link_edit: None,
+            doc_link_for: None,
+            doc_table_for: None,
             workspace_loaded: false,
             filter: None,
             sidebar_recent: Vec::new(),
@@ -1538,6 +1544,10 @@ fn apply_language(ui: &AppWindow, language: Language) {
     s.set_table_align_left(strings.table_align_left.into());
     s.set_table_align_center(strings.table_align_center.into());
     s.set_table_align_right(strings.table_align_right.into());
+    s.set_table_delete_table(strings.table_delete_table.into());
+    s.set_table_dialog_title(strings.table_dialog_title.into());
+    s.set_table_rows(strings.table_rows.into());
+    s.set_table_columns(strings.table_columns.into());
     ui.set_heading_names(model(
         toolbar::heading_names(strings)
             .into_iter()
@@ -1752,7 +1762,7 @@ fn refresh_toolbar(ui: &AppWindow, shell: &mut Shell) {
     shell.shown_cell = view.cell;
     shell.shown_heading = view.heading;
     shell.shown_styles = view.styles;
-    ui.set_in_table(view.styles.table);
+    ui.set_in_table(view.styles.table || writer_ui::in_table(shell));
     {
         use aster_markdown::format::Block;
         let styles = view.styles;
@@ -6251,6 +6261,14 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_toolbar_command(handler!(|ui, shell, id| {
+        if shell.active_doc().is_some() {
+            match Command::from_id(id) {
+                Some(Command::InsertLink) => return writer_ui::open_link_dialog(&ui, shell),
+                Some(Command::InsertImage) => return writer_ui::insert_picture(&ui, shell),
+                Some(Command::InsertTable) => return writer_ui::open_table_dialog(&ui, shell),
+                _ => {}
+            }
+        }
         if shell.active_slides().is_some() {
             match Command::from_id(id) {
                 Some(Command::InsertImage) => {
@@ -6351,7 +6369,18 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
 
     agent::Assistant::start(&ui, &mut shell.borrow_mut());
     ui.on_link_accept(handler!(|ui, shell| {
+        if writer_ui::accept_link(&ui, shell) {
+            return;
+        }
         accept_link(&ui, shell);
+    }));
+    ui.on_table_accept(handler!(|ui, shell| {
+        writer_ui::accept_table(&ui, shell);
+    }));
+    ui.on_table_cancel(handler!(|ui, shell| {
+        ui.set_table_open(false);
+        shell.doc_table_for = None;
+        ui.invoke_focus_document();
     }));
     ui.on_encoding_accept(handler!(|ui, shell| {
         accept_encoding(&ui, shell);
@@ -6554,6 +6583,7 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     ui.on_link_cancel(handler!(|ui, shell| {
         ui.set_link_open(false);
         shell.link_edit = None;
+        shell.doc_link_for = None;
         ui.invoke_focus_document();
     }));
     ui.on_outline_toggled(handler!(|ui, shell, index| {
@@ -6662,6 +6692,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
     }));
 
     ui.on_format(handler!(|ui, shell, code| {
+        if shell.active_doc().is_some() {
+            writer_ui::format(&ui, shell, code);
+            return;
+        }
         if let Some(format) = format_of_menu(code) {
             apply_format(&ui, shell, format);
         }
@@ -6828,6 +6862,10 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             let Ok(mut borrowed) = shell.try_borrow_mut() else {
                 return;
             };
+            if borrowed.active_doc().is_some() {
+                writer_ui::export_pdf(&ui, &mut borrowed);
+                return;
+            }
             let strings = borrowed.language.strings();
             let Some(id) = borrowed.tabs.active_id() else {
                 return;
@@ -10138,5 +10176,458 @@ mod ui_tests {
         );
         assert!(with_doc(&app, |tab| tab.view.has_selection()));
         assert!(with_doc(&app, |tab| !tab.view.selected_text().is_empty()));
+    }
+
+    // --- Tables, links, pictures, export and saving in a Word document ---
+
+    /// A 1 by 1 pixel PNG file.
+    const DOT_PNG: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// A new Word document in front, with the keyboard.
+    fn new_writer(app: &App) {
+        app.ui.invoke_new_document(DocKind::Writer.index() as i32);
+        app.ui.invoke_focus_document();
+    }
+
+    /// Save the Word document in front the way the save path does (the
+    /// write runs on a worker thread in the window, here it is done at
+    /// once), and read the file back.
+    fn save_and_read(app: &App, dir: &std::path::Path, name: &str) -> aster_writer::Document {
+        let path = dir.join(name);
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let job = {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.saving = false;
+            tab.begin_save().unwrap()
+        };
+        let written = job.write(&path).expect("it writes");
+        {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.finish_save(&job, &path, Some(written));
+            shell.sync_modified();
+        }
+        let mut document = aster_ooxml::docx::read(std::fs::read(&path).unwrap()).unwrap();
+        document.renumber();
+        document
+    }
+
+    fn first_table(document: &aster_writer::Document) -> Option<&aster_writer::Table> {
+        document.body.blocks.iter().find_map(|b| b.as_table())
+    }
+
+    fn tab_modified(app: &App) -> bool {
+        app.shell.borrow().tabs.active().unwrap().modified
+    }
+
+    #[test]
+    fn the_insert_table_dialog_makes_a_table_and_the_table_menu_follows_the_caret() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "hello");
+        assert!(!ui.get_in_table());
+        // The toolbar button is on, and opens the dialog with a start.
+        let items = ui.get_toolbar_items();
+        let enabled: Vec<i32> = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .filter(|item| item.enabled)
+            .map(|item| item.command)
+            .collect();
+        for command in [
+            Command::InsertTable,
+            Command::InsertLink,
+            Command::InsertImage,
+        ] {
+            assert!(enabled.contains(&command.id()), "{command:?}");
+        }
+        ui.invoke_toolbar_command(Command::InsertTable.id());
+        assert!(ui.get_table_open());
+        assert_eq!(ui.get_table_rows().as_str(), "3");
+        assert_eq!(ui.get_table_columns().as_str(), "3");
+        // Something that is not a number, or 0, keeps it open; Escape (its
+        // cancel) closes it and does nothing.
+        ui.set_table_rows("x".into());
+        ui.invoke_table_accept();
+        assert!(ui.get_table_open());
+        ui.set_table_rows("0".into());
+        ui.invoke_table_accept();
+        assert!(ui.get_table_open());
+        ui.invoke_table_cancel();
+        assert!(!ui.get_table_open());
+        assert!(with_doc(&app, |tab| first_table(tab.view.document()).is_none()));
+        // The menu item opens it too.
+        ui.invoke_format(10);
+        assert!(ui.get_table_open());
+        ui.set_table_rows("2".into());
+        ui.set_table_columns("4".into());
+        ui.invoke_table_accept();
+        assert!(!ui.get_table_open());
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).expect("a table");
+            assert_eq!((table.rows.len(), table.columns.len()), (2, 4));
+            assert!(tab.view.in_table());
+        });
+        assert!(ui.get_in_table(), "the table items of the menu are on");
+        assert!(tab_modified(&app));
+
+        // Rows and columns from the menu (codes 30 to 35, 39).
+        ui.invoke_format(31);
+        ui.invoke_format(33);
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!((table.rows.len(), table.columns.len()), (3, 5));
+        });
+        ui.invoke_format(30);
+        ui.invoke_format(32);
+        ui.invoke_format(34);
+        ui.invoke_format(35);
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!((table.rows.len(), table.columns.len()), (3, 5));
+        });
+
+        // Tab walks the cells, and in the last one adds a row.
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!((table.rows.len(), table.columns.len()), (2, 4));
+        });
+        ui.invoke_edit_redo();
+        ui.invoke_edit_undo();
+        let cells = 2 * 4;
+        for _ in 0..cells - 1 {
+            key(ui, Key::Tab);
+        }
+        with_doc(&app, |tab| {
+            assert_eq!(first_table(tab.view.document()).unwrap().rows.len(), 2);
+        });
+        key(ui, Key::Tab);
+        with_doc(&app, |tab| {
+            let table = first_table(tab.view.document()).unwrap();
+            assert_eq!(table.rows.len(), 3, "Tab in the last cell adds a row");
+            let caret = tab.view.caret().cloned().unwrap();
+            assert_eq!(
+                caret.path.in_cell().map(|(_, r, c, _)| (r, c)),
+                Some((2, 0))
+            );
+        });
+
+        // It is saved and read back.
+        let dir = tempfile::tempdir().unwrap();
+        let read = save_and_read(&app, dir.path(), "表.docx");
+        let table = first_table(&read).expect("the table is in the file");
+        assert_eq!((table.rows.len(), table.columns.len()), (3, 4));
+        assert!(aster_writer::edit::check_table(table).is_ok());
+
+        // The whole table goes, and comes back with undo; with the caret
+        // out of the table the items are off.
+        ui.invoke_format(39);
+        assert!(with_doc(&app, |tab| first_table(tab.view.document()).is_none()));
+        assert!(!ui.get_in_table());
+        ui.invoke_edit_undo();
+        assert!(ui.get_in_table());
+        ui.invoke_format(39);
+        key(ui, Key::RightArrow);
+        // No table at the caret: the items do nothing.
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        for code in [30, 31, 32, 33, 34, 35, 39] {
+            ui.invoke_format(code);
+        }
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+    }
+
+    #[test]
+    fn the_link_dialog_sets_changes_and_removes_a_link_in_a_word_document() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "see the site now");
+        with_doc(&app, |tab| {
+            let a = tab.view.document().start().unwrap();
+            let mut b = a.clone();
+            let mut c = a.clone();
+            b.offset = 4;
+            c.offset = 12;
+            tab.view.set_selection(b, c);
+        });
+        // Ctrl+K is the menu item (code 8); the dialog starts from the
+        // selected text.
+        ui.invoke_format(8);
+        assert!(ui.get_link_open());
+        assert!(!ui.get_link_image());
+        assert_eq!(ui.get_link_label().as_str(), "the site");
+        assert_eq!(ui.get_link_address().as_str(), "");
+        // Cancel does nothing.
+        let before = with_doc(&app, |tab| tab.view.document().clone());
+        ui.invoke_link_cancel();
+        assert!(!ui.get_link_open());
+        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), before);
+        ui.invoke_toolbar_command(Command::InsertLink.id());
+        assert!(ui.get_link_open());
+        ui.set_link_address("https://example.com/".into());
+        ui.invoke_link_accept();
+        assert!(!ui.get_link_open());
+        assert!(tab_modified(&app));
+        let link = |app: &App| {
+            with_doc(app, |tab| {
+                tab.view
+                    .document()
+                    .paragraphs()
+                    .iter()
+                    .flat_map(|(_, p)| p.runs.iter())
+                    .filter(|r| r.link.is_some())
+                    .map(|r| (r.text.clone(), r.link.as_ref().unwrap().target.clone()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            link(&app),
+            vec![("the site".to_owned(), "https://example.com/".to_owned())]
+        );
+        // Reopened with the caret inside the link: text and address are the
+        // link's. Changing both rewrites it.
+        with_doc(&app, |tab| {
+            let mut at = tab.view.document().start().unwrap();
+            at.offset = 6;
+            tab.view.go_to(&at);
+        });
+        ui.invoke_format(8);
+        assert_eq!(ui.get_link_label().as_str(), "the site");
+        assert_eq!(ui.get_link_address().as_str(), "https://example.com/");
+        ui.set_link_label("the docs".into());
+        ui.set_link_address("https://docs.example.com/".into());
+        ui.invoke_link_accept();
+        assert_eq!(
+            link(&app),
+            vec![(
+                "the docs".to_owned(),
+                "https://docs.example.com/".to_owned()
+            )]
+        );
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "see the docs now"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let read = save_and_read(&app, dir.path(), "链接.docx");
+        let saved: Vec<String> = read
+            .paragraphs()
+            .iter()
+            .flat_map(|(_, p)| p.runs.iter())
+            .filter_map(|r| r.link.as_ref().map(|l| l.target.clone()))
+            .collect();
+        assert_eq!(saved, ["https://docs.example.com/"]);
+        // An empty address removes it.
+        with_doc(&app, |tab| {
+            let mut at = tab.view.document().start().unwrap();
+            at.offset = 6;
+            tab.view.go_to(&at);
+        });
+        ui.invoke_format(8);
+        ui.set_link_address("".into());
+        ui.invoke_link_accept();
+        assert!(link(&app).is_empty());
+        assert!(tab_modified(&app));
+        ui.invoke_edit_undo();
+        assert_eq!(link(&app).len(), 1);
+        assert!(!tab_modified(&app), "back to what was saved");
+        // A link dialog of a Markdown tab is not taken for this one.
+        ui.invoke_new_document(DocKind::Markdown.index() as i32);
+        ui.invoke_format(8);
+        assert!(ui.get_link_open());
+        ui.invoke_link_cancel();
+    }
+
+    #[test]
+    fn links_open_only_where_the_platform_allows_and_bookmarks_do_nothing() {
+        assert!(writer_ui::open_address("#section").is_ok());
+        assert!(matches!(
+            writer_ui::open_address("file:///etc/hosts"),
+            Err(aster_platform::links::OpenError::Refused)
+        ));
+    }
+
+    #[test]
+    fn a_picture_file_is_put_in_the_document_or_refused_with_the_reason() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "ab");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let path = std::path::Path::new("点.png");
+        let size = aster_shell::writer_tab::read_picture(&DOT_PNG).expect("a picture");
+        assert_eq!(size, (1, 1));
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::place_picture(ui, &mut shell, id, path, Ok((DOT_PNG.to_vec(), size)));
+        }
+        let text = with_doc(&app, |tab| tab.view.document().plain_text());
+        assert_eq!(text, "ab\u{FFFC}");
+        assert!(tab_modified(&app));
+        let dir = tempfile::tempdir().unwrap();
+        let read = save_and_read(&app, dir.path(), "图.docx");
+        let drawings = read
+            .paragraphs()
+            .iter()
+            .flat_map(|(_, p)| p.runs.iter())
+            .filter(|r| matches!(r.kind, aster_writer::Inline::Drawing(_)))
+            .count();
+        assert_eq!(drawings, 1);
+        // Undo takes it out and the tab is as saved before it.
+        ui.invoke_edit_undo();
+        assert_eq!(with_doc(&app, |tab| tab.view.document().plain_text()), "ab");
+        // Why not: the strings are the document's own.
+        type Said = fn(&i18n::Strings) -> &'static str;
+        let cases: [(aster_shell::writer_tab::PictureProblem, Said); 2] = [
+            (aster_shell::writer_tab::PictureProblem::NotAPicture, |s| {
+                s.doc_picture_failed_body
+            }),
+            (aster_shell::writer_tab::PictureProblem::TooLarge, |s| {
+                s.picture_too_large_body
+            }),
+        ];
+        for (problem, expected) in cases {
+            {
+                let mut shell = app.shell.borrow_mut();
+                writer_ui::place_picture(ui, &mut shell, id, path, Err(problem));
+            }
+            let strings = app.shell.borrow().language.strings();
+            assert_eq!(ui.get_dialog_kind(), 2);
+            assert_eq!(ui.get_dialog_body().as_str(), expected(strings));
+            assert!(ui.get_dialog_title().contains("点.png"));
+            ui.invoke_dialog_cancel();
+        }
+        assert!(
+            ui.get_dialog_kind() == 0,
+            "the message is dismissed for the next one"
+        );
+    }
+
+    #[test]
+    fn a_word_document_exports_as_a_pdf_file() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "你好 hello");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("导出.pdf");
+        // The dialog and the worker thread need the event loop; this is
+        // what the worker does with what the dialog gave.
+        let job = with_doc(&app, |tab| tab.pdf_job("导出"));
+        writer_ui::write_pdf(&job, &path).expect("it exports");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.starts_with(b"%PDF"),
+            "{:?}",
+            &bytes[..8.min(bytes.len())]
+        );
+        assert!(bytes.len() > 500);
+        // A folder that is not there is an error, as the export of a
+        // Markdown document reports it.
+        let missing = dir.path().join("无").join("x.pdf");
+        assert!(writer_ui::write_pdf(&job, &missing).is_err());
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::export_failed(ui, &mut shell, &missing, "disk".into());
+        }
+        assert_eq!(ui.get_dialog_kind(), 2);
+        assert_eq!(ui.get_dialog_body().as_str(), "disk");
+        ui.invoke_dialog_cancel();
+        // The suggestion for the dialog is the document's name with .pdf.
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let (existing, suggested) = app.shell.borrow_mut().save_target(id).unwrap();
+        assert!(existing.is_none());
+        assert_eq!(
+            suggested
+                .with_extension("pdf")
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("pdf")
+        );
+    }
+
+    #[test]
+    fn saving_keeps_the_undo_history_and_undoing_to_the_saved_state_clears_the_mark() {
+        let app = app();
+        let ui = &app.ui;
+        new_writer(&app);
+        type_text(ui, "one");
+        assert!(tab_modified(&app));
+        let dir = tempfile::tempdir().unwrap();
+        let read = save_and_read(&app, dir.path(), "存.docx");
+        assert_eq!(read.plain_text(), "one");
+        assert!(!tab_modified(&app));
+        assert!(
+            with_doc(&app, |tab| tab.view.can_undo()),
+            "saving keeps the history"
+        );
+        key(ui, Key::Return);
+        type_text(ui, "two");
+        assert!(tab_modified(&app));
+        // Undo goes back through typing and Enter to the saved text: the
+        // mark goes; one step further it is back.
+        ui.invoke_edit_undo();
+        ui.invoke_edit_undo();
+        assert_eq!(
+            with_doc(&app, |tab| tab.view.document().plain_text()),
+            "one"
+        );
+        assert!(!tab_modified(&app));
+        ui.invoke_edit_undo();
+        assert!(tab_modified(&app), "before the save is not the saved file");
+        ui.invoke_edit_redo();
+        assert!(!tab_modified(&app));
+        // Saving again goes on from the same bytes and writes what is there.
+        ui.invoke_edit_redo();
+        ui.invoke_edit_redo();
+        assert!(tab_modified(&app));
+        let read = save_and_read(&app, dir.path(), "存.docx");
+        assert_eq!(read.plain_text(), "one\ntwo");
+        assert!(!tab_modified(&app));
+        assert!(with_doc(&app, |tab| tab.view.can_undo()));
+    }
+
+    #[test]
+    fn every_language_has_the_words_for_tables_links_and_pictures() {
+        for language in Language::ALL {
+            let s = language.strings();
+            for text in [
+                s.table_delete_table,
+                s.table_dialog_title,
+                s.table_rows,
+                s.table_columns,
+                s.picture_too_large_body,
+                s.doc_picture_failed_body,
+            ] {
+                assert!(!text.is_empty(), "{}", language.tag());
+            }
+            let hint = i18n::fill(
+                &i18n::fill(s.link_follow, "key", "Cmd"),
+                "address",
+                "https://x.org/",
+            );
+            assert!(
+                hint.contains("Cmd") && hint.contains("https://x.org/"),
+                "{hint}"
+            );
+            assert!(!hint.contains('{'), "{hint}");
+        }
     }
 }

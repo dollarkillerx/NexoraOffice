@@ -103,6 +103,17 @@ pub fn export_doc_pdf(
     export(layout, document, info, true)
 }
 
+/// Lay `document` out afresh and export it: for a worker thread that has
+/// the document (cloning one is cheap) but not the view's layout. The same
+/// shaping fonts as the view's, so the pages are the ones on screen.
+pub fn export_document(document: &Document, info: &DocPdfInfo) -> Result<Vec<u8>, String> {
+    let mut shaper = aster_text::Shaper::new();
+    shaper.set_han_fallbacks(&crate::text_surface::HAN_FALLBACK_FAMILIES);
+    let mut layouter = aster_layout::Layouter::with_shaper(shaper);
+    let layout = layouter.layout(document);
+    export_doc_pdf(&layout, document, info)
+}
+
 /// Like [`export_doc_pdf`]; without compression the content streams, the
 /// ToUnicode maps and the document information can be read in the bytes.
 fn export(

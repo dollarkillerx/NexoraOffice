@@ -10,11 +10,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aster_platform::dialogs::{self, FileType};
 use aster_shell::recovery::{Candidate, RecordInfo};
 use aster_shell::tabs::TabId;
-use aster_shell::writer_tab::{DocSave, DocTab, Written, find_position};
+use aster_shell::writer_tab::{
+    DocPdf, DocSave, DocTab, PictureProblem, TableEdit, Written, find_position, read_picture,
+};
 use aster_storage::Contents;
-use aster_surface::doc_view::{Align, Break, DocCommand, Move};
+use aster_surface::doc_view::{Align, Break, Corner, DocCommand, Move};
 use slint::{ComponentHandle, SharedString, TimerMode};
 
 use super::{
@@ -29,8 +32,18 @@ const OUTLINE_INDENT: u8 = 8;
 /// sidebar's outline marking the heading the caret is under.
 pub(crate) fn after_move(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
+    sync_table_flag(ui, shell);
     sync_outline(ui, shell);
     present(ui, shell);
+}
+
+/// Tell the window whether the caret is in a table, for the menu's table
+/// items.
+fn sync_table_flag(ui: &AppWindow, shell: &mut Shell) {
+    let now = in_table(shell);
+    if ui.get_in_table() != now {
+        ui.set_in_table(now);
+    }
 }
 
 /// How long typing has to pause before the words are counted again.
@@ -41,6 +54,7 @@ const COUNT_DELAY: Duration = Duration::from_millis(500);
 /// and the picture.
 pub(crate) fn after_edit(ui: &AppWindow, shell: &mut Shell) {
     shell.wake_caret();
+    sync_table_flag(ui, shell);
     if shell.sync_modified() {
         refresh_tabs(ui, shell);
     }
@@ -179,8 +193,9 @@ pub(crate) fn pointer_down(
 ) {
     shell.doc_drag_at = None;
     shell.drag_timer.stop();
+    let primary = ui.get_pointer_primary();
     if let Some(tab) = shell.active_doc() {
-        tab.pointer_down(x, y, clicks.clamp(1, 3), shift);
+        tab.pointer_down_with(x, y, clicks.clamp(1, 3), shift, primary);
     }
     refresh_status(ui, shell);
     after_move(ui, shell);
@@ -236,7 +251,13 @@ pub(crate) fn pointer_up(ui: &AppWindow, shell: &mut Shell) {
     let Some(tab) = shell.active_doc() else {
         return;
     };
-    let Some(url) = tab.pointer_up() else {
+    let resizing = tab.view.is_resizing();
+    let link = tab.pointer_up();
+    if resizing {
+        // The resize is one step of undo, made now.
+        after_edit(ui, shell);
+    }
+    let Some(url) = link else {
         return;
     };
     // A link to a place in the document (`#name`) has no place to go to
@@ -245,7 +266,7 @@ pub(crate) fn pointer_up(ui: &AppWindow, shell: &mut Shell) {
         return;
     }
     // The same links as in the Markdown preview: web pages and e-mail only.
-    let refused = match aster_platform::links::open(&url) {
+    let refused = match open_address(&url) {
         Ok(()) => false,
         Err(aster_platform::links::OpenError::Refused) => true,
         Err(err) => {
@@ -262,19 +283,44 @@ pub(crate) fn pointer_up(ui: &AppWindow, shell: &mut Shell) {
 /// The pointer moved over the pages without a button down: an I-beam over a
 /// page, a hand over a link (cursors 4 and 5 in the window's numbers).
 pub(crate) fn hover(ui: &AppWindow, shell: &mut Shell, x: f64, y: f64) {
+    let primary = ui.get_pointer_primary();
     let Some(tab) = shell.active_doc() else {
         return;
     };
-    let cursor = if tab.view.link_at(x, y).is_some() {
-        5
-    } else if tab.view.is_over_page(x, y) {
-        4
+    let link = if tab.view.is_resizing() {
+        None
     } else {
-        0
+        tab.view.link_at(x, y)
     };
+    // The hand only with the key that opens links held; the corners of a
+    // selected picture show the shape of what dragging them does.
+    let cursor = match tab.view.handle_at(x, y) {
+        Some(Corner::TopLeft | Corner::BottomRight) => 6,
+        Some(Corner::TopRight | Corner::BottomLeft) => 7,
+        None if link.is_some() && primary => 5,
+        None if tab.view.is_over_page(x, y) => 4,
+        None => 0,
+    };
+    let hint_changed = tab.hover_link != link;
+    if hint_changed {
+        tab.hover_link = link;
+    }
     if cursor != ui.get_resize_cursor() {
         ui.set_resize_cursor(cursor);
     }
+    if hint_changed {
+        refresh_status(ui, shell);
+    }
+}
+
+/// Open a link's address: web pages and e-mail only, as in the Markdown
+/// preview; `#name` (a bookmark of the document) goes nowhere yet. Returns
+/// whether the address was refused.
+pub(crate) fn open_address(url: &str) -> Result<(), aster_platform::links::OpenError> {
+    if url.starts_with('#') {
+        return Ok(());
+    }
+    aster_platform::links::open(url)
 }
 
 /// The wheel or trackpad, in physical pixels.
@@ -408,6 +454,18 @@ pub(crate) fn status(ui: &AppWindow, strings: &'static i18n::Strings, tab: &DocT
     ui.set_status_format(format.into());
     ui.set_status_notice(if tab.link_refused {
         strings.notice_link_refused.into()
+    } else if let Some(address) = &tab.hover_link {
+        let key = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        i18n::fill(
+            &i18n::fill(strings.link_follow, "key", key),
+            "address",
+            address,
+        )
+        .into()
     } else {
         SharedString::new()
     });
@@ -626,6 +684,245 @@ pub(crate) fn find(ui: &AppWindow, shell: &mut Shell, action: FindAction) -> boo
     sync_outline(ui, shell);
     super::after_find(ui, shell, None);
     true
+}
+
+// --- Tables, links, pictures and the Format menu ---
+
+/// The Format menu's codes (see `format` in `ui/app.slint`) for a Word
+/// document: 8 link, 9 picture, 10 table, 30 to 35 and 39 the table's rows,
+/// columns and the table itself.
+pub(crate) fn format(ui: &AppWindow, shell: &mut Shell, code: i32) {
+    let edit = match code {
+        8 => return open_link_dialog(ui, shell),
+        9 => return insert_picture(ui, shell),
+        10 => return open_table_dialog(ui, shell),
+        30 => TableEdit::RowAbove,
+        31 => TableEdit::RowBelow,
+        32 => TableEdit::ColumnLeft,
+        33 => TableEdit::ColumnRight,
+        34 => TableEdit::DeleteRow,
+        35 => TableEdit::DeleteColumn,
+        39 => TableEdit::DeleteTable,
+        _ => return,
+    };
+    if shell.active_doc().is_some_and(|tab| tab.edit_table(edit)) {
+        after_edit(ui, shell);
+    }
+}
+
+/// Whether the caret of the Word document in front is in a table.
+pub(crate) fn in_table(shell: &mut Shell) -> bool {
+    shell
+        .active_doc()
+        .is_some_and(|tab| !tab.view.is_composing() && tab.view.in_table())
+}
+
+/// Open the link dialog on the selection or the link around the caret: its
+/// text and address as they are, or empty for a new link.
+pub(crate) fn open_link_dialog(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+        return;
+    };
+    if tab.view.is_composing() {
+        return;
+    }
+    let info = tab.link_info();
+    shell.doc_link_for = Some(id);
+    ui.set_link_image(false);
+    ui.set_link_label(info.text.into());
+    ui.set_link_address(info.target.unwrap_or_default().into());
+    ui.set_link_open(true);
+}
+
+/// OK in the link dialog of a Word document: the link is set (or taken off
+/// when the address is empty), one step of undo. False when the dialog was
+/// not for a Word document.
+pub(crate) fn accept_link(ui: &AppWindow, shell: &mut Shell) -> bool {
+    let Some(id) = shell.doc_link_for.take() else {
+        return false;
+    };
+    ui.set_link_open(false);
+    let text = ui.get_link_label().to_string();
+    let address = ui.get_link_address().to_string();
+    if let Some(Content::Doc(tab)) = shell.contents.get_mut(&id)
+        && tab.edit_link(&text, &address)
+    {
+        after_edit(ui, shell);
+    }
+    ui.invoke_focus_document();
+    true
+}
+
+/// Open the insert table dialog, three by three to start with.
+pub(crate) fn open_table_dialog(ui: &AppWindow, shell: &mut Shell) {
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+        return;
+    };
+    if tab.view.is_composing() {
+        return;
+    }
+    shell.doc_table_for = Some(id);
+    ui.set_table_rows("3".into());
+    ui.set_table_columns("3".into());
+    ui.set_table_open(true);
+}
+
+/// OK in the insert table dialog. Numbers that are not whole numbers, or
+/// are 0, keep the dialog open; larger ones than the limits are cut to them.
+pub(crate) fn accept_table(ui: &AppWindow, shell: &mut Shell) {
+    let number = |text: SharedString| text.trim().parse::<usize>().ok().filter(|n| *n > 0);
+    let (Some(rows), Some(columns)) = (number(ui.get_table_rows()), number(ui.get_table_columns()))
+    else {
+        return;
+    };
+    ui.set_table_open(false);
+    if let Some(id) = shell.doc_table_for.take()
+        && let Some(Content::Doc(tab)) = shell.contents.get_mut(&id)
+        && tab.insert_table(rows, columns)
+    {
+        after_edit(ui, shell);
+    }
+    ui.invoke_focus_document();
+}
+
+/// Ask for a picture file and put it in the document at the caret.
+pub(crate) fn insert_picture(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    if !shell
+        .active_doc()
+        .is_some_and(|tab| !tab.view.is_composing())
+    {
+        return;
+    }
+    let weak = ui.as_weak();
+    let _ = slint::spawn_local(async move {
+        let types = [FileType {
+            name: strings.file_type_picture,
+            extensions: &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"],
+        }];
+        let Some(path) = dialogs::pick_file_to_open(strings.insert_picture_dialog, &types).await
+        else {
+            return;
+        };
+        // Read and measured on a worker thread: a photo can be large.
+        std::thread::spawn(move || {
+            let read = std::fs::read(&path)
+                .map_err(|_| PictureProblem::NotAPicture)
+                .and_then(|bytes| read_picture(&bytes).map(|size| (bytes, size)));
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                deliver(
+                    ui,
+                    Box::new(move |ui, shell| place_picture(ui, shell, id, &path, read)),
+                );
+            });
+        });
+    });
+}
+
+/// A picture file has been read: put it in the document, or say why not.
+pub(crate) fn place_picture(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    path: &std::path::Path,
+    read: Result<(Vec<u8>, (u32, u32)), PictureProblem>,
+) {
+    let strings = shell.language.strings();
+    match read {
+        Ok((bytes, size)) => {
+            if let Some(Content::Doc(tab)) = shell.contents.get_mut(&id)
+                && tab.insert_picture(bytes, size)
+            {
+                after_edit(ui, shell);
+            }
+        }
+        Err(problem) => {
+            let title = i18n::fill(strings.picture_failed, "name", &files::display_name(path));
+            let body = match problem {
+                PictureProblem::NotAPicture => strings.doc_picture_failed_body,
+                PictureProblem::TooLarge => strings.picture_too_large_body,
+            };
+            show_dialog(ui, shell, 2, title, body.into());
+        }
+    }
+}
+
+// --- Export ---
+
+/// File, Export as PDF for the Word document in front: ask where to, then
+/// lay out and write on a worker thread, from a copy of the document taken
+/// now. Errors are reported as the Markdown export reports them.
+pub(crate) fn export_pdf(ui: &AppWindow, shell: &mut Shell) {
+    let strings = shell.language.strings();
+    let Some(id) = shell.tabs.active_id() else {
+        return;
+    };
+    let Some((existing, suggested)) = shell.save_target(id) else {
+        return;
+    };
+    let title = shell
+        .tabs
+        .get(id)
+        .map(|tab| tab.title.clone())
+        .unwrap_or_default();
+    let name = std::path::Path::new(&title)
+        .file_stem()
+        .map_or(title.clone(), |stem| stem.to_string_lossy().into_owned());
+    let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+        return;
+    };
+    let job = tab.pdf_job(&name);
+    let suggested = existing.unwrap_or(suggested).with_extension("pdf");
+    let weak = ui.as_weak();
+    let _ = slint::spawn_local(async move {
+        let types = [FileType {
+            name: strings.file_type_pdf,
+            extensions: &["pdf"],
+        }];
+        let Some(path) =
+            dialogs::pick_file_to_save(strings.menu_export_pdf, &suggested, &types).await
+        else {
+            return;
+        };
+        // Laying out and writing a long document takes a moment.
+        std::thread::spawn(move || {
+            if let Err(err) = write_pdf(&job, &path) {
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    deliver(
+                        ui,
+                        Box::new(move |ui, shell| export_failed(ui, shell, &path, err)),
+                    );
+                });
+            }
+        });
+    });
+}
+
+/// Lay the document out and write it as a PDF file at `path`.
+pub(crate) fn write_pdf(job: &DocPdf, path: &std::path::Path) -> Result<(), String> {
+    let bytes = job.bytes()?;
+    aster_storage::write_atomically(path, &bytes).map_err(|err| err.to_string())
+}
+
+/// Tell the user that the export to `path` failed.
+pub(crate) fn export_failed(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    path: &std::path::Path,
+    err: String,
+) {
+    let strings = shell.language.strings();
+    let title = i18n::fill(strings.export_failed, "name", &files::display_name(path));
+    show_dialog(ui, shell, 2, title, err);
 }
 
 // --- Saving ---

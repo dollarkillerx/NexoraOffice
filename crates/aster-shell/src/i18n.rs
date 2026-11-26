@@ -798,6 +798,15 @@ strings! {
     table_align_left,
     table_align_center,
     table_align_right,
+    /// The Format menu's table items for a Word document, the insert table
+    /// dialog, the pictures a Word document takes, and the hint over a link.
+    table_delete_table,
+    table_dialog_title,
+    table_rows,
+    table_columns,
+    picture_too_large_body,
+    doc_picture_failed_body,
+    link_follow,
 }
 
 impl Strings {
@@ -1381,6 +1390,13 @@ pub const ZH_HANS: Strings = Strings {
     table_align_left: "本列左对齐",
     table_align_center: "本列居中",
     table_align_right: "本列右对齐",
+    table_delete_table: "删除表格",
+    table_dialog_title: "插入表格",
+    table_rows: "行数",
+    table_columns: "列数",
+    picture_too_large_body: "这张图片的像素太多，无法插入。",
+    doc_picture_failed_body: "只能插入 PNG、JPEG、GIF、BMP 和 TIFF 图片。",
+    link_follow: "{key}+单击打开：{address}",
 };
 
 pub const JA: Strings = Strings {
@@ -1908,6 +1924,13 @@ pub const JA: Strings = Strings {
     table_align_left: "列を左揃え",
     table_align_center: "列を中央揃え",
     table_align_right: "列を右揃え",
+    table_delete_table: "表を削除",
+    table_dialog_title: "表の挿入",
+    table_rows: "行数",
+    table_columns: "列数",
+    picture_too_large_body: "この画像はピクセル数が多すぎて挿入できません。",
+    doc_picture_failed_body: "挿入できるのは PNG、JPEG、GIF、BMP、TIFF の画像だけです。",
+    link_follow: "{key} を押しながらクリックで開く：{address}",
 };
 
 pub const EN: Strings = Strings {
@@ -2435,6 +2458,13 @@ pub const EN: Strings = Strings {
     table_align_left: "Align Column Left",
     table_align_center: "Center Column",
     table_align_right: "Align Column Right",
+    table_delete_table: "Delete Table",
+    table_dialog_title: "Insert Table",
+    table_rows: "Rows",
+    table_columns: "Columns",
+    picture_too_large_body: "This picture has too many pixels to be inserted.",
+    doc_picture_failed_body: "Only PNG, JPEG, GIF, BMP and TIFF pictures can be inserted.",
+    link_follow: "{key}+click to open: {address}",
 };
 
 pub const ZH_HANT: Strings = Strings {
@@ -2955,6 +2985,13 @@ pub const ZH_HANT: Strings = Strings {
     table_align_left: "本欄靠左對齊",
     table_align_center: "本欄置中",
     table_align_right: "本欄靠右對齊",
+    table_delete_table: "刪除表格",
+    table_dialog_title: "插入表格",
+    table_rows: "列數",
+    table_columns: "欄數",
+    picture_too_large_body: "這張圖片的像素太多，無法插入。",
+    doc_picture_failed_body: "只能插入 PNG、JPEG、GIF、BMP 和 TIFF 圖片。",
+    link_follow: "{key}+點按以開啟：{address}",
 };
 
 pub const FR: Strings = Strings {
@@ -3475,6 +3512,13 @@ pub const FR: Strings = Strings {
     table_align_left: "Aligner la colonne à gauche",
     table_align_center: "Centrer la colonne",
     table_align_right: "Aligner la colonne à droite",
+    table_delete_table: "Supprimer le tableau",
+    table_dialog_title: "Insérer un tableau",
+    table_rows: "Lignes",
+    table_columns: "Colonnes",
+    picture_too_large_body: "Cette image compte trop de pixels pour être insérée.",
+    doc_picture_failed_body: "Seules les images PNG, JPEG, GIF, BMP et TIFF peuvent être insérées.",
+    link_follow: "{key}+clic pour ouvrir : {address}",
 };
 
 pub const DE: Strings = Strings {
@@ -3995,6 +4039,13 @@ pub const DE: Strings = Strings {
     table_align_left: "Spalte links ausrichten",
     table_align_center: "Spalte zentrieren",
     table_align_right: "Spalte rechts ausrichten",
+    table_delete_table: "Tabelle löschen",
+    table_dialog_title: "Tabelle einfügen",
+    table_rows: "Zeilen",
+    table_columns: "Spalten",
+    picture_too_large_body: "Dieses Bild hat zu viele Pixel, um eingefügt zu werden.",
+    doc_picture_failed_body: "Nur PNG-, JPEG-, GIF-, BMP- und TIFF-Bilder können eingefügt werden.",
+    link_follow: "{key}+Klick zum Öffnen: {address}",
 };
 
 pub const ES: Strings = Strings {
@@ -4515,6 +4566,13 @@ pub const ES: Strings = Strings {
     table_align_left: "Alinear columna a la izquierda",
     table_align_center: "Centrar columna",
     table_align_right: "Alinear columna a la derecha",
+    table_delete_table: "Eliminar tabla",
+    table_dialog_title: "Insertar tabla",
+    table_rows: "Filas",
+    table_columns: "Columnas",
+    picture_too_large_body: "Esta imagen tiene demasiados píxeles para insertarla.",
+    doc_picture_failed_body: "Solo se pueden insertar imágenes PNG, JPEG, GIF, BMP y TIFF.",
+    link_follow: "{key}+clic para abrir: {address}",
 };
 
 pub const KO: Strings = Strings {
@@ -5035,6 +5093,13 @@ pub const KO: Strings = Strings {
     table_align_left: "열 왼쪽 정렬",
     table_align_center: "열 가운데 정렬",
     table_align_right: "열 오른쪽 정렬",
+    table_delete_table: "표 삭제",
+    table_dialog_title: "표 삽입",
+    table_rows: "행",
+    table_columns: "열",
+    picture_too_large_body: "이 그림은 픽셀 수가 너무 많아 삽입할 수 없습니다.",
+    doc_picture_failed_body: "PNG, JPEG, GIF, BMP, TIFF 그림만 삽입할 수 있습니다.",
+    link_follow: "{key}+클릭하여 열기: {address}",
 };
 
 #[cfg(test)]

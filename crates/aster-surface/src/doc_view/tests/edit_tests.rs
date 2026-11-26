@@ -236,7 +236,8 @@ fn tab_types_a_tab_moves_lists_a_level_and_walks_table_cells() {
     assert!(view.tab(true));
     assert_eq!(level(&view), Some(0));
     assert_eq!(texts(&view)[0], "it\tem");
-    // Table: next and previous cells, the last cell stays.
+    // Table: next and previous cells; in the last cell a row is added
+    // (see `object_tests`).
     caret_at(&mut view, 0, 0);
     view.set_selection(cell_pos(1, 0, 0, 1), cell_pos(1, 0, 0, 1));
     assert!(view.tab(false));
@@ -246,7 +247,9 @@ fn tab_types_a_tab_moves_lists_a_level_and_walks_table_cells() {
     assert!(view.tab(true));
     assert_eq!(caret(&view), cell_pos(1, 0, 1, 0));
     view.set_selection(cell_pos(1, 1, 1, 1), cell_pos(1, 1, 1, 1));
-    assert!(!view.tab(false));
+    assert!(view.tab(false));
+    assert_eq!(caret(&view), cell_pos(1, 2, 0, 0));
+    assert!(view.undo());
     assert_eq!(caret(&view), cell_pos(1, 1, 1, 1));
     // Typing in a cell.
     view.type_text("!");

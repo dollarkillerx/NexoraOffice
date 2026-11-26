@@ -17,6 +17,7 @@ mod glyphs;
 pub mod host;
 pub mod md_picture;
 pub mod pdf;
+mod pdf_common;
 pub mod pdf_view;
 mod picture;
 pub mod preview;

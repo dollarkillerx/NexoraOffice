@@ -149,10 +149,7 @@ pub fn save(source: Vec<u8>, document: &Document) -> Result<Vec<u8>> {
     if !types_edit.is_empty() {
         let types = package.read(TYPES)?;
         let items = types_edit.concat();
-        replaced.insert(
-            TYPES.to_ascii_lowercase(),
-            append_to_root(&types, &items),
-        );
+        replaced.insert(TYPES.to_ascii_lowercase(), append_to_root(&types, &items));
     }
     if replaced.is_empty() && added.is_empty() {
         // Nothing changed: the file as it was.
@@ -372,13 +369,20 @@ impl<'a> Saver<'a> {
         let (open, close) = inner(element);
         let mut region = body.start + open..body.start + close;
         // The final section properties stay after everything.
-        let last = children(element).into_iter().rev().find(|c| c.name != "");
+        let last = children(element)
+            .into_iter()
+            .rev()
+            .find(|c| !c.name.is_empty());
         if let Some(last) = last
             && last.name == "sectPr"
         {
             region.end = body.start + last.start;
         }
-        let blocks = self.container(region.clone(), &self.original.body.blocks, &self.document.body.blocks);
+        let blocks = self.container(
+            region.clone(),
+            &self.original.body.blocks,
+            &self.document.body.blocks,
+        );
         let mut out = String::with_capacity(text.len());
         out.push_str(&text[..region.start]);
         out.push_str(&blocks);
@@ -416,7 +420,11 @@ impl<'a> Saver<'a> {
             .collect();
         let n = ranges.len();
         let gap = |g: usize| -> Range<usize> {
-            let start = if g == 0 { region.start } else { ranges[g - 1].end };
+            let start = if g == 0 {
+                region.start
+            } else {
+                ranges[g - 1].end
+            };
             let end = if g == n { region.end } else { ranges[g].start };
             start..end
         };
@@ -586,9 +594,9 @@ impl<'a> Saver<'a> {
                 RowHeight::AtLeast(h) => pr.push_str(&format!(
                     "<{w}trHeight {w}val=\"{h}\" {w}hRule=\"atLeast\"/>"
                 )),
-                RowHeight::Exactly(h) => pr.push_str(&format!(
-                    "<{w}trHeight {w}val=\"{h}\" {w}hRule=\"exact\"/>"
-                )),
+                RowHeight::Exactly(h) => {
+                    pr.push_str(&format!("<{w}trHeight {w}val=\"{h}\" {w}hRule=\"exact\"/>"))
+                }
             }
             if row.header {
                 pr.push_str(&format!("<{w}tblHeader/>"));
@@ -599,12 +607,7 @@ impl<'a> Saver<'a> {
             let mut column = row.grid_before as usize;
             for cell in &row.cells {
                 let span = cell.span.max(1) as usize;
-                let width: i32 = table
-                    .columns
-                    .iter()
-                    .skip(column)
-                    .take(span)
-                    .sum();
+                let width: i32 = table.columns.iter().skip(column).take(span).sum();
                 column += span;
                 out.push_str(&format!(
                     "<{w}tc><{w}tcPr><{w}tcW {w}w=\"{width}\" {w}type=\"dxa\"/>"
@@ -753,9 +756,7 @@ impl<'a> Saver<'a> {
             if span.start < at || span.end > limit || span.start >= span.end {
                 return None;
             }
-            if run.parent.is_some()
-                && (run.range.start < span.start || run.range.end > span.end)
-            {
+            if run.parent.is_some() && (run.range.start < span.start || run.range.end > span.end) {
                 return None;
             }
             at = span.end;
@@ -780,7 +781,12 @@ impl<'a> Saver<'a> {
                 ppr_old,
                 &osrc.props,
                 &model.props,
-                Some(self.document.styles.paragraph_look(model.props.style.as_deref()).0),
+                Some(
+                    self.document
+                        .styles
+                        .paragraph_look(model.props.style.as_deref())
+                        .0,
+                ),
                 &src_mark,
                 &model.mark,
                 &model.base,
@@ -840,7 +846,12 @@ impl<'a> Saver<'a> {
             let claim = run
                 .source
                 .as_ref()
-                .and_then(|s| index_of.get(&run_key(s)).copied().filter(|&i| *osrc.runs[i] == **s))
+                .and_then(|s| {
+                    index_of
+                        .get(&run_key(s))
+                        .copied()
+                        .filter(|&i| *osrc.runs[i] == **s)
+                })
                 .filter(|&i| i as isize > last);
             match claim {
                 Some(i) => {
@@ -1122,8 +1133,24 @@ impl<'a> Saver<'a> {
             };
         }
         field!(
-            font, east_asian_font, size, bold, italic, underline, strike, double_strike, color,
-            highlight, shading, position, caps, small_caps, hidden, spacing, scale, raise
+            font,
+            east_asian_font,
+            size,
+            bold,
+            italic,
+            underline,
+            strike,
+            double_strike,
+            color,
+            highlight,
+            shading,
+            position,
+            caps,
+            small_caps,
+            hidden,
+            spacing,
+            scale,
+            raise
         );
         look
     }
@@ -1167,8 +1194,6 @@ struct Unit {
     group: bool,
 }
 
-
-
 /// The paragraph is what the file had: the same properties, mark, section
 /// and runs, each as read.
 fn para_unchanged(model: &Paragraph, op: &Paragraph) -> bool {
@@ -1208,11 +1233,12 @@ fn same_structure(model: &Table, ot: &Table) -> bool {
 fn table_unchanged(model: &Table, ot: &Table) -> bool {
     same_structure(model, ot)
         && model.source == ot.source
-        && model
-            .rows
-            .iter()
-            .zip(&ot.rows)
-            .all(|(r, o)| r.cells.iter().zip(&o.cells).all(|(c, oc)| cell_unchanged(c, oc)))
+        && model.rows.iter().zip(&ot.rows).all(|(r, o)| {
+            r.cells
+                .iter()
+                .zip(&o.cells)
+                .all(|(c, oc)| cell_unchanged(c, oc))
+        })
 }
 
 fn cell_unchanged(cell: &aster_writer::Cell, ocell: &aster_writer::Cell) -> bool {
@@ -1401,7 +1427,11 @@ fn add_namespace(text: &str, prefix: &str, uri: &str) -> String {
                 break;
             };
             let end = start + end;
-            let insert = if text[..end].ends_with('/') { end - 1 } else { end };
+            let insert = if text[..end].ends_with('/') {
+                end - 1
+            } else {
+                end
+            };
             return format!(
                 "{} xmlns:{prefix}=\"{uri}\"{}",
                 &text[..insert],
@@ -1517,12 +1547,9 @@ fn numbering_new(lists: &[&List]) -> String {
 fn numbering_with(text: &str, lists: &[&List]) -> String {
     let (abstracts, nums) = list_elements(text, lists);
     let root = text
-        .find(|c: char| c == '<')
-        .and_then(|_| {
-            text.match_indices('<')
-                .map(|(i, _)| i)
-                .find(|&i| text[i + 1..].starts_with(|c: char| c.is_ascii_alphabetic()))
-        })
+        .match_indices('<')
+        .map(|(i, _)| i)
+        .find(|&i| text[i + 1..].starts_with(|c: char| c.is_ascii_alphabetic()))
         .unwrap_or(0);
     let (root_open, _) = inner(&text[root..]);
     let root_open = root + root_open;

@@ -100,11 +100,7 @@ pub fn is_balanced(xml: &str) -> bool {
     for token in tokens {
         match token {
             Tok::Open(name, _) => stack.push(name),
-            Tok::Close(name, _) => {
-                if stack.pop() != Some(name) {
-                    return false;
-                }
-            }
+            Tok::Close(name, _) if stack.pop() != Some(name) => return false,
             _ => {}
         }
     }

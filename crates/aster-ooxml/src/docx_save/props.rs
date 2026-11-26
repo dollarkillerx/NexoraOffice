@@ -183,17 +183,16 @@ fn toggle(w: &str, name: &str, on: bool) -> String {
 }
 
 fn val(w: &str, name: &str, value: impl std::fmt::Display) -> String {
-    format!("<{w}{name} {w}val=\"{}\"/>", escape_attribute(&value.to_string()))
+    format!(
+        "<{w}{name} {w}val=\"{}\"/>",
+        escape_attribute(&value.to_string())
+    )
 }
 
 /// Patch the typefaces of an `rFonts` element.
-fn fonts(
-    w: &str,
-    rpr: &str,
-    latin: Option<Option<&str>>,
-    east: Option<Option<&str>>,
-) -> String {
-    let mut element = child_text(rpr, "rFonts").map_or_else(|| format!("<{w}rFonts/>"), str::to_owned);
+fn fonts(w: &str, rpr: &str, latin: Option<Option<&str>>, east: Option<Option<&str>>) -> String {
+    let mut element =
+        child_text(rpr, "rFonts").map_or_else(|| format!("<{w}rFonts/>"), str::to_owned);
     if let Some(face) = latin {
         element = remove_attribute(&element, &format!("{w}asciiTheme"));
         element = remove_attribute(&element, &format!("{w}hAnsiTheme"));
@@ -300,11 +299,7 @@ pub fn rpr_patch(
         val(w, "color", new.color.map_or("auto".to_owned(), hex))
     );
     other!(spacing, "spacing", val(w, "spacing", new.spacing));
-    other!(
-        scale,
-        "w",
-        val(w, "w", (new.scale * 100.0).round() as i64)
-    );
+    other!(scale, "w", val(w, "w", (new.scale * 100.0).round() as i64));
     other!(
         raise,
         "position",
@@ -512,7 +507,9 @@ pub fn ppr_patch(
         *ppr = put(ppr, PPR_ORDER, name, &element);
     }
     if new.style != src.style {
-        set(&mut ppr, "pStyle",
+        set(
+            &mut ppr,
+            "pStyle",
             new.style
                 .as_deref()
                 .map_or(String::new(), |s| val(w, "pStyle", s)),

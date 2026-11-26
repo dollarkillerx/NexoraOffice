@@ -89,28 +89,6 @@ fn assert_well_formed(bytes: &[u8]) {
     }
 }
 
-fn describe(p: &aster_writer::Paragraph) -> String {
-    let runs: Vec<String> = p
-        .runs
-        .iter()
-        .map(|r| {
-            format!(
-                "{:?} {:.60?} {:?} {:?} {:?}",
-                r.text, r.kind, r.look, r.style, r.link
-            )
-        })
-        .collect();
-    format!(
-        "props {:?}\n  base {:?}\n  mark {:?}\n  label {:?} section {}\n  runs {}",
-        p.props,
-        p.base,
-        p.mark,
-        p.label,
-        p.section.is_some(),
-        runs.join("\n       ")
-    )
-}
-
 fn sample() -> Vec<u8> {
     docx_sample::sample()
 }
@@ -203,9 +181,16 @@ fn check(source: &[u8], edited: &Document, may_change: &[&str]) -> Vec<u8> {
     if !same_content(edited, &back) {
         let a: Vec<String> = edited.paragraphs().iter().map(|(_, p)| p.text()).collect();
         let b: Vec<String> = back.paragraphs().iter().map(|(_, p)| p.text()).collect();
-        let pairs: Vec<_> = edited.paragraphs().into_iter().zip(back.paragraphs()).collect();
+        let pairs: Vec<_> = edited
+            .paragraphs()
+            .into_iter()
+            .zip(back.paragraphs())
+            .collect();
         for ((path, x), (_, y)) in pairs {
-            if !same_blocks(&[Block::Paragraph(x.clone())], &[Block::Paragraph(y.clone())]) {
+            if !same_blocks(
+                &[Block::Paragraph(x.clone())],
+                &[Block::Paragraph(y.clone())],
+            ) {
                 eprintln!("paragraph {path:?} differs");
                 eprintln!("props equal: {}", x.props == y.props);
                 if x.props != y.props {
@@ -216,10 +201,26 @@ fn check(source: &[u8], edited: &Document, may_change: &[&str]) -> Vec<u8> {
                 eprintln!("label equal: {}", x.label == y.label);
                 eprintln!("runs: edited {} saved {}", x.runs.len(), y.runs.len());
                 for (i, (r, t)) in x.runs.iter().zip(&y.runs).enumerate() {
-                    if r.text != t.text || r.kind != t.kind || r.look != t.look || r.style != t.style || r.link != t.link {
-                        eprintln!("run {i}: edited {:?} {:.50?} style {:?} link {:?}", r.text, r.kind, r.style, r.link);
-                        eprintln!("       saved  {:?} {:.50?} style {:?} link {:?}", t.text, t.kind, t.style, t.link);
-                        eprintln!("       looks equal {}  edited {:?}\n       saved {:?}", r.look == t.look, r.look, t.look);
+                    if r.text != t.text
+                        || r.kind != t.kind
+                        || r.look != t.look
+                        || r.style != t.style
+                        || r.link != t.link
+                    {
+                        eprintln!(
+                            "run {i}: edited {:?} {:.50?} style {:?} link {:?}",
+                            r.text, r.kind, r.style, r.link
+                        );
+                        eprintln!(
+                            "       saved  {:?} {:.50?} style {:?} link {:?}",
+                            t.text, t.kind, t.style, t.link
+                        );
+                        eprintln!(
+                            "       looks equal {}  edited {:?}\n       saved {:?}",
+                            r.look == t.look,
+                            r.look,
+                            t.look
+                        );
                         break;
                     }
                 }
@@ -579,7 +580,12 @@ fn typing_inside_a_hyperlink_in_another_look_splits_it() {
         ]
     );
     // Both halves of the link point where it did, through one relationship.
-    assert_eq!(part(&saved, "word/_rels/document.xml.rels").matches("example.org").count(), 1);
+    assert_eq!(
+        part(&saved, "word/_rels/document.xml.rels")
+            .matches("example.org")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -722,10 +728,13 @@ fn bookmarks_comment_ranges_and_proofing_marks_survive_edits() {
 fn a_complex_field_is_kept_whole_when_typing_next_to_it() {
     let field = r#"<w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>7</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t xml:space="preserve"> of the end</w:t></w:r>"#;
     for (name, edit) in [
-        ("before the field", (|d: &mut Document| {
-            let at = after(d, "Page ");
-            insert_text(d, &at, "no. ", Some(&bold_at(d, &at)));
-        }) as fn(&mut Document)),
+        (
+            "before the field",
+            (|d: &mut Document| {
+                let at = after(d, "Page ");
+                insert_text(d, &at, "no. ", Some(&bold_at(d, &at)));
+            }) as fn(&mut Document),
+        ),
         ("after the field", |d| {
             let at = before(d, " of the");
             insert_text(d, &at, "!", Some(&bold_at(d, &at)));
@@ -743,7 +752,12 @@ fn a_complex_field_is_kept_whole_when_typing_next_to_it() {
         eprintln!("{name}");
         let (_, saved) = run_edit(field, edit);
         let xml = paragraph_xml(&saved);
-        for part in ["fldCharType=\"begin\"", "instrText", "fldCharType=\"separate\"", "fldCharType=\"end\""] {
+        for part in [
+            "fldCharType=\"begin\"",
+            "instrText",
+            "fldCharType=\"separate\"",
+            "fldCharType=\"end\"",
+        ] {
             assert!(xml.contains(part), "{name}: {part} lost");
         }
     }
@@ -772,7 +786,10 @@ fn typing_inside_a_content_control_stays_inside() {
     assert_eq!(xml.matches("<w:sdt>").count(), 1);
     assert_eq!(xml.matches("</w:sdtContent>").count(), 1);
     let sdt = &xml[xml.find("<w:sdtContent>").unwrap()..xml.find("</w:sdtContent>").unwrap()];
-    assert_eq!(sdt.matches("<w:p>").count() + sdt.matches("<w:p ").count(), 3);
+    assert_eq!(
+        sdt.matches("<w:p>").count() + sdt.matches("<w:p ").count(),
+        3
+    );
     // Removing everything in the control keeps the control.
     let xml = make(&|d| {
         let from = start_of(d, "inside");
@@ -857,7 +874,10 @@ fn new_lists_are_written_into_the_numbering_part() {
     set_list(&mut doc, &from, &from, Some(ListKind::Numbered));
     // The sample has numbered list 1 already: reused, nothing new.
     let saved = check(&bytes, &doc, &[]);
-    assert_eq!(parts(&saved)["word/numbering.xml"], parts(&bytes)["word/numbering.xml"]);
+    assert_eq!(
+        parts(&saved)["word/numbering.xml"],
+        parts(&bytes)["word/numbering.xml"]
+    );
     // A list of a new shape gets added.
     let mut doc = read(&bytes);
     let at = start_of(&doc, "Before the break");
@@ -873,7 +893,15 @@ fn the_blank_document_reads_and_a_typed_document_saves() {
     assert_well_formed(&bytes);
     let doc = read(&bytes);
     assert_eq!(doc.last_section.page, (11_906, 16_838));
-    for id in ["Normal", "Title", "Heading1", "Heading6", "ListParagraph", "Hyperlink", "TableGrid"] {
+    for id in [
+        "Normal",
+        "Title",
+        "Heading1",
+        "Heading6",
+        "ListParagraph",
+        "Hyperlink",
+        "TableGrid",
+    ] {
         assert!(doc.styles.get(id).is_some(), "{id}");
     }
     assert!(doc.settings.compress_punctuation);
@@ -898,7 +926,15 @@ fn the_blank_document_reads_and_a_typed_document_saves() {
     at = insert_text(&mut doc, &at, "one\ntwo\nthree", None);
     let first = Pos::new(Path::body(at.path.top() - 2), 0);
     set_list(&mut doc, &first, &at, Some(ListKind::Bullet));
-    let saved = check(&bytes, &doc, &["word/numbering.xml", "word/_rels/document.xml.rels", "[Content_Types].xml"]);
+    let saved = check(
+        &bytes,
+        &doc,
+        &[
+            "word/numbering.xml",
+            "word/_rels/document.xml.rels",
+            "[Content_Types].xml",
+        ],
+    );
     let back = read(&saved);
     assert_eq!(back.plain_text(), doc.plain_text());
     assert!(parts(&saved).contains_key("word/numbering.xml"));
@@ -913,7 +949,9 @@ fn the_blank_document_reads_and_a_typed_document_saves() {
 #[test]
 fn a_document_that_does_not_match_the_file_saves_without_panicking() {
     let bytes = sample();
-    let other = docx_doc::doc("<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p>").bytes();
+    let other =
+        docx_doc::doc("<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p>")
+            .bytes();
     // A document read from another file, saved over this one: its ranges mean
     // nothing here. It must not panic; the result reads back as that
     // document.
@@ -932,10 +970,13 @@ fn a_document_that_does_not_match_the_file_saves_without_panicking() {
     assert!(back.plain_text().contains("The quick brown fox"));
     // A document made from nothing.
     let mut empty = Document::default();
-    empty.body.blocks.push(Block::paragraph(aster_writer::Paragraph {
-        runs: vec![Run::text("made here", RunLook::default())],
-        ..Default::default()
-    }));
+    empty
+        .body
+        .blocks
+        .push(Block::paragraph(aster_writer::Paragraph {
+            runs: vec![Run::text("made here", RunLook::default())],
+            ..Default::default()
+        }));
     let saved = save(bytes, &empty).expect("saves");
     assert_well_formed(&saved);
     assert_eq!(read(&saved).plain_text(), "made here");
@@ -946,6 +987,132 @@ fn a_document_that_does_not_match_the_file_saves_without_panicking() {
 fn a_package_that_is_not_a_document_is_refused() {
     let doc = Document::default();
     assert!(save(b"not a zip".to_vec(), &doc).is_err());
+}
+
+#[test]
+fn sources_that_point_into_the_wrong_bytes_never_panic() {
+    let bytes = sample();
+    for shift in [1usize, 7, 5_000, 1_000_000] {
+        let mut doc = read(&bytes);
+        let paths: Vec<Path> = doc.paragraphs().into_iter().map(|(p, _)| p).collect();
+        for path in &paths {
+            let p = doc.paragraph_mut(path).unwrap();
+            let source = p.source.clone().unwrap();
+            let moved = |r: &std::ops::Range<usize>| r.start + shift..r.end + shift;
+            let runs: Vec<_> = source
+                .runs
+                .iter()
+                .map(|r| {
+                    Arc::new(aster_writer::RunSource {
+                        range: moved(&r.range),
+                        parent: r.parent.as_ref().map(moved),
+                        ..(**r).clone()
+                    })
+                })
+                .collect();
+            for (run, src) in p.runs.iter_mut().zip(&runs) {
+                run.source = Some(src.clone());
+            }
+            p.source = Some(Arc::new(aster_writer::ParaSource {
+                range: moved(&source.range),
+                runs,
+                ..(*source).clone()
+            }));
+        }
+        let at = after(&doc, "Introduction");
+        insert_text(&mut doc, &at, "!", None);
+        let at = after(&doc, "quick brown");
+        split_paragraph(&mut doc, &at);
+        let saved = save(bytes.clone(), &doc).expect("saves");
+        assert_well_formed(&saved);
+        let back = read(&saved);
+        assert_eq!(back.paragraphs().len(), doc.paragraphs().len());
+        assert!(back.plain_text().contains("Introduction!"));
+    }
+}
+
+#[test]
+fn a_byte_order_mark_and_empty_elements_are_handled() {
+    let mut d = docx_doc::doc(
+        "<w:p/><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:p><w:p><w:r><w:t>text</w:t></w:r></w:p>",
+    );
+    d.bom = true;
+    let bytes = d.bytes();
+    let mut doc = read(&bytes);
+    insert_text(
+        &mut doc,
+        &Pos::new(Path::body(0), 0),
+        "into an empty one",
+        None,
+    );
+    insert_text(&mut doc, &Pos::new(Path::body(1), 0), "centred", None);
+    let at = Pos::new(Path::body(2), 2);
+    split_paragraph(&mut doc, &at);
+    let saved = check(&bytes, &doc, &[]);
+    let xml = parts(&saved)["word/document.xml"].clone();
+    assert!(xml.starts_with(b"\xEF\xBB\xBF"));
+    assert_eq!(
+        read(&saved).plain_text(),
+        "into an empty one\ncentred\nte\nxt"
+    );
+}
+
+#[test]
+fn a_section_break_goes_with_its_paragraph_and_stays_when_it_is_split() {
+    let bytes = sample();
+    let count = |saved: &[u8]| {
+        part(saved, "word/document.xml")
+            .matches("<w:sectPr>")
+            .count()
+    };
+    let before = count(&bytes);
+    assert_eq!(before, 3);
+    // The empty paragraph that ends section one is taken into the paragraph
+    // before it: the break is carried by the joined paragraph.
+    let mut doc = read(&bytes);
+    let end = end_of(&doc, "After the break");
+    delete_forward(&mut doc, &end);
+    let saved = check(&bytes, &doc, &[]);
+    assert_eq!(count(&saved), 3);
+    // The paragraph that ends section one is taken into the one after it:
+    // that one has no break, so the break is gone.
+    let mut doc = read(&bytes);
+    let end = end_of(&doc, "After the break");
+    let next = {
+        let mut path = end.path.clone();
+        *path.0.last_mut().unwrap() += 1;
+        Pos::new(path, 0)
+    };
+    let after_it = {
+        let mut path = next.path.clone();
+        *path.0.last_mut().unwrap() += 1;
+        Pos::new(path, 0)
+    };
+    delete(&mut doc, &next, &after_it);
+    assert_eq!(doc.sections().len(), 2);
+    // (The line grid of the section that is gone changes what spacing in
+    // lines comes to for the paragraphs in it; the model does not follow, so
+    // the content is not compared here.)
+    let saved = save(bytes.clone(), &doc).expect("saves");
+    assert_well_formed(&saved);
+    assert_eq!(count(&saved), 2);
+    assert_eq!(read(&saved).sections().len(), 2);
+    assert_eq!(read(&saved).plain_text(), doc.plain_text());
+    // Enter at the end of the paragraph with the break: the break moves to
+    // the new paragraph.
+    let mut doc = read(&bytes);
+    let at = Pos::new(
+        {
+            let mut path = end_of(&doc, "After the break").path;
+            *path.0.last_mut().unwrap() += 1;
+            path
+        },
+        0,
+    );
+    split_paragraph(&mut doc, &at);
+    let saved = check(&bytes, &doc, &[]);
+    assert_eq!(count(&saved), 3);
+    assert_eq!(read(&saved).sections().len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,7 +1170,11 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
         6 | 7 => {
             let b = random_pos(doc, rng);
             // Keep ranges short most of the time.
-            let b = if rng.below(4) == 0 || a.path == b.path { b } else { a.clone() };
+            let b = if rng.below(4) == 0 || a.path == b.path {
+                b
+            } else {
+                a.clone()
+            };
             delete(doc, &a, &b);
         }
         8 | 9 => {
@@ -1062,11 +1233,10 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
             // The text in a text box reads with the table style of the cell
             // it ends up in, which the model does not follow: no text boxes
             // into cells here.
-            let drawing = part.iter().filter_map(Block::as_paragraph).any(|p| {
-                p.runs
-                    .iter()
-                    .any(|r| matches!(r.kind, Inline::Drawing(_)))
-            });
+            let drawing = part
+                .iter()
+                .filter_map(Block::as_paragraph)
+                .any(|p| p.runs.iter().any(|r| matches!(r.kind, Inline::Drawing(_))));
             if !(drawing && c.path.0.len() > 1) {
                 insert_fragment(doc, &c, &part);
             }
@@ -1075,7 +1245,12 @@ fn random_edit(doc: &mut Document, rng: &mut Rng, log: &mut Vec<String>) {
             insert_break(doc, &a, [Break::Line, Break::Page][rng.below(2)]);
         }
         16 => {
-            set_line_spacing(doc, &a, &a, LineSpacing::Multiple(1.0 + rng.below(3) as f32 * 0.25));
+            set_line_spacing(
+                doc,
+                &a,
+                &a,
+                LineSpacing::Multiple(1.0 + rng.below(3) as f32 * 0.25),
+            );
             set_space_after(doc, &a, &a, rng.below(300) as i32);
         }
         _ => {
@@ -1113,10 +1288,13 @@ fn random_edits_save_and_read_back() {
             continue;
         }
         let numbering = doc.numbering.lists.len() > read(&bytes).numbering.lists.len();
-        let may: &[&str] = if numbering { &["word/numbering.xml"] } else { &[] };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check(&bytes, &doc, may)
-        }));
+        let may: &[&str] = if numbering {
+            &["word/numbering.xml"]
+        } else {
+            &[]
+        };
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&bytes, &doc, may)));
         if let Err(err) = result {
             eprintln!("seed {seed} failed after {steps} edits: {log:#?}");
             std::panic::resume_unwind(err);

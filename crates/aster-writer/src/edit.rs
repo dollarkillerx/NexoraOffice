@@ -642,13 +642,7 @@ fn clear_between(
     }
 }
 
-fn clear_cell(
-    blocks: &mut Vec<Block>,
-    prefix: &[u32],
-    f: &Pos,
-    t: &Pos,
-    moved: &mut Vec<Run>,
-) {
+fn clear_cell(blocks: &mut Vec<Block>, prefix: &[u32], f: &Pos, t: &Pos, moved: &mut Vec<Run>) {
     let mut k = 0;
     while k < blocks.len() {
         let mut here = prefix.to_vec();
@@ -973,8 +967,24 @@ fn rebased(base: &RunLook, old: &RunLook, new: &RunLook, defaults: &RunLook) -> 
         };
     }
     field!(
-        font, east_asian_font, size, bold, italic, underline, strike, double_strike, color,
-        highlight, shading, position, caps, small_caps, hidden, spacing, scale, raise
+        font,
+        east_asian_font,
+        size,
+        bold,
+        italic,
+        underline,
+        strike,
+        double_strike,
+        color,
+        highlight,
+        shading,
+        position,
+        caps,
+        small_caps,
+        hidden,
+        spacing,
+        scale,
+        raise
     );
     out
 }

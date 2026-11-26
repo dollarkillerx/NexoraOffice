@@ -215,6 +215,8 @@ pub(crate) struct Cx<'a> {
     pub grid: Option<f32>,
     pub max_object: f32,
     pub background: Option<[u8; 4]>,
+    /// Cells covered by a vertical merge, and where their places are.
+    pub redirects: Vec<(Path, Path)>,
     pub page_values: Option<PageValues>,
 }
 
@@ -236,6 +238,9 @@ fn same_box(a: &Paragraph, b: &Paragraph) -> bool {
         && a.props.first_line == b.props.first_line
 }
 
+/// What automatic paragraph spacing comes to, twips.
+const AUTO_SPACE: i32 = 280;
+
 /// The space between two paragraphs, and whether it is dropped.
 pub(crate) fn gap(prev: &Paragraph, next: &Paragraph) -> f32 {
     let same_style = prev.props.style == next.props.style;
@@ -249,6 +254,12 @@ pub(crate) fn gap(prev: &Paragraph, next: &Paragraph) -> f32 {
     } else {
         next.props.space_before
     };
+    // Space that the file asks for as "automatic" (HTML-style) is 14 points,
+    // and two of them next to each other do not add up: the model keeps no
+    // flag for it, so two 14-point spaces are taken as that.
+    if after == AUTO_SPACE && before == AUTO_SPACE {
+        return pt(AUTO_SPACE);
+    }
     pt(after.max(0)) + pt(before.max(0))
 }
 

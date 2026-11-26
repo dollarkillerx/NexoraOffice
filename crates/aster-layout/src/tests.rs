@@ -589,6 +589,7 @@ fn tall_table(rows: usize, header: bool) -> Block {
     for i in 0..rows {
         all.push(Row {
             cells: vec![cell(&format!("row {i}\nsecond line\nthird"))],
+            cant_split: true,
             ..Row::default()
         });
     }
@@ -2032,4 +2033,129 @@ fn wave_and_dotted_underlines_keep_their_kind() {
     assert_eq!(kind_of(UnderlineStyle::Dotted), LineKind::Dotted);
     assert_eq!(kind_of(UnderlineStyle::Dashed), LineKind::Dashed);
     assert_eq!(kind_of(UnderlineStyle::Single), LineKind::Solid);
+}
+
+#[test]
+fn cells_covered_by_a_vertical_merge_stand_for_the_start_cell() {
+    let start = Cell {
+        blocks: vec![pb("merged text")],
+        merge: VMerge::Start,
+        ..Cell::default()
+    };
+    let covered = |text: &str| Cell {
+        blocks: vec![pb(text)],
+        merge: VMerge::Continue,
+        ..Cell::default()
+    };
+    let rows = vec![
+        Row {
+            cells: vec![start, cell("a")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![covered(""), cell("b")],
+            ..Row::default()
+        },
+        Row {
+            cells: vec![covered(""), cell("c")],
+            ..Row::default()
+        },
+    ];
+    let layout = lay(&doc(vec![table(vec![2_000, 2_000], rows)]));
+    let at_start = layout.caret(&cell_pos(0, 0, 0)).unwrap();
+    for row in [1, 2] {
+        let caret = layout
+            .caret(&cell_pos(0, row, 0))
+            .expect("a caret in a covered cell");
+        assert_eq!((caret.x, caret.top), (at_start.x, at_start.top));
+        assert_eq!(layout.page_of(&cell_pos(0, row, 0)), Some(0));
+        assert!(layout.line_start(&cell_pos(0, row, 0)).is_some());
+    }
+    // What the queries hand out always has a caret.
+    let mut pos = cell_pos(0, 0, 1);
+    for _ in 0..6 {
+        pos = layout.below(&pos, at_start.x + 60.0).unwrap_or(pos);
+        assert!(layout.caret(&pos).is_some());
+    }
+    for y in [0.0, 25.0, 60.0, 90.0] {
+        let hit = layout.hit(0, 30.0, y).unwrap();
+        assert!(layout.caret(&hit).is_some());
+    }
+}
+
+#[test]
+fn text_continues_below_a_float_on_the_same_page() {
+    let mut f = float_at(Wrap::Square, false);
+    f.y.at = FloatAt::Offset(15 * 12_700);
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("first\nsecond", look()),
+        picture(40.0, 30.0, Some(f)),
+        Run::text("\nthird\nfourth\nfifth", look()),
+    ];
+    let layout = lay(&doc(vec![Block::paragraph(p)]));
+    assert_eq!(layout.pages.len(), 1);
+    let end = layout.caret(&Pos::new(Path::body(0), 28)).unwrap();
+    assert!(end.top < 100.0, "{end:?}");
+}
+
+#[test]
+fn a_row_may_split_between_pages_unless_it_cannot() {
+    let lines = (0..8)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let build = |cant_split: bool| {
+        let mut blocks = numbered(12);
+        blocks.push(table(
+            vec![4_000],
+            vec![Row {
+                cells: vec![cell(&lines)],
+                cant_split,
+                ..Row::default()
+            }],
+        ));
+        doc(blocks)
+    };
+    let path = Path::body(12).cell_block(0, 0, 0);
+    let free = lay(&build(false));
+    let parts = lines_of(&free, &path);
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert_eq!(parts.iter().map(|p| p.1).sum::<usize>(), 8);
+    let kept = lay(&build(true));
+    assert_eq!(lines_of(&kept, &path).len(), 1);
+}
+
+#[test]
+fn the_paragraph_mark_counts_in_the_last_line_and_a_picture_line_is_not_stretched() {
+    let height = |mark: f32| {
+        let mut p = paragraph("a");
+        p.mark.size = mark;
+        let layout = lay(&doc(vec![Block::paragraph(p), pb("next")]));
+        caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
+    };
+    assert!(height(24.0) > height(10.0) + 8.0);
+    // Spacing 1.5 stretches the text, not the picture in the line.
+    let step = |multiple: f32| {
+        let mut p = paragraph("");
+        p.runs = vec![picture(20.0, 100.0, None)];
+        p.props.line = LineSpacing::Multiple(multiple);
+        let layout = lay(&doc(vec![Block::paragraph(p), pb("next")]));
+        caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
+    };
+    assert!(step(1.5) - step(1.0) < 10.0, "{} {}", step(1.5), step(1.0));
+}
+
+#[test]
+fn automatic_spacing_of_neighbours_does_not_add_up() {
+    let gap = |a: i32, b: i32| {
+        let layout = lay(&doc(vec![
+            with("one", |p| p.space_after = a),
+            with("two", |p| p.space_before = b),
+        ]));
+        caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
+    };
+    let base = gap(0, 0);
+    assert!((gap(280, 280) - base - 14.0).abs() < 0.01);
+    assert!((gap(200, 280) - base - 24.0).abs() < 0.01);
 }

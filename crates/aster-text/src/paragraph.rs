@@ -240,6 +240,14 @@ pub struct Natural {
     pub ratio: f32,
 }
 
+/// The paragraph mark's look.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub style: Style,
+    /// As [`Extra::base_natural`].
+    pub natural: Option<f32>,
+}
+
 /// What a word processor adds to a paragraph. Lengths are in logical pixels
 /// (they are multiplied by [`Spec::scale`]).
 #[derive(Clone, Debug)]
@@ -270,6 +278,8 @@ pub struct Extra<'a> {
     pub scaling: &'a [Scaling],
     /// The same for an empty line.
     pub base_natural: Option<f32>,
+    /// The paragraph mark: its look counts in the height of the last line.
+    pub mark: Option<Mark>,
     /// Lines are rounded up to whole multiples of this, the text centred
     /// (the grid of East Asian documents).
     pub grid: Option<f32>,
@@ -299,6 +309,7 @@ impl Default for Extra<'_> {
             above: &[],
             scaling: &[],
             base_natural: None,
+            mark: None,
             grid: None,
             distribute: false,
             snap: true,
@@ -533,17 +544,27 @@ impl Shaper {
 
     /// The font metrics `style` has: what an empty line of it is as high as.
     fn probe(&mut self, spec: &Spec<'_>, ratio: Option<f32>) -> Option<(f32, f32, f32)> {
+        self.probe_style(spec, &spec.base, ratio)
+    }
+
+    fn probe_style(
+        &mut self,
+        spec: &Spec<'_>,
+        style: &Style,
+        ratio: Option<f32>,
+    ) -> Option<(f32, f32, f32)> {
         let probe = Spec {
             text: " ",
             spans: &[],
             width: None,
+            base: style.clone(),
             ..spec.clone()
         };
         let laid = self.lay_out_with(&probe, &Extra::default());
         let face = laid.faces.first()?;
         Some(scaled_metrics(
             (face.ascent, face.descent, face.leading),
-            ratio.map(|r| r * spec.base.size * spec.scale),
+            ratio.map(|r| r * style.size * spec.scale),
         ))
     }
 
@@ -801,7 +822,14 @@ impl Shaper {
         });
         let line_factor = spec.line_height;
         let mut top = 0.0;
-        for line in broken {
+        // The paragraph mark sits at the end of the last line and counts in
+        // its height.
+        let mark = match &extra.mark {
+            Some(mark) if !text.is_empty() => self.probe_style(spec, &mark.style, mark.natural),
+            _ => None,
+        };
+        let last_line = broken.len().saturating_sub(1);
+        for (line_number, line) in broken.into_iter().enumerate() {
             let (mut ascent, mut descent, mut size) = (0.0f32, 0.0f32, 0.0f32);
             let (mut leading, mut up, mut down, mut object) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
             for index in line.clusters.clone() {
@@ -835,6 +863,16 @@ impl Shaper {
                     down = down.max(fd - rise);
                 }
             }
+            if let Some((ma, md, ml)) = mark
+                && line_number == last_line
+                && !ends_in_break
+            {
+                ascent = ascent.max(ma);
+                descent = descent.max(md);
+                leading = leading.max(ml);
+                up = up.max(ma);
+                down = down.max(md);
+            }
             if size == 0.0 {
                 size = spec.base.size * scale;
             }
@@ -849,7 +887,7 @@ impl Shaper {
                 let baseline = round((height - (ascent + descent)) / 2.0 + ascent);
                 grid_fit(grid, height, baseline)
             } else {
-                line_extent(rule, grid, round, up.max(object), down, leading, scale)
+                line_extent(rule, grid, round, up.max(object), down, leading, scale, up)
             };
             let width = from_fx(line.width);
             paragraph.width = paragraph.width.max(width);
@@ -881,7 +919,7 @@ impl Shaper {
                     (height, round(height / 2.0 + size * 0.3))
                 }
                 Some((ascent, descent, leading)) => {
-                    line_extent(rule, grid, round, ascent, descent, leading, scale)
+                    line_extent(rule, grid, round, ascent, descent, leading, scale, ascent)
                 }
             };
             let line = LineBox {
@@ -930,6 +968,7 @@ fn scaled_metrics(m: (f32, f32, f32), target: Option<f32>) -> (f32, f32, f32) {
 
 /// The height of a line and where its baseline is in it, from the largest
 /// ascent (with what is raised), descent and line gap on it.
+#[allow(clippy::too_many_arguments)]
 fn line_extent(
     rule: LineRule,
     grid: Option<f32>,
@@ -938,6 +977,7 @@ fn line_extent(
     descent: f32,
     leading: f32,
     scale: f32,
+    font_ascent: f32,
 ) -> (f32, f32) {
     let natural = ascent + descent + leading;
     if let Some(pitch) = grid
@@ -959,8 +999,11 @@ fn line_extent(
     let (height, baseline) = match rule {
         LineRule::Legacy => (natural, ascent + leading / 2.0),
         LineRule::Multiple(multiple) => {
-            let height = natural * multiple.max(0.0);
-            (height, height - descent - leading / 2.0)
+            // A picture in the line is not stretched by the spacing, only
+            // the text's own height is.
+            let text = font_ascent.min(ascent) + descent + leading;
+            let height = natural + text * (multiple.max(0.0) - 1.0);
+            (height.max(0.0), height.max(0.0) - descent - leading / 2.0)
         }
         LineRule::AtLeast(least) => {
             let height = natural.max(least * scale);

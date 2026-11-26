@@ -609,6 +609,10 @@ pub(crate) fn shape(
     };
     let grid_fit = grid;
     let base_natural = builder_base_natural;
+    let mark = (para.mark != *base_look && !text.is_empty()).then(|| aster_text::Mark {
+        style: text_style(builder.families, &para.mark, false, builder.background),
+        natural: builder.families.ratio(&para.mark, ""),
+    });
     let text_width = width.max(1.0);
     let spec = Spec {
         text: &text,
@@ -634,6 +638,7 @@ pub(crate) fn shape(
         above: &builder.above,
         scaling: &builder.scaling,
         base_natural,
+        mark,
         grid: grid_fit,
         distribute: props.align == Align::Distribute,
         snap: false,

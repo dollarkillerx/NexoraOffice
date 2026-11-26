@@ -339,6 +339,44 @@ fn pictures_made_here_are_stored_once_and_can_float() {
 }
 
 #[test]
+fn a_picture_pasted_from_another_file_is_that_picture_not_the_one_at_its_place() {
+    // Two files laid out alike, with different images at the same place.
+    let a = file(&inline_run());
+    let mut d = docx_doc::doc(&format!(
+        r#"<w:p><w:r><w:t xml:space="preserve">before </w:t></w:r>{}<w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p>"#,
+        inline_run()
+    ))
+    .rel("rIdImg", "image", "media/pic.png");
+    d.binary
+        .push(("word/media/pic.png".to_owned(), docx_sample::png(40, 40)));
+    let b = d.bytes();
+    let doc_a = read(&a);
+    let mut doc_b = read(&b);
+    let from = Pos::new(Path::body(0), "before ".len());
+    let to = Pos::new(Path::body(0), "before ".len() + OBJECT.len());
+    let fragment = fragment(&doc_a, &from, &to);
+    insert_fragment(&mut doc_b, &Pos::new(Path::body(1), 3), &fragment);
+    let bytes = save(b.clone(), &doc_b).unwrap();
+    let back = read(&bytes);
+    let image_of = |doc: &Document, block: usize, offset: usize| match &drawing_at(
+        doc,
+        &Pos::new(Path::body(block), offset),
+    )
+    .unwrap()
+    .content
+    {
+        aster_writer::DrawingContent::Picture(p) => p.image.clone(),
+        other => panic!("{other:?}"),
+    };
+    let mine: Arc<[u8]> = Arc::from(docx_sample::png(24, 12));
+    assert_eq!(image_of(&back, 1, 3), mine);
+    assert_eq!(
+        &*image_of(&back, 0, "before ".len()),
+        &*docx_sample::png(40, 40)
+    );
+}
+
+#[test]
 fn a_picture_that_was_not_changed_is_the_file_it_was() {
     for run in [inline_run(), anchor_run()] {
         let bytes = file(&run);

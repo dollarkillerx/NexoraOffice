@@ -1203,7 +1203,15 @@ impl<'a> Saver<'a> {
         let origin = run
             .source
             .as_ref()
-            .and_then(|s| self.runs.get(&run_key(s)).copied().filter(|o| **o == **s));
+            .and_then(|s| self.runs.get(&run_key(s)).copied().filter(|o| **o == **s))
+            // A drawing pasted from another file that happens to have the
+            // same place in its file is not the drawing found here.
+            .filter(
+                |origin| match (&run.kind, self.drawings.get(&run_key(origin))) {
+                    (Inline::Drawing(now), Some(then)) => then.content == now.content,
+                    _ => true,
+                },
+            );
         match origin {
             Some(origin) => self.run_from_origin(run, origin, base),
             None => self.run_from_model(run, base),

@@ -370,3 +370,113 @@ fn a_table_that_was_not_changed_is_the_file_it_was() {
     let doc = read(&bytes);
     assert_eq!(save(bytes.clone(), &doc).unwrap(), bytes);
 }
+
+// -- random sequences ----------------------------------------------------------------
+
+/// Every part is well-formed XML with one root.
+fn assert_well_formed(bytes: &[u8]) {
+    for (name, data) in parts(bytes) {
+        if !(name.ends_with(".xml") || name.ends_with(".rels")) {
+            continue;
+        }
+        let mut reader = quick_xml::Reader::from_reader(data.as_slice());
+        let (mut depth, mut roots) = (0i32, 0);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Start(_)) => {
+                    roots += i32::from(depth == 0);
+                    depth += 1;
+                }
+                Ok(quick_xml::events::Event::Empty(_)) => roots += i32::from(depth == 0),
+                Ok(quick_xml::events::Event::End(_)) => depth -= 1,
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(err) => panic!("{name} is not well-formed: {err}"),
+            }
+        }
+        assert_eq!((depth, roots), (0, 1), "{name}");
+    }
+}
+
+#[test]
+fn random_sequences_of_table_edits_save_and_read_back() {
+    let bytes = crafted();
+    let mut seed = 99u64;
+    let mut next = |n: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let mut saved_count = 0;
+    for round in 0..150 {
+        let mut doc = read(&bytes);
+        let mut log = Vec::new();
+        for _ in 0..1 + next(6) {
+            let t = table(&doc);
+            let r1 = next(t.rows.len());
+            let r2 = next(t.rows.len());
+            let a = cell_pos(r1, next(t.rows[r1].cells.len()));
+            let b = cell_pos(r2, next(t.rows[r2].cells.len()));
+            let op = next(12);
+            log.push(op);
+            match op {
+                0 | 1 => {
+                    merge_cells(&mut doc, &a, &b);
+                }
+                2 => {
+                    unmerge_cell(&mut doc, &a);
+                }
+                3 => {
+                    split_cell(&mut doc, &a, 1 + next(3), 1 + next(3));
+                }
+                4 => {
+                    insert_columns(&mut doc, &a, &b, next(2) == 0);
+                }
+                5 => {
+                    insert_rows(&mut doc, &a, &b, next(2) == 0);
+                }
+                6 => {
+                    delete_columns(&mut doc, &a, &b);
+                }
+                7 => {
+                    delete_rows(&mut doc, &a, &b);
+                }
+                8 | 9 => {
+                    move_column_border(&mut doc, &Path::body(1), next(6), next(800) as i32 - 400);
+                }
+                10 => {
+                    set_row_height(&mut doc, &a, &b, RowHeight::AtLeast(next(900) as i32));
+                }
+                _ => {
+                    set_column_width(&mut doc, &Path::body(1), next(4), 300 + next(3000) as i32);
+                }
+            }
+            if !matches!(doc.body.blocks.get(1), Some(Block::Table(_))) {
+                break;
+            }
+        }
+        if !matches!(doc.body.blocks.get(1), Some(Block::Table(_))) {
+            continue;
+        }
+        let out =
+            save(bytes.clone(), &doc).unwrap_or_else(|e| panic!("round {round} {log:?}: {e}"));
+        assert_well_formed(&out);
+        let back = read(&out);
+        assert!(
+            same_content(&doc, &back),
+            "round {round} {log:?}\n{}",
+            main_xml(&out)
+        );
+        check_table(table(&back)).unwrap();
+        assert_widths_agree(&main_xml(&out));
+        // Saving what was read again changes nothing.
+        assert_eq!(
+            save(out.clone(), &back).unwrap(),
+            out,
+            "round {round} {log:?}"
+        );
+        saved_count += 1;
+    }
+    assert!(saved_count > 100);
+}

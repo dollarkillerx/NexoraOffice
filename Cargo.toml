@@ -94,7 +94,7 @@ sys-locale = "0.3.2"
 # Pictures on the macOS clipboard (NSPasteboard), for pasting them into
 # Markdown documents. The same versions winit and rfd already use.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString", "NSURL"] }
 # Moving files to the system trash rather than deleting them.
 trash = { version = "5.4", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"] }
 # JSON for the tool layer, MCP and the AI providers' wire formats.

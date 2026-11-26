@@ -62,6 +62,7 @@ Apple M6，macOS 27.0.1，2026-11-22，版本 0.0.1。
 - **Windows 安装程序**。目前只有压缩包，可执行文件也没有嵌入图标。
 - **macOS 图标留白**。现在用的是通用图标，没有按 macOS 的图标规范另出一版。
 - **许可证全文**。随包分发的只有包名、版本和许可证名称的清单。多数许可证要求附带全文，正式发布前要补上。
+- **文档类型**。`macos-document-types.plist` 是 `Info.plist` 里 `CFBundleDocumentTypes` 与 `UTImportedTypeDeclarations` 的片段（所有类型的 `LSHandlerRank` 都是 `Alternate`，不会成为默认应用），`spikes/bundle-macos.sh` 的 `documents` 选项已经在用。现在被打包的 Demo 不能打开文档，所以 `macos.sh` 没有包含它；安装包换成 `aster-shell` 时必须把它写进 `Info.plist`。
 - **应用标识**。`dev.aster.office.preview` 是占位符，要换成我们自己域名下的标识。
 - **内置字体**。还没有打进包里，所以体积数字不含那 45 到 60 MB。
 - **自动更新**和**通用二进制**（同时支持 Intel 和 Apple 芯片的 Mac）。

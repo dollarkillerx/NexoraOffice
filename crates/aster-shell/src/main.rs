@@ -5185,6 +5185,37 @@ fn select_backend() -> Result<(), slint::PlatformError> {
     selector.select()
 }
 
+/// Open the files the system sends to the running application (Finder's
+/// double click and "Open With", a drop on the Dock icon) the way files from
+/// the open dialog are opened. Requests that came before this, while the
+/// window was being made, are opened now; `command_line` files are not
+/// opened twice.
+fn receive_system_open_requests(ui: &AppWindow, command_line: &[PathBuf]) {
+    use aster_platform::open_requests;
+    if !open_requests::install() {
+        return;
+    }
+    let weak = ui.as_weak();
+    open_requests::requests().attach(
+        move |paths| {
+            let _ = weak.upgrade_in_event_loop(move |ui| open_from_system(&ui, paths));
+        },
+        command_line,
+    );
+}
+
+/// Files the system asked to open: each one as if chosen in the open dialog,
+/// and the window to the front, since the request comes from outside it.
+fn open_from_system(ui: &AppWindow, paths: Vec<PathBuf>) {
+    for path in paths {
+        spawn_load(ui, path);
+    }
+    ui.window().with_winit_window(|window| {
+        window.set_minimized(false);
+        window.focus_window();
+    });
+}
+
 /// The window with its shell and handlers, ready for the event loop; the
 /// timers that drive it live as long as this does.
 struct App {
@@ -5195,7 +5226,13 @@ struct App {
 
 fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     select_backend()?;
+    let command_line: Vec<PathBuf> = options
+        .files
+        .iter()
+        .map(|path| aster_platform::open_requests::absolute(path))
+        .collect();
     let App { ui, shell, _timers } = setup(options)?;
+    receive_system_open_requests(&ui, &command_line);
     ui.run()?;
     if let Ok(mut shell) = shell.try_borrow_mut() {
         agent::shut_down(&mut shell);
@@ -7712,6 +7749,40 @@ mod tests {
 
     fn shell() -> Shell {
         Shell::new(ThemeMode::Light, Language::ZhHans)
+    }
+
+    /// What the macOS Info.plist says the application opens must be what the
+    /// open dialog offers, or Finder offers files the shell then refuses (or
+    /// never offers ones it opens).
+    #[test]
+    fn the_macos_document_types_list_every_supported_extension() {
+        let fragment = include_str!("../../../packaging/macos-document-types.plist");
+        for extension in SUPPORTED_EXTENSIONS {
+            let entry = format!("<string>{extension}</string>");
+            assert!(
+                fragment.contains(&entry),
+                "packaging/macos-document-types.plist does not list .{extension}"
+            );
+        }
+        // Every extension the fragment lists is one the shell opens.
+        for line in fragment.lines().filter(|l| l.contains("<array>")) {
+            if line.contains('.') {
+                continue; // type identifiers
+            }
+            for part in line.split("<string>").skip(1) {
+                let extension = part.split("</string>").next().unwrap_or("");
+                assert!(
+                    SUPPORTED_EXTENSIONS.contains(&extension),
+                    ".{extension} is in the fragment but not in SUPPORTED_EXTENSIONS"
+                );
+            }
+        }
+        // The application is only offered, never made the default.
+        let ranks = fragment.matches("<key>LSHandlerRank</key>").count();
+        let alternates = fragment
+            .matches("<key>LSHandlerRank</key><string>Alternate</string>")
+            .count();
+        assert!(ranks > 0 && ranks == alternates);
     }
 
     #[test]

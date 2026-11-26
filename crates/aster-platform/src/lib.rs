@@ -11,6 +11,7 @@ pub mod dialogs;
 pub mod files;
 pub mod links;
 pub mod locale;
+pub mod open_requests;
 pub mod paths;
 pub mod reveal;
 pub mod volumes;

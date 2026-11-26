@@ -12,7 +12,8 @@ rfd = { workspace = true }
 trash = { workspace = true }
 sys-locale = { workspace = true }
 
-# Reading pictures from the clipboard (clipboard.rs).
+# Reading pictures from the clipboard (clipboard.rs) and receiving the files
+# Finder opens (open_requests.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }

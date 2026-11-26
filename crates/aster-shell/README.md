@@ -14,6 +14,9 @@ cargo run -p aster-shell -- 预算.xlsx 发布会.pptx          # 只读的 Shee
 
 cargo build -p aster-shell && spikes/bundle-macos.sh aster-shell   # macOS：打成带图标的 .app
 open target/debug/aster-shell.app
+
+# macOS：加上第三个参数 documents，.app 才声明能打开哪些文件类型（访达双击、“打开方式”、拖到 Dock 图标）
+cargo build -p aster-shell && spikes/bundle-macos.sh aster-shell debug documents
 ```
 
 macOS 上要测输入法，请用 `.app` 包启动：裸的可执行文件不是一个正常的应用，切不到前台时收不到输入法事件。
@@ -624,6 +627,7 @@ Markdown 标签有了查找栏，在编辑区上方。查找和替换的逻辑�
 | 刷新 | 不监视文件夹（`notify` 是 CC0-1.0，方案里属于要法务确认的许可证，没有引入）。窗口重新获得焦点时和点刷新按钮时，把屏幕上展开着的文件夹重新读一遍；新的列表到之前旧的留在屏幕上，不闪 |
 | 搜索框 | 按文件名过滤最近列表和树里已经读到的条目，不分大小写，先把名字合成 NFC 再比（macOS 给的文件名常是分解形式，不合成的话输入的“が”找不到磁盘上的“が”）。树里留下匹配的条目和通往它们的文件夹；没展开过的文件夹没读过，不在搜索范围里。Esc 或 × 清空。不做全文搜索 |
 | 拖进窗口打开 | 把文件或文件夹从访达拖到窗口上：拖着经过窗口时整个窗口罩上一层淡紫色，中间写“松开即可打开”；松开后文件夹在侧边栏打开（和“打开文件夹…”一样），`.md`、`.markdown`、`.txt`、`.xlsx`、`.pptx`、`.pdf` 在新标签里打开（已经开着就切过去），和“打开…”走同一条路（`start_load`），PowerPoint 和 PDF 文件只读；其他文件弹出“暂不支持打开”。一次拖进几个就逐个处理。屏幕上有对话框或恢复提示时不接受拖放，也不显示那层提示，免得新标签盖住正在问的问题。判断在 `src/files.rs` 的 `dropped`，事件取自 winit 的 `HoveredFile`、`HoveredFileCancelled`、`DroppedFile` |
+| 访达打开 | macOS 上从访达双击、“打开方式”、把文件拖到 Dock 图标，系统会把文件交给程序。`.app` 的 `Info.plist` 要声明文档类型（`packaging/macos-document-types.plist`，`spikes/bundle-macos.sh` 的 `documents` 参数会写进去；全部是 `Alternate`，所以程序只出现在“打开方式”里，不会成为任何文件的默认程序）。winit 的应用代理没有实现 `application:openURLs:`，所以 `aster-platform/src/open_requests.rs` 在事件循环开始前用 Objective-C 运行时给 winit 的代理类（`WinitApplicationDelegate`）补上这个方法；系统每次来请求都会问代理有哪些方法，所以补得上。只接受 `file://` 地址（百分号转义和中日文路径都解码），其余忽略。文件走和“打开…”一样的路径（`spawn_load`），窗口回到前台。程序是被这个请求启动的时候，请求可能比窗口先到：先排队，窗口做好后一次交出，按顺序、不重复，命令行里已经给过的路径不再打开第二次。一份清单测试保证 `Info.plist` 片段里的扩展名和打开对话框的 `SUPPORTED_EXTENSIONS` 一致。**没有在访达里试过**：需要有人在真实的 `.app` 上双击文件、用“打开方式”和拖到 Dock 图标各试一次，运行中和未运行时各一次 |
 | 在访达中显示 | 树和最近列表每行的右键菜单，以及“文件”菜单里对当前文档的一项。macOS 用 `open -R`；Windows 用 `explorer.exe /select,`；Linux 先试 freedesktop 的 `FileManager1.ShowItems`，不行就用 `xdg-open` 打开所在文件夹。路径作为参数传，不经过 shell，在工作线程上等它结束；失败时说明原因。Windows 和 Linux 的写好了，**没有运行过** |
 
 不做的：不监视文件夹；不在树里拖动移动文件；不永久删除（只移到废纸篓，见“编码、外部修改和更多编辑”一节）；不做全文搜索。

@@ -41,7 +41,8 @@ Apple M6，macOS 27.0.1，2026-11-26，版本 0.0.1。
 | 在没有应用运行时从包内运行 `aster-mcp` | 打印“Aster Office is not running or MCP is off”，退出码 3 |
 | 临时签名校验（先签 `aster-mcp`，再签整个包，`codesign --verify --deep --strict`） | 通过 |
 | `.dmg` 校验 | 通过 |
-| 从挂载的 `.dmg` 启动图形界面 | 本次未测（由评审人手工测试） |
+| 从挂载的 `.dmg` 启动图形界面 | 能启动；系统发来的 Markdown、PDF、xlsx、pptx 都能打开，PDF 的沙盒子进程从包内启动 |
+| 包内的 AI/MCP 设置页 | 未测（`aster-mcp` 已在包内，能运行） |
 | 首次 `dist` 构建（两个包） | 约 2 分 48 秒 |
 
 ### 许可证，已在本机验证

@@ -582,9 +582,9 @@ fn delete_across(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
     // Tables that are cut through: empty the paragraphs between, remove the
     // tables that are inside.
     let bj = t.path.top();
-    clear_between(&mut doc.body.blocks, bi, &mut Vec::new(), f, &t, &mut moved);
+    clear_between(&mut doc.body.blocks, bi, &[], f, &t, &mut moved);
     if bj != bi {
-        clear_between(&mut doc.body.blocks, bj, &mut Vec::new(), f, &t, &mut moved);
+        clear_between(&mut doc.body.blocks, bj, &[], f, &t, &mut moved);
     }
     if !moved.is_empty()
         && let Some(p) = doc.paragraph_mut(&f.path)
@@ -600,12 +600,12 @@ fn delete_across(doc: &mut Document, f: &Pos, t: &Pos) -> Pos {
 fn clear_between(
     blocks: &mut [Block],
     index: usize,
-    prefix: &mut Vec<u32>,
+    prefix: &[u32],
     f: &Pos,
     t: &Pos,
     moved: &mut Vec<Run>,
 ) {
-    let mut here = prefix.clone();
+    let mut here = prefix.to_vec();
     here.push(index as u32);
     // Look before copying: a table the range does not touch stays shared.
     let Some(block @ Block::Table(_)) = blocks.get(index) else {
@@ -623,21 +623,21 @@ fn clear_between(
         for (c, cell) in row.cells.iter_mut().enumerate() {
             let mut inner = here.clone();
             inner.extend([r as u32, c as u32]);
-            clear_cell(&mut cell.blocks, &mut inner, f, t, moved);
+            clear_cell(&mut cell.blocks, &inner, f, t, moved);
         }
     }
 }
 
 fn clear_cell(
     blocks: &mut Vec<Block>,
-    prefix: &mut Vec<u32>,
+    prefix: &[u32],
     f: &Pos,
     t: &Pos,
     moved: &mut Vec<Run>,
 ) {
     let mut k = 0;
     while k < blocks.len() {
-        let mut here = prefix.clone();
+        let mut here = prefix.to_vec();
         here.push(k as u32);
         if blocks[k].as_table().is_some() {
             let (first, last) = table_span(&blocks[k], &here);
@@ -1257,12 +1257,11 @@ fn insert_runs(doc: &mut Document, at: &Pos, runs: &[Run]) -> Pos {
         return at.clone();
     };
     let offset = snap(p, at.offset, false);
-    let mut index = split_run(p, offset);
-    for run in runs {
+    let index = split_run(p, offset);
+    for (k, run) in runs.iter().enumerate() {
         let mut run = run.clone();
         run.source = None;
-        p.runs.insert(index, run);
-        index += 1;
+        p.runs.insert(index + k, run);
     }
     merge_runs(p);
     Pos::new(at.path.clone(), offset + size)

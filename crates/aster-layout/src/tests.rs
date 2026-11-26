@@ -2492,3 +2492,168 @@ fn flowing_around_a_picture_does_not_reshape_other_paragraphs() {
     layouter.layout(&again);
     assert_eq!(layouter.shaped_count(), count + 3);
 }
+
+// ---------------------------------------------------------------------------
+// Footnotes that go on to the next page
+// ---------------------------------------------------------------------------
+
+/// The lines of a page that belong to the note called "zq": its text is
+/// `zq1`, `zq2` and so on, one to a line.
+fn note_lines(page: &Page) -> Vec<String> {
+    page_texts(page)
+        .iter()
+        .flat_map(|t| t.split('\n').map(str::to_owned).collect::<Vec<_>>())
+        .filter(|l| l.contains("zq"))
+        .collect()
+}
+
+fn text_y(page: &Page, needle: &str) -> f32 {
+    page.items
+        .iter()
+        .find_map(|i| match i {
+            Item::Text(t) if t.paragraph.text().contains(needle) => Some(t.y),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no text with {needle}"))
+}
+
+fn note_of(id: i32, lines: usize) -> Note {
+    let text = (1..=lines)
+        .map(|n| format!("zq{n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::object(Inline::Footnote(id), look()),
+        Run::text(format!(" {text}"), look()),
+    ];
+    Note {
+        id,
+        blocks: vec![Block::paragraph(p)],
+    }
+}
+
+/// A document with `before` plain lines, then a line with a reference to a
+/// note of `lines` lines, then `after` plain paragraphs.
+fn noted(before: usize, lines: usize, after: usize) -> Document {
+    let mut blocks = numbered(before);
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("ref", look()),
+        Run::object(Inline::Footnote(1), look()),
+    ];
+    blocks.push(Block::paragraph(p));
+    blocks.extend((0..after).map(|i| pb(&format!("later {i}"))));
+    let mut document = doc(blocks);
+    document.footnotes = Notes {
+        notes: vec![note_of(1, lines)],
+        part: None,
+    };
+    document
+}
+
+fn line_step() -> f32 {
+    let layout = lay(&doc(numbered(2)));
+    caret_top(&layout, 1, 0) - caret_top(&layout, 0, 0)
+}
+
+#[test]
+fn a_footnote_that_just_overflows_continues_on_the_next_page() {
+    let h = line_step();
+    // Room for two and a half lines of note under the reference line.
+    let before = ((160.0 - 6.0 - 2.5 * h) / h).floor() as usize - 1;
+    let layout = lay(&noted(before, 5, 3));
+    // The reference stays where it is, with the first lines of the note
+    // that fit under it, and the rest comes on the next page.
+    assert_eq!(page_of(&layout, before), 0);
+    let first = note_lines(&layout.pages[0]);
+    assert!((1..5).contains(&first.len()), "{first:?}");
+    let rest = note_lines(&layout.pages[1]);
+    assert_eq!(first.len() + rest.len(), 5, "{first:?} {rest:?}");
+    // In order, and the number is not repeated.
+    assert!(first[0].contains("zq1"));
+    assert!(
+        rest[0].starts_with(&format!("zq{}", first.len() + 1)),
+        "{rest:?}"
+    );
+    // One line more would not have left room for the reference's line.
+    assert!(first.len() <= 3);
+    // The continuation has the separator, and is under the body text.
+    assert!(
+        layout.pages[1]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Rule { .. }))
+    );
+    assert!(text_y(&layout.pages[1], &rest[0]) > text_y(&layout.pages[1], "later 2"));
+    // The text after the reference goes on as before.
+    assert!(page_has(&layout.pages[1], "later 0"));
+}
+
+#[test]
+fn a_continued_note_comes_before_the_notes_of_the_page_it_continues_on() {
+    let h = line_step();
+    let before = ((160.0 - 6.0 - 2.5 * h) / h).floor() as usize - 1;
+    let mut document = noted(before, 5, 0);
+    // A second reference near the top of the next page.
+    let mut blocks = document.body.blocks.clone();
+    for i in 0..4 {
+        blocks.push(pb(&format!("later {i}")));
+    }
+    let mut p = paragraph("");
+    p.runs = vec![
+        Run::text("again", look()),
+        Run::object(Inline::Footnote(2), look()),
+    ];
+    blocks.push(Block::paragraph(p));
+    document.body = Story { blocks, part: None };
+    let mut second = note_of(2, 1);
+    if let Block::Paragraph(p) = &mut second.blocks[0] {
+        Arc::make_mut(p).runs[1].text = " own note".into();
+    }
+    document.footnotes.notes.push(second);
+    let layout = lay(&document);
+    let page = &layout.pages[1];
+    assert!(page_has(page, "own note"));
+    assert!(text_y(page, "zq3") < text_y(page, "own note"));
+    assert!(text_y(page, "again") < text_y(page, "zq3"));
+    // Numbered in the order of the references.
+    assert!(page_has(page, "2 own note"));
+}
+
+#[test]
+fn a_footnote_longer_than_a_page_runs_over_several() {
+    let layout = lay(&noted(3, 45, 2));
+    assert!(layout.pages.len() >= 3, "{}", layout.pages.len());
+    let mut seen = Vec::new();
+    for (n, page) in layout.pages.iter().enumerate() {
+        let lines = note_lines(page);
+        if n == 0 {
+            // The reference is on this page, and so is the start of the note.
+            assert_eq!(page_of(&layout, 3), 0);
+            assert!(!lines.is_empty());
+        }
+        seen.extend(lines);
+    }
+    // Every line once, in order.
+    assert_eq!(seen.len(), 45, "{seen:?}");
+    for (n, line) in seen.iter().enumerate() {
+        assert!(line.contains(&format!("zq{}", n + 1)), "{n}: {line}");
+    }
+    // Nothing is drawn below the bottom margin.
+    for page in &layout.pages {
+        for item in &page.items {
+            if let Item::Text(t) = item {
+                let last = t.paragraph.lines()[t.lines.end - 1].top + t.y;
+                assert!(last < 200.0 - 20.0 + 0.5 || t.y > 180.0, "{last}");
+            }
+        }
+    }
+    // The text after the reference follows the note's last line.
+    let end = layout
+        .pages
+        .iter()
+        .rposition(|p| !note_lines(p).is_empty())
+        .unwrap();
+    assert!(page_of(&layout, 5) <= end + 1);
+}

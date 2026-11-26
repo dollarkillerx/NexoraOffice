@@ -17,8 +17,9 @@ use aster_text::{
     Scaling, Shaper, Slot, Spacing, Span, Spec, Stroke, Style, TabAlign, TabStop,
 };
 use aster_writer::{
-    Align, Break, Drawing, Inline, LineSpacing, PageField, Paragraph, RunLook, Settings, Suffix,
-    TWIPS_PER_POINT, TabAlign as WTabAlign, TabLeader, UnderlineStyle, VertAlign,
+    Align, Annotation, Break, Drawing, Inline, LineSpacing, PageField, Paragraph, RunLook,
+    Settings, Suffix, TWIPS_PER_POINT, TabAlign as WTabAlign, TabLeader, Underline, UnderlineStyle,
+    VertAlign,
 };
 
 use crate::display::Rect;
@@ -50,8 +51,60 @@ pub(crate) struct PageValues {
     pub section_pages: String,
 }
 
+/// The colours of the authors of tracked changes and comments: one for each,
+/// in the order they first appear in the document.
+const AUTHOR_COLORS: [[u8; 4]; 8] = [
+    [0xc0, 0x1f, 0x1f, 0xff],
+    [0x1f, 0x5f, 0xc8, 0xff],
+    [0x1a, 0x8a, 0x3c, 0xff],
+    [0x93, 0x2a, 0xa8, 0xff],
+    [0xd0, 0x6b, 0x00, 0xff],
+    [0x00, 0x8a, 0x93, 0xff],
+    [0x7a, 0x55, 0x1a, 0xff],
+    [0xc8, 0x1f, 0x74, 0xff],
+];
+
+/// The colour for the author at `index` of the document's authors.
+pub fn author_color(index: usize) -> [u8; 4] {
+    AUTHOR_COLORS[index % AUTHOR_COLORS.len()]
+}
+
+/// How changes and comments are shown: the authors, and who wrote each
+/// comment.
+pub(crate) struct Markup {
+    pub authors: Vec<Arc<str>>,
+    pub comment_authors: HashMap<i64, Arc<str>>,
+}
+
+impl Markup {
+    pub fn new(doc: &aster_writer::Document) -> Self {
+        Self {
+            authors: doc.authors(),
+            comment_authors: doc
+                .comments
+                .iter()
+                .map(|c| (c.id, Arc::from(c.author.as_str())))
+                .collect(),
+        }
+    }
+
+    pub fn color(&self, author: &str) -> [u8; 4] {
+        let index = self.authors.iter().position(|a| &**a == author);
+        author_color(index.unwrap_or(0))
+    }
+
+    pub fn comment_color(&self, id: i64) -> [u8; 4] {
+        self.comment_authors
+            .get(&id)
+            .map_or([0x80, 0x80, 0x80, 0xff], |author| self.color(author))
+    }
+}
+
 /// What shaping a paragraph depends on besides the paragraph.
 pub(crate) struct Env<'a> {
+    /// Changes and comments are shown; `None` shows the text as if every
+    /// change was accepted, with no comment marks.
+    pub markup: Option<&'a Markup>,
     pub settings: &'a Settings,
     /// The section's grid line pitch, points.
     pub grid: Option<f32>,
@@ -102,6 +155,16 @@ pub(crate) struct Shaped {
     pub has_tabs: bool,
     /// Readings above ranges of the text.
     pub rubies: Vec<RubyMark>,
+    /// Text of tracked changes, and the colour of its author: the lines it
+    /// is on get a change bar.
+    pub changes: Vec<(Range<usize>, [u8; 4])>,
+    /// A change to the paragraph as a whole: every line gets a bar (its
+    /// formatting changed), the last (its mark was inserted or deleted).
+    pub bar_all: Option<[u8; 4]>,
+    pub bar_last: Option<[u8; 4]>,
+    /// Where a comment's range starts, and its colour: the line gets a mark
+    /// in the margin.
+    pub comment_marks: Vec<(usize, [u8; 4])>,
 }
 
 /// A reading drawn above a range of shaped text.
@@ -203,6 +266,33 @@ pub(crate) fn context(para: &Paragraph, env: &Env<'_>) -> u64 {
             text.hash(&mut hasher);
         }
     }
+    // What the colours of the authors are matters only where there is
+    // something to colour.
+    env.markup.is_some().hash(&mut hasher);
+    if let Some(markup) = env.markup {
+        for run in &para.runs {
+            match &run.annotation {
+                Some(Annotation::Inserted(change)) => {
+                    markup.color(&change.author).hash(&mut hasher)
+                }
+                Some(Annotation::Deleted(deleted)) => {
+                    markup.color(&deleted.change.author).hash(&mut hasher)
+                }
+                Some(
+                    Annotation::CommentStart(id)
+                    | Annotation::CommentEnd(id)
+                    | Annotation::CommentReference(id),
+                ) => markup.comment_color(*id).hash(&mut hasher),
+                None => {}
+            }
+        }
+        for change in [&para.changes.inserted_mark, &para.changes.deleted_mark]
+            .into_iter()
+            .flatten()
+        {
+            markup.color(&change.author).hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -299,6 +389,14 @@ struct Builder<'a, 'e> {
     notes: Vec<(usize, i32, bool)>,
     breaks: Vec<(usize, Break)>,
     backs: Vec<(Range<usize>, [u8; 4])>,
+    changes: Vec<(Range<usize>, [u8; 4])>,
+    comment_marks: Vec<(usize, [u8; 4])>,
+    /// Comments whose range is open: the id and where it started.
+    open_comments: Vec<(i64, usize)>,
+    /// The paragraph's base look, for the text of deletions.
+    base: &'a RunLook,
+    /// Bytes of the shaped text before the paragraph's own text.
+    prefix: usize,
     families: &'a mut Families,
     env: &'a Env<'e>,
 }
@@ -350,8 +448,62 @@ impl Builder<'_, '_> {
         self.decor.push(decor);
     }
 
+    /// A run in the paragraph's text; with markup on, the text of tracked
+    /// changes in the colour of their author and the ranges of comments.
     fn add_run(&mut self, run: &aster_writer::Run, orig: Range<usize>) {
-        let look = &run.look;
+        let mut marked: Option<RunLook> = None;
+        let mut change_color = None;
+        if let Some(markup) = self.env.markup {
+            match &run.annotation {
+                Some(Annotation::Inserted(change)) => {
+                    let color = markup.color(&change.author);
+                    let mut look = run.look.clone();
+                    look.color = Some(color);
+                    if look.underline.is_none() {
+                        look.underline = Some(Underline {
+                            style: UnderlineStyle::Single,
+                            color: Some(color),
+                        });
+                    }
+                    marked = Some(look);
+                    change_color = Some(color);
+                }
+                Some(Annotation::Deleted(deleted)) => {
+                    // Shown struck through where it was; it takes no place
+                    // in the paragraph's text.
+                    let color = markup.color(&deleted.change.author);
+                    let start = self.text.len();
+                    for mut shown in deleted.shown(self.base) {
+                        shown.look.color = Some(color);
+                        shown.look.strike = true;
+                        shown.look.double_strike = false;
+                        self.add_run(&shown, orig.end..orig.end);
+                    }
+                    if self.text.len() > start {
+                        self.changes.push((start..self.text.len(), color));
+                    }
+                }
+                Some(Annotation::CommentStart(id)) => {
+                    self.open_comments.push((*id, self.text.len()));
+                    self.comment_marks
+                        .push((self.text.len(), markup.comment_color(*id)));
+                }
+                Some(Annotation::CommentEnd(id)) => {
+                    let color = markup.comment_color(*id);
+                    let from = match self.open_comments.iter().position(|(open, _)| open == id) {
+                        Some(i) => self.open_comments.remove(i).1,
+                        // Started in an earlier paragraph.
+                        None => self.prefix,
+                    };
+                    if self.text.len() > from {
+                        self.backs
+                            .push((from..self.text.len(), [color[0], color[1], color[2], 0x40]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let look = marked.as_ref().unwrap_or(&run.look);
         let start = self.text.len();
         let hidden = look.hidden;
         let mut copy = false;
@@ -429,6 +581,11 @@ impl Builder<'_, '_> {
             }
         }
         let end = self.text.len();
+        if let Some(color) = change_color
+            && end > start
+        {
+            self.changes.push((start..end, color));
+        }
         self.pieces.push(Piece {
             orig: (orig.start, orig.end),
             shaped: (start, end),
@@ -501,6 +658,13 @@ pub(crate) fn shape(
 ) -> Shaped {
     for run in &para.runs {
         families.ensure(shaper, &run.look);
+        if env.markup.is_some()
+            && let Some(Annotation::Deleted(deleted)) = &run.annotation
+        {
+            for shown in deleted.shown(&para.base) {
+                families.ensure(shaper, &shown.look);
+            }
+        }
     }
     families.ensure(shaper, &para.base);
     families.ensure(shaper, &para.mark);
@@ -524,6 +688,11 @@ pub(crate) fn shape(
         notes: Vec::new(),
         breaks: Vec::new(),
         backs: Vec::new(),
+        changes: Vec::new(),
+        comment_marks: Vec::new(),
+        open_comments: Vec::new(),
+        base: &para.base,
+        prefix: 0,
         families,
         env,
     };
@@ -550,6 +719,7 @@ pub(crate) fn shape(
         }
     }
     let prefix = builder.text.len();
+    builder.prefix = prefix;
     let mut at = 0;
     for run in &para.runs {
         let end = at + run.text.len();
@@ -557,6 +727,31 @@ pub(crate) fn shape(
         at = end;
     }
     let orig_len = at;
+    // A comment whose range goes on into the next paragraph is shaded to the
+    // end of this one.
+    for (id, from) in std::mem::take(&mut builder.open_comments) {
+        let color = env.markup.map_or([0; 4], |m| m.comment_color(id));
+        if builder.text.len() > from {
+            builder.backs.push((
+                from..builder.text.len(),
+                [color[0], color[1], color[2], 0x40],
+            ));
+        }
+    }
+    let (bar_all, bar_last) = match env.markup {
+        Some(markup) => {
+            let mark = para
+                .changes
+                .inserted_mark
+                .as_ref()
+                .or(para.changes.deleted_mark.as_ref());
+            (
+                para.changes.formatting.then_some([0x60, 0x60, 0x60, 0xff]),
+                mark.map(|change| markup.color(&change.author)),
+            )
+        }
+        None => (None, None),
+    };
 
     let base_look = if para.runs.iter().all(|run| run.text.is_empty()) && para.label.is_none() {
         &para.mark
@@ -681,6 +876,10 @@ pub(crate) fn shape(
         backs: builder.backs,
         has_tabs,
         rubies: builder.rubies,
+        changes: builder.changes,
+        bar_all,
+        bar_last,
+        comment_marks: builder.comment_marks,
     }
 }
 

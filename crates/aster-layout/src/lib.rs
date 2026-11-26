@@ -36,6 +36,8 @@ pub use query::{Caret, GridRow, Layout, LinkRect, OutlineEntry, PageInfo, TableB
 #[cfg(test)]
 mod grid_tests;
 #[cfg(test)]
+mod markup_tests;
+#[cfg(test)]
 mod story_tests;
 #[cfg(test)]
 mod tests;

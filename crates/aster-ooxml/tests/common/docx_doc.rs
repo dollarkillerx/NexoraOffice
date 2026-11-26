@@ -23,6 +23,7 @@ pub struct Doc {
     theme: Option<String>,
     footnotes: Option<String>,
     endnotes: Option<String>,
+    comments: Option<String>,
     /// (part name, xml), related from the main part as headers or footers.
     pub parts: Vec<(String, String)>,
     /// (id, kind, target) of the main part's relationships.
@@ -63,6 +64,10 @@ impl Doc {
     }
     pub fn endnotes(mut self, inner: &str) -> Self {
         self.endnotes = Some(format!(r#"<w:endnotes {NS}>{inner}</w:endnotes>"#));
+        self
+    }
+    pub fn comments(mut self, inner: &str) -> Self {
+        self.comments = Some(format!(r#"<w:comments {NS}>{inner}</w:comments>"#));
         self
     }
     /// A header or footer part, related with `id`.
@@ -118,6 +123,7 @@ impl Doc {
             "footnotes.xml",
         );
         optional(&self.endnotes, "rIdEndnotes", "endnotes", "endnotes.xml");
+        optional(&self.comments, "rIdComments", "comments", "comments.xml");
         for (name, xml) in &self.parts {
             parts.push((name.clone(), xml.clone().into_bytes()));
         }

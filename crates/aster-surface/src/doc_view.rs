@@ -34,6 +34,9 @@ mod editing;
 mod format;
 mod modify;
 mod objects;
+mod review;
+#[cfg(test)]
+mod review_tests;
 mod search;
 mod stories;
 #[cfg(test)]
@@ -66,6 +69,7 @@ pub use editing::Move;
 pub use format::{DocCommand, FormatState, Tri};
 pub use modify::Unit;
 pub use objects::{Corner, Handle, LinkInfo, ObjectInfo};
+pub use review::CommentInfo;
 pub use search::{DocQuery, MAX_MATCHES, Match};
 pub use text::text_between;
 
@@ -225,6 +229,8 @@ pub struct DocView {
     /// The selection of the body when a header or footer was entered, to
     /// go back to.
     body_sel: Option<Sel>,
+    /// What is worked out from the changes and comments of a revision.
+    review: review::Review,
 }
 
 impl DocView {
@@ -280,6 +286,7 @@ impl DocView {
             page: None,
             new_marginal: None,
             body_sel: None,
+            review: review::Review::default(),
         };
         view.lay_out();
         view.saved = Some(view.document.clone());

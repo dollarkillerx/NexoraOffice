@@ -4,8 +4,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aster_writer::{
-    Block, Break, Inline, Link, OBJECT, PageField, ParaSource, Paragraph, Ruby, Run, RunLook,
-    RunSource,
+    Annotation, Block, Break, Change, Deleted, Inline, Link, OBJECT, PageField, ParaChanges,
+    ParaSource, Paragraph, Ruby, Run, RunLook, RunSource,
 };
 
 use super::dom::{Item, Node, flatten};
@@ -23,6 +23,8 @@ const MAX_FIELDS: usize = 32;
 struct Cx<'b> {
     base: &'b RunLook,
     link: Option<Arc<Link>>,
+    /// The insertion the content is inside of.
+    change: Option<Arc<Change>>,
 }
 
 /// One content child of a run, as a piece of the line.
@@ -31,6 +33,7 @@ struct Piece {
     text: String,
     /// A typeface the run's own look does not have.
     font: Option<Arc<str>>,
+    annotation: Option<Annotation>,
 }
 
 impl Piece {
@@ -40,6 +43,7 @@ impl Piece {
             kind,
             text,
             font: None,
+            annotation: None,
         }
     }
 
@@ -48,7 +52,21 @@ impl Piece {
             kind: Inline::Text,
             text,
             font: None,
+            annotation: None,
         }
+    }
+}
+
+/// A tracked change's `w:id`, author and date.
+fn change_of(node: &Node<'_>, moved: bool) -> Change {
+    Change {
+        id: node.int("id").unwrap_or(0),
+        author: Arc::from(node.attr("author").unwrap_or_default().as_str()),
+        date: node
+            .attr("date")
+            .filter(|d| !d.is_empty())
+            .map(|d| Arc::from(d.as_str())),
+        moved,
     }
 }
 
@@ -265,9 +283,12 @@ impl Reader<'_> {
         let cx = Cx {
             base: &base.look,
             link: None,
+            change: None,
         };
+        part.formatting_changed = false;
         self.content(&node.children, part, &cx, &mut runs, 0);
         let runs = merge_markers(runs);
+        let changes = paragraph_changes(node, part.formatting_changed);
 
         let section = match ppr.as_ref().and_then(|p| p.section) {
             Some(sect) if part.sections && part.depth == 0 => {
@@ -283,6 +304,7 @@ impl Reader<'_> {
             props: props.clone(),
             mark: mark.clone(),
             section: section.clone(),
+            changes: changes.clone(),
         };
         Paragraph {
             runs,
@@ -292,6 +314,7 @@ impl Reader<'_> {
             label: None,
             section,
             source: Some(Arc::new(source)),
+            changes,
         }
     }
 
@@ -316,6 +339,7 @@ impl Reader<'_> {
                     let inner = Cx {
                         base: cx.base,
                         link: link.or_else(|| cx.link.clone()),
+                        change: cx.change.clone(),
                     };
                     self.content(&node.children, part, &inner, out, depth + 1);
                 }
@@ -330,6 +354,7 @@ impl Reader<'_> {
                     let inner = Cx {
                         base: cx.base,
                         link: link.or_else(|| cx.link.clone()),
+                        change: cx.change.clone(),
                     };
                     let outer = part.simple.take();
                     part.simple =
@@ -337,18 +362,43 @@ impl Reader<'_> {
                     self.content(&node.children, part, &inner, out, depth + 1);
                     part.simple = outer;
                 }
-                b"ins" | b"moveTo" | b"smartTag" | b"customXml" | b"dir" | b"bdo"
-                    if depth < MAX_NESTING =>
-                {
+                b"ins" | b"moveTo" if depth < MAX_NESTING => {
+                    let inner = Cx {
+                        base: cx.base,
+                        link: cx.link.clone(),
+                        change: Some(Arc::new(change_of(node, node.is("moveTo")))),
+                    };
+                    self.content(&node.children, part, &inner, out, depth + 1);
+                }
+                b"smartTag" | b"customXml" | b"dir" | b"bdo" if depth < MAX_NESTING => {
                     self.content(&node.children, part, cx, out, depth + 1);
+                }
+                // Tracked deletions keep their text to show and bring back.
+                b"del" | b"moveFrom" => {
+                    let deleted = Deleted {
+                        change: change_of(node, node.is("moveFrom")),
+                        runs: self.deleted_runs(node, cx, 0),
+                        base: cx.base.clone(),
+                    };
+                    let annotation = Annotation::Deleted(Arc::new(deleted));
+                    self.annotated_marker(out, cx, item.range.clone(), annotation);
+                }
+                b"commentRangeStart" | b"commentRangeEnd" => {
+                    let id = node.int("id").unwrap_or(-1);
+                    let annotation = if node.is("commentRangeStart") {
+                        Annotation::CommentStart(id)
+                    } else {
+                        Annotation::CommentEnd(id)
+                    };
+                    self.annotated_marker(out, cx, item.range.clone(), annotation);
                 }
                 b"sdt" if depth < MAX_NESTING => {
                     if let Some(content) = node.child("sdtContent") {
                         self.content(&content.children, part, cx, out, depth + 1);
                     }
                 }
-                // Tracked deletions, bookmarks, comment ranges and what we
-                // do not know are kept in place and show nothing.
+                // Bookmarks and what we do not know are kept in place and
+                // show nothing.
                 _ => self.marker(out, cx, item.range.clone(), None),
             }
         }
@@ -386,7 +436,86 @@ impl Reader<'_> {
             cx.link.clone(),
             range,
             parent,
+            None,
         );
+    }
+
+    fn annotated_marker(
+        &self,
+        out: &mut Vec<Run>,
+        cx: &Cx<'_>,
+        range: Range<usize>,
+        annotation: Annotation,
+    ) {
+        let mut piece = Piece::new(Inline::Marker);
+        piece.annotation = Some(annotation);
+        self.push_run(
+            out,
+            piece,
+            cx.base,
+            None,
+            cx.link.clone(),
+            range,
+            None,
+            None,
+        );
+    }
+
+    /// The text a `w:del` or `w:moveFrom` holds, as runs that can be shown
+    /// and brought back: text, tabs and line breaks. Anything else in it
+    /// (a picture, a field) is left to the element's bytes.
+    fn deleted_runs(&self, node: &Node<'_>, cx: &Cx<'_>, depth: usize) -> Vec<Run> {
+        let mut out = Vec::new();
+        let mut items = Vec::new();
+        flatten(&node.children, &|_| false, &mut items);
+        for item in items {
+            let child = item.node;
+            match child.local() {
+                b"r" => {
+                    let rpr = child.child("rPr").map(|n| parse_rpr(n, &self.env));
+                    let (look, style) = self.run_look(cx.base, rpr.as_ref());
+                    for part_node in &child.children {
+                        let (kind, text) = match part_node.local() {
+                            b"delText" | b"t" => (Inline::Text, run_text(part_node)),
+                            b"tab" => (Inline::Tab, "\t".to_owned()),
+                            b"br" | b"cr"
+                                if !matches!(
+                                    part_node.attr("type").as_deref(),
+                                    Some("page" | "column")
+                                ) =>
+                            {
+                                (Inline::Break(Break::Line), "\n".to_owned())
+                            }
+                            b"noBreakHyphen" => (Inline::Text, "\u{2011}".to_owned()),
+                            _ => continue,
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let mut run = Run::text(text, look.clone());
+                        run.kind = kind;
+                        run.style = style.clone();
+                        run.link = cx.link.clone();
+                        out.push(run);
+                    }
+                }
+                b"hyperlink" | b"smartTag" | b"customXml" if depth < 4 => {
+                    out.extend(self.deleted_runs(child, cx, depth + 1));
+                }
+                _ => {}
+            }
+        }
+        // Neighbouring text of one look is one run.
+        let mut merged: Vec<Run> = Vec::with_capacity(out.len());
+        for run in out {
+            match merged.last_mut() {
+                Some(last) if last.is_text() && run.is_text() && last.same_look(&run) => {
+                    last.text.push_str(&run.text);
+                }
+                _ => merged.push(run),
+            }
+        }
+        merged
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -399,8 +528,16 @@ impl Reader<'_> {
         link: Option<Arc<Link>>,
         range: Range<usize>,
         parent: Option<Range<usize>>,
+        inserted: Option<&Arc<Change>>,
     ) {
         let mut look = look.clone();
+        // Text and objects inside an insertion are inserted; the places of
+        // other things are not.
+        let annotation = piece.annotation.clone().or_else(|| {
+            inserted
+                .filter(|_| !matches!(piece.kind, Inline::Marker))
+                .map(|change| Annotation::Inserted(change.clone()))
+        });
         if let Some(font) = piece.font {
             look.font = Some(font);
         }
@@ -411,6 +548,7 @@ impl Reader<'_> {
             look: look.clone(),
             style: style.clone(),
             link: link.clone(),
+            annotation: annotation.clone(),
         });
         out.push(Run {
             text: piece.text,
@@ -419,6 +557,7 @@ impl Reader<'_> {
             style,
             link,
             source: Some(source),
+            annotation,
         });
     }
 
@@ -431,6 +570,12 @@ impl Reader<'_> {
         out: &mut Vec<Run>,
     ) {
         let rpr = node.child("rPr").map(|n| parse_rpr(n, &self.env));
+        if node
+            .child("rPr")
+            .is_some_and(|n| n.child("rPrChange").is_some())
+        {
+            part.formatting_changed = true;
+        }
         let (look, style) = self.run_look(cx.base, rpr.as_ref());
         let mut items: Vec<Item<'_, '_>> = Vec::new();
         flatten(&node.children, &|_| false, &mut items);
@@ -454,6 +599,7 @@ impl Reader<'_> {
                 link,
                 range,
                 None,
+                cx.change.as_ref(),
             );
             return;
         }
@@ -465,7 +611,16 @@ impl Reader<'_> {
                 (item.range.clone(), Some(range.clone()))
             };
             let piece = self.piece(item.node, part, &look);
-            self.push_run(out, piece, &look, style.clone(), link.clone(), at, parent);
+            self.push_run(
+                out,
+                piece,
+                &look,
+                style.clone(),
+                link.clone(),
+                at,
+                parent,
+                cx.change.as_ref(),
+            );
         }
     }
 
@@ -539,6 +694,11 @@ impl Reader<'_> {
                 let drawing = self.vml(node, part);
                 let mut piece = Piece::new(Inline::Drawing(Arc::new(drawing)));
                 piece.text = OBJECT.to_owned();
+                piece
+            }
+            b"commentReference" => {
+                let mut piece = Piece::new(Inline::Marker);
+                piece.annotation = node.int("id").map(Annotation::CommentReference);
                 piece
             }
             b"footnoteReference" => match node.int("id") {
@@ -636,6 +796,8 @@ fn merge_markers(runs: Vec<Run>) -> Vec<Run> {
         if let (Some(last), Some(source)) = (out.last_mut(), &run.source)
             && matches!(last.kind, Inline::Marker)
             && matches!(run.kind, Inline::Marker)
+            && last.annotation.is_none()
+            && run.annotation.is_none()
             && let Some(prev) = &last.source
             && prev.range.end == source.range.start
             && prev.parent == source.parent
@@ -653,4 +815,34 @@ fn merge_markers(runs: Vec<Run>) -> Vec<Run> {
         out.push(run);
     }
     out
+}
+
+/// The tracked changes of the paragraph itself: its mark inserted or
+/// deleted (`w:ins`, `w:del`, `w:moveTo`, `w:moveFrom` in the mark's `rPr`),
+/// and formatting changes (`w:pPrChange`, `w:rPrChange` in the mark or in
+/// any of its runs).
+fn paragraph_changes(node: &Node<'_>, formatting_in_runs: bool) -> ParaChanges {
+    let mut changes = ParaChanges {
+        formatting: formatting_in_runs,
+        ..ParaChanges::default()
+    };
+    let Some(ppr) = node.child("pPr") else {
+        return changes;
+    };
+    changes.formatting |= ppr.child("pPrChange").is_some();
+    if let Some(mark) = ppr.child("rPr") {
+        changes.formatting |= mark.child("rPrChange").is_some();
+        for child in &mark.children {
+            match child.local() {
+                b"ins" | b"moveTo" if changes.inserted_mark.is_none() => {
+                    changes.inserted_mark = Some(Arc::new(change_of(child, child.is("moveTo"))));
+                }
+                b"del" | b"moveFrom" if changes.deleted_mark.is_none() => {
+                    changes.deleted_mark = Some(Arc::new(change_of(child, child.is("moveFrom"))));
+                }
+                _ => {}
+            }
+        }
+    }
+    changes
 }

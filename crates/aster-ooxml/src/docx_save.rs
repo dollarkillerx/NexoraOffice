@@ -56,6 +56,20 @@
 //!   style, the list and the mark's `rPr`; its runs have an `rPr` with what
 //!   differs from the paragraph's base look.
 //!
+//! **Tracked changes and comments** (`track.rs`). Inserted text still in its
+//! `w:ins` stays in the wrapper the file had (the bytes between runs are
+//! copied); a run made here that belongs to an insertion (typed into it,
+//! a piece of a split) gets a wrapper of its own with the same id, author and
+//! date, and one that was accepted leaves it. A wrapper with nothing left in
+//! it is dropped. A deletion is a marker whose `w:del` element is copied as it
+//! was; an accepted one is gone, a rejected one is written as ordinary runs. A
+//! paragraph whose mark was inserted or deleted keeps the record in its
+//! `pPr/rPr`; one that moved to the second half of a split is written there;
+//! an accepted one is taken out, as are `pPrChange` and `rPrChange` records
+//! of an accepted formatting change. Comment range markers and the
+//! reference run are markers (their bytes are copied); `word/comments.xml` is
+//! never written, so a comment cannot be removed.
+//!
 //! **Pictures.** A picture made here (or pasted from another place, with no
 //! usable source) is written as `<w:drawing>` with a `wp:inline`, or a
 //! `wp:anchor` when it floats (position, wrap, `behindDoc` and the room
@@ -1054,7 +1068,9 @@ impl<'a> Saver<'a> {
         }
         gaps.push(from..limit);
         let mut content = self.rewrite_runs(model, osrc, &units, gaps)?;
-        if osrc.changes.formatting && !model.changes.formatting {
+        // No change of formatting is recorded: none of the runs (a paragraph
+        // joined to this one brings its own) may carry a record of one.
+        if !model.changes.formatting {
             content = track::without_elements(&content, "rPrChange");
         }
         let end_tag = format!("</{qname}>");
@@ -1313,6 +1329,9 @@ impl<'a> Saver<'a> {
             i = j;
         }
         out.push_str(&format!("</{w}p>"));
+        if !p.changes.formatting {
+            out = track::without_elements(&out, "rPrChange");
+        }
         out
     }
 

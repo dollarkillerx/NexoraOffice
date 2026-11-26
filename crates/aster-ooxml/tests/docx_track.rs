@@ -403,3 +403,79 @@ fn a_comment_across_paragraphs_is_one_range() {
     // No `comments.xml`: the anchor is there, the comment is not.
     assert!(doc.comment(1).is_none());
 }
+
+#[test]
+fn a_word_made_paragraph_with_every_kind_of_record_is_accepted_clean() {
+    // As Word writes a paragraph that was inserted and then formatted.
+    let bytes = docx_doc::doc(concat!(
+        "<w:p><w:pPr><w:spacing w:after=\"0\"/><w:rPr><w:ins w:id=\"5\" w:author=\"P\"/><w:sz w:val=\"24\"/>",
+        "<w:rPrChange w:id=\"6\" w:author=\"P\"><w:rPr><w:ins w:id=\"7\" w:author=\"P\"/><w:sz w:val=\"20\"/></w:rPr></w:rPrChange></w:rPr></w:pPr>",
+        "<w:ins w:id=\"8\" w:author=\"P\"><w:r><w:rPr><w:sz w:val=\"24\"/><w:rPrChange w:id=\"9\" w:author=\"P\"><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:rPrChange></w:rPr>",
+        "<w:t>March 2009</w:t></w:r></w:ins></w:p><w:p><w:r><w:t>next</w:t></w:r></w:p>"
+    ))
+    .bytes();
+    let mut doc = read(&bytes);
+    assert_eq!(doc.changes().len(), 3);
+    assert_eq!(accept_all(&mut doc), 3);
+    let (saved, back) = round_trip(&bytes, &doc);
+    let xml = main_xml(&saved);
+    assert!(!xml.contains("Change"), "{xml}");
+    assert!(!xml.contains("<w:ins"), "{xml}");
+    assert!(!back.has_changes());
+    assert_eq!(back.plain_text(), "March 2009\nnext");
+}
+
+#[test]
+fn accepting_a_deleted_mark_brings_the_next_paragraphs_formatting_records_along_clean() {
+    let bytes = docx_doc::doc(concat!(
+        "<w:p><w:pPr><w:rPr><w:del w:id=\"1\" w:author=\"P\"/></w:rPr></w:pPr>",
+        "<w:del w:id=\"2\" w:author=\"P\"><w:r><w:delText>old</w:delText></w:r></w:del></w:p>",
+        "<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id=\"3\" w:author=\"P\"><w:rPr/></w:rPrChange></w:rPr><w:t>kept</w:t></w:r></w:p>"
+    ))
+    .bytes();
+    let mut doc = read(&bytes);
+    assert_eq!(accept_all(&mut doc), 3);
+    assert_eq!(doc.body.blocks.len(), 1);
+    let (saved, back) = round_trip(&bytes, &doc);
+    let xml = main_xml(&saved);
+    assert!(!xml.contains("Change") && !xml.contains("<w:del"), "{xml}");
+    assert_eq!(back.plain_text(), "kept");
+    assert!(back.paragraph(&Path::body(0)).unwrap().runs[0].look.bold);
+}
+
+#[test]
+fn formatting_the_middle_of_an_insertion_keeps_all_of_it_inserted() {
+    let bytes = file();
+    let mut doc = read(&bytes);
+    apply_run_patch(
+        &mut doc,
+        &at(0, 5),
+        &at(0, 7),
+        &aster_writer::RunPatch {
+            bold: Some(true),
+            ..aster_writer::RunPatch::default()
+        },
+    );
+    let (saved, back) = round_trip(&bytes, &doc);
+    let changes = back.changes();
+    assert_eq!(changes.len(), 3);
+    assert_eq!((changes[0].start.offset, changes[0].end.offset), (4, 8));
+    // One wrapper holds the three pieces.
+    let xml = main_xml(&saved);
+    assert_eq!(xml.matches("<w:ins w:id=\"1\"").count(), 1, "{xml}");
+}
+
+#[test]
+fn a_tab_or_line_break_typed_into_an_insertion_is_inserted_too() {
+    let bytes = file();
+    let mut doc = read(&bytes);
+    insert_text(&mut doc, &at(0, 6), "\t", None);
+    let (saved, back) = round_trip(&bytes, &doc);
+    assert_eq!(
+        back.paragraph(&Path::body(0)).unwrap().text(),
+        "one tw\to three"
+    );
+    let start = main_xml(&saved).find("<w:ins w:id=\"1\"").unwrap();
+    assert!(main_xml(&saved)[start..].contains("<w:tab/>"));
+    assert_eq!(back.changes()[0].end.offset, 9);
+}

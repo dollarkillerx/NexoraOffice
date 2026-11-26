@@ -987,8 +987,8 @@ pub enum Inline {
     /// base text. Taken or left whole.
     Ruby(Arc<Ruby>),
     /// Something kept in place that shows nothing and takes no room: a
-    /// bookmark, a comment range, a field's code, deleted text of a tracked
-    /// change. Its text is empty. Edits never remove a marker except with
+    /// bookmark, a field's code, the end of a comment's range, deleted text
+    /// of a tracked change (see [`Run::annotation`]). Its text is empty. Edits never remove a marker except with
     /// the whole document content around it; when paragraphs are joined
     /// their markers stay.
     Marker,

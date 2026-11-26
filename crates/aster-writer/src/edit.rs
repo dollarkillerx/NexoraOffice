@@ -22,6 +22,12 @@
 //! the place the text was; where paragraphs are joined or removed, their
 //! markers move into the paragraph that remains.
 //!
+//! **Tracked changes** are not recorded: typing and deleting are ordinary
+//! edits. Text typed inside or at the end of an inserted range stays part of
+//! the insertion; deleting text takes out inserted text like any other and
+//! leaves the markers of deletions and comments. [`accept_all`],
+//! [`reject_all`], [`accept_in`] and [`reject_in`] resolve them.
+//!
 //! **Where it works.** In any story: the body, headers and footers, footnotes
 //! and endnotes, table cells in them included (a [`Pos`]'s path names its
 //! story, see [`crate::StoryId`]). A range lives in one story: given two

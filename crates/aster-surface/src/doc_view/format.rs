@@ -1,6 +1,6 @@
 //! Formatting commands and the state the toolbar shows.
 
-use aster_writer::edit::{self, ListKind, Selection};
+use aster_writer::edit::{self, ListKind, PictureLayout, Selection};
 use aster_writer::{
     Align, Document, LineSpacing, NumberFormat, Paragraph, Pos, RunLook, RunPatch, Underline,
     UnderlineStyle, VertAlign,
@@ -98,6 +98,17 @@ pub enum DocCommand {
     DeleteRows,
     DeleteColumns,
     DeleteTable,
+    /// Merge the selected cells of a table into one.
+    MergeCells,
+    /// Cut the cell the caret is in into this many columns and rows.
+    SplitCell {
+        columns: usize,
+        rows: usize,
+    },
+    /// Take the merged cell the caret is in apart.
+    UnmergeCell,
+    /// How the selected picture sits in relation to the text.
+    PictureLayout(PictureLayout),
     /// Put this address on the selection or the link around the caret;
     /// `None` takes the link off.
     SetLink(Option<String>),
@@ -406,6 +417,10 @@ impl DocView {
             DocCommand::DeleteRows => self.delete_rows(),
             DocCommand::DeleteColumns => self.delete_columns(),
             DocCommand::DeleteTable => self.delete_table(),
+            DocCommand::MergeCells => self.merge_cells(),
+            DocCommand::SplitCell { columns, rows } => self.split_cell(columns, rows),
+            DocCommand::UnmergeCell => self.unmerge_cell(),
+            DocCommand::PictureLayout(layout) => self.set_picture_layout(layout),
             DocCommand::SetLink(target) => self.set_link_command(target),
             DocCommand::EditLink { text, target } => self.edit_link(&text, &target),
             DocCommand::InsertLink { text, target } => self.insert_linked_text(&text, &target),

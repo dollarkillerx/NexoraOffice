@@ -17,7 +17,7 @@ use aster_shell::writer_tab::{
     DocPdf, DocSave, DocTab, PictureProblem, TableEdit, Written, find_position, read_picture,
 };
 use aster_storage::Contents;
-use aster_surface::doc_view::{Align, Break, Corner, DocCommand, Move};
+use aster_surface::doc_view::{Align, Break, Corner, DocCommand, Handle, Move};
 use slint::{ComponentHandle, SharedString, TimerMode};
 
 use super::{
@@ -295,8 +295,12 @@ pub(crate) fn hover(ui: &AppWindow, shell: &mut Shell, x: f64, y: f64) {
     // The hand only with the key that opens links held; the corners of a
     // selected picture show the shape of what dragging them does.
     let cursor = match tab.view.handle_at(x, y) {
-        Some(Corner::TopLeft | Corner::BottomRight) => 6,
-        Some(Corner::TopRight | Corner::BottomLeft) => 7,
+        Some(Handle::Corner(Corner::TopLeft | Corner::BottomRight)) => 6,
+        Some(Handle::Corner(Corner::TopRight | Corner::BottomLeft)) => 7,
+        Some(Handle::ColumnBorder) => 1,
+        Some(Handle::RowBorder) => 2,
+        // No cursor for moving yet: the pointer stays what the page makes it.
+        Some(Handle::Move) => 0,
         None if link.is_some() && primary => 5,
         None if tab.view.is_over_page(x, y) => 4,
         None => 0,

@@ -15,22 +15,43 @@
 //!
 //! **Pictures.** A click on a picture selects it: the selection is its one
 //! object character, so Delete and Backspace remove it and typing replaces
-//! it. A picture in the line (not floating) shows a handle at each corner;
-//! dragging one resizes it keeping its proportions: the new size is the
-//! distance from the pointer to the opposite corner as it was when the
-//! button went down. A picture in the line stays where the line puts it, so
-//! its top left corner stays and the others move with the size. The
-//! document changes while the pointer moves and the whole drag is one step
-//! of undo, recorded when the button goes up. Floating pictures can be selected and deleted,
-//! but have no handles and cannot be moved.
+//! it. This holds for the pictures of the body, of footnotes and endnotes, and
+//! of a header or footer (once the caret is in it). A selected picture shows
+//! a frame and a handle at each corner, and nothing else: the selection of
+//! its object character is not tinted. Dragging a handle resizes it keeping
+//! its proportions: the new size is the distance from the pointer to the
+//! opposite corner as it was when the button went down. A picture in the line
+//! keeps its top left corner; a floating one keeps the opposite corner, so
+//! its position changes with it. The document changes while the pointer
+//! moves and the whole drag is one step of undo, recorded when the button
+//! goes up.
+//!
+//! Pressing on a picture and dragging it moves it. A floating picture is
+//! shown as a ghost where it will land and moves by as much as the pointer
+//! did ([`aster_writer::edit::move_floating_drawing`]); a picture in the line
+//! shows a caret where it will land in the text
+//! ([`aster_writer::edit::move_drawing`]), in the same story. The document
+//! changes when the button goes up, as one step of undo; a press that stays
+//! within a few pixels is only a click. While a floating picture is selected
+//! the arrow keys move it ([`DocView::nudge_object`]) instead of the caret.
+//! [`DocView::picture_layout`] and [`DocView::set_picture_layout`] ask and
+//! set how it sits in relation to the text.
+//!
+//! **While composing.** An input method that is composing makes the view
+//! ignore clicks and commands until it ends: no drag begins, and one that
+//! was going on changes nothing when the button goes up.
 
 use std::sync::Arc;
 
 use aster_layout::{Item, Rect as PageRect};
-use aster_writer::edit::{self, PictureError, Selection};
-use aster_writer::{Document, DrawingContent, Inline, Link, OBJECT, Path, Pos, paragraphs_of};
+use aster_writer::edit::{self, PictureError, PictureLayout, Selection};
+use aster_writer::{
+    Document, Drawing, DrawingContent, FloatFrom, Inline, Link, OBJECT, Path, Pos, StoryId,
+    paragraphs_of,
+};
 
 use super::DocView;
+use super::stories::Area;
 use super::text::{sanitized, text_between};
 
 /// EMU in a point, and in a twip.
@@ -43,6 +64,11 @@ const MIN_SIDE: f64 = 8.0;
 /// Logical pixels: a handle's side, and how far from its centre it is hit.
 const HANDLE: f64 = 7.0;
 const HANDLE_HIT: f64 = 6.0;
+/// How far the pointer must go before a press on a picture is a drag, logical
+/// pixels.
+const DRAG_SLOP: f64 = 4.0;
+/// How far one press of an arrow key moves a floating picture, points.
+pub const NUDGE: f64 = 2.0;
 
 /// A corner of a picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +106,20 @@ impl Corner {
     }
 }
 
+/// What the pointer is over that dragging acts on; the window shows the
+/// cursor that goes with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    /// A corner of the selected picture: resizes it.
+    Corner(Corner),
+    /// The selected picture: dragging moves it.
+    Move,
+    /// A vertical line between two columns of a table.
+    ColumnBorder,
+    /// The bottom line of a row of a table.
+    RowBorder,
+}
+
 /// The picture that is selected as an object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectInfo {
@@ -92,6 +132,8 @@ pub struct ObjectInfo {
     /// Where it is drawn: the page and the rectangle in its points.
     pub page: usize,
     pub rect: PageRect,
+    /// How it sits in relation to the text.
+    pub layout: PictureLayout,
 }
 
 /// What the link dialog starts from.
@@ -118,6 +160,25 @@ pub(super) struct Resize {
     fixed: (f32, f32),
     start: (i64, i64),
     size: (i64, i64),
+    /// For a floating picture: the sizes its position is measured from.
+    spans: Option<(i64, i64)>,
+}
+
+/// A press on a picture that becomes a move when the pointer goes far enough.
+pub(super) struct Moving {
+    pub(super) pos: Pos,
+    pub(super) floating: bool,
+    /// The page it is on, and where on it (points).
+    pub(super) page: usize,
+    pub(super) rect: PageRect,
+    /// Where the button went down, and how far the pointer is from it,
+    /// physical pixels.
+    pub(super) start: (f64, f64),
+    pub(super) delta: (f64, f64),
+    pub(super) spans: (i64, i64),
+    pub(super) dragged: bool,
+    /// For a picture in the line: where it would land.
+    pub(super) target: Option<Pos>,
 }
 
 impl DocView {
@@ -407,8 +468,9 @@ impl DocView {
         }
     }
 
-    /// The picture that is selected as an object, if one is.
-    pub fn selected_object(&self) -> Option<ObjectInfo> {
+    /// The drawing the selection is exactly the object character of, and
+    /// where it starts.
+    fn selected_drawing(&self) -> Option<(Pos, &Drawing)> {
         let sel = self.sel.as_ref()?;
         let (a, b) = if sel.anchor <= sel.focus {
             (&sel.anchor, &sel.focus)
@@ -418,32 +480,55 @@ impl DocView {
         if a.path != b.path || b.offset != a.offset + OBJECT.len() {
             return None;
         }
-        let paragraph = self.document.paragraph(&a.path)?;
-        let mut start = 0;
-        for run in &paragraph.runs {
-            if start == a.offset {
-                let Inline::Drawing(drawing) = &run.kind else {
-                    return None;
-                };
-                let DrawingContent::Picture(picture) = &drawing.content else {
-                    return None;
-                };
-                let (page, rect) = self.picture_rect(&picture.image, drawing.size, a)?;
-                return Some(ObjectInfo {
-                    pos: a.clone(),
-                    inline: drawing.float.is_none(),
-                    size: drawing.size,
-                    page,
-                    rect,
-                });
-            }
-            start += run.text.len();
+        Some((a.clone(), edit::drawing_at(&self.document, a)?))
+    }
+
+    /// A picture is selected as an object (cheap: no layout is asked).
+    pub(super) fn object_selected(&self) -> bool {
+        self.selected_drawing()
+            .is_some_and(|(_, d)| matches!(d.content, DrawingContent::Picture(_)))
+    }
+
+    /// The picture that is selected as an object, if one is.
+    pub fn selected_object(&self) -> Option<ObjectInfo> {
+        let (pos, drawing) = self.selected_drawing()?;
+        let DrawingContent::Picture(picture) = &drawing.content else {
+            return None;
+        };
+        let (page, rect) = self.picture_rect(&picture.image, drawing.size, &pos)?;
+        Some(ObjectInfo {
+            inline: drawing.float.is_none(),
+            size: drawing.size,
+            layout: edit::picture_layout(drawing),
+            pos,
+            page,
+            rect,
+        })
+    }
+
+    /// How the selected picture sits in relation to the text.
+    pub fn picture_layout(&self) -> Option<PictureLayout> {
+        let (_, drawing) = self.selected_drawing()?;
+        matches!(drawing.content, DrawingContent::Picture(_)).then(|| edit::picture_layout(drawing))
+    }
+
+    /// Give the selected picture another layout (see
+    /// [`edit::set_picture_layout`] for what stays and what changes). One
+    /// step of undo. False where no picture is selected or it has the layout.
+    pub fn set_picture_layout(&mut self, layout: PictureLayout) -> bool {
+        if self.compose.is_some() || !self.object_selected() {
+            return false;
         }
-        None
+        self.apply(None, true, |document, selection| {
+            let (at, _) = selection.ordered();
+            edit::set_picture_layout(document, &at, layout).then(|| selection.clone())
+        })
     }
 
     /// Where the picture with these bytes and this size is drawn: the one
-    /// nearest the object character at `at` when there are several.
+    /// nearest the object character at `at` when there are several. A
+    /// picture of a header or footer is looked for on the page the caret is
+    /// on.
     fn picture_rect(
         &self,
         image: &Arc<[u8]>,
@@ -451,8 +536,15 @@ impl DocView {
         at: &Pos,
     ) -> Option<(usize, PageRect)> {
         let (w, h) = (size.0 as f64 / EMU_PT, size.1 as f64 / EMU_PT);
+        let caret = self.layout.caret_on(self.page_for(at.path.story), at);
+        let only = matches!(at.path.story, StoryId::Marginal(_))
+            .then(|| caret.map(|c| c.page))
+            .flatten();
         let mut found: Vec<(usize, PageRect)> = Vec::new();
         for (index, page) in self.layout.pages.iter().enumerate() {
+            if only.is_some_and(|p| p != index) {
+                continue;
+            }
             for item in &page.items {
                 if let Item::Picture(p) = item
                     && Arc::ptr_eq(&p.image, image)
@@ -463,7 +555,6 @@ impl DocView {
                 }
             }
         }
-        let caret = self.layout.caret(at);
         found.into_iter().min_by(|(pa, ra), (pb, rb)| {
             let distance = |page: usize, rect: &PageRect| match caret {
                 Some(c) if c.page == page => {
@@ -475,19 +566,39 @@ impl DocView {
         })
     }
 
+    /// The story a point of a page is in, as far as the pointer works on it
+    /// now: the body and the notes while the caret is not in a header or
+    /// footer, the strips of the header and footer while it is. `None`
+    /// where a press is something else (a click in the body that leaves
+    /// the header, the first click above the body that does not enter it).
+    pub(super) fn pointer_story(&self, page: usize, x: f32, y: f32) -> Option<StoryId> {
+        let inside = self.in_marginal();
+        match self.area_at(page, x, y) {
+            Area::Header | Area::Footer => inside
+                .then(|| self.layout.story_at(page, x, y))
+                .flatten()
+                .filter(|story| matches!(story, StoryId::Marginal(_))),
+            Area::Note(story) => (!inside).then_some(story),
+            Area::Body => (!inside).then_some(StoryId::Body),
+        }
+    }
+
     /// The picture under a point of the window (physical pixels): its place
-    /// in the text, so that it can be selected.
-    fn object_at(&self, x: f64, y: f64) -> Option<(Pos, Pos)> {
+    /// in the text, so that it can be selected, and the page it is on. Found
+    /// in the story the point is in: a picture of a note, or of a header or
+    /// footer the caret is in, is one like those of the body.
+    fn object_at(&self, x: f64, y: f64) -> Option<(Pos, Pos, usize)> {
         if !self.is_over_page(x, y) {
             return None;
         }
         let (page, px, py) = self.locate(x, y);
+        let story = self.pointer_story(page, px, py)?;
         let items = &self.layout.pages.get(page)?.items;
         let hit = items.iter().rev().find_map(|item| match item {
             Item::Picture(p) if p.rect.contains(px, py) => Some(p),
             _ => None,
         })?;
-        let near = self.layout.hit(page, px, py);
+        let near = self.layout.hit_in(page, story, px, py);
         let size = |s: (i64, i64)| {
             (s.0 as f64 / EMU_PT - f64::from(hit.rect.width())).abs() < 1.0
                 && (s.1 as f64 / EMU_PT - f64::from(hit.rect.height())).abs() < 1.0
@@ -513,7 +624,7 @@ impl DocView {
         };
         // The picture the click is on is next to the place it hits (in the
         // line, one of the two sides of it); a floating one may be anchored
-        // anywhere, and is looked for in the whole body.
+        // anywhere, and is looked for in the whole story.
         let mut candidates: Vec<Pos> = Vec::new();
         if let Some(near) = &near
             && let Some(p) = self.document.paragraph(&near.path)
@@ -533,7 +644,7 @@ impl DocView {
             .find(|c| matching(&c.path, c.offset))
             .or_else(|| {
                 self.document
-                    .paragraphs()
+                    .paragraphs_in(story)
                     .into_iter()
                     .find_map(|(path, p)| {
                         let mut start = 0;
@@ -547,13 +658,16 @@ impl DocView {
                     })
             })?;
         let end = Pos::new(found.path.clone(), found.offset + OBJECT.len());
-        Some((found, end))
+        Some((found, end, page))
     }
 
     /// Select the picture under a point as an object. False when there is
     /// none, or while composing.
     fn select_object_at(&mut self, x: f64, y: f64) -> bool {
-        let Some((start, end)) = self.object_at(x, y) else {
+        if self.compose.is_some() {
+            return false;
+        }
+        let Some((start, end, page)) = self.object_at(x, y) else {
             return false;
         };
         let (Some(start), Some(end)) = (
@@ -564,14 +678,21 @@ impl DocView {
         };
         self.goal_x = None;
         self.press = None;
-        self.set_sel(start, end);
+        self.set_sel_on(start, end, Some(page));
         true
     }
 
-    /// The handle (a corner of the selected picture) under a point of the
-    /// window, for the pointer's shape.
-    pub fn handle_at(&self, x: f64, y: f64) -> Option<Corner> {
-        let info = self.selected_object().filter(|info| info.inline)?;
+    /// Whether a point of the window (physical pixels) is in the rectangle
+    /// of the picture `info`.
+    fn over_object(&self, info: &ObjectInfo, x: f64, y: f64) -> bool {
+        let rect = self.page_rect(info.page);
+        let ppp = self.pixels_per_point();
+        info.rect
+            .contains(((x - rect.x0) / ppp) as f32, ((y - rect.y0) / ppp) as f32)
+    }
+
+    /// The corner handle of `info` under a point of the window.
+    fn corner_at(&self, info: &ObjectInfo, x: f64, y: f64) -> Option<Corner> {
         let rect = self.page_rect(info.page);
         let ppp = self.pixels_per_point();
         let reach = HANDLE_HIT * self.s();
@@ -582,13 +703,70 @@ impl DocView {
         })
     }
 
-    /// A press that begins a resize or selects a picture. `Some(changed)`
-    /// when the press was about a picture, `None` when it was not.
-    pub(super) fn press_object(&mut self, x: f64, y: f64) -> Option<bool> {
-        if let Some(corner) = self.handle_at(x, y)
-            && let Some(info) = self.selected_object()
-            && let Some(selection) = self.selection_value()
-        {
+    /// What the pointer is over that can be dragged, for its shape: a
+    /// corner of the selected picture, the selected picture itself (to move
+    /// it) or a line of a table. While a drag goes on, what is dragged.
+    pub fn handle_at(&self, x: f64, y: f64) -> Option<Handle> {
+        if let Some(resize) = &self.resizing {
+            return Some(Handle::Corner(resize.corner));
+        }
+        if self.moving.as_ref().is_some_and(|m| m.dragged) {
+            return Some(Handle::Move);
+        }
+        if let Some(info) = self.selected_object() {
+            if let Some(corner) = self.corner_at(&info, x, y) {
+                return Some(Handle::Corner(corner));
+            }
+            if self.over_object(&info, x, y) {
+                return Some(Handle::Move);
+            }
+        }
+        self.border_handle(x, y)
+    }
+
+    /// The page's width and the margin box's, as far as a floating
+    /// drawing's position is measured from them (EMU): horizontally, and
+    /// vertically. Only needed for positions given by alignment. A column is
+    /// taken as the margin box, and a paragraph (vertically) too.
+    fn float_spans(&self, at: &Pos, page: usize) -> (i64, i64) {
+        let Some(float) = edit::drawing_at(&self.document, at).and_then(|d| d.float) else {
+            return (0, 0);
+        };
+        let Some(sheet) = self.layout.pages.get(page) else {
+            return (0, 0);
+        };
+        let margin = self
+            .layout
+            .page_info(page)
+            .map_or(PageRect::new(0.0, 0.0, sheet.width, sheet.height), |i| {
+                i.margin
+            });
+        let line = self
+            .layout
+            .caret_on(self.page_for(at.path.story), at)
+            .map_or(0.0, |c| c.height);
+        let across = match float.x.from {
+            FloatFrom::Page => sheet.width,
+            FloatFrom::Text => 0.0,
+            _ => margin.width(),
+        };
+        let down = match float.y.from {
+            FloatFrom::Page => sheet.height,
+            FloatFrom::Text => line,
+            _ => margin.height(),
+        };
+        let emu = |points: f32| (f64::from(points) * EMU_PT).round() as i64;
+        (emu(across), emu(down))
+    }
+
+    /// A press that starts something on the picture that is selected: a
+    /// resize from a corner, or a move from anywhere on it. `Some(changed)`
+    /// when the press was about it, `None` when it was not.
+    pub(super) fn press_selected_object(&mut self, x: f64, y: f64) -> Option<bool> {
+        let info = self.selected_object()?;
+        if let Some(corner) = self.corner_at(&info, x, y) {
+            let selection = self.selection_value()?;
+            let spans = (!info.inline).then(|| self.float_spans(&info.pos, info.page));
             self.press = None;
             self.resizing = Some(Resize {
                 pos: info.pos,
@@ -599,10 +777,48 @@ impl DocView {
                 fixed: corner.opposite().of(&info.rect),
                 start: info.size,
                 size: info.size,
+                spans,
             });
             return Some(false);
         }
-        self.select_object_at(x, y).then_some(true)
+        if self.over_object(&info, x, y) {
+            self.arm_move(&info, x, y);
+            return Some(false);
+        }
+        None
+    }
+
+    /// A press that selects the picture under it (and may begin to move it).
+    /// `Some(changed)` when there was one, `None` when there was not.
+    pub(super) fn press_object(&mut self, x: f64, y: f64) -> Option<bool> {
+        if !self.select_object_at(x, y) {
+            return None;
+        }
+        if let Some(info) = self.selected_object() {
+            self.arm_move(&info, x, y);
+        }
+        Some(true)
+    }
+
+    /// The button is down on a picture: if the pointer goes some way before
+    /// it is let go, the picture moves.
+    fn arm_move(&mut self, info: &ObjectInfo, x: f64, y: f64) {
+        self.press = None;
+        self.moving = Some(Moving {
+            pos: info.pos.clone(),
+            floating: !info.inline,
+            page: info.page,
+            rect: info.rect,
+            start: (x, y),
+            spans: if info.inline {
+                (0, 0)
+            } else {
+                self.float_spans(&info.pos, info.page)
+            },
+            dragged: false,
+            delta: (0.0, 0.0),
+            target: None,
+        });
     }
 
     /// The pointer moved while a picture is being resized. `None` when none
@@ -634,6 +850,26 @@ impl DocView {
             return Some(false);
         }
         let mut document = resize.before.clone();
+        // A floating picture is placed by its top left corner: when the
+        // held corner is on the left or the top, that corner moves by what
+        // the picture grows, so that the opposite one stays where it was.
+        // The move comes first, while the size is the one the position was
+        // worked out for.
+        if let Some(spans) = resize.spans {
+            let shift = (
+                if held.0 < 0.5 {
+                    resize.start.0 - size.0
+                } else {
+                    0
+                },
+                if held.1 < 0.5 {
+                    resize.start.1 - size.1
+                } else {
+                    0
+                },
+            );
+            edit::move_floating_drawing(&mut document, &resize.pos, shift, spans);
+        }
         edit::resize_drawing(&mut document, &resize.pos, size);
         if let Some(resize) = &mut self.resizing {
             resize.size = size;
@@ -669,9 +905,126 @@ impl DocView {
         true
     }
 
-    /// Whether a picture is being resized.
+    /// The pointer moved while the button is down on a picture: once it has
+    /// gone some way, the picture is being moved (a floating one is shown as
+    /// a ghost where it will be, a picture in the line as a caret where it
+    /// will land). `None` when there is no such press.
+    pub(super) fn drag_move(&mut self, x: f64, y: f64) -> Option<bool> {
+        let moving = self.moving.as_ref()?;
+        let delta = (x - moving.start.0, y - moving.start.1);
+        let slop = DRAG_SLOP * self.s();
+        if !moving.dragged && delta.0.hypot(delta.1) < slop {
+            return Some(false);
+        }
+        let target = if moving.floating {
+            None
+        } else {
+            self.pos_in_story(x, y, moving.pos.path.story)
+        };
+        if let Some(moving) = &mut self.moving {
+            moving.dragged = true;
+            moving.delta = delta;
+            moving.target = target;
+        }
+        self.touch();
+        Some(true)
+    }
+
+    /// The button went up: a picture that was dragged lands where it was
+    /// taken to, as one step of undo. Returns whether the document changed.
+    pub(super) fn finish_move(&mut self) -> bool {
+        let Some(moving) = self.moving.take() else {
+            return false;
+        };
+        self.touch();
+        if !moving.dragged || self.compose.is_some() {
+            return false;
+        }
+        let at = moving.pos;
+        if moving.floating {
+            let ppp = self.pixels_per_point();
+            let delta = (
+                (moving.delta.0 / ppp * EMU_PT).round() as i64,
+                (moving.delta.1 / ppp * EMU_PT).round() as i64,
+            );
+            let spans = moving.spans;
+            return self.apply_in_place(|document, selection| {
+                edit::move_floating_drawing(document, &at, delta, spans).then(|| selection.clone())
+            });
+        }
+        let Some(target) = moving.target else {
+            return false;
+        };
+        self.apply_in_place(|document, _| {
+            let now = edit::move_drawing(document, &at, &target)?;
+            (now != at).then(|| {
+                let end = Pos::new(now.path.clone(), now.offset + OBJECT.len());
+                Selection::new(now, end)
+            })
+        })
+    }
+
+    /// Move the selected floating picture by `dx` and `dy` steps of
+    /// [`NUDGE`] points (negative for left and up); what the arrow keys do
+    /// while one is selected. Each is a step of undo. False where no
+    /// floating picture is selected.
+    pub fn nudge_object(&mut self, dx: i32, dy: i32) -> bool {
+        if self.compose.is_some() || self.is_dragging() {
+            return false;
+        }
+        let Some((at, drawing)) = self.selected_drawing() else {
+            return false;
+        };
+        if drawing.float.is_none() || !matches!(drawing.content, DrawingContent::Picture(_)) {
+            return false;
+        }
+        let Some(page) = self
+            .layout
+            .caret_on(self.page_for(at.path.story), &at)
+            .map(|c| c.page)
+        else {
+            return false;
+        };
+        let spans = self.float_spans(&at, page);
+        let step = (NUDGE * EMU_PT) as i64;
+        let delta = (i64::from(dx) * step, i64::from(dy) * step);
+        self.apply_in_place(|document, selection| {
+            edit::move_floating_drawing(document, &at, delta, spans).then(|| selection.clone())
+        })
+    }
+
+    /// Whether the selection is a floating picture, which the arrow keys
+    /// move instead of the caret.
+    pub(super) fn floating_picture_selected(&self) -> bool {
+        self.selected_drawing().is_some_and(|(_, d)| {
+            d.float.is_some() && matches!(d.content, DrawingContent::Picture(_))
+        })
+    }
+
+    /// An edit that does not scroll to the caret: what dragging does, where
+    /// the caret may be far from the thing that is changed.
+    pub(super) fn apply_in_place(
+        &mut self,
+        edit: impl FnOnce(&mut Document, &Selection) -> Option<Selection>,
+    ) -> bool {
+        let scroll = (self.scroll_x, self.scroll_y);
+        let done = self.apply(None, true, edit);
+        (self.scroll_x, self.scroll_y) = scroll;
+        self.clamp();
+        done
+    }
+
+    /// Something is being dragged (a picture resized or moved, a line of a
+    /// table): the button went down and has not come up. Edits wait for it.
+    pub fn is_dragging(&self) -> bool {
+        self.resizing.is_some() || self.moving.is_some() || self.border.is_some()
+    }
+
+    /// Whether a drag is going on (the same as [`DocView::is_dragging`]): the
+    /// window asks it to know that the button going up may have changed the
+    /// document.
     pub fn is_resizing(&self) -> bool {
-        self.resizing.is_some()
+        self.is_dragging()
     }
 
     /// Paint the frame and handles of the selected picture on one page.
@@ -688,18 +1041,7 @@ impl DocView {
             page.y0 + f64::from(info.rect.y1) * ppp,
         );
         let line = (1.5 * s).round().max(1.0);
-        self.ctx.set_paint(super::color(style.object));
-        for edge in [
-            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y0 - line, r.x1 + line, r.y0),
-            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y1, r.x1 + line, r.y1 + line),
-            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y0, r.x0, r.y1),
-            vello_cpu::kurbo::Rect::new(r.x1, r.y0, r.x1 + line, r.y1),
-        ] {
-            self.ctx.fill_rect(&edge);
-        }
-        if !info.inline {
-            return;
-        }
+        self.draw_frame(r, line, &style);
         let half = (HANDLE * s / 2.0).round().max(2.0);
         for corner in Corner::ALL {
             let (cx, cy) = corner.of(&info.rect);
@@ -722,5 +1064,69 @@ impl DocView {
                 y + half - line,
             ));
         }
+    }
+
+    /// Four thin bars round `r` (outside it).
+    fn draw_frame(&mut self, r: vello_cpu::kurbo::Rect, line: f64, style: &super::DocStyle) {
+        self.ctx.set_paint(super::color(style.object));
+        for edge in [
+            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y0 - line, r.x1 + line, r.y0),
+            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y1, r.x1 + line, r.y1 + line),
+            vello_cpu::kurbo::Rect::new(r.x0 - line, r.y0, r.x0, r.y1),
+            vello_cpu::kurbo::Rect::new(r.x1, r.y0, r.x1 + line, r.y1),
+        ] {
+            self.ctx.fill_rect(&edge);
+        }
+    }
+
+    /// What a drag shows while it goes on, on one page: the guide of a line
+    /// of a table, the ghost of a floating picture, the caret where a
+    /// picture in the line will land.
+    pub(super) fn draw_drag(&mut self, index: usize, page: vello_cpu::kurbo::Rect, ppp: f64) {
+        let style = self.style.clone();
+        self.draw_border_guide(index, page, ppp, &style);
+        let Some(moving) = self.moving.as_ref().filter(|m| m.dragged) else {
+            return;
+        };
+        let line = (1.5 * self.s()).round().max(1.0);
+        if moving.floating {
+            if moving.page != index {
+                return;
+            }
+            let shift = (moving.delta.0, moving.delta.1);
+            let r = vello_cpu::kurbo::Rect::new(
+                page.x0 + f64::from(moving.rect.x0) * ppp + shift.0,
+                page.y0 + f64::from(moving.rect.y0) * ppp + shift.1,
+                page.x0 + f64::from(moving.rect.x1) * ppp + shift.0,
+                page.y0 + f64::from(moving.rect.y1) * ppp + shift.1,
+            );
+            // A translucent veil as well as the frame, so that the ghost is
+            // seen over the picture it leaves.
+            let mut veil = style.object;
+            veil[3] = 0x33;
+            self.ctx.set_paint(super::color(veil));
+            self.ctx.fill_rect(&r);
+            self.draw_frame(r, line, &style);
+            return;
+        }
+        let Some(target) = moving.target.clone() else {
+            return;
+        };
+        let Some(caret) = self
+            .layout
+            .caret_on(self.page_for(target.path.story), &target)
+            .filter(|c| c.page == index)
+        else {
+            return;
+        };
+        let x = (page.x0 + f64::from(caret.x) * ppp - line / 2.0).round();
+        let top = page.y0 + f64::from(caret.top) * ppp;
+        self.ctx.set_paint(super::color(style.caret));
+        self.ctx.fill_rect(&vello_cpu::kurbo::Rect::new(
+            x,
+            top.round(),
+            x + line,
+            (top + f64::from(caret.height) * ppp).round(),
+        ));
     }
 }

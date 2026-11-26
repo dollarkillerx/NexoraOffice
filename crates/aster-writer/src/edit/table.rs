@@ -35,9 +35,9 @@ use crate::{
 
 mod shape;
 pub use shape::{
-    MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, can_merge_cells, can_split_cell,
-    can_unmerge_cell, merge_cells, move_column_border, set_column_width, set_row_height,
-    split_cell, unmerge_cell,
+    CellRange, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, can_merge_cells,
+    can_split_cell, can_unmerge_cell, cell_range, merge_cells, move_column_border, row_start,
+    set_column_width, set_row_height, split_cell, unmerge_cell,
 };
 
 /// Most columns a table made here has (Word's own limit).

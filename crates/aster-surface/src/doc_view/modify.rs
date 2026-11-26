@@ -131,8 +131,8 @@ impl DocView {
         check: bool,
         edit: impl FnOnce(&mut Document, &Selection) -> Option<Selection>,
     ) -> bool {
-        // A picture being resized finishes first.
-        if self.compose.is_some() || self.resizing.is_some() || !self.ensure_paragraph() {
+        // A drag that is going on finishes first.
+        if self.compose.is_some() || self.is_dragging() || !self.ensure_paragraph() {
             return false;
         }
         let Some(old_selection) = self.selection_value() else {
@@ -550,7 +550,7 @@ impl DocView {
         // While an input method is composing, keys, typed text and commands
         // wait for it to end, as in the Markdown editor; only a commit
         // enters composed text.
-        if self.compose.is_some() || self.resizing.is_some() {
+        if self.compose.is_some() || self.is_dragging() {
             return false;
         }
 
@@ -567,7 +567,7 @@ impl DocView {
         // While an input method is composing, keys, typed text and commands
         // wait for it to end, as in the Markdown editor; only a commit
         // enters composed text.
-        if self.compose.is_some() || self.resizing.is_some() {
+        if self.compose.is_some() || self.is_dragging() {
             return false;
         }
 

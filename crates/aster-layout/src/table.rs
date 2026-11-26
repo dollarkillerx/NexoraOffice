@@ -9,6 +9,7 @@ use aster_writer::{Align, Border, CellAlign, Path, RowHeight, Table, VMerge};
 
 use crate::cx::{Cx, EmitCtx, Entry, Layer, Out, Paths, Stack, border_color, rule_style};
 use crate::display::{Item, Rect, Rgba};
+use crate::query::{GridRow, TableGrid};
 use crate::shape::pt;
 
 /// Most grid columns taken from a table.
@@ -43,6 +44,8 @@ pub(crate) struct CellLayout {
 }
 
 pub(crate) struct TableLayout {
+    /// Where the table is in its story, when it can be pointed at.
+    pub path: Option<Path>,
     /// Left edge relative to the container's left.
     pub x: f32,
     /// Grid lines relative to the table's left edge.
@@ -336,6 +339,7 @@ impl Cx<'_> {
             .max(0.0);
         }
         TableLayout {
+            path: path.cloned(),
             x,
             cols,
             rows,
@@ -464,6 +468,54 @@ impl Cx<'_> {
             y = y_bot;
         }
         tops.push(y);
+        if ec.record
+            && let Some(path) = &table.path
+            && !slices.is_empty()
+        {
+            let columns = (0..=ncols).map(|g| ox + table.cols[g]).collect();
+            let rows = slices
+                .iter()
+                .enumerate()
+                .map(|(i, slice)| {
+                    let owners = &table.owner[slice.row];
+                    let edges = (0..=ncols)
+                        .map(|g| {
+                            let left = if g > 0 { owners[g - 1] } else { None };
+                            let right = if g < ncols { owners[g] } else { None };
+                            left != right
+                        })
+                        .collect();
+                    // The cell ends here unless a merge goes on below.
+                    let ends = owners
+                        .iter()
+                        .map(|owner| {
+                            owner.is_some_and(|ci| {
+                                let cell = &table.cells[ci];
+                                slice.row + 1 == cell.row0 + cell.rows
+                            })
+                        })
+                        .collect();
+                    let height = table.rows[slice.row].height;
+                    GridRow {
+                        row: slice.row,
+                        top: tops[i],
+                        bottom: tops[i + 1],
+                        height,
+                        starts: slice.c0 <= 0.01,
+                        finishes: slice.c1 >= height - 0.01,
+                        repeat: slice.repeat,
+                        edges,
+                        ends,
+                    }
+                })
+                .collect();
+            out.grids.push(TableGrid {
+                table: path.clone(),
+                page: ec.page,
+                columns,
+                rows,
+            });
+        }
 
         // Borders: each edge once, from the cells on both sides of it.
         let cell_border = |ci: Option<usize>, side: usize| -> Option<&Border> {

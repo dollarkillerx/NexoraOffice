@@ -220,14 +220,27 @@ impl DocView {
         if self.compose.is_some() {
             return false;
         }
+        // A press on the selected picture (its handles, or to move it), on a
+        // line of a table, or on another picture. These come before the
+        // stories: pictures and tables of notes, headers and footers are
+        // worked on like those of the body.
+        if !extend {
+            if let Some(changed) = self.press_selected_object(x, y) {
+                return changed;
+            }
+            if clicks == 1
+                && let Some(changed) = self.press_border(x, y)
+            {
+                return changed;
+            }
+            if let Some(changed) = self.press_object(x, y) {
+                return changed;
+            }
+        }
         // A click in a note or in the strip of a header or footer, or in the
         // body while inside a header or footer.
         if let Some(done) = self.press_story(x, y, clicks, extend) {
             return done;
-        }
-        // A click on a picture, or on a handle of the selected one.
-        if !extend && let Some(changed) = self.press_object(x, y) {
-            return changed;
         }
         let Some(pos) = self.pos_at(x, y) else {
             return false;
@@ -259,6 +272,12 @@ impl DocView {
     /// to the point, by the same unit. Returns whether the picture changed.
     pub fn drag(&mut self, x: f64, y: f64) -> bool {
         if let Some(changed) = self.drag_object(x, y) {
+            return changed;
+        }
+        if let Some(changed) = self.drag_move(x, y) {
+            return changed;
+        }
+        if let Some(changed) = self.drag_border(x, y) {
             return changed;
         }
         let Some(press) = self.press.clone() else {
@@ -307,11 +326,15 @@ impl DocView {
         self.drag(x, y) || moved
     }
 
-    /// The button went up. Returns whether a picture was being resized (the
-    /// resize is then a step of undo).
+    /// The button went up. Returns whether a drag was going on that may have
+    /// changed the document: a picture resized or moved, a line of a table
+    /// moved (each is then one step of undo, made now).
     pub fn release(&mut self) -> bool {
         self.press = None;
-        self.finish_resize()
+        let resized = self.finish_resize();
+        let moved = self.finish_move();
+        let dragged = self.finish_border();
+        resized || moved || dragged
     }
 
     // --- The keys ---
@@ -326,6 +349,19 @@ impl DocView {
         // Nothing to move in a header or footer that is not made yet.
         if self.new_marginal.is_some() {
             return false;
+        }
+        // The arrow keys move a floating picture that is selected.
+        if !select && self.floating_picture_selected() {
+            let step = match movement {
+                Move::Left => Some((-1, 0)),
+                Move::Right => Some((1, 0)),
+                Move::Up => Some((0, -1)),
+                Move::Down => Some((0, 1)),
+                _ => None,
+            };
+            if let Some((dx, dy)) = step {
+                return self.nudge_object(dx, dy);
+            }
         }
         let Some(sel) = self.sel.clone() else {
             return false;
@@ -736,9 +772,18 @@ impl DocView {
     /// The rectangles of the selection, per page.
     pub(super) fn selection_rects(&mut self) -> &[(usize, PageRect)] {
         if self.sel_rects.is_none() {
-            let rects = match self.selection() {
-                Some((a, b)) => self.layout.selection_on(self.page_for(a.path.story), a, b),
-                None => Vec::new(),
+            // A picture selected as an object shows its frame and handles,
+            // not the tint of the text around its object character; a
+            // selection of several cells is of whole cells.
+            let rects = if self.object_selected() {
+                Vec::new()
+            } else if let Some(cells) = self.cell_selection_rects() {
+                cells
+            } else {
+                match self.selection() {
+                    Some((a, b)) => self.layout.selection_on(self.page_for(a.path.story), a, b),
+                    None => Vec::new(),
+                }
             };
             self.sel_rects = Some(rects);
         }

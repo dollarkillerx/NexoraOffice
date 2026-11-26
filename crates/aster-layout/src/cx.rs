@@ -14,6 +14,7 @@ use aster_writer::{
 
 use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
 use crate::fonts::Families;
+use crate::query::TableGrid;
 use crate::shape::{
     Env, NoteNumbers, PageValues, Shaped, context, emu_pt, fully_hidden, pt, shape,
 };
@@ -62,6 +63,8 @@ pub(crate) struct Frag {
 pub(crate) struct Out<'a> {
     pub layers: &'a mut Layers,
     pub frags: &'a mut Vec<Frag>,
+    /// Where the grid lines of tables are, for the pointer.
+    pub grids: &'a mut Vec<TableGrid>,
 }
 
 /// Where things are being put, for floating drawings and for fragments.
@@ -548,10 +551,12 @@ impl Cx<'_> {
                 // together in the paint order.
                 let mut nested = Layers::default();
                 let mut frags = Vec::new();
+                let mut grids = Vec::new();
                 {
                     let mut sub = Out {
                         layers: &mut nested,
                         frags: &mut frags,
+                        grids: &mut grids,
                     };
                     self.emit_stack(
                         &stack,

@@ -638,6 +638,54 @@ pub fn set_row_height(doc: &mut Document, from: &Pos, to: &Pos, height: RowHeigh
     changed
 }
 
+/// The block of cells a selection that runs over several cells of one table
+/// selects: whole rows `rows.0..=rows.1` and grid columns
+/// `columns.0..columns.1`, widened over merged cells as a merge would.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellRange {
+    pub table: Path,
+    pub rows: (usize, usize),
+    pub columns: (usize, usize),
+}
+
+/// The cells the selection from `from` to `to` selects when its ends are in
+/// two different cells of one table (the innermost one that holds both): a
+/// selection inside one cell, or that is not in a table, is text, so `None`.
+/// Where the table has holes in it the cells are not widened.
+pub fn cell_range(doc: &Document, from: &Pos, to: &Pos) -> Option<CellRange> {
+    let a = cells_around(doc, from);
+    let b = cells_around(doc, to);
+    for cell in a.iter().rev() {
+        let Some(other) = b.iter().find(|o| o.table == cell.table) else {
+            continue;
+        };
+        if (cell.row, cell.cell) == (other.row, other.cell) {
+            // Both in one cell: the text of it, even in a table within it.
+            return None;
+        }
+        let rows = (cell.row.min(other.row), cell.row.max(other.row));
+        let columns = (
+            cell.column.min(other.column),
+            (cell.column + cell.span).max(other.column + other.span),
+        );
+        let table = table_of(doc, &cell.table)?;
+        let grown = grow_rect(table, rows, columns);
+        return Some(CellRange {
+            table: cell.table.clone(),
+            rows: grown.map_or(rows, |r| r.rows),
+            columns: grown.map_or(columns, |r| r.columns),
+        });
+    }
+    None
+}
+
+/// The start of the first paragraph of the first cell of row `row` of the
+/// table at `table`: a place in the row, for the operations that take the
+/// ends of a selection ([`set_row_height`]).
+pub fn row_start(doc: &Document, table: &Path, row: usize) -> Option<Pos> {
+    cell_start(table, table_of(doc, table)?, row, 0)
+}
+
 #[cfg(test)]
 #[path = "shape_tests.rs"]
 mod tests;

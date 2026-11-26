@@ -18,7 +18,7 @@ use crate::cx::{
     space_before,
 };
 use crate::display::{Item, Page, Rect, RuleStyle};
-use crate::query::{Layout, OutlineEntry, PageInfo};
+use crate::query::{Layout, OutlineEntry, PageInfo, TableGrid};
 use crate::shape::{NoteNumbers, PageValues, emu_pt, outline_text, pt};
 use crate::table::{Slice, TableLayout};
 
@@ -238,6 +238,7 @@ struct Flow<'a, 'b> {
     doc: &'a Document,
     pages: Vec<PageState>,
     frags: Vec<Frag>,
+    grids: Vec<TableGrid>,
     outline: Vec<OutlineEntry>,
     section: usize,
     sec: Arc<Section>,
@@ -278,6 +279,7 @@ struct Snapshot {
     pages: usize,
     last: Option<PageState>,
     frags: usize,
+    grids: usize,
     outline: usize,
     redirects: usize,
     section: usize,
@@ -356,6 +358,7 @@ impl Layouter {
             doc: document,
             pages: Vec::new(),
             frags: Vec::new(),
+            grids: Vec::new(),
             outline: Vec::new(),
             section: 0,
             sec: first_section,
@@ -434,6 +437,7 @@ impl Flow<'_, '_> {
             pages: self.pages.len(),
             last: self.pages.last().cloned(),
             frags: self.frags.len(),
+            grids: self.grids.len(),
             outline: self.outline.len(),
             redirects: self.cx.redirects.len(),
             section: self.section,
@@ -458,6 +462,7 @@ impl Flow<'_, '_> {
             *last = page.clone();
         }
         self.frags.truncate(s.frags);
+        self.grids.truncate(s.grids);
         self.outline.truncate(s.outline);
         self.cx.redirects.truncate(s.redirects);
         self.section = s.section;
@@ -1314,6 +1319,7 @@ impl Flow<'_, '_> {
                 let mut out = Out {
                     layers: &mut layers,
                     frags: &mut self.frags,
+                    grids: &mut self.grids,
                 };
                 self.cx.emit_para(
                     &entry,
@@ -1545,6 +1551,7 @@ impl Flow<'_, '_> {
             let mut out = Out {
                 layers: &mut layers,
                 frags: &mut self.frags,
+                grids: &mut self.grids,
             };
             self.cx.emit_row_slices(layout, batch, ox, y, &ec, &mut out)
         };
@@ -1609,6 +1616,7 @@ impl Flow<'_, '_> {
         let mut pages = Vec::with_capacity(count);
         let mut infos = Vec::with_capacity(count);
         let mut marginal_frags = Vec::new();
+        let mut marginal_grids = Vec::new();
         let states = std::mem::take(&mut self.pages);
         for (index, mut state) in states.into_iter().enumerate() {
             let sec = state.sec.clone();
@@ -1640,6 +1648,7 @@ impl Flow<'_, '_> {
                 slot: self.slot(&sec, state.number, state.page_in_section == 0),
                 header_area: Rect::new(0.0, 0.0, state.width, state.body_top),
                 footer_area: Rect::new(0.0, state.body_bottom, state.width, state.height),
+                margin: state.margin,
             });
             self.cx.grid = sections
                 .get(state.section)
@@ -1676,11 +1685,18 @@ impl Flow<'_, '_> {
                     frag.y += dy;
                     frag.bounds = frag.bounds.shifted(dy);
                 }
+                for grid in self.grids.iter_mut().filter(|g| g.page == index) {
+                    for row in &mut grid.rows {
+                        row.top += dy;
+                        row.bottom += dy;
+                    }
+                }
             }
             {
                 let mut out = Out {
                     layers: &mut layers,
                     frags: &mut marginal_frags,
+                    grids: &mut marginal_grids,
                 };
                 if let Some(stack) = &header {
                     let y = pt(sec.margins.header).max(0.0);
@@ -1773,7 +1789,10 @@ impl Flow<'_, '_> {
         let redirects = std::mem::take(&mut self.cx.redirects);
         // After the body's, so that reading order within a story holds.
         self.frags.append(&mut marginal_frags);
-        Layout::new(pages, self.frags, self.outline, redirects).with_page_info(infos)
+        self.grids.append(&mut marginal_grids);
+        Layout::new(pages, self.frags, self.outline, redirects)
+            .with_page_info(infos)
+            .with_grids(self.grids)
     }
 }
 

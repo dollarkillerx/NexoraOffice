@@ -52,6 +52,10 @@ impl Piece {
     }
 }
 
+fn clamp_id(id: i64) -> i32 {
+    id.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 fn page_field(instruction: &str) -> Option<PageField> {
     let word = instruction.split_whitespace().next()?;
     if word.eq_ignore_ascii_case("PAGE") {
@@ -521,11 +525,11 @@ impl Reader<'_> {
                 piece
             }
             b"footnoteReference" => match node.int("id") {
-                Some(id) => Piece::new(Inline::Footnote(id as i32)),
+                Some(id) => Piece::new(Inline::Footnote(clamp_id(id))),
                 None => Piece::new(Inline::Marker),
             },
             b"endnoteReference" => match node.int("id") {
-                Some(id) => Piece::new(Inline::Endnote(id as i32)),
+                Some(id) => Piece::new(Inline::Endnote(clamp_id(id))),
                 None => Piece::new(Inline::Marker),
             },
             b"footnoteRef" | b"endnoteRef" => match part.note {

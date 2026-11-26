@@ -46,7 +46,7 @@ pub fn renumber(document: &mut Document) {
                 let mut look = paragraph.mark.clone();
                 own.look.apply(&mut look);
                 Label {
-                    text: label_text(list, level, number, state),
+                    text: label_text(list, own, level, number, state),
                     look,
                     suffix: own.suffix,
                     align: own.align,
@@ -65,9 +65,13 @@ pub fn renumber(document: &mut Document) {
 
 /// The level's text with `%1` to `%9` replaced by the numbers of those
 /// levels.
-fn label_text(list: &List, level: usize, number: u32, state: &[Option<u32>; LEVELS]) -> String {
-    let own = &list.levels[level.min(list.levels.len().saturating_sub(1))];
-    let own = list.levels.get(level).unwrap_or(own);
+fn label_text(
+    list: &List,
+    own: &ListLevel,
+    level: usize,
+    number: u32,
+    state: &[Option<u32>; LEVELS],
+) -> String {
     if own.format == NumberFormat::Bullet {
         return own.text.clone();
     }

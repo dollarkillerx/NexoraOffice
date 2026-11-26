@@ -174,8 +174,11 @@ impl Reader<'_> {
                 .child("tblInd")
                 .and_then(|n| n.int("w"))
                 .map_or(0, |w| w.clamp(-100_000, 100_000) as Twips);
-            props.fixed_layout =
-                pr.child("tblLayout").and_then(Node::val).as_deref() == Some("fixed");
+            props.fixed_layout = pr
+                .child("tblLayout")
+                .and_then(|l| l.attr("type"))
+                .as_deref()
+                == Some("fixed");
             if let Some(b) = pr.child("tblBorders") {
                 own_borders = parse_tbl_borders(b, &self.env);
             }

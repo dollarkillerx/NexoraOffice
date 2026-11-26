@@ -13,8 +13,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aster_text::{
-    Align as TextAlign, Decor, Extra, InlineObject, LineRule, Rules, Shaper, Spacing, Span, Spec,
-    Stroke, Style, TabAlign, TabStop,
+    Align as TextAlign, Decor, Extra, InlineObject, LineRule, Natural, Rules, Shaper, Spacing,
+    Span, Spec, Stroke, Style, TabAlign, TabStop,
 };
 use aster_writer::{
     Align, Break, Drawing, Inline, LineSpacing, PageField, Paragraph, RunLook, Settings, Suffix,
@@ -237,6 +237,7 @@ struct Builder<'a, 'e> {
     spans: Vec<Span>,
     pieces: Vec<Piece>,
     decor: Vec<Decor>,
+    natural: Vec<Natural>,
     spacing: Vec<Spacing>,
     objects: Vec<InlineObject>,
     drawings: Vec<(usize, Arc<Drawing>)>,
@@ -389,6 +390,14 @@ impl Builder<'_, '_> {
             }
         }
         self.decorate(start..end, look);
+        if let Some(ratio) = self.families.ratio(look, &self.text[start..end])
+            && end > start
+        {
+            self.natural.push(Natural {
+                range: start..end,
+                ratio,
+            });
+        }
         if look.spacing != 0 && end > start {
             self.spacing.push(Spacing {
                 range: start..end,
@@ -413,11 +422,20 @@ pub(crate) fn shape(
     width: f32,
     env: &Env<'_>,
 ) -> Shaped {
+    for run in &para.runs {
+        families.ensure(shaper, &run.look);
+    }
+    families.ensure(shaper, &para.base);
+    families.ensure(shaper, &para.mark);
+    if let Some(label) = &para.label {
+        families.ensure(shaper, &label.look);
+    }
     let mut builder = Builder {
         text: String::new(),
         spans: Vec::new(),
         pieces: Vec::new(),
         decor: Vec::new(),
+        natural: Vec::new(),
         spacing: Vec::new(),
         objects: Vec::new(),
         drawings: Vec::new(),
@@ -442,6 +460,13 @@ pub(crate) fn shape(
         let style = text_style(builder.families, &label.look, false);
         builder.span(0..builder.text.len(), style);
         builder.decorate(0..label_end, &label.look);
+        if let Some(ratio) = builder.families.ratio(&label.look, &builder.text) {
+            let end = builder.text.len();
+            builder.natural.push(Natural {
+                range: 0..end,
+                ratio,
+            });
+        }
     }
     let prefix = builder.text.len();
     let mut at = 0;
@@ -457,6 +482,7 @@ pub(crate) fn shape(
     } else {
         &para.base
     };
+    let builder_base_natural = builder.families.ratio(base_look, "");
     let base = text_style(builder.families, base_look, false);
     let text = std::mem::take(&mut builder.text);
     let has_tabs = text.contains('\t');
@@ -511,22 +537,13 @@ pub(crate) fn shape(
     stops.sort_by(|a, b| a.position.total_cmp(&b.position));
 
     let grid = if props.snap_to_grid { env.grid } else { None };
-    let line = match (props.line, grid) {
-        (LineSpacing::Multiple(m), Some(pitch)) if m > 1.0 => LineRule::AtLeast(pitch * m),
-        (LineSpacing::Multiple(m), Some(pitch)) => {
-            let _ = m;
-            LineRule::AtLeast(pitch)
-        }
-        (LineSpacing::Multiple(m), None) => LineRule::Multiple(m.max(0.0)),
-        (LineSpacing::AtLeast(v), _) => LineRule::AtLeast(pt(v)),
-        (LineSpacing::Exactly(v), _) => LineRule::Exactly(pt(v)),
+    let line = match props.line {
+        LineSpacing::Multiple(m) => LineRule::Multiple(m.max(0.0)),
+        LineSpacing::AtLeast(v) => LineRule::AtLeast(pt(v)),
+        LineSpacing::Exactly(v) => LineRule::Exactly(pt(v)),
     };
-    let grid_fit = match (props.line, grid) {
-        (LineSpacing::Multiple(m), Some(pitch)) if m <= 1.0 => Some(pitch),
-        (LineSpacing::Exactly(_), _) => None,
-        (_, Some(pitch)) => Some(pitch),
-        _ => None,
-    };
+    let grid_fit = grid;
+    let base_natural = builder_base_natural;
     let text_width = width.max(1.0);
     let spec = Spec {
         text: &text,
@@ -548,6 +565,8 @@ pub(crate) fn shape(
         spacing: &builder.spacing,
         decor: &builder.decor,
         line,
+        natural: &builder.natural,
+        base_natural,
         grid: grid_fit,
         distribute: props.align == Align::Distribute,
         snap: false,

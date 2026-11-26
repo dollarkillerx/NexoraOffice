@@ -97,8 +97,8 @@ pub(crate) struct ParaEntry {
     pub x: f32,
     pub top: f32,
     pub bx: Option<ParaBox>,
-    /// Where the floating drawings anchored in it go, where the flow has
-    /// already worked that out.
+    /// Where the floating drawings anchored in it go (by index in
+    /// `Shaped::floats`), where the flow has already worked that out.
     pub floats: Vec<(usize, Rect)>,
 }
 
@@ -549,7 +549,7 @@ impl Cx<'_> {
             lines: lines.clone(),
         }));
         for (range, color) in &shaped.backs {
-            for r in paragraph.rects_in(range.clone(), lines.clone()) {
+            for r in paragraph.text_rects_in(range.clone(), lines.clone()) {
                 out.layers.shade.push(Item::Fill {
                     rect: Rect::new(x + r[0], y + r[1], x + r[2], y + r[3]),
                     color: *color,
@@ -590,7 +590,7 @@ impl Cx<'_> {
             }
         }
         let mut keep_clear = Vec::new();
-        for (offset, drawing) in &shaped.floats {
+        for (n, (offset, drawing)) in shaped.floats.iter().enumerate() {
             let (line_index, caret_x) = paragraph.caret(*offset);
             if !lines.contains(&line_index) {
                 continue;
@@ -599,7 +599,7 @@ impl Cx<'_> {
                 continue;
             };
             let line = &all[line_index];
-            let rect = match entry.floats.iter().find(|(o, _)| o == offset) {
+            let rect = match entry.floats.iter().find(|(i, _)| *i == n) {
                 Some((_, rect)) => *rect,
                 None => self.float_rect(
                     drawing,

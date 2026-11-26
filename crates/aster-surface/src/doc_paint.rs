@@ -401,4 +401,39 @@ mod tests {
         let png = painter.encode_png(&layout.pages[0], 0.5).unwrap();
         assert_eq!(&png[1..4], b"PNG");
     }
+
+    fn ink(bold: bool, painter: &mut DocPainter) -> usize {
+        let look = RunLook {
+            size: 30.0,
+            bold,
+            font: Some("Calibri".into()),
+            east_asian_font: Some("宋体".into()),
+            ..RunLook::default()
+        };
+        let paragraph = Paragraph {
+            runs: vec![Run::text("第一章谢谢", look.clone())],
+            base: look.clone(),
+            mark: look,
+            ..Paragraph::default()
+        };
+        let document = Document {
+            body: Story {
+                blocks: vec![Block::paragraph(paragraph)],
+                part: None,
+            },
+            last_section: Arc::new(Section::default()),
+            ..Document::default()
+        };
+        let layout = Layouter::new().layout(&document);
+        let pixmap = painter.render(&layout.pages[0], 2.0);
+        pixmap.data().iter().filter(|p| p.r < 128).count()
+    }
+
+    #[test]
+    fn bold_east_asian_text_has_more_ink_even_after_regular_text() {
+        let mut painter = DocPainter::new();
+        let regular = ink(false, &mut painter);
+        let bold = ink(true, &mut painter);
+        assert!(bold * 100 > regular * 118, "{regular} {bold}");
+    }
 }

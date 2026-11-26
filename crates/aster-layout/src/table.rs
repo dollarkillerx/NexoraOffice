@@ -230,6 +230,10 @@ impl Cx<'_> {
                     start
                 } else {
                     let [ml, mt, mr, mb] = cell.margins.map(|m| pt(m).max(0.0));
+                    // The borders' own width is part of the row: half of each
+                    // lies inside it.
+                    let border = |side: usize| cell.borders[side].map_or(0.0, |b| b.width.max(0.0));
+                    let (mt, mb) = (mt + border(1) / 2.0, mb + border(3) / 2.0);
                     let inner = (cols[col + span] - cols[col] - ml - mr).max(1.0);
                     let paths = match path {
                         Some(table_path) => Paths::Cell(table_path.clone(), r, c),

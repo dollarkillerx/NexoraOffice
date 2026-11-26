@@ -610,7 +610,7 @@ impl Flow<'_, '_> {
                     let ec = self.ec(false);
                     let origin_y = y0 - shaped.lines()[0].top;
                     let origin_x = col_x + pt(props.indent_left);
-                    for (offset, drawing) in &shaped.floats {
+                    for (n, (offset, drawing)) in shaped.floats.iter().enumerate() {
                         let Some(float) = drawing.float else {
                             continue;
                         };
@@ -628,7 +628,7 @@ impl Flow<'_, '_> {
                             origin_y,
                             origin_y + shaped.paragraph.height(),
                         );
-                        fixed.push((*offset, rect));
+                        fixed.push((n, rect));
                         if float.wrap != Wrap::None {
                             let [dl, dt, dr, db] = float.distance.map(emu_pt);
                             self.pages[page_index].obstructions.push(Rect::new(

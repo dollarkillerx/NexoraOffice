@@ -33,7 +33,10 @@ use crate::{
 };
 
 pub use link::{insert_link, link_range, set_link};
-pub use picture::{ImageFormat, PictureError, image_format, insert_picture, resize_drawing};
+pub use picture::{
+    ImageFormat, PictureError, PictureLayout, drawing_at, image_format, insert_picture,
+    move_drawing, move_floating_drawing, picture_layout, resize_drawing, set_picture_layout,
+};
 pub use table::{
     CellPos, MAX_ROW_HEIGHT, MAX_TABLE_WIDTH, MIN_COLUMN, MIN_EXACT_ROW, available_width,
     can_merge_cells, can_split_cell, can_unmerge_cell, cell_at, check_table, delete_columns,

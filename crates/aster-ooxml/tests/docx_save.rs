@@ -1071,6 +1071,34 @@ fn a_byte_order_mark_and_empty_elements_are_handled() {
     );
 }
 
+/// Automatic spacing is a flag: the half a split makes keeps it, and a space
+/// set by hand takes it off.
+#[test]
+fn automatic_spacing_is_written_for_a_split_paragraph_and_cleared_by_a_set_space() {
+    let bytes = docx_doc::doc(
+        "<w:p><w:pPr><w:spacing w:before=\"100\" w:beforeAutospacing=\"1\" w:after=\"100\" \
+         w:afterAutospacing=\"1\"/></w:pPr><w:r><w:t>First second</w:t></w:r></w:p>",
+    )
+    .bytes();
+    let mut doc = read(&bytes);
+    assert!(docx_doc::p(&doc, 0).props.space_before_auto);
+    split_paragraph(&mut doc, &Pos::new(Path(vec![0]), 5));
+    let saved = save(bytes.clone(), &doc).expect("saves");
+    let again = read(&saved);
+    for index in 0..2 {
+        let props = &docx_doc::p(&again, index).props;
+        assert!(props.space_before_auto && props.space_after_auto, "{index}");
+    }
+    let start = Pos::new(Path(vec![0]), 0);
+    set_space_before(&mut doc, &start, &start, 240);
+    let saved = save(bytes, &doc).expect("saves");
+    let again = read(&saved);
+    let props = &docx_doc::p(&again, 0).props;
+    assert_eq!(props.space_before, 240);
+    assert!(!props.space_before_auto && props.space_after_auto);
+    assert!(docx_doc::p(&again, 1).props.space_before_auto);
+}
+
 #[test]
 fn a_section_break_goes_with_its_paragraph_and_stays_when_it_is_split() {
     let bytes = sample();

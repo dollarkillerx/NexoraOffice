@@ -468,9 +468,21 @@ fn spacing_element(w: &str, p: &ParaProps) -> String {
         LineSpacing::AtLeast(t) => (i64::from(t), "atLeast"),
         LineSpacing::Exactly(t) => (i64::from(t), "exact"),
     };
+    // Automatic spacing is a flag beside the number, which Word keeps for
+    // when the flag is taken off.
+    let auto = |name: &str, on: bool| {
+        if on {
+            format!(" {w}{name}=\"1\"")
+        } else {
+            String::new()
+        }
+    };
     format!(
-        "<{w}spacing {w}before=\"{}\" {w}after=\"{}\" {w}line=\"{line}\" {w}lineRule=\"{rule}\"/>",
-        p.space_before, p.space_after
+        "<{w}spacing {w}before=\"{}\"{} {w}after=\"{}\"{} {w}line=\"{line}\" {w}lineRule=\"{rule}\"/>",
+        p.space_before,
+        auto("beforeAutospacing", p.space_before_auto),
+        p.space_after,
+        auto("afterAutospacing", p.space_after_auto),
     )
 }
 
@@ -603,7 +615,15 @@ pub fn ppr_patch(
     );
     // `force_layout`: a paragraph in a table cell, where the table style
     // may say something the paragraph's own style does not.
-    let spacing = |p: &ParaProps| (p.space_before, p.space_after, p.line);
+    let spacing = |p: &ParaProps| {
+        (
+            p.space_before,
+            p.space_after,
+            p.line,
+            p.space_before_auto,
+            p.space_after_auto,
+        )
+    };
     field!(
         "spacing",
         force_layout || spacing(new) != spacing(src),

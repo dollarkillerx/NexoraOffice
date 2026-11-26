@@ -908,9 +908,11 @@ pub fn set_space_before(doc: &mut Document, from: &Pos, to: &Pos, space: Twips) 
         from,
         to,
         |p| {
+            // A space set by hand replaces an automatic one.
             p.props.space_before = space;
+            p.props.space_before_auto = false;
         },
-        |p| p.props.space_before != space,
+        |p| p.props.space_before != space || p.props.space_before_auto,
     );
 }
 
@@ -922,8 +924,9 @@ pub fn set_space_after(doc: &mut Document, from: &Pos, to: &Pos, space: Twips) {
         to,
         |p| {
             p.props.space_after = space;
+            p.props.space_after_auto = false;
         },
-        |p| p.props.space_after != space,
+        |p| p.props.space_after != space || p.props.space_after_auto,
     );
 }
 

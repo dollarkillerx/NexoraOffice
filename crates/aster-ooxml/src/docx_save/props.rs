@@ -500,6 +500,7 @@ pub fn ppr_patch(
     old: Option<&str>,
     src: &ParaProps,
     new: &ParaProps,
+    style: Option<&ParaProps>,
     src_mark: &RunLook,
     new_mark: &RunLook,
     base: &RunLook,
@@ -517,26 +518,63 @@ pub fn ppr_patch(
                 .map_or(String::new(), |s| val(w, "pStyle", s)),
         );
     }
-    if new.keep_next != src.keep_next {
-        set(&mut ppr, "keepNext", toggle(w, "keepNext", new.keep_next));
+    // A paragraph that has a new style: what it has of its own is what
+    // differs from that style, and what it had of its own before may no
+    // longer be wanted. Otherwise: what differs from what it was.
+    let restyle = style.filter(|_| new.style != src.style);
+    // 0: leave it, 1: write it, 2: take it out.
+    let act = |changed: bool, differs_from_style: bool| -> u8 {
+        match restyle {
+            Some(_) if differs_from_style => 1,
+            Some(_) => 2,
+            None => u8::from(changed),
+        }
+    };
+    macro_rules! field {
+        ($name:expr, $differs:expr, $style:expr, $element:expr) => {
+            match act($differs, restyle.is_some_and(|st| $style(st))) {
+                1 => set(&mut ppr, $name, $element),
+                2 => set(&mut ppr, $name, String::new()),
+                _ => {}
+            }
+        };
     }
-    if new.keep_lines != src.keep_lines {
-        set(&mut ppr, "keepLines", toggle(w, "keepLines", new.keep_lines));
-    }
-    if new.page_break_before != src.page_break_before {
-        set(&mut ppr, "pageBreakBefore",
-            toggle(w, "pageBreakBefore", new.page_break_before),
-        );
-    }
-    if new.widow_control != src.widow_control {
-        set(&mut ppr, "widowControl", toggle(w, "widowControl", new.widow_control));
-    }
-    if new.list != src.list {
-        set(&mut ppr, "numPr", num_element(w, new.list));
-    }
-    if new.borders != src.borders || new.border_between != src.border_between {
-        let empty = new.borders.iter().all(Option::is_none) && new.border_between.is_none();
-        let element = if empty && src.borders.iter().all(Option::is_none) {
+    field!(
+        "keepNext",
+        new.keep_next != src.keep_next,
+        |st: &ParaProps| new.keep_next != st.keep_next,
+        toggle(w, "keepNext", new.keep_next)
+    );
+    field!(
+        "keepLines",
+        new.keep_lines != src.keep_lines,
+        |st: &ParaProps| new.keep_lines != st.keep_lines,
+        toggle(w, "keepLines", new.keep_lines)
+    );
+    field!(
+        "pageBreakBefore",
+        new.page_break_before != src.page_break_before,
+        |st: &ParaProps| new.page_break_before != st.page_break_before,
+        toggle(w, "pageBreakBefore", new.page_break_before)
+    );
+    field!(
+        "widowControl",
+        new.widow_control != src.widow_control,
+        |st: &ParaProps| new.widow_control != st.widow_control,
+        toggle(w, "widowControl", new.widow_control)
+    );
+    field!(
+        "numPr",
+        new.list != src.list,
+        |st: &ParaProps| new.list != st.list,
+        num_element(w, new.list)
+    );
+    let borders_empty = new.borders.iter().all(Option::is_none) && new.border_between.is_none();
+    field!(
+        "pBdr",
+        new.borders != src.borders || new.border_between != src.border_between,
+        |st: &ParaProps| new.borders != st.borders || new.border_between != st.border_between,
+        if borders_empty && src.borders.iter().all(Option::is_none) {
             String::new()
         } else {
             borders_element(
@@ -546,46 +584,62 @@ pub fn ppr_patch(
                 Some(new.border_between.as_ref()),
                 ["left", "top", "right", "bottom"],
             )
-        };
-        set(&mut ppr, "pBdr", element);
-    }
-    if new.shading != src.shading {
-        set(&mut ppr, "shd", shading_element(w, new.shading));
-    }
-    if new.tabs != src.tabs {
-        set(&mut ppr, "tabs", tabs_element(w, &new.tabs));
-    }
-    if new.snap_to_grid != src.snap_to_grid {
-        set(&mut ppr, "snapToGrid", toggle(w, "snapToGrid", new.snap_to_grid));
-    }
+        }
+    );
+    field!(
+        "shd",
+        new.shading != src.shading,
+        |st: &ParaProps| new.shading != st.shading,
+        shading_element(w, new.shading)
+    );
+    field!(
+        "tabs",
+        new.tabs != src.tabs,
+        |st: &ParaProps| new.tabs != st.tabs,
+        tabs_element(w, &new.tabs)
+    );
+    field!(
+        "snapToGrid",
+        new.snap_to_grid != src.snap_to_grid,
+        |st: &ParaProps| new.snap_to_grid != st.snap_to_grid,
+        toggle(w, "snapToGrid", new.snap_to_grid)
+    );
     // `force_layout`: a paragraph in a table cell, where the table style
     // may say something the paragraph's own style does not.
-    if force_layout
-        || (new.space_before, new.space_after, new.line)
-            != (src.space_before, src.space_after, src.line)
-    {
-        set(&mut ppr, "spacing", spacing_element(w, new));
-    }
+    let spacing = |p: &ParaProps| (p.space_before, p.space_after, p.line);
+    field!(
+        "spacing",
+        force_layout || spacing(new) != spacing(src),
+        |st: &ParaProps| force_layout || spacing(new) != spacing(st),
+        spacing_element(w, new)
+    );
     // The indents of a list level belong to the list: when the list changes
     // the indents are written out, so that they stay what they are.
-    if force_layout
-        || (new.indent_left, new.indent_right, new.first_line)
-            != (src.indent_left, src.indent_right, src.first_line)
-        || new.list != src.list
-    {
-        set(&mut ppr, "ind", ind_element(w, new));
-    }
-    if new.contextual_spacing != src.contextual_spacing {
-        set(&mut ppr, "contextualSpacing",
-            toggle(w, "contextualSpacing", new.contextual_spacing),
-        );
-    }
-    if force_layout || new.align != src.align {
-        set(&mut ppr, "jc", val(w, "jc", align_name(new.align)));
-    }
-    if new.outline_level != src.outline_level {
-        set(&mut ppr, "outlineLvl", val(w, "outlineLvl", new.outline_level.unwrap_or(9)));
-    }
+    let indents = |p: &ParaProps| (p.indent_left, p.indent_right, p.first_line);
+    field!(
+        "ind",
+        force_layout || indents(new) != indents(src) || new.list != src.list,
+        |st: &ParaProps| force_layout || indents(new) != indents(st) || new.list.is_some(),
+        ind_element(w, new)
+    );
+    field!(
+        "contextualSpacing",
+        new.contextual_spacing != src.contextual_spacing,
+        |st: &ParaProps| new.contextual_spacing != st.contextual_spacing,
+        toggle(w, "contextualSpacing", new.contextual_spacing)
+    );
+    field!(
+        "jc",
+        force_layout || new.align != src.align,
+        |st: &ParaProps| force_layout || new.align != st.align,
+        val(w, "jc", align_name(new.align))
+    );
+    field!(
+        "outlineLvl",
+        new.outline_level != src.outline_level,
+        |st: &ParaProps| new.outline_level != st.outline_level,
+        val(w, "outlineLvl", new.outline_level.unwrap_or(9))
+    );
     if new_mark != src_mark {
         let old_mark = child_text(&ppr, "rPr").map(str::to_owned);
         let rpr = rpr_patch(
@@ -681,6 +735,7 @@ mod tests {
             Some(old),
             &src,
             &new,
+            None,
             &look(),
             &look(),
             &look(),
@@ -697,6 +752,7 @@ mod tests {
             None,
             &src,
             &src,
+            None,
             &look(),
             &look(),
             &look(),

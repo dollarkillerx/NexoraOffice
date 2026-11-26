@@ -69,8 +69,9 @@ fn layers_add_up_from_defaults_through_styles_to_direct_formatting() {
 }
 
 #[test]
-fn a_table_style_sits_between_the_paragraph_style_and_the_character_style() {
-    let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="20"/><w:color w:val="000001"/></w:rPr></w:style>
+fn a_table_style_sits_between_the_document_defaults_and_the_paragraph_style() {
+    let styles = r#"<w:docDefaults><w:rPrDefault><w:rPr><w:color w:val="000001"/></w:rPr></w:rPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="20"/></w:rPr></w:style>
 <w:style w:type="character" w:styleId="Em"><w:name w:val="Em"/><w:rPr><w:color w:val="AA0000"/></w:rPr></w:style>
 <w:style w:type="table" w:styleId="Grid"><w:name w:val="Grid"/><w:rPr><w:color w:val="00AA00"/><w:i/></w:rPr><w:pPr><w:jc w:val="center"/></w:pPr></w:style>"#;
     let table = |cell: &str| {
@@ -94,6 +95,26 @@ fn a_table_style_sits_between_the_paragraph_style_and_the_character_style() {
     let outside = p(&document, 1);
     assert_eq!(outside.base.color, Some(rgb(1)));
     assert_eq!(outside.props.align, Align::Left);
+}
+
+#[test]
+fn a_paragraph_style_keeps_its_look_in_a_styled_table() {
+    let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:b w:val="0"/><w:color w:val="1F3864"/><w:sz w:val="32"/></w:rPr></w:style>
+<w:style w:type="table" w:styleId="Head"><w:name w:val="Head"/><w:tblStylePr w:type="firstRow"><w:rPr><w:b/><w:color w:val="FFFFFF"/></w:rPr></w:tblStylePr></w:style>"#;
+    let document = doc(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Head"/><w:tblLook w:firstRow="1"/></w:tblPr><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>H</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>plain</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+    )
+    .styles(styles)
+    .read();
+    let row = &t(&document, 0).rows[0];
+    let heading = row.cells[0].blocks[0].as_paragraph().unwrap();
+    assert_eq!(heading.base.color, Some(rgb(0x1F3864)));
+    assert_eq!(heading.base.size, 16.0);
+    assert!(!heading.base.bold);
+    let plain = row.cells[1].blocks[0].as_paragraph().unwrap();
+    assert!(plain.base.bold);
+    assert_eq!(plain.base.color, Some(rgb(0xFFFFFF)));
 }
 
 #[test]

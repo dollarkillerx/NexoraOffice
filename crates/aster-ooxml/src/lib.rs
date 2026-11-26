@@ -7,14 +7,15 @@
 //! parts this version models; everything else is left in the package
 //! untouched. [`docx`] reads the resolved text, styles, lists, tables,
 //! sections and drawings of a Word document, with the byte range of every
-//! paragraph, run, table and section in its part for saving. Nothing is
-//! written yet: the tabs are read-only.
+//! paragraph, run, table and section in its part for saving.
 //!
-//! Each format is a [`FormatCodec`]: bytes in, model out. Saving will be its
-//! other half, writing back untouched parts as they were read.
+//! Each format is a [`FormatCodec`]: bytes in, model out. Saving is its other
+//! half, writing back untouched parts and untouched bytes as they were read
+//! ([`docx_save`], [`pptx_save`], [`xlsx_save`]).
 
 pub mod chart;
 pub mod docx;
+pub mod docx_save;
 pub mod drawingml;
 pub mod error;
 pub mod package;

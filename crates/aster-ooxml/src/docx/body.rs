@@ -189,7 +189,9 @@ impl Reader<'_> {
         let empty_run = RunProps::default();
         let chain_run = chain.map_or(&empty_run, |c| &c.run);
         let cell_run = part.cell.as_ref().map_or(&empty_run, |c| &c.run);
-        let look = finalize_run(&[&styles.defaults_run, chain_run, cell_run]);
+        // The file format's order: document defaults, table style,
+        // paragraph style (character style and direct formatting follow).
+        let look = finalize_run(&[&styles.defaults_run, cell_run, chain_run]);
         let mut lower = styles.defaults_para.clone();
         if let Some(cell) = &part.cell {
             lower.merge(&cell.para);

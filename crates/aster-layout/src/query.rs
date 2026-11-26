@@ -65,6 +65,74 @@ pub struct PageInfo {
     /// header or footer in them.
     pub header_area: Rect,
     pub footer_area: Rect,
+    /// The box the body's text is set in: the page less its margins.
+    pub margin: Rect,
+}
+
+/// The part of a table's rows that is on one page, and where its grid lines
+/// are (page points). A table split over pages, or one in a header, which
+/// is on every page, has one for each page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableGrid {
+    /// The table's block.
+    pub table: Path,
+    pub page: usize,
+    /// The vertical grid lines, left to right: one more than the table has
+    /// grid columns.
+    pub columns: Vec<f32>,
+    /// The rows here, top to bottom.
+    pub rows: Vec<GridRow>,
+}
+
+/// A row, or the part of it that is on a page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridRow {
+    /// Index into the table's rows.
+    pub row: usize,
+    pub top: f32,
+    pub bottom: f32,
+    /// How high the whole row is.
+    pub height: f32,
+    /// This is where the row starts / ends (it is not a piece of a row that
+    /// goes on over the page).
+    pub starts: bool,
+    pub finishes: bool,
+    /// A copy of a header row at the top of a later page.
+    pub repeat: bool,
+    /// For each grid line (the same number as `columns`): whether a cell of
+    /// this row ends there; a line a merged cell hides is not one.
+    pub edges: Vec<bool>,
+    /// For each grid column: whether the cell over it ends with this row
+    /// (not for one merged with the row below, and not where there is no
+    /// cell).
+    pub ends: Vec<bool>,
+}
+
+/// A line of a table that can be dragged.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableBorder {
+    /// The vertical line `border` (0 is the table's left edge, as many as
+    /// there are grid columns the right one) at page x `x`, which runs from
+    /// `y0` to `y1` on the page.
+    Column {
+        table: Path,
+        border: usize,
+        page: usize,
+        x: f32,
+        y0: f32,
+        y1: f32,
+    },
+    /// The bottom of row `row`, at page y `y`, across `x0..x1`; `height` is
+    /// the row's height now.
+    Row {
+        table: Path,
+        row: usize,
+        page: usize,
+        y: f32,
+        x0: f32,
+        x1: f32,
+        height: f32,
+    },
 }
 
 /// A laid-out document.
@@ -77,6 +145,7 @@ pub struct Layout {
     redirects: HashMap<Path, Path>,
     outline: Vec<OutlineEntry>,
     infos: Vec<PageInfo>,
+    grids: Vec<TableGrid>,
 }
 
 impl Layout {
@@ -99,12 +168,144 @@ impl Layout {
             redirects: redirects.into_iter().collect(),
             outline,
             infos: Vec::new(),
+            grids: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_grids(mut self, grids: Vec<TableGrid>) -> Self {
+        self.grids = grids;
+        self
     }
 
     pub(crate) fn with_page_info(mut self, infos: Vec<PageInfo>) -> Self {
         self.infos = infos;
         self
+    }
+
+    /// The grid lines of every table with rows on `page`, outermost first
+    /// for tables inside one another.
+    pub fn table_grids(&self, page: usize) -> impl Iterator<Item = &TableGrid> {
+        self.grids.iter().filter(move |grid| grid.page == page)
+    }
+
+    /// The line of a table that is within `reach` points of a point of
+    /// `page`, the nearest (the innermost table for a tie). A column line is
+    /// only where a cell of the row ends, and a row's bottom only where a
+    /// cell ends with the row and the row ends on this page, so that a line
+    /// a merged cell hides is not found. `marginal` says whether the tables
+    /// of headers and footers are asked about or those of the body and
+    /// the notes.
+    pub fn table_border_at(
+        &self,
+        page: usize,
+        x: f32,
+        y: f32,
+        reach: f32,
+        marginal: bool,
+    ) -> Option<TableBorder> {
+        let mut best: Option<(f32, usize, TableBorder)> = None;
+        let mut consider = |distance: f32, depth: usize, border: TableBorder| {
+            let better = best.as_ref().is_none_or(|(d, deep, _)| {
+                distance < *d - 0.001 || (distance < *d + 0.001 && depth > *deep)
+            });
+            if better {
+                best = Some((distance, depth, border));
+            }
+        };
+        for grid in self.table_grids(page) {
+            if matches!(grid.table.story, StoryId::Marginal(_)) != marginal {
+                continue;
+            }
+            let (Some(first), Some(last)) = (grid.rows.first(), grid.rows.last()) else {
+                continue;
+            };
+            let depth = grid.table.steps.len();
+            let (left, right) = (
+                grid.columns.first().copied().unwrap_or(0.0),
+                grid.columns.last().copied().unwrap_or(0.0),
+            );
+            if y >= first.top - reach && y <= last.bottom + reach {
+                for (border, line) in grid.columns.iter().enumerate() {
+                    let distance = (x - line).abs();
+                    let drawn = grid
+                        .rows
+                        .iter()
+                        .any(|r| y >= r.top - 0.01 && y <= r.bottom + 0.01 && r.edges[border]);
+                    if distance <= reach && drawn {
+                        consider(
+                            distance,
+                            depth,
+                            TableBorder::Column {
+                                table: grid.table.clone(),
+                                border,
+                                page,
+                                x: *line,
+                                y0: first.top,
+                                y1: last.bottom,
+                            },
+                        );
+                    }
+                }
+            }
+            if x >= left && x <= right {
+                for row in grid.rows.iter().filter(|r| r.finishes) {
+                    let distance = (y - row.bottom).abs();
+                    let over_end = grid.columns.windows(2).enumerate().any(|(c, pair)| {
+                        x >= pair[0] && x <= pair[1] && row.ends.get(c).copied().unwrap_or(false)
+                    });
+                    if distance <= reach && over_end {
+                        consider(
+                            distance,
+                            depth,
+                            TableBorder::Row {
+                                table: grid.table.clone(),
+                                row: row.row,
+                                page,
+                                y: row.bottom,
+                                x0: left,
+                                x1: right,
+                                height: row.height,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        best.map(|(_, _, border)| border)
+    }
+
+    /// The area rows `rows.0..=rows.1` and grid columns `columns.0..columns.1`
+    /// of the table at `table` take, one rectangle per page it is on (whole
+    /// cells, borders and all). For a table of a header or footer, `page`
+    /// limits it to the page it is shown on.
+    pub fn cell_rects(
+        &self,
+        page: Option<usize>,
+        table: &Path,
+        rows: (usize, usize),
+        columns: (usize, usize),
+    ) -> Vec<(usize, Rect)> {
+        let single = matches!(table.story, StoryId::Marginal(_));
+        let mut out = Vec::new();
+        for grid in &self.grids {
+            if grid.table != *table || (single && page.is_some_and(|p| p != grid.page)) {
+                continue;
+            }
+            let (Some(x0), Some(x1)) = (grid.columns.get(columns.0), grid.columns.get(columns.1))
+            else {
+                continue;
+            };
+            let mut wanted = grid
+                .rows
+                .iter()
+                .filter(|r| r.row >= rows.0 && r.row <= rows.1);
+            let Some(first) = wanted.next() else {
+                continue;
+            };
+            let bottom = wanted.last().map_or(first.bottom, |r| r.bottom);
+            out.push((grid.page, Rect::new(*x0, first.top, *x1, bottom)));
+        }
+        out
     }
 
     /// What `page` shows around its body.

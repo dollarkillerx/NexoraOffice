@@ -758,7 +758,7 @@ impl Flow<'_, '_> {
             if near.is_empty() {
                 return result;
             }
-            result = self.cx.shaped_around(para, width, &near);
+            result = self.cx.shaped_around(para, width, &near, limit);
             let height = result.paragraph.height();
             if height <= reach + EPS {
                 return result;
@@ -899,16 +899,7 @@ impl Flow<'_, '_> {
                 let crowded = self.pages.last().is_some_and(|p| !p.wraps.is_empty());
                 let obstacles = if crowded {
                     let origin_x = col_x + pt(props.indent_left);
-                    // A line that starts lower than this does not fit above
-                    // the bottom of the page: it goes to the next one, where
-                    // what is on this page is not in its way.
-                    let shortest = plain
-                        .lines()
-                        .iter()
-                        .map(|l| l.height)
-                        .fold(f32::INFINITY, f32::min)
-                        .max(1.0);
-                    self.wrap_obstacles(origin_x, y0, bottom_edge - shortest)
+                    self.wrap_obstacles(origin_x, y0, bottom_edge)
                 } else {
                     Vec::new()
                 };
@@ -917,7 +908,10 @@ impl Flow<'_, '_> {
                         shaped = plain.clone();
                     }
                 } else {
-                    shaped = self.shaped_beside(para, &plain, text_width, &obstacles);
+                    // A line that would end below the bottom goes to the
+                    // next page, where nothing of this page is beside it.
+                    shaped =
+                        self.shaped_beside(para, &plain, text_width, &obstacles, bottom_edge - y0);
                 }
                 nlines = shaped.lines().len();
                 break_lines = Self::break_lines_of(&shaped);
@@ -934,6 +928,7 @@ impl Flow<'_, '_> {
                 k = nlines - line;
             }
             for j in if force { nlines..nlines } else { line..nlines } {
+        limit: f32,
                 let h = lines[j].height;
                 let j_top = origin_y + lines[j].top;
                 if let Some(b) = self.obstruction(j_top, j_top + h) {

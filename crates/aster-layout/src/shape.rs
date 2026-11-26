@@ -64,6 +64,10 @@ pub(crate) struct Env<'a> {
     /// Places text flows around, from the paragraph's top-left corner
     /// (floating drawings that text wraps beside).
     pub obstacles: &'a [Rect],
+    /// How far down from the paragraph's top the page has room for a line
+    /// (a line that would end below it is moved to the next page, where the
+    /// obstacles are not): infinite when there is no such limit.
+    pub limit: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +194,9 @@ pub(crate) fn context(para: &Paragraph, env: &Env<'_>) -> u64 {
         for v in [o.x0, o.y0, o.x1, o.y1] {
             ((v * 16.0).round() as i32).hash(&mut hasher);
         }
+    }
+    if !env.obstacles.is_empty() && env.limit.is_finite() {
+        ((env.limit * 16.0).round() as i32).hash(&mut hasher);
     }
     for run in &para.runs {
         if let Some(text) = replacement(run, env) {
@@ -655,7 +662,7 @@ pub(crate) fn shape(
         trailing_line: true,
         flow: None,
     };
-    let around = |band: Band| free_stretch(env.obstacles, band);
+    let around = |band: Band| free_stretch(env.obstacles, env.limit, band);
     let extra = Extra {
         flow: (!env.obstacles.is_empty()).then_some(Flow(&around)),
         ..extra
@@ -689,10 +696,19 @@ pub(crate) fn fully_hidden(para: &Paragraph) -> bool {
 
 /// The widest stretch of a band that none of `obstacles` covers, and where
 /// to go to get below them (they are rectangles from the paragraph's
-/// top-left corner). With nothing in the way it is the band itself.
-pub(crate) fn free_stretch(obstacles: &[Rect], band: Band) -> Slot {
+/// top-left corner). With nothing in the way it is the band itself. A band
+/// that reaches below `limit` is for a line that goes to the next page, and
+/// nothing on this page is in the way of that.
+pub(crate) fn free_stretch(obstacles: &[Rect], limit: f32, band: Band) -> Slot {
     const EPS: f32 = 0.01;
     let bottom = band.top + band.height;
+    if bottom > limit + EPS {
+        return Slot {
+            left: band.left,
+            right: band.right,
+            below: band.top,
+        };
+    }
     let mut free = vec![(band.left, band.right)];
     let mut below = band.top;
     for o in obstacles {

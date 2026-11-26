@@ -2544,6 +2544,33 @@ fn flowing_around_a_picture_does_not_reshape_other_paragraphs() {
     }];
     blocks.extend(numbered(60));
     let before = doc(blocks);
+#[test]
+fn a_line_moved_to_the_next_page_does_not_keep_the_indent_of_the_picture() {
+    // The picture hangs over the foot of the page, at heights that put the
+    // last line beside it at every offset in a line's height.
+    for offset in 118..140 {
+        let layout = lay(&floated_n(
+            12,
+            beside(FloatAt::Start, offset, Wrap::Square, 0),
+            50.0,
+            90.0,
+            vec![],
+        ));
+        assert!(layout.pages.len() >= 2, "{offset}");
+        for frag in layout.frags.iter().filter(|f| f.page == 1) {
+            let lines = frag.shaped.paragraph.lines();
+            for line in &lines[frag.lines.clone()] {
+                assert!(
+                    (frag.x + line.left - 20.0).abs() < 0.01,
+                    "offset {offset}: indent {} at {}",
+                    line.left,
+                    frag.y + line.top
+                );
+            }
+        }
+    }
+}
+
     let mut layouter = Layouter::new();
     layouter.layout(&before);
     let count = layouter.shaped_count();

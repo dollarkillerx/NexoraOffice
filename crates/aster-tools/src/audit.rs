@@ -17,7 +17,9 @@ const KEPT: usize = 500;
 
 /// Arguments whose values are recorded as a length only: they hold the
 /// user's text.
-const TEXT_ARGUMENTS: &[&str] = &["text", "find", "replace", "query", "title"];
+const TEXT_ARGUMENTS: &[&str] = &[
+    "text", "find", "replace", "query", "title", "phrase", "link",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditRecord {
@@ -162,6 +164,18 @@ mod tests {
             summary,
             json!({"document": "1", "text": {"chars": 4}, "line": 3})
         );
+    }
+
+    #[test]
+    fn the_phrase_and_link_of_a_word_edit_are_recorded_by_length() {
+        let summary = summarise(&json!({
+            "document": "1", "block": 2, "phrase": "機密の語句", "link": "https://example.com/?k=secret", "bold": true
+        }));
+        assert_eq!(
+            summary,
+            json!({"document": "1", "block": 2, "phrase": {"chars": 5}, "link": {"chars": 29}, "bold": true})
+        );
+        assert!(!summary.to_string().contains("secret"));
     }
 
     #[test]

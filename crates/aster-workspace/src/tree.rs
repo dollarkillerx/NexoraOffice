@@ -39,7 +39,7 @@ impl FileKind {
         Some(match extension.as_str() {
             "md" | "markdown" => Self::Markdown,
             "txt" => Self::Text,
-            "docx" => Self::Word,
+            "docx" | "docm" => Self::Word,
             "xlsx" | "xlsm" => Self::Spreadsheet,
             "pptx" | "pptm" => Self::Presentation,
             "pdf" => Self::Pdf,
@@ -47,12 +47,18 @@ impl FileKind {
         })
     }
 
-    /// Whether this version can open it. The others are shown, marked as not
-    /// supported yet. Presentations and PDF files open read-only.
+    /// Whether this version can open it. The others (there are none now)
+    /// are shown, marked as not supported yet. Word documents and PDF files
+    /// open read-only.
     pub fn opens(self) -> bool {
         matches!(
             self,
-            Self::Markdown | Self::Text | Self::Spreadsheet | Self::Presentation | Self::Pdf
+            Self::Markdown
+                | Self::Text
+                | Self::Word
+                | Self::Spreadsheet
+                | Self::Presentation
+                | Self::Pdf
         )
     }
 }
@@ -600,8 +606,8 @@ mod tests {
         assert_eq!(kind("発表.pptx"), EntryKind::File(FileKind::Presentation));
         assert!(FileKind::Markdown.opens() && FileKind::Text.opens());
         assert!(FileKind::Spreadsheet.opens() && FileKind::Presentation.opens());
-        assert!(FileKind::Pdf.opens());
-        assert!(!FileKind::Word.opens());
+        assert!(FileKind::Pdf.opens() && FileKind::Word.opens());
+        assert_eq!(FileKind::of(Path::new("宏.DOCM")), Some(FileKind::Word));
         assert_eq!(listing.omitted, 0);
         assert!(!listing.incomplete);
     }

@@ -862,6 +862,13 @@ impl DocView {
         )
     }
 
+    /// Whether a point of the window (physical pixels) is on a page.
+    pub fn is_over_page(&self, x: f64, y: f64) -> bool {
+        let (page, _, _) = self.locate(x, y);
+        let rect = self.page_rect(page);
+        x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1
+    }
+
     /// Scroll just enough to show a rectangle of the window (x, y, width,
     /// height, physical pixels), with some room around it.
     fn reveal(&mut self, rect: (f64, f64, f64, f64)) -> bool {

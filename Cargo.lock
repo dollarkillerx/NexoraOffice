@@ -468,6 +468,7 @@ dependencies = [
  "aster-text",
  "aster-tools",
  "aster-workspace",
+ "aster-writer",
  "chrono",
  "i-slint-backend-testing",
  "ropey",
@@ -475,6 +476,7 @@ dependencies = [
  "slint",
  "slint-build",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

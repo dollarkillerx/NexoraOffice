@@ -457,7 +457,7 @@ export component Sidebar inherits Rectangle {
                 padding-left: Tokens.space-md + 2px;
                 padding-right: Tokens.space-md;
                 Text {
-                    text: root.outline-pdf ? root.outline-hint : root.has-outline ? Strings.outline-empty : Strings.outline-none;
+                    text: root.outline-hint != "" ? root.outline-hint : root.outline-pdf ? "" : root.has-outline ? Strings.outline-empty : Strings.outline-none;
                     font-size: Tokens.font-sm;
                     color: Tokens.text-tertiary;
                     wrap: word-wrap;

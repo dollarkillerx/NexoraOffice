@@ -79,7 +79,10 @@ fn main() {
     view.set_zoom(Zoom::FitWidth);
     let started = Instant::now();
     view.render();
-    println!("first frame (two or three pages painted): {:.1} ms", ms(started));
+    println!(
+        "first frame (two or three pages painted): {:.1} ms",
+        ms(started)
+    );
 
     // A step of the wheel: the pages are already painted.
     let mut samples = Vec::new();

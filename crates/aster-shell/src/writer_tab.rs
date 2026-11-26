@@ -17,6 +17,7 @@ use aster_surface::doc_view::{
     Align, DocCommand, DocQuery, DocStyle, DocView, FormatState, LineSpacing, LinkInfo, Move, Tri,
     Unit, Zoom,
 };
+use aster_writer::edit::Selection;
 use aster_writer::{Break, Document, OBJECT};
 
 use crate::i18n::{self, Strings};
@@ -453,6 +454,23 @@ impl DocTab {
         Duration::from_millis(cost.saturating_mul(5)).max(Duration::from_secs(2))
     }
 
+    /// Change the document for the assistant or an MCP client: `edit` works
+    /// on a copy of the document and says where the selection goes (`None`
+    /// when it changed nothing and the document stays as it is). It is one
+    /// step of undo, like a user's edit, so the modified mark, the recovery
+    /// record and the toolbar follow in the same way (the caller then calls
+    /// the shell's after-edit). Returns whether the document changed. Refused
+    /// while an input method is composing in the tab.
+    pub fn edit_document(
+        &mut self,
+        edit: impl FnOnce(&mut Document, &Selection) -> Option<Selection>,
+    ) -> Result<bool, &'static str> {
+        if self.view.is_composing() {
+            return Err(crate::doc_tools::COMPOSING);
+        }
+        Ok(self.view.edit_document(edit))
+    }
+
     /// The document came back from a recovery record: it has changes the
     /// file does not.
     pub fn mark_recovered(&mut self) {
@@ -843,7 +861,7 @@ pub fn doc_style(tokens: &theme::Tokens) -> DocStyle {
 
 #[cfg(test)]
 #[path = "../../aster-ooxml/tests/common/docx_sample.rs"]
-mod docx_sample;
+pub(crate) mod docx_sample;
 
 #[cfg(test)]
 mod tests {

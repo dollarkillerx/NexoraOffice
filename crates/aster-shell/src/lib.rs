@@ -9,6 +9,7 @@
 pub mod assistant;
 pub mod cli;
 pub mod content;
+pub mod doc_tools;
 pub mod files;
 pub mod formula_hints;
 pub mod i18n;

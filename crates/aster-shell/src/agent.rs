@@ -28,6 +28,7 @@ use aster_ai::{
 use aster_markdown::Selection;
 use aster_mcp::{McpClient, McpConfig, McpEvents, McpServer};
 use aster_shell::assistant;
+use aster_shell::doc_tools;
 use aster_shell::i18n;
 use aster_shell::sheet_tools;
 use aster_shell::tabs::{DocKind, TabId};
@@ -1383,6 +1384,10 @@ fn effect(shell: &mut Shell, request: &ApprovalRequest) -> (String, String, Stri
         .as_ref()
         .and_then(|d| d.id.parse().ok())
         .map(TabId);
+    if let Some(Content::Doc(tab)) = id.and_then(|id| shell.contents.get(&id)) {
+        let (facts, removed, new) = doc_tools::card(tab, request.tool.name, args, strings);
+        return (facts, shortened(&removed, SHOWN, strings), written(new));
+    }
     if request.tool.name == "write_cells" {
         let Some(Content::Sheet(tab)) = id.and_then(|id| shell.contents.get(&id)) else {
             return (String::new(), String::new(), String::new());
@@ -1476,6 +1481,11 @@ fn effect(shell: &mut Shell, request: &ApprovalRequest) -> (String, String, Stri
                 })
                 .unwrap_or_else(|| "?".to_owned());
             let scope = if args["all"].as_bool().unwrap_or(true) {
+                // With a limit, the card counts what will be replaced.
+                let count = match (args["limit"].as_u64(), count.parse::<u64>()) {
+                    (Some(limit), Ok(found)) => limit.min(found).to_string(),
+                    _ => count.clone(),
+                };
                 i18n::fill(strings.approval_all, "count", &count)
             } else {
                 i18n::fill(strings.approval_first, "count", &count)
@@ -1787,14 +1797,32 @@ impl ShellHost {
         expect: Option<String>,
     ) -> Result<String, String> {
         on_ui(&self.ui, UI_WAIT, move |ui, shell| {
-            if let Some(expect) = &expect
-                && fingerprint_of(shell, id, name, &args).as_ref() != Some(expect)
+            run_on_document(ui, shell, id, name, &args, expect.as_deref())
+        })
+        .unwrap_or_else(|| Err(NO_ANSWER.to_owned()))
+    }
+}
+
+/// The work of a document tool on the interface thread: the check against
+/// what the user was shown, the tool, and what follows a change.
+fn run_on_document(
+    ui: &AppWindow,
+    shell: &mut Shell,
+    id: TabId,
+    name: &str,
+    args: &Value,
+    expect: Option<&str>,
+) -> Result<String, String> {
+    {
+        {
+            if let Some(expect) = expect
+                && fingerprint_of(shell, id, name, args).as_deref() != Some(expect)
             {
                 return Err(aster_tools::CHANGED_WHILE_ASKING.to_owned());
             }
             let language = shell.language.tag();
             if let Some(Content::Sheet(tab)) = shell.contents.get_mut(&id) {
-                let (result, changes) = sheet_tools::run(tab, name, &args, language)?;
+                let (result, changes) = sheet_tools::run(tab, name, args, language)?;
                 if !changes.is_empty() {
                     if shell.tabs.active_id() == Some(id) {
                         after_sheet_change(ui, shell, changes);
@@ -1807,32 +1835,32 @@ impl ShellHost {
                 }
                 return Ok(result);
             }
-            if let Some(Content::Doc(tab)) = shell.contents.get(&id) {
-                let text = tab.view.document().plain_text().replace(aster_writer::OBJECT, "");
-                let headings: Vec<Value> = tab
-                    .view
-                    .outline()
-                    .iter()
-                    .map(|e| json!({ "level": u32::from(e.level) + 1, "text": e.text, "page": e.page + 1 }))
-                    .collect();
-                return assistant::run_on_word(
-                    &text,
-                    &tab.view.selected_text(),
-                    headings,
-                    name,
-                    &args,
-                );
+            if let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) {
+                let (result, changed) = doc_tools::run(tab, name, args)?;
+                if changed {
+                    if shell.tabs.active_id() == Some(id) {
+                        after_edit(ui, shell, true);
+                    } else {
+                        // Not in front: its modified mark and recovery record
+                        // follow now; the toolbar and outline are made when it
+                        // comes to the front.
+                        if shell.sync_modified() {
+                            refresh_tabs(ui, shell);
+                        }
+                        shell.sync_doc_records();
+                    }
+                }
+                return Ok(result);
             }
             let Some(editor) = shell.markdown(id) else {
                 return Err("only Markdown documents can be read and changed for now".to_owned());
             };
-            let result = assistant::run(editor, name, &args);
+            let result = assistant::run(editor, name, args);
             if result.is_ok() && !tool_reads_only(name) {
                 after_edit(ui, shell, true);
             }
             result
-        })
-        .unwrap_or_else(|| Err(NO_ANSWER.to_owned()))
+        }
     }
 }
 
@@ -1987,6 +2015,91 @@ mod tests {
             fingerprint_of(&mut shell, id, "replace_lines", &Value::Null),
             Some(edit)
         );
+    }
+
+    /// A call on a Word tab goes the way the user's own edit does: the tab
+    /// is marked modified, one undo takes the call back, and an approval
+    /// given for an earlier version of the document is void.
+    #[test]
+    fn a_word_tool_call_is_an_ordinary_edit_of_the_tab() {
+        use aster_shell::i18n::Language;
+        use aster_shell::theme::ThemeMode;
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().unwrap();
+        let mut shell = Shell::new(ThemeMode::Light, Language::En);
+        let id = shell.open_untitled(DocKind::Writer);
+        let modified = |shell: &mut Shell| {
+            shell
+                .tabs
+                .tabs()
+                .iter()
+                .find(|tab| tab.id == id)
+                .is_some_and(|tab| tab.modified)
+        };
+        let text = |shell: &mut Shell| match shell.contents.get(&id) {
+            Some(Content::Doc(tab)) => tab.view.document().plain_text(),
+            _ => panic!("a Word tab"),
+        };
+        assert!(!modified(&mut shell));
+        let args = json!({ "document": id.0.to_string(), "block": 1, "text": "Hello\nWorld" });
+        let shown = fingerprint_of(&mut shell, id, "replace_paragraphs", &args).unwrap();
+        let read = run_on_document(&ui, &mut shell, id, "read_word", &json!({}), None).unwrap();
+        assert!(read.contains("\"total_blocks\":1"), "{read}");
+        // Reading changes nothing.
+        assert!(!modified(&mut shell));
+        assert_eq!(
+            fingerprint_of(&mut shell, id, "replace_paragraphs", &args).as_ref(),
+            Some(&shown)
+        );
+        let done = run_on_document(
+            &ui,
+            &mut shell,
+            id,
+            "replace_paragraphs",
+            &args,
+            Some(&shown),
+        );
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(text(&mut shell), "Hello\nWorld");
+        assert!(modified(&mut shell));
+        // The same approval cannot be used again: the document is another.
+        let again = run_on_document(
+            &ui,
+            &mut shell,
+            id,
+            "replace_paragraphs",
+            &args,
+            Some(&shown),
+        );
+        assert_eq!(again, Err(aster_tools::CHANGED_WHILE_ASKING.to_owned()));
+        // The user undoes what the assistant did, in one step.
+        match shell.contents.get_mut(&id) {
+            Some(Content::Doc(tab)) => {
+                assert!(tab.view.undo());
+            }
+            _ => panic!("a Word tab"),
+        }
+        assert_eq!(text(&mut shell), "");
+        // A call that is wrong changes nothing and says why.
+        let wrong = run_on_document(
+            &ui,
+            &mut shell,
+            id,
+            "delete_blocks",
+            &json!({ "document": id.0.to_string(), "block": 4 }),
+            None,
+        );
+        assert!(wrong.unwrap_err().contains("block 4 is outside"));
+        // The Markdown tools do not work on it, and the error points the way.
+        let markdown = run_on_document(
+            &ui,
+            &mut shell,
+            id,
+            "replace_lines",
+            &json!({ "document": id.0.to_string(), "start_line": 1, "end_line": 1, "text": "x" }),
+            None,
+        );
+        assert!(markdown.unwrap_err().contains("replace_paragraphs"));
     }
 
     #[test]

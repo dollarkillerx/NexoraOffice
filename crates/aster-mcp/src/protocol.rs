@@ -1073,6 +1073,42 @@ mod tests {
         assert_eq!(clean_client_name(Some(&"x".repeat(100))).len(), 64);
     }
 
+    /// The tools for Word documents are offered to MCP clients with the
+    /// same hints as the spreadsheet ones: the reader read-only, the
+    /// writers not.
+    #[test]
+    fn the_word_tools_are_in_the_list_with_their_hints() {
+        let list = tool_list()["tools"].as_array().unwrap();
+        let entry = |name: &str| {
+            list.iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is listed"))
+        };
+        assert_eq!(entry("read_word")["annotations"]["readOnlyHint"], true);
+        for name in [
+            "replace_paragraphs",
+            "insert_paragraphs",
+            "delete_blocks",
+            "find_and_replace",
+            "format_text",
+            "edit_table",
+            "write_cells",
+        ] {
+            assert_eq!(entry(name)["annotations"]["readOnlyHint"], false, "{name}");
+            assert_eq!(entry(name)["inputSchema"]["additionalProperties"], false);
+        }
+        // Deleting and replacing are marked destructive, inserting and
+        // formatting are not.
+        assert_eq!(
+            entry("delete_blocks")["annotations"]["destructiveHint"],
+            true
+        );
+        assert_eq!(
+            entry("format_text")["annotations"]["destructiveHint"],
+            false
+        );
+    }
+
     #[test]
     fn the_tool_list_follows_the_catalogue() {
         let list = tool_list()["tools"].as_array().unwrap();

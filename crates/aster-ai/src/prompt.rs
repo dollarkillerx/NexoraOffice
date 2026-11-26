@@ -20,6 +20,9 @@ Editing:
 current text.
 - Prefer small, targeted edits: replace_selection, replace_lines, insert_text and \
 find_and_replace. Do not rewrite a whole document to change part of it.
+- A Word document is read with read_word, which numbers its blocks (paragraphs and tables); \
+replace_paragraphs, insert_paragraphs, delete_blocks, format_text and edit_table take those \
+numbers. Numbers change when blocks are inserted or deleted, so read again after such a change.
 - Every edit can be undone in the editor, so the user stays in control; still, change only \
 what the user asked for.
 - Some tool calls need the user's approval. If a call is refused or fails, read the reason, \
@@ -41,6 +44,12 @@ mod tests {
             "replace_lines",
             "insert_text",
             "find_and_replace",
+            "read_word",
+            "replace_paragraphs",
+            "insert_paragraphs",
+            "delete_blocks",
+            "format_text",
+            "edit_table",
         ] {
             assert!(SYSTEM_PROMPT.contains(tool), "{tool}");
             assert!(aster_tools::find(tool).is_some(), "{tool} is a real tool");

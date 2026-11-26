@@ -108,6 +108,20 @@ impl DocView {
         self.sel.is_some()
     }
 
+    /// Carry out an edit made by something other than the keyboard (the
+    /// assistant): `edit` changes a copy of the document and says where the
+    /// selection goes, or `None` when it changed nothing. One step of undo
+    /// that never joins the typing around it; a step that leaves the
+    /// document as it was is not made. Returns whether the document changed
+    /// (false while an input method is composing or a picture is being
+    /// resized).
+    pub fn edit_document(
+        &mut self,
+        edit: impl FnOnce(&mut Document, &Selection) -> Option<Selection>,
+    ) -> bool {
+        self.apply(None, true, edit)
+    }
+
     /// Carry out an edit. `edit` changes a copy of the document and says
     /// where the selection goes, or `None` when it changed nothing. With
     /// `check`, an edit that leaves the document as it was is not a step.

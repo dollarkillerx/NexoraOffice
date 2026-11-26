@@ -31,9 +31,7 @@ pub use cx::Layouter;
 pub use display::{
     FrameItem, Item, LeaderItem, Page, PictureItem, Rect, Rgba, RuleStyle, TextItem,
 };
-pub use query::{
-    Caret, GridRow, Layout, LinkRect, OutlineEntry, PageInfo, TableBorder, TableGrid,
-};
+pub use query::{Caret, GridRow, Layout, LinkRect, OutlineEntry, PageInfo, TableBorder, TableGrid};
 
 #[cfg(test)]
 mod grid_tests;

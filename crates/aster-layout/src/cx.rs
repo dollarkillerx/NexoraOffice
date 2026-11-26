@@ -14,10 +14,10 @@ use aster_writer::{
 
 use crate::display::{FrameItem, Item, LeaderItem, PictureItem, Rect, Rgba, RuleStyle, TextItem};
 use crate::fonts::Families;
+use crate::query::TableGrid;
 use crate::shape::{
     Env, NoteNumbers, PageValues, Shaped, context, emu_pt, fully_hidden, pt, shape,
 };
-use crate::query::TableGrid;
 use crate::table::TableLayout;
 
 /// The paint order of a page: shading under everything, then drawings

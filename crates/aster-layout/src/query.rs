@@ -302,7 +302,7 @@ impl Layout {
             let Some(first) = wanted.next() else {
                 continue;
             };
-            let bottom = wanted.last().map_or(first.bottom, |r| r.bottom);
+            let bottom = wanted.next_back().map_or(first.bottom, |r| r.bottom);
             out.push((grid.page, Rect::new(*x0, first.top, *x1, bottom)));
         }
         out

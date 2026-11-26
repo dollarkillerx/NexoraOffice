@@ -19,6 +19,13 @@
 //! view remembers the page the caret is on. Find searches the body only.
 //! Text boxes are drawn but cannot be pointed at.
 //!
+//! Pictures are objects: a click selects one (in the body, a note, or a header
+//! or footer the caret is in), dragging moves it, its corners resize it, the
+//! arrow keys nudge a floating one. In tables the pointer drags column lines
+//! and the bottoms of rows, a drag over several cells selects whole cells, and
+//! they can be merged and split. See `objects` and `tables`; [`Handle`] tells
+//! what dragging at a point would do, for the pointer's shape.
+//!
 //! Building a view lays the document out, which for a large document takes a
 //! few hundred milliseconds: do it on a worker thread, [`DocView`] is `Send`.
 
@@ -31,6 +38,7 @@ mod search;
 mod stories;
 #[cfg(test)]
 mod story_tests;
+mod tables;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -52,11 +60,12 @@ use crate::picture::draw_image;
 use crate::text_surface::{HAN_FALLBACK_FAMILIES, Rgba8};
 
 pub use crate::pdf_view::{LINE_STEP, ZOOM_MAX, ZOOM_MIN, Zoom};
+pub use aster_writer::edit::PictureLayout;
 pub use aster_writer::{Align, Break, LineSpacing};
 pub use editing::Move;
 pub use format::{DocCommand, FormatState, Tri};
 pub use modify::Unit;
-pub use objects::{Corner, LinkInfo, ObjectInfo};
+pub use objects::{Corner, Handle, LinkInfo, ObjectInfo};
 pub use search::{DocQuery, MAX_MATCHES, Match};
 pub use text::text_between;
 
@@ -195,6 +204,10 @@ pub struct DocView {
     modified: std::cell::Cell<Option<(u64, bool)>>,
     /// A picture being resized with its corner handle.
     resizing: Option<objects::Resize>,
+    /// A picture being pressed on to move it, or moved.
+    moving: Option<objects::Moving>,
+    /// A line of a table being dragged.
+    border: Option<tables::BorderDrag>,
     /// A look chosen with only a caret, for the text typed next.
     pending: Option<RunPatch>,
     compose: Option<compose::Compose>,
@@ -258,6 +271,8 @@ impl DocView {
             saved: None,
             modified: std::cell::Cell::new(None),
             resizing: None,
+            moving: None,
+            border: None,
             pending: None,
             compose: None,
             last_edit: None,
@@ -308,6 +323,8 @@ impl DocView {
         self.saved_revision = self.revision;
         self.saved = Some(self.document.clone());
         self.resizing = None;
+        self.moving = None;
+        self.border = None;
         self.clamp();
         self.touch();
     }
@@ -901,6 +918,7 @@ impl DocView {
             self.ctx.fill_rect(&on_page(r));
         }
         self.draw_object(index, rect, ppp);
+        self.draw_drag(index, rect, ppp);
         self.draw_marginal_edges(index, rect, ppp, style);
         if self.caret_shown()
             && let Some(caret) = self.caret_geometry().filter(|c| c.page == index)

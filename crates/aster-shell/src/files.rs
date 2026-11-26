@@ -252,8 +252,8 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 pub enum Dropped {
     /// Show it in the sidebar.
     Folder,
-    /// Open it in a tab: Markdown and text to edit, Excel and PowerPoint to
-    /// look at, as "Open..." does.
+    /// Open it in a tab: Markdown and text to edit, Word, Excel and PowerPoint
+    /// to look at, as "Open..." does.
     File,
     /// Say this version cannot open it.
     Unsupported,
@@ -573,10 +573,12 @@ mod tests {
             "todo.txt",
             "预算.xlsx",
             "发布会.PPTX",
+            "报告.docx",
+            "宏.DOCM",
         ] {
             assert_eq!(dropped(&write(&dir, name, b"x")), Dropped::File, "{name}");
         }
-        for name in ["报告.docx", "photo.png", "no-extension"] {
+        for name in ["旧报告.doc", "photo.png", "no-extension"] {
             assert_eq!(
                 dropped(&write(&dir, name, b"x")),
                 Dropped::Unsupported,

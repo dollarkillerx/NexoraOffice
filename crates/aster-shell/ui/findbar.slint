@@ -132,6 +132,8 @@ export component FindBar inherits Rectangle {
     // Only the query and "match case": a PDF has no replace, whole-word or
     // pattern search.
     in property <bool> simple;
+    // No pattern search (but whole words): a Word document.
+    in property <bool> no-regex;
     in-out property <string> query;
     in-out property <string> replacement;
     // "3 / 120", "无结果", "正在统计…": put together by the shell.
@@ -285,7 +287,7 @@ export component FindBar inherits Rectangle {
                     }
                 }
 
-                if !root.simple: Toggle {
+                if !root.simple && !root.no-regex: Toggle {
                     label: ".*";
                     description: Strings.find-regex;
                     checked: root.use-regex;

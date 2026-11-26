@@ -22,6 +22,7 @@ pub mod stats;
 pub mod tabs;
 pub mod theme;
 pub mod toolbar;
+pub mod writer_tab;
 
 #[cfg(test)]
 mod tests {

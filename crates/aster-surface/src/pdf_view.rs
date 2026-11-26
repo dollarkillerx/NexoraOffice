@@ -31,7 +31,7 @@ const STRIP_MIN_WINDOW: f64 = 560.0;
 const MARGIN: f64 = 24.0;
 const GAP: f64 = 16.0;
 /// Zoom steps, in percent.
-const ZOOM_STEPS: [f32; 15] = [
+pub(crate) const ZOOM_STEPS: [f32; 15] = [
     10.0, 25.0, 33.0, 50.0, 67.0, 75.0, 90.0, 100.0, 125.0, 150.0, 200.0, 300.0, 400.0, 600.0,
     800.0,
 ];

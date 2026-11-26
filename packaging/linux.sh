@@ -36,7 +36,7 @@ Icon=aster-office
 Categories=Office;
 # The formats in SUPPORTED_EXTENSIONS (crates/aster-shell/src/main.rs). This
 # only lists what the application can open; it does not make it the default.
-MimeType=text/markdown;text/plain;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint.presentation.macroEnabled.12;application/pdf;
+MimeType=text/markdown;text/plain;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.ms-word.document.macroEnabled.12;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint.presentation.macroEnabled.12;application/pdf;
 Terminal=false
 DESKTOP
 

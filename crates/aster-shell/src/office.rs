@@ -24,6 +24,7 @@ use aster_sheets::{
     DateOrder, Edit, Shown, Workbook,
 };
 use aster_slides::Presentation;
+use aster_surface::doc_view::DocView;
 use aster_surface::sheet_view::{Direction, MIN_SIZE, Resize, SheetKey, SheetStyle, SheetView};
 use aster_surface::slide_view::{SlideStyle, SlideView};
 
@@ -33,6 +34,7 @@ use crate::theme;
 
 pub const SHEET_EXTENSIONS: &[&str] = &["xlsx", "xlsm"];
 pub const SLIDE_EXTENSIONS: &[&str] = &["pptx", "pptm"];
+pub const DOCUMENT_EXTENSIONS: &[&str] = &["docx", "docm"];
 /// Files larger than this are not read: the package limits would refuse
 /// them anyway once inflated, and reading them takes the memory first.
 pub const MAX_FILE: u64 = 1 << 30;
@@ -44,6 +46,8 @@ pub fn kind_of(path: &Path) -> Option<DocKind> {
         Some(DocKind::Sheets)
     } else if SLIDE_EXTENSIONS.contains(&extension.as_str()) {
         Some(DocKind::Slides)
+    } else if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) {
+        Some(DocKind::Writer)
     } else {
         None
     }
@@ -54,6 +58,9 @@ pub enum Loaded {
     Workbook(Workbook, Arc<Vec<u8>>),
     /// The presentation and the file's bytes, which saving starts from.
     Presentation(Presentation, Arc<Vec<u8>>),
+    /// A Word document, already laid out, and the file's bytes, which
+    /// saving will start from.
+    Document(Box<DocView>, Arc<Vec<u8>>),
 }
 
 #[derive(Debug)]
@@ -105,6 +112,14 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
             Pptx.read(bytes)
                 .map(|presentation| Loaded::Presentation(presentation, source))
                 .map_err(LoadError::Format)
+        }
+        Some(DocKind::Writer) => {
+            let source = Arc::new(bytes.clone());
+            let mut document = aster_ooxml::docx::read(bytes).map_err(LoadError::Format)?;
+            document.renumber();
+            // The first layout takes a while for a long document: it is
+            // done here, on the worker.
+            Ok(Loaded::Document(Box::new(DocView::new(document)), source))
         }
         _ => {
             let source = Arc::new(bytes.clone());
@@ -3396,6 +3411,13 @@ mod tests {
         assert_eq!(kind_of(Path::new("预算.XLSX")), Some(DocKind::Sheets));
         assert_eq!(kind_of(Path::new("a/b/マクロ.xlsm")), Some(DocKind::Sheets));
         assert_eq!(kind_of(Path::new("発表.pptx")), Some(DocKind::Slides));
+        assert_eq!(kind_of(Path::new("报告.DOCX")), Some(DocKind::Writer));
+        assert_eq!(
+            kind_of(Path::new("宏/レポート.docm")),
+            Some(DocKind::Writer)
+        );
+        assert_eq!(kind_of(Path::new("old.doc")), None);
+        assert_eq!(kind_of(Path::new("docx")), None);
         assert_eq!(kind_of(Path::new("old.xls")), None);
         assert_eq!(kind_of(Path::new("notes.md")), None);
         assert_eq!(kind_of(Path::new("xlsx")), None);

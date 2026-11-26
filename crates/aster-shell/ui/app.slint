@@ -248,7 +248,8 @@ export component AppWindow inherits Window {
     out property <bool> surface-focused: scope.has-focus;
     out property <length> preview-width: preview-pane.width;
     out property <length> preview-height: preview-pane.height;
-    // Read-only views of files: 0 none, 1 a workbook, 2 a presentation.
+    // Views of files: 0 none, 1 a workbook, 2 a presentation, 3 a PDF file, 4 a
+    // Word document (read-only).
     in property <int> viewer;
     // The selected cell of a workbook, and the sheets one can switch to.
     in property <string> cell-address;
@@ -675,7 +676,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-copy;
                 shortcut: @keys(Control + C);
-                enabled: !root.dialog-text && (root.can-save || root.viewer == 3);
+                enabled: !root.dialog-text && (root.can-save || root.viewer == 3 || root.viewer == 4);
                 activated => {
                     if (findbar.editing-text) {
                         findbar.edit(2);
@@ -803,7 +804,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find;
                 shortcut: @keys(Control + F);
-                enabled: root.editing || root.viewer == 1 || root.viewer == 3;
+                enabled: root.editing || root.viewer == 1 || root.viewer == 3 || root.viewer == 4;
                 activated => {
                     root.menu-find();
                 }
@@ -812,7 +813,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-next;
                 shortcut: @keys(Control + G);
-                enabled: root.editing || root.viewer == 1 || root.viewer == 3;
+                enabled: root.editing || root.viewer == 1 || root.viewer == 3 || root.viewer == 4;
                 activated => {
                     root.find-next();
                 }
@@ -821,7 +822,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-previous;
                 shortcut: @keys(Control + Shift + G);
-                enabled: root.editing || root.viewer == 1 || root.viewer == 3;
+                enabled: root.editing || root.viewer == 1 || root.viewer == 3 || root.viewer == 4;
                 activated => {
                     root.find-previous();
                 }
@@ -830,7 +831,7 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: Strings.menu-find-selection;
                 shortcut: @keys(Control + E);
-                enabled: root.editing || root.viewer == 1 || root.viewer == 3;
+                enabled: root.editing || root.viewer == 1 || root.viewer == 3 || root.viewer == 4;
                 activated => {
                     root.menu-find-selection();
                 }
@@ -1497,11 +1498,12 @@ export component AppWindow inherits Window {
                         x: 0;
                         y: 0;
                         width: parent.width;
-                        // Markdown documents and workbooks.
-                        visible: root.find-open && (root.active-kind == 3 || root.viewer == 1 || root.viewer == 3);
+                        // Markdown documents, workbooks, PDF files and Word documents.
+                        visible: root.find-open && (root.active-kind == 3 || root.viewer == 1 || root.viewer == 3 || root.viewer == 4);
                         // A PDF is searched for text only: no replacing, no
                         // whole words or patterns.
                         simple: root.viewer == 3;
+                        no-regex: root.viewer == 4;
                         replace-visible: root.find-replace;
                         query <=> root.find-query;
                         replacement <=> root.find-replacement;
@@ -1637,7 +1639,7 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     enabled: root.surface-active && root.view-mode != 2;
-                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
+                                    mouse-cursor: root.viewer == 2 ? (root.slide-cursor == 1 ? MouseCursor.text : root.slide-cursor == 2 ? MouseCursor.move : root.slide-cursor == 3 ? MouseCursor.ew-resize : root.slide-cursor == 4 ? MouseCursor.ns-resize : root.slide-cursor == 5 ? MouseCursor.nwse-resize : root.slide-cursor == 6 ? MouseCursor.nesw-resize : MouseCursor.default) : root.resize-cursor == 1 ? MouseCursor.col-resize : root.resize-cursor == 2 ? MouseCursor.row-resize : root.resize-cursor == 3 ? MouseCursor.crosshair : root.resize-cursor == 4 ? MouseCursor.text : root.resize-cursor == 5 ? MouseCursor.pointer : root.viewer > 0 ? MouseCursor.default : MouseCursor.text;
                                     pointer-event(event) => {
                                         if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                                             scope.focus();

@@ -468,6 +468,7 @@ dependencies = [
  "aster-text",
  "aster-tools",
  "aster-workspace",
+ "aster-writer",
  "chrono",
  "i-slint-backend-testing",
  "ropey",
@@ -475,6 +476,7 @@ dependencies = [
  "slint",
  "slint-build",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -504,6 +506,7 @@ dependencies = [
  "aster-text",
  "aster-writer",
  "bytemuck",
+ "icu_segmenter",
  "krilla",
  "parley 0.13.0",
  "png",
@@ -511,6 +514,7 @@ dependencies = [
  "slint",
  "tempfile",
  "vello_cpu 0.2.0",
+ "zip",
 ]
 
 [[package]]

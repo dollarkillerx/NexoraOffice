@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 aster-image = { workspace = true }
+icu_segmenter = { workspace = true }
 aster-layout = { workspace = true }
 aster-markdown = { workspace = true }
 aster-platform = { workspace = true }
@@ -28,3 +29,4 @@ png = { workspace = true }
 tempfile = { workspace = true }
 aster-calc = { workspace = true }
 aster-ooxml = { workspace = true }
+zip = { workspace = true }

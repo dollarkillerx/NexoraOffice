@@ -179,6 +179,7 @@ impl Layouter {
             notes,
             grid: None,
             max_object: 1.0,
+            background: None,
             page_values: None,
         };
         let mut flow = Flow {

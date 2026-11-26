@@ -190,6 +190,34 @@ pub enum Stroke {
     Double,
     /// Twice as thick.
     Thick,
+    Dotted,
+    Dashed,
+    Wave,
+}
+
+/// How a decoration is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LineKind {
+    #[default]
+    Solid,
+    Dotted,
+    Dashed,
+    Wave,
+}
+
+/// Room kept above a range, for what is drawn there (a ruby).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Above {
+    pub range: Range<usize>,
+    /// Logical pixels above the range's own ascent.
+    pub height: f32,
+}
+
+/// A range stretched or squeezed horizontally.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scaling {
+    pub range: Range<usize>,
+    pub factor: f32,
 }
 
 /// Underline and strikethrough for a range, with more choice than
@@ -236,6 +264,10 @@ pub struct Extra<'a> {
     /// font size a line of it is high (the font the document names has these
     /// metrics, not the substitute). Sorted, not overlapping.
     pub natural: &'a [Natural],
+    /// Room above ranges, sorted.
+    pub above: &'a [Above],
+    /// Horizontal stretch of ranges, sorted.
+    pub scaling: &'a [Scaling],
     /// The same for an empty line.
     pub base_natural: Option<f32>,
     /// Lines are rounded up to whole multiples of this, the text centred
@@ -264,6 +296,8 @@ impl Default for Extra<'_> {
             decor: &[],
             line: LineRule::Legacy,
             natural: &[],
+            above: &[],
+            scaling: &[],
             base_natural: None,
             grid: None,
             distribute: false,
@@ -334,6 +368,9 @@ pub struct DrawRun<'a> {
     /// Slant to draw with, in degrees: the face's own made-up italic, or one
     /// added because italic was asked for and the face has none.
     pub skew: Option<f32>,
+    /// Horizontal stretch of the glyphs themselves (their positions are
+    /// already stretched).
+    pub x_scale: f32,
     pub glyphs: Vec<Glyph>,
 }
 
@@ -346,6 +383,7 @@ pub struct Decoration {
     pub y: f32,
     pub thickness: f32,
     pub color: Rgba,
+    pub kind: LineKind,
 }
 
 /// Per cluster: which face, which glyphs, which style.
@@ -357,6 +395,8 @@ struct Look {
     style: usize,
     /// Width and height of the inline object this cluster stands for.
     object: Option<[f32; 2]>,
+    /// Horizontal stretch.
+    xscale: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -638,12 +678,22 @@ impl Shaper {
                         }));
                     }
                     let style = style_at(range.start);
+                    let xscale = {
+                        let after = extra
+                            .scaling
+                            .partition_point(|n| n.range.start <= range.start);
+                        after
+                            .checked_sub(1)
+                            .map(|i| &extra.scaling[i])
+                            .filter(|n| n.range.contains(&range.start))
+                            .map_or(1.0, |n| n.factor.clamp(0.1, 10.0))
+                    };
                     let advance = if newline {
                         0
                     } else if let Some(object) = object {
                         to_fx(object.width * scale)
                     } else {
-                        to_fx(cluster.advance())
+                        to_fx(cluster.advance() * xscale)
                     };
                     found.push((
                         Cluster {
@@ -662,6 +712,7 @@ impl Shaper {
                             glyphs: start..glyphs.len(),
                             style,
                             object: object.map(|o| [o.width * scale, o.height * scale]),
+                            xscale,
                         },
                     ));
                 }
@@ -692,6 +743,7 @@ impl Shaper {
                     glyphs: 0..0,
                     style: style_at(start),
                     object: None,
+                    xscale: 1.0,
                 });
             }
         };
@@ -769,11 +821,17 @@ impl Shaper {
                         .map(|n| n.ratio * style.size * scale);
                     let (fa, fd, fl) =
                         scaled_metrics((face.ascent, face.descent, face.leading), target);
+                    let above_at = extra.above.partition_point(|n| n.range.start <= at);
+                    let room = above_at
+                        .checked_sub(1)
+                        .map(|i| &extra.above[i])
+                        .filter(|n| n.range.contains(&at))
+                        .map_or(0.0, |n| n.height * scale);
                     ascent = ascent.max(fa);
                     descent = descent.max(fd);
                     leading = leading.max(fl);
                     let rise = style.rise * scale;
-                    up = up.max(fa + rise);
+                    up = up.max(fa + rise + room);
                     down = down.max(fd - rise);
                 }
             }
@@ -1008,13 +1066,17 @@ impl Paragraph {
                 let color = self.styles[look.style].color;
                 let skew = self.skew(look, face);
                 let same = runs.last().is_some_and(|run| {
-                    std::ptr::eq(run.face, face) && run.color == color && run.skew == skew
+                    std::ptr::eq(run.face, face)
+                        && run.color == color
+                        && run.skew == skew
+                        && run.x_scale == look.xscale
                 });
                 if !same {
                     runs.push(DrawRun {
                         face,
                         color,
                         skew,
+                        x_scale: look.xscale,
                         glyphs: Vec::new(),
                     });
                 }
@@ -1024,10 +1086,10 @@ impl Paragraph {
                 for glyph in &self.glyphs[look.glyphs.clone()] {
                     run.glyphs.push(Glyph {
                         id: glyph.id,
-                        x: pen + glyph.x,
+                        x: pen + glyph.x * look.xscale,
                         y: baseline + glyph.y,
                     });
-                    pen += glyph.advance;
+                    pen += glyph.advance * look.xscale;
                 }
             }
         }
@@ -1078,18 +1140,20 @@ impl Paragraph {
                 let baseline = line.baseline - style.rise * self.scale;
                 let decor = self.decor_at(cluster.text.start);
                 let color = style.color;
-                let mut add = |offset: f32, size: f32, color: Rgba| {
+                let mut add = |offset: f32, size: f32, color: Rgba, kind: LineKind| {
                     let decoration = Decoration {
                         x0,
                         x1,
                         y: baseline - offset,
                         thickness: size.max(min_thickness),
                         color,
+                        kind,
                     };
                     // Join with the piece just before on the same line.
                     if let Some(last) = out.iter_mut().rev().take(4).find(|last| {
                         last.y == decoration.y
                             && last.color == decoration.color
+                            && last.kind == decoration.kind
                             && (last.x1 - decoration.x0).abs() < 1.0
                     }) {
                         last.x1 = decoration.x1;
@@ -1098,10 +1162,15 @@ impl Paragraph {
                     }
                 };
                 if style.underline {
-                    add(face.underline_offset, face.underline_size, color);
+                    add(
+                        face.underline_offset,
+                        face.underline_size,
+                        color,
+                        LineKind::Solid,
+                    );
                 }
                 if style.strike {
-                    add(face.strike_offset, face.strike_size, color);
+                    add(face.strike_offset, face.strike_size, color, LineKind::Solid);
                 }
                 if let Some(decor) = decor {
                     let (offset, size) = (face.underline_offset, face.underline_size);
@@ -1110,25 +1179,29 @@ impl Paragraph {
                         .all(char::is_whitespace);
                     let underline_color = decor.color.unwrap_or(color);
                     if !(decor.words_only && blank) {
+                        let c = underline_color;
                         match decor.underline {
                             Stroke::None => {}
-                            Stroke::Single => add(offset, size, underline_color),
-                            Stroke::Thick => add(offset, size * 2.0, underline_color),
+                            Stroke::Single => add(offset, size, c, LineKind::Solid),
+                            Stroke::Thick => add(offset, size * 2.0, c, LineKind::Solid),
+                            Stroke::Dotted => add(offset, size, c, LineKind::Dotted),
+                            Stroke::Dashed => add(offset, size, c, LineKind::Dashed),
+                            Stroke::Wave => add(offset - size, size, c, LineKind::Wave),
                             Stroke::Double => {
-                                add(offset, size, underline_color);
-                                add(offset - size * 2.0, size, underline_color);
+                                add(offset, size, c, LineKind::Solid);
+                                add(offset - size * 2.0, size, c, LineKind::Solid);
                             }
                         }
                     }
                     let (offset, size) = (face.strike_offset, face.strike_size);
                     match decor.strike {
                         Stroke::None => {}
-                        Stroke::Single => add(offset, size, color),
-                        Stroke::Thick => add(offset, size * 2.0, color),
                         Stroke::Double => {
-                            add(offset + size, size, color);
-                            add(offset - size, size, color);
+                            add(offset + size, size, color, LineKind::Solid);
+                            add(offset - size, size, color, LineKind::Solid);
                         }
+                        Stroke::Thick => add(offset, size * 2.0, color, LineKind::Solid),
+                        _ => add(offset, size, color, LineKind::Solid),
                     }
                 }
             }

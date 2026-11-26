@@ -239,7 +239,10 @@ impl Cx<'_> {
                         Some(table_path) => Paths::Cell(table_path.clone(), r, c),
                         None => Paths::None,
                     };
+                    let outer = self.background;
+                    self.background = cell.shading.or(outer);
                     let stack = self.layout_stack(&cell.blocks, &paths, inner, depth);
+                    self.background = outer;
                     cells.push(CellLayout {
                         row0: r,
                         rows: 1,

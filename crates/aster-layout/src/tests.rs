@@ -1919,3 +1919,117 @@ fn several_floats_in_one_paragraph_keep_their_own_places() {
     );
     assert!(page_has(&layout.pages[0], "boxed"));
 }
+
+#[test]
+fn ruby_is_drawn_small_above_its_base_and_makes_the_line_tall() {
+    let ruby = |with: bool| {
+        let mut p = paragraph("");
+        let run = if with {
+            Run {
+                text: "漢字".into(),
+                kind: Inline::Ruby(Arc::new(Ruby {
+                    text: "かんじ".into(),
+                    size: 5.0,
+                })),
+                look: look(),
+                ..Run::default()
+            }
+        } else {
+            Run::text("漢字", look())
+        };
+        p.runs = vec![run, Run::text("\nnext", look())];
+        lay(&doc(vec![Block::paragraph(p)]))
+    };
+    let (with, without) = (ruby(true), ruby(false));
+    let step = |l: &Layout| caret_top(l, 0, 7) - caret_top(l, 0, 0);
+    assert!(step(&with) > step(&without) + 5.0);
+    let texts = page_texts(&with.pages[0]);
+    assert!(texts.iter().any(|t| t == "かんじ"), "{texts:?}");
+    // Above the base: its item sits higher than the paragraph's own.
+    let ys: Vec<f32> = with.pages[0]
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Text(t) => Some(t.y),
+            _ => None,
+        })
+        .collect();
+    assert!(ys[1] < ys[0] + 5.0);
+}
+
+#[test]
+fn horizontal_scale_widens_a_run() {
+    let end = |scale: f32| {
+        let mut l = look();
+        l.scale = scale;
+        let mut p = paragraph("");
+        p.runs = vec![Run::text("abcd", l)];
+        lay(&doc(vec![Block::paragraph(p)]))
+            .caret(&Pos::new(Path::body(0), 4))
+            .unwrap()
+            .x
+    };
+    assert!(((end(2.0) - 20.0) / (end(1.0) - 20.0) - 2.0).abs() < 0.02);
+}
+
+#[test]
+fn automatic_text_is_white_on_dark_backgrounds() {
+    let colour_of = |shading: Option<Rgba>, in_cell: bool| {
+        let block = if in_cell {
+            let mut c = cell("x");
+            c.shading = shading;
+            table(
+                vec![2_000],
+                vec![Row {
+                    cells: vec![c],
+                    ..Row::default()
+                }],
+            )
+        } else {
+            with("x", |p| p.shading = shading)
+        };
+        let layout = lay(&doc(vec![block]));
+        layout.pages[0]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Text(t) => Some(t.paragraph.draw_runs(0.0, 100.0)[0].color),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(colour_of(None, false), [0, 0, 0, 255]);
+    assert_eq!(colour_of(Some([255, 255, 255, 255]), true), [0, 0, 0, 255]);
+    assert_eq!(
+        colour_of(Some([20, 30, 90, 255]), true),
+        [255, 255, 255, 255]
+    );
+    assert_eq!(
+        colour_of(Some([20, 30, 90, 255]), false),
+        [255, 255, 255, 255]
+    );
+}
+
+#[test]
+fn wave_and_dotted_underlines_keep_their_kind() {
+    use aster_text::LineKind;
+    let kind_of = |style| {
+        let mut l = look();
+        l.underline = Some(Underline { style, color: None });
+        let mut p = paragraph("");
+        p.runs = vec![Run::text("abc", l)];
+        let layout = lay(&doc(vec![Block::paragraph(p)]));
+        layout.pages[0]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Text(t) => Some(t.paragraph.decorations(0.0, 100.0, 0.5)[0].kind),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(kind_of(UnderlineStyle::Wave), LineKind::Wave);
+    assert_eq!(kind_of(UnderlineStyle::Dotted), LineKind::Dotted);
+    assert_eq!(kind_of(UnderlineStyle::Dashed), LineKind::Dashed);
+    assert_eq!(kind_of(UnderlineStyle::Single), LineKind::Solid);
+}

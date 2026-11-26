@@ -26,7 +26,8 @@ pub mod selection;
 
 pub use breaker::{BreakKind, EndTreatment, Fx, Leader, TabAlign};
 pub use paragraph::{
-    Align, Decor, Decoration, DrawRun, Extra, Face, Family, Glyph, InlineObject, LineBox, LineRule,
-    Natural, Paragraph, Rgba, Rules, Shaper, Spacing, Span, Spec, Stroke, Style, TabGap, TabStop,
+    Above, Align, Decor, Decoration, DrawRun, Extra, Face, Family, Glyph, InlineObject, LineBox,
+    LineKind, LineRule, Natural, Paragraph, Rgba, Rules, Scaling, Shaper, Spacing, Span, Spec,
+    Stroke, Style, TabGap, TabStop,
 };
 pub use selection::{Selection, TextPoint};

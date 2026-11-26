@@ -214,6 +214,7 @@ pub(crate) struct Cx<'a> {
     pub notes: NoteNumbers,
     pub grid: Option<f32>,
     pub max_object: f32,
+    pub background: Option<[u8; 4]>,
     pub page_values: Option<PageValues>,
 }
 
@@ -273,6 +274,7 @@ impl Cx<'_> {
             notes: &self.notes,
             page: self.page_values.as_ref(),
             max_object: self.max_object,
+            background: self.background,
         };
         let key = Key {
             ptr: Arc::as_ptr(para) as usize,
@@ -588,6 +590,35 @@ impl Cx<'_> {
                 let drawing = drawing.clone();
                 self.emit_drawing(&drawing, r, Layer::Body, ec, out);
             }
+        }
+        for ruby in &shaped.rubies {
+            let Some(r) = paragraph
+                .text_rects_in(ruby.range.clone(), lines.clone())
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let language = aster_text::segment::guess_language(&ruby.text, "ja");
+            let laid = self.lay.shaper.lay_out(&aster_text::Spec {
+                text: &ruby.text,
+                base: ruby.style.clone(),
+                spans: &[],
+                language,
+                width: None,
+                scale: 1.0,
+                line_height: 1.0,
+                align: aster_text::Align::Start,
+                rules: aster_text::Rules::for_language(language),
+            });
+            let (w, h) = (laid.width(), laid.height());
+            let centre = x + (r[0] + r[2]) / 2.0;
+            out.layers.body.push(Item::Text(TextItem {
+                paragraph: Arc::new(laid),
+                x: centre - w / 2.0,
+                y: y + r[1] - h,
+                lines: 0..1,
+            }));
         }
         let mut keep_clear = Vec::new();
         for (n, (offset, drawing)) in shaped.floats.iter().enumerate() {

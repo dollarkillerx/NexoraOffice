@@ -294,6 +294,46 @@ impl Pen<'_> {
         }
     }
 
+    fn decoration(&mut self, line: &aster_text::Decoration, ox: f32, oy: f32, s: f32) {
+        use aster_text::LineKind;
+        let (x0, x1) = (f64::from(ox + line.x0 * s), f64::from(ox + line.x1 * s));
+        let (y, t) = (
+            f64::from(oy + line.y * s),
+            f64::from(line.thickness * s).max(1.0),
+        );
+        self.ctx.set_paint(color(line.color));
+        match line.kind {
+            LineKind::Solid => self.ctx.fill_rect(&Rect::new(x0, y, x1, y + t)),
+            LineKind::Dotted | LineKind::Dashed => {
+                let (on, off) = if line.kind == LineKind::Dotted {
+                    (t, t)
+                } else {
+                    (t * 4.0, t * 2.0)
+                };
+                let mut at = x0;
+                while at < x1 {
+                    self.ctx
+                        .fill_rect(&Rect::new(at, y, (at + on).min(x1), y + t));
+                    at += on + off;
+                }
+            }
+            LineKind::Wave => {
+                let mut path = vello_cpu::kurbo::BezPath::new();
+                let (step, amp) = (t * 2.0, t * 1.2);
+                let mut at = x0;
+                let mut up = false;
+                path.move_to((at, y + t / 2.0));
+                while at < x1 {
+                    at = (at + step).min(x1);
+                    up = !up;
+                    path.line_to((at, y + t / 2.0 + if up { -amp } else { amp }));
+                }
+                self.ctx.set_stroke(Stroke::new(t * 0.8));
+                self.ctx.stroke_path(&path);
+            }
+        }
+    }
+
     fn text(&mut self, item: &aster_layout::TextItem) {
         let s = self.s as f32;
         let (ox, oy) = (self.x as f32 + item.x * s, self.y as f32 + item.y * s);
@@ -312,22 +352,17 @@ impl Pen<'_> {
                 embolden: run.face.embolden,
                 skew: run.skew,
             };
-            glyphs::draw_face(
+            glyphs::draw_face_scaled(
                 self.ctx,
                 self.resources,
                 &face,
                 color(run.color),
                 self.buffer,
+                run.x_scale,
             );
         }
         for line in paragraph.decorations_in(item.lines.clone(), 0.5) {
-            self.ctx.set_paint(color(line.color));
-            self.ctx.fill_rect(&Rect::new(
-                f64::from(ox + line.x0 * s),
-                f64::from(oy + line.y * s),
-                f64::from(ox + line.x1 * s),
-                f64::from(oy + (line.y + line.thickness) * s),
-            ));
+            self.decoration(&line, ox, oy, s);
         }
     }
 }

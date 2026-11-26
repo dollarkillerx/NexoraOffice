@@ -2,7 +2,7 @@
 name = "aster-ooxml"
 version.workspace = true
 license.workspace = true
-description = "Office Open XML: the OPC package with safety limits, and the XLSX and PPTX readers"
+description = "Office Open XML: the OPC package with safety limits, and the DOCX, XLSX and PPTX readers"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true

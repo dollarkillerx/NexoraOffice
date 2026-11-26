@@ -1,16 +1,20 @@
 //! Office Open XML: our own package layer (ADR 0001) and the readers that
-//! turn XLSX and PPTX files into the Sheets and Slides models.
+//! turn DOCX, XLSX and PPTX files into the Writer, Sheets and Slides
+//! models.
 //!
 //! [`package`] reads the zip container part by part under safety limits,
 //! with content types and relationships. [`xlsx`] and [`pptx`] read the
 //! parts this version models; everything else is left in the package
-//! untouched. Nothing is written yet: the tabs are read-only. DOCX is not
-//! read yet.
+//! untouched. [`docx`] reads the resolved text, styles, lists, tables,
+//! sections and drawings of a Word document, with the byte range of every
+//! paragraph, run, table and section in its part for saving. Nothing is
+//! written yet: the tabs are read-only.
 //!
 //! Each format is a [`FormatCodec`]: bytes in, model out. Saving will be its
 //! other half, writing back untouched parts as they were read.
 
 pub mod chart;
+pub mod docx;
 pub mod drawingml;
 pub mod error;
 pub mod package;
@@ -30,6 +34,18 @@ pub trait FormatCodec {
     /// File name extensions, lower case, without the dot.
     const EXTENSIONS: &'static [&'static str];
     fn read(&self, bytes: Vec<u8>) -> Result<Self::Model>;
+}
+
+/// `.docx` and `.docm` into [`aster_writer::Document`]. Macros are not run
+/// or read.
+pub struct Docx;
+
+impl FormatCodec for Docx {
+    type Model = aster_writer::Document;
+    const EXTENSIONS: &'static [&'static str] = &["docx", "docm"];
+    fn read(&self, bytes: Vec<u8>) -> Result<Self::Model> {
+        docx::read(bytes)
+    }
 }
 
 /// `.xlsx` and `.xlsm` into [`aster_sheets::Workbook`]. Macros are not run

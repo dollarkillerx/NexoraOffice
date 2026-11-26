@@ -1,11 +1,14 @@
 # Builds a .zip for the Windows machine this runs on.
 #   pwsh packaging/windows.ps1
-# There is no installer yet and the executable is not signed.
+# There is no installer yet and the executables are not signed.
+# NOT YET RUN on Windows.
 $ErrorActionPreference = 'Stop'
 
 # Keep these in step with packaging/common.sh.
-$AppBinary = 'g1-ime'
-$AppPackage = 'g1-ime'
+$AppBinary = 'aster-shell'
+$AppPackage = 'aster-shell'
+$BridgeBinary = 'aster-mcp'
+$BridgePackage = 'aster-mcp-bridge'
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Dist = Join-Path $Root 'target/dist-packages'
@@ -15,13 +18,15 @@ $metadata = cargo metadata --format-version 1 --no-deps --locked --manifest-path
 $version = ($metadata.packages | Where-Object { $_.name -eq $AppPackage }).version
 $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
 
-cargo build --locked --profile dist -p $AppPackage --manifest-path $Manifest
+cargo build --locked --profile dist -p $AppPackage -p $BridgePackage --manifest-path $Manifest
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
 $stage = Join-Path $Dist 'aster-office'
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item (Join-Path $Root "target/dist/$AppBinary.exe") (Join-Path $stage 'aster-office.exe')
+# The bridge must sit in the same directory as the executable.
+Copy-Item (Join-Path $Root "target/dist/$BridgeBinary.exe") (Join-Path $stage "$BridgeBinary.exe")
 Copy-Item (Join-Path $Root 'assets/brand/logo/aster.ico') $stage
 python (Join-Path $Root 'packaging/licenses.py') --report (Join-Path $stage 'THIRD-PARTY-PACKAGES.txt') | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'licence report failed' }
@@ -31,6 +36,6 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip
 
 Write-Host "Windows packages, version $version ($arch):"
-foreach ($file in @((Join-Path $stage 'aster-office.exe'), $zip)) {
+foreach ($file in @((Join-Path $stage 'aster-office.exe'), (Join-Path $stage "$BridgeBinary.exe"), $zip)) {
     '  {0,-44} {1,8} KB' -f (Split-Path -Leaf $file), [math]::Floor((Get-Item $file).Length / 1KB) | Write-Host
 }

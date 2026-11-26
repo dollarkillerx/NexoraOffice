@@ -190,7 +190,6 @@ strings! {
     pdf_undecided,
 
     /// Says that a Writer tab is plain text, not the word processor.
-    plain_text_note,
     /// `{count}` is a number.
     word_count,
     char_count,
@@ -325,7 +324,6 @@ strings! {
     mcp_no_bridge,
 
     /// What a new Writer tab starts with.
-    writer_sample,
 
     /// Menu bar. On macOS these are the system menu; elsewhere a bar in the window.
     menu_file,
@@ -853,7 +851,6 @@ pub const ZH_HANS: Strings = Strings {
     planned_phase: "按路线图，{name} 在 Phase {phase} 交付。",
     pdf_undecided: "PDF 阅读器是否进入第一版还没有决定。",
 
-    plain_text_note: "纯文本原型",
     word_count: "{count} 字",
     char_count: "{count} 字符",
     ime_enabled: "输入法已启用",
@@ -980,17 +977,6 @@ pub const ZH_HANS: Strings = Strings {
     mcp_failed: "MCP 无法启动：{error}",
     mcp_no_bridge: "找不到 aster-mcp 程序，请从安装包运行 Aster Office",
 
-    writer_sample: "\
-Aster Office 外壳原型
-
-这一页不是界面框架的文本控件。文字由 Parley 排版、vello_cpu 渲染，再作为一张图贴进窗口，输入法事件直接取自窗口系统。
-
-现在能做的：输入中文、日文和英文，移动光标，选择，滚动，缩放。
-还不能做的：格式、撤销、打开和保存。工具栏上置灰的按钮都还没有接上功能。
-
-日本語の入力も試してください。English works too.
-
-",
 
     menu_file: "文件",
     menu_edit: "编辑",
@@ -1380,7 +1366,6 @@ pub const JA: Strings = Strings {
     planned_phase: "ロードマップでは、{name} は Phase {phase} で提供する予定です。",
     pdf_undecided: "PDF ビューアーを最初の版に含めるかどうかは未定です。",
 
-    plain_text_note: "プレーンテキストの試作",
     word_count: "{count} 語",
     char_count: "{count} 文字",
     ime_enabled: "入力メソッド有効",
@@ -1507,17 +1492,6 @@ pub const JA: Strings = Strings {
     mcp_failed: "MCP を開始できません：{error}",
     mcp_no_bridge: "aster-mcp が見つかりません。インストールした Aster Office から起動してください",
 
-    writer_sample: "\
-Aster Office シェルの試作
-
-このページは UI フレームワークのテキスト部品ではありません。文字は Parley で組版し、vello_cpu で描画して、一枚の画像としてウィンドウに貼っています。入力メソッドのイベントはウィンドウシステムから直接受け取ります。
-
-できること：日本語、中国語、英語の入力、カーソル移動、選択、スクロール、拡大縮小。
-まだできないこと：書式、元に戻す、開く、保存。ツールバーの灰色のボタンには機能がつながっていません。
-
-中文输入也请试一下。English works too.
-
-",
 
     menu_file: "ファイル",
     menu_edit: "編集",
@@ -1907,7 +1881,6 @@ pub const EN: Strings = Strings {
     planned_phase: "On the roadmap, {name} arrives in Phase {phase}.",
     pdf_undecided: "Whether a PDF reader ships in the first version has not been decided.",
 
-    plain_text_note: "Plain-text prototype",
     word_count: "{count} words",
     char_count: "{count} characters",
     ime_enabled: "Input method on",
@@ -2034,17 +2007,6 @@ pub const EN: Strings = Strings {
     mcp_failed: "MCP could not start: {error}",
     mcp_no_bridge: "The aster-mcp program is missing; run Aster Office from its installed package",
 
-    writer_sample: "\
-Aster Office shell prototype
-
-This page is not a text widget of the UI toolkit. The text is laid out by Parley, drawn by vello_cpu and placed in the window as one image; input-method events come straight from the window system.
-
-What works: typing in English, Chinese and Japanese, moving the caret, selecting, scrolling, zooming.
-What does not: formatting, undo, opening and saving. The greyed-out toolbar buttons are not connected to anything yet.
-
-中文输入也请试一下。日本語の入力も試してください。
-
-",
 
     menu_file: "File",
     menu_edit: "Edit",
@@ -2429,7 +2391,6 @@ pub const ZH_HANT: Strings = Strings {
     placeholder_body: "這個分頁只用來檢視外殼的版面：分頁、工具列和狀態列會隨文件類型切換，但這裡沒有任何編輯功能，工具列按鈕全部無法使用。背後的線框是版面示意，不是實際介面。",
     planned_phase: "依照路線圖，{name} 會在 Phase {phase} 交付。",
     pdf_undecided: "PDF 閱讀器是否納入第一版尚未決定。",
-    plain_text_note: "純文字原型",
     word_count: "{count} 字",
     char_count: "{count} 字元",
     ime_enabled: "輸入法已啟用",
@@ -2553,7 +2514,6 @@ pub const ZH_HANT: Strings = Strings {
     mcp_copy: "拷貝",
     mcp_failed: "MCP 無法啟動：{error}",
     mcp_no_bridge: "找不到 aster-mcp 程式，請從安裝套件執行 Aster Office",
-    writer_sample: "Aster Office 外殼原型\n\n這一頁不是介面框架的文字元件。文字由 Parley 排版、vello_cpu 繪製，再當成一張圖貼進視窗，輸入法事件直接取自視窗系統。\n\n現在能做的：輸入中文、日文和英文，移動游標，選取，捲動，縮放。\n還不能做的：格式、復原、開啟和儲存。工具列上變灰的按鈕都還沒有接上功能。\n\n日本語の入力も試してください。English works too.\n\n",
 
     menu_file: "檔案",
     menu_edit: "編輯",
@@ -2938,7 +2898,6 @@ pub const FR: Strings = Strings {
     placeholder_body: "Cet onglet montre seulement la disposition de l’interface. Les onglets, la barre d’outils et la barre d’état changent selon le type de document, mais rien ici ne peut être modifié et tous les boutons de la barre d’outils sont désactivés. Le tracé à l’arrière-plan est une esquisse de la disposition, pas une vue fonctionnelle.",
     planned_phase: "D’après la feuille de route, {name} arrive en Phase {phase}.",
     pdf_undecided: "La présence d’un lecteur PDF dans la première version n’est pas encore décidée.",
-    plain_text_note: "Prototype en texte brut",
     word_count: "{count} mots",
     char_count: "{count} caractères",
     ime_enabled: "Méthode de saisie active",
@@ -3062,7 +3021,6 @@ pub const FR: Strings = Strings {
     mcp_copy: "Copier",
     mcp_failed: "MCP n’a pas pu démarrer : {error}",
     mcp_no_bridge: "Le programme aster-mcp est introuvable ; lancez Aster Office depuis son paquet installé",
-    writer_sample: "Prototype de l’interface d’Aster Office\n\nCette page n’est pas un champ de texte de la bibliothèque d’interface. Le texte est composé par Parley, dessiné par vello_cpu et placé dans la fenêtre sous forme d’image ; les événements de la méthode de saisie viennent directement du système de fenêtrage.\n\nCe qui fonctionne : saisir du français, du chinois et du japonais, déplacer le curseur, sélectionner, faire défiler, zoomer.\nCe qui ne fonctionne pas : la mise en forme, l’annulation, l’ouverture et l’enregistrement. Les boutons grisés de la barre d’outils ne sont reliés à rien pour l’instant.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
 
     menu_file: "Fichier",
     menu_edit: "Édition",
@@ -3447,7 +3405,6 @@ pub const DE: Strings = Strings {
     placeholder_body: "Dieser Tab zeigt nur den Aufbau der Oberfläche. Tabs, Symbolleiste und Statusleiste wechseln mit der Art des Dokuments, aber hier lässt sich nichts bearbeiten, und alle Schaltflächen der Symbolleiste sind deaktiviert. Die Linien im Hintergrund sind eine Skizze des Aufbaus, keine funktionierende Ansicht.",
     planned_phase: "Laut Fahrplan kommt {name} in Phase {phase}.",
     pdf_undecided: "Ob die erste Version einen PDF-Betrachter enthält, ist noch nicht entschieden.",
-    plain_text_note: "Prototyp für reinen Text",
     word_count: "{count} Wörter",
     char_count: "{count} Zeichen",
     ime_enabled: "Eingabemethode aktiv",
@@ -3571,7 +3528,6 @@ pub const DE: Strings = Strings {
     mcp_copy: "Kopieren",
     mcp_failed: "MCP konnte nicht starten: {error}",
     mcp_no_bridge: "Das Programm aster-mcp fehlt; starten Sie Aster Office aus dem installierten Paket",
-    writer_sample: "Prototyp der Aster-Office-Oberfläche\n\nDiese Seite ist kein Textfeld des UI-Toolkits. Der Text wird von Parley gesetzt, von vello_cpu gezeichnet und als ein Bild ins Fenster gelegt; die Ereignisse der Eingabemethode kommen direkt vom Fenstersystem.\n\nWas geht: Deutsch, Chinesisch und Japanisch tippen, die Einfügemarke bewegen, markieren, scrollen, zoomen.\nWas nicht geht: Formatierung, Rückgängig, Öffnen und Speichern. Die ausgegrauten Schaltflächen der Symbolleiste sind noch mit nichts verbunden.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
 
     menu_file: "Datei",
     menu_edit: "Bearbeiten",
@@ -3956,7 +3912,6 @@ pub const ES: Strings = Strings {
     placeholder_body: "Esta pestaña solo muestra la disposición de la interfaz. Las pestañas, la barra de herramientas y la barra de estado cambian según el tipo de documento, pero aquí no se puede editar nada y todos los botones de la barra de herramientas están desactivados. El trazado del fondo es un boceto de la disposición, no una vista que funcione.",
     planned_phase: "Según la hoja de ruta, {name} llega en la Phase {phase}.",
     pdf_undecided: "Aún no se ha decidido si la primera versión incluirá un lector de PDF.",
-    plain_text_note: "Prototipo de texto sin formato",
     word_count: "{count} palabras",
     char_count: "{count} caracteres",
     ime_enabled: "Método de entrada activo",
@@ -4080,7 +4035,6 @@ pub const ES: Strings = Strings {
     mcp_copy: "Copiar",
     mcp_failed: "No se pudo iniciar MCP: {error}",
     mcp_no_bridge: "Falta el programa aster-mcp; ejecuta Aster Office desde su paquete instalado",
-    writer_sample: "Prototipo de la interfaz de Aster Office\n\nEsta página no es un campo de texto de la biblioteca de interfaz. El texto lo compone Parley, lo dibuja vello_cpu y se coloca en la ventana como una sola imagen; los eventos del método de entrada llegan directamente del sistema de ventanas.\n\nLo que funciona: escribir en español, chino y japonés, mover el cursor, seleccionar, desplazarse, ampliar y reducir.\nLo que no: el formato, deshacer, abrir y guardar. Los botones atenuados de la barra de herramientas aún no están conectados a nada.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
 
     menu_file: "Archivo",
     menu_edit: "Edición",
@@ -4465,7 +4419,6 @@ pub const KO: Strings = Strings {
     placeholder_body: "이 탭은 셸의 레이아웃을 확인하기 위한 것입니다. 탭, 도구 모음, 상태 표시줄은 문서 종류에 따라 바뀌지만 편집 기능은 없으며 도구 모음의 버튼은 모두 비활성 상태입니다. 뒤에 보이는 선 그림은 레이아웃 스케치이며 실제 화면이 아닙니다.",
     planned_phase: "로드맵에 따르면 {name}은(는) Phase {phase}에서 제공됩니다.",
     pdf_undecided: "PDF 뷰어를 첫 버전에 포함할지는 아직 정해지지 않았습니다.",
-    plain_text_note: "일반 텍스트 프로토타입",
     word_count: "{count} 단어",
     char_count: "{count} 글자",
     ime_enabled: "입력기 켜짐",
@@ -4589,7 +4542,6 @@ pub const KO: Strings = Strings {
     mcp_copy: "복사",
     mcp_failed: "MCP를 시작할 수 없습니다: {error}",
     mcp_no_bridge: "aster-mcp 프로그램이 없습니다. 설치된 패키지에서 Aster Office를 실행하세요",
-    writer_sample: "Aster Office 셸 프로토타입\n\n이 페이지는 UI 프레임워크의 텍스트 컨트롤이 아닙니다. 글자는 Parley가 조판하고 vello_cpu가 그린 뒤 한 장의 이미지로 창에 올라가며, 입력기 이벤트는 창 시스템에서 직접 받습니다.\n\n되는 것: 한국어, 중국어, 일본어, 영어 입력, 커서 이동, 선택, 스크롤, 확대와 축소.\n아직 안 되는 것: 서식, 실행 취소, 열기와 저장. 도구 모음의 회색 버튼은 아직 기능에 연결되어 있지 않습니다.\n\n中文输入也请试一下。日本語の入力も試してください。\n\n",
 
     menu_file: "파일",
     menu_edit: "편집",
@@ -5130,10 +5082,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_writer_sample_ends_with_room_to_type() {
-        for language in Language::ALL {
-            assert!(language.strings().writer_sample.ends_with("\n\n"));
-        }
-    }
 }

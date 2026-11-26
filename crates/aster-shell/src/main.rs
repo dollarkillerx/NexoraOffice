@@ -7929,6 +7929,15 @@ fn setup(options: Options) -> Result<App, Box<dyn std::error::Error>> {
             // no caret to blink.
             let editor_moved = mode.shows_source() && size != surface.size();
             let mut dirty = editor_moved || focused != was_focused || preview_moved;
+            // A composition is dropped when the document loses the keyboard.
+            if was_focused
+                && !focused
+                && shell
+                    .active_doc()
+                    .is_some_and(|tab| tab.view.cancel_composition())
+            {
+                dirty = true;
+            }
             was_focused = focused;
             if blink_due {
                 shell.last_blink = Instant::now();
@@ -8168,6 +8177,71 @@ mod tests {
             Some("未保存のタイトル")
         );
         assert_eq!(presentation.slides[1].notes.as_deref(), Some("メモ"));
+        // Closing it is the user's choice: the record goes.
+        again.force_close(id);
+        if let Some(writer) = &again.writer {
+            writer.flush();
+        }
+        assert!(recovery::find(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_word_document_with_unsaved_changes_comes_back_from_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("報告.docx");
+        std::fs::write(&file, docx_sample::sample()).unwrap();
+        let root = RecoveryRoot::new(dir.path().join("records"));
+        let mut shell = shell();
+        shell.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let Ok(loaded) = office::load(&file) else {
+            panic!("the document loads");
+        };
+        let id = shell.open_office(file.clone(), loaded);
+        shell.sync_doc_records();
+        assert!(shell.writer.is_some());
+        {
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a Word tab");
+            };
+            assert!(tab.record.is_none(), "nothing changed, no record");
+            assert!(tab.view.type_text("未保存の変更 "));
+        }
+        shell.sync_doc_records();
+        if let Some(writer) = &shell.writer {
+            writer.flush();
+        }
+        let Some(Content::Doc(tab)) = shell.contents.get(&id) else {
+            panic!("a Word tab");
+        };
+        assert!(tab.record.is_some());
+
+        // As after a crash: a new run finds the record and restores it.
+        drop(shell);
+        let mut candidates = recovery::find(&root).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+        assert!(candidate.is_readable());
+        assert!(candidate.info.as_ref().is_some_and(|i| i.document));
+        assert_eq!(candidate.disk, Some(FileState::Unchanged));
+        let mut again = self::shell();
+        again.writer = Some(RecordWriter::spawn(root.clone(), |_| {}));
+        let id = again.restore(candidate).expect("restored");
+        let Some(Content::Doc(tab)) = again.contents.get(&id) else {
+            panic!("a Word tab");
+        };
+        assert!(tab.is_modified());
+        assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+        assert!(tab.view.document().plain_text().starts_with("未保存の変更 "));
+        // Saving it starts from the bytes the record held.
+        let job = again
+            .contents
+            .get_mut(&id)
+            .and_then(|c| match c {
+                Content::Doc(tab) => tab.begin_save(),
+                _ => None,
+            })
+            .expect("a save job");
+        assert!(job.bytes().is_ok());
         // Closing it is the user's choice: the record goes.
         again.force_close(id);
         if let Some(writer) = &again.writer {
@@ -8548,9 +8622,9 @@ mod tests {
             titles,
             ["未命名文档 1", "Untitled document 2", "無題のシート 1"]
         );
-        // The text of a new Writer document follows the language too.
+        // A new Writer document is a real, empty one.
         let surface = shell.contents.get_mut(&english).expect("open").surface();
-        assert!(surface.text().starts_with("Aster Office shell"));
+        assert_eq!(surface.text(), "");
         // A new Markdown document is empty.
         shell.open_untitled(DocKind::Markdown);
         assert_eq!(shell.active_markdown().map(|e| e.document.len()), Some(0));
@@ -9704,7 +9778,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn a_word_document_opens_in_a_read_only_tab() {
+    fn a_word_document_opens_in_an_editable_tab() {
         let app = app();
         let ui = &app.ui;
         open_document(&app);
@@ -9713,23 +9787,34 @@ mod ui_tests {
             DocKind::Writer
         );
         assert_eq!(ui.get_viewer(), 4);
-        // Nothing to save, and no formatting: only the zoom buttons work.
-        assert!(!ui.get_can_save());
+        // It can be saved; the editing buttons work, printing does not.
+        assert!(ui.get_can_save());
         let items = ui.get_toolbar_items();
         let enabled: Vec<i32> = (0..items.row_count())
             .filter_map(|i| items.row_data(i))
             .filter(|item| item.enabled && item.command >= 0)
             .map(|item| item.command)
             .collect();
-        assert_eq!(
-            enabled,
-            [
-                Command::ZoomOut.id(),
-                Command::ZoomReset.id(),
-                Command::ZoomIn.id()
-            ]
-        );
-        // The status bar says the page, the counts, the format and the zoom.
+        for command in [
+            Command::Bold,
+            Command::Italic,
+            Command::Underline,
+            Command::ParagraphStyle,
+            Command::FontFamily,
+            Command::FontSize,
+            Command::TextColor,
+            Command::Highlight,
+            Command::AlignCenter,
+            Command::BulletList,
+            Command::IndentMore,
+            Command::ZoomIn,
+        ] {
+            assert!(enabled.contains(&command.id()), "{command:?}");
+        }
+        assert!(!enabled.contains(&Command::Print.id()));
+        assert!(!enabled.contains(&Command::Undo.id()), "nothing to undo yet");
+        // The status bar says the page, the counts, the format and the zoom,
+        // and no longer says "read-only".
         assert!(
             ui.get_status_words().contains("1"),
             "{}",
@@ -9738,6 +9823,7 @@ mod ui_tests {
         assert_eq!(ui.get_status_format().as_str(), "DOCX");
         assert!(ui.get_status_zoom().ends_with('%'));
         assert!(ui.get_zoom_enabled());
+        assert!(!ui.get_status_note().contains(app.shell.borrow().language.strings().read_only_note));
         // The outline lists the headings.
         let headings = with_doc(&app, |tab| tab.view.outline().len());
         assert!(headings > 0);
@@ -9751,7 +9837,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn keys_move_the_caret_in_a_word_document_and_typing_changes_nothing() {
+    fn typing_in_a_word_document_changes_it_and_marks_the_tab() {
         let app = app();
         let ui = &app.ui;
         open_document(&app);
@@ -9764,16 +9850,102 @@ mod ui_tests {
         key(ui, Key::DownArrow);
         let lower = with_doc(&app, |tab| tab.view.caret().cloned().unwrap());
         assert!(lower > caret);
-        type_text(ui, "typed");
-        key(ui, Key::Backspace);
-        key(ui, Key::Delete);
-        key(ui, Key::Return);
-        assert_eq!(with_doc(&app, |tab| tab.view.document().clone()), document);
         assert!(!app.shell.borrow().tabs.active().unwrap().modified);
+        type_text(ui, "typed");
+        assert!(app.shell.borrow().tabs.active().unwrap().modified);
+        assert!(with_doc(&app, |tab| tab.view.document().plain_text().contains("typed")));
+        // The undo buttons come alive; undo goes back to the opened text.
+        let items = ui.get_toolbar_items();
+        let undo = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .find(|item| item.command == Command::Undo.id())
+            .unwrap();
+        assert!(undo.enabled);
+        ui.invoke_edit_undo();
+        assert!(aster_writer::edit::same_content(
+            &with_doc(&app, |tab| tab.view.document().clone()),
+            &document
+        ));
+        ui.invoke_edit_redo();
+        key(ui, Key::Backspace);
+        key(ui, Key::Return);
+        assert!(with_doc(&app, |tab| tab.view.document().plain_text().len() > 0));
+        // Select all, copy, and the Format menu's bold.
         command(ui, "a");
         assert!(with_doc(&app, |tab| tab.view.selected_text().len() > 200));
+        ui.invoke_sheet_format(0);
+        assert!(with_doc(&app, |tab| tab.look().bold));
         key(ui, Key::Escape);
         assert!(!with_doc(&app, |tab| tab.view.has_selection()));
+    }
+
+    #[test]
+    fn a_new_writer_document_saves_through_the_save_dialog_path() {
+        let app = app();
+        let ui = &app.ui;
+        ui.invoke_new_document(DocKind::Writer.index() as i32);
+        ui.invoke_focus_document();
+        type_text(ui, "hello");
+        let id = app.shell.borrow().tabs.active_id().unwrap();
+        let (existing, suggested) = app.shell.borrow_mut().save_target(id).unwrap();
+        assert!(existing.is_none());
+        assert_eq!(suggested.extension().and_then(|e| e.to_str()), Some("docx"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("新建.docx");
+        {
+            let mut shell = app.shell.borrow_mut();
+            writer_ui::start_save(ui, &mut shell, id, path.clone(), AfterSave::Nothing);
+        }
+        // The write runs on a worker thread and comes back through the
+        // event loop, which the headless tests do not run: do what it does.
+        let job = {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.saving = false;
+            tab.begin_save().unwrap()
+        };
+        let written = job.write(&path).expect("it writes");
+        {
+            let mut shell = app.shell.borrow_mut();
+            let Some(Content::Doc(tab)) = shell.contents.get_mut(&id) else {
+                panic!("a document");
+            };
+            tab.finish_save(&job, &path, Some(written));
+            shell.sync_modified();
+        }
+        assert!(!app.shell.borrow().tabs.active().unwrap().modified);
+        let again = aster_ooxml::docx::read(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(again.plain_text(), "hello");
+    }
+
+    #[test]
+    fn a_double_click_on_the_document_does_not_zoom_the_window() {
+        let app = app();
+        let ui = &app.ui;
+        open_document(&app);
+        let pane = ElementHandle::find_by_element_id(ui, "AppWindow::editor-pane")
+            .next()
+            .expect("the document pane");
+        let origin = pane.absolute_position();
+        let at = LogicalPosition::new(origin.x + 200.0, origin.y + 120.0);
+        let window = ui.window();
+        let before = window.is_maximized();
+        window.dispatch_event(WindowEvent::PointerMoved { position: at });
+        for _ in 0..2 {
+            window.dispatch_event(WindowEvent::PointerPressed {
+                position: at,
+                button: PointerEventButton::Left,
+            });
+            window.dispatch_event(WindowEvent::PointerReleased {
+                position: at,
+                button: PointerEventButton::Left,
+            });
+        }
+        assert_eq!(window.is_maximized(), before);
+        // The double click selected a word.
+        assert!(with_doc(&app, |tab| tab.view.has_selection()));
     }
 
     #[test]
@@ -9784,6 +9956,8 @@ mod ui_tests {
         ui.invoke_menu_find();
         assert!(ui.get_find_open());
         assert!(!ui.get_find_replace());
+        ui.invoke_menu_replace();
+        assert!(ui.get_find_replace());
         ui.invoke_find_query_edited("the".into());
         let position = ui.get_find_position().to_string();
         assert!(position.contains('9') || position.chars().any(|c| c.is_ascii_digit()));

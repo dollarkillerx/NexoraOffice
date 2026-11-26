@@ -293,7 +293,7 @@ pub fn refresh(ui: &AppWindow, shell: &mut Shell) {
     };
     let policy = ai.policy.lock().map(|p| p.clone()).unwrap_or_default();
     match active {
-        Some((id, DocKind::Markdown | DocKind::Sheets, title)) => {
+        Some((id, DocKind::Markdown | DocKind::Sheets | DocKind::Writer, title)) => {
             let level = policy.level_of(&id.0.to_string(), path.as_deref());
             ui.set_ai_access_level(level_index(level));
             ui.set_ai_access_label(i18n::fill(strings.ai_access_label, "name", &title).into());
@@ -747,7 +747,7 @@ fn context(shell: &mut Shell) -> TurnContext {
     let Some((id, title)) = shell
         .tabs
         .active()
-        .filter(|tab| matches!(tab.kind, DocKind::Markdown | DocKind::Sheets))
+        .filter(|tab| matches!(tab.kind, DocKind::Markdown | DocKind::Sheets | DocKind::Writer))
         .map(|tab| (tab.id, tab.title.clone()))
     else {
         return context;
@@ -765,6 +765,13 @@ fn context(shell: &mut Shell) -> TurnContext {
     }
     context.document_id = Some(id.0.to_string());
     context.document_title = Some(title);
+    if let Some(Content::Doc(tab)) = shell.contents.get(&id) {
+        let selected = tab.view.selected_text();
+        if !selected.is_empty() {
+            context.selection = Some(selected);
+        }
+        return context;
+    }
     if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
         // Where the user is in the workbook; the cells themselves are read
         // with read_sheet.
@@ -1609,7 +1616,7 @@ struct ShellHost {
 fn kind_name(kind: DocKind) -> &'static str {
     match kind {
         DocKind::Markdown => "markdown",
-        DocKind::Writer => "text",
+        DocKind::Writer => "word",
         DocKind::Sheets => "spreadsheet",
         DocKind::Slides => "presentation",
         _ => "other",
@@ -1639,6 +1646,7 @@ fn document_path(shell: &mut Shell, id: TabId) -> Option<PathBuf> {
     match shell.contents.get(&id)? {
         Content::Markdown(editor) => editor.path.clone(),
         Content::Sheet(tab) => tab.path.clone(),
+        Content::Doc(tab) => tab.path.clone(),
         _ => None,
     }
 }
@@ -1725,6 +1733,9 @@ impl Host for ShellHost {
 /// document's text version, and for the tools that act at the selection,
 /// the selection too. An approved call runs only while this is unchanged.
 fn fingerprint_of(shell: &mut Shell, id: TabId, tool: &str, args: &Value) -> Option<String> {
+    if let Some(Content::Doc(tab)) = shell.contents.get(&id) {
+        return Some(format!("r{}", tab.view.revision()));
+    }
     if let Some(Content::Sheet(tab)) = shell.contents.get(&id) {
         return Some(match tool {
             "write_cells" => sheet_tools::fingerprint(tab, args),
@@ -1790,6 +1801,22 @@ impl ShellHost {
                     }
                 }
                 return Ok(result);
+            }
+            if let Some(Content::Doc(tab)) = shell.contents.get(&id) {
+                let text = tab.view.document().plain_text().replace(aster_writer::OBJECT, "");
+                let headings: Vec<Value> = tab
+                    .view
+                    .outline()
+                    .iter()
+                    .map(|e| json!({ "level": u32::from(e.level) + 1, "text": e.text, "page": e.page + 1 }))
+                    .collect();
+                return assistant::run_on_word(
+                    &text,
+                    &tab.view.selected_text(),
+                    headings,
+                    name,
+                    &args,
+                );
             }
             let Some(editor) = shell.markdown(id) else {
                 return Err("only Markdown documents can be read and changed for now".to_owned());
